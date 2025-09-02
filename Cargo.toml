@@ -1,0 +1,9 @@
+[workspace]
+members = ["alloc", "bootloader", "dtb", "mutex", "xtask"]
+workspace.resolver = "3"
+build-std-features = ["compiler-builtins-mem"]
+
+[profile.release]
+panic = 'abort'
+[profile.dev]
+panic = 'abort'

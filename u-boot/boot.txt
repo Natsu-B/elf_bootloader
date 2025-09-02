@@ -1,0 +1,8 @@
+setenv autostart yes
+
+if load virtio 0 $kernel_addr_r elf-hypervisor.elf; then
+	bootelf $kernel_addr_r $fdt_addr $kernel_addr_rg
+else
+	echo "Unable to read elf-hypervisor.elf"
+fi
+sleep 10000000
