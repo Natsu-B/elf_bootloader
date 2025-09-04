@@ -3,4 +3,18 @@ name = "alloc"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+pedantic = "warn"
+# missing_docs_in_private_items = "warn"
+
+[lints.rust]
+# missing_docs = "warn"
+
+[lints.rustdoc]
+# missing_crate_level_docs = "warn"
+
 [dependencies]
+mutex = { path = "../mutex" }
+
+[features]
+debug-assertions = []

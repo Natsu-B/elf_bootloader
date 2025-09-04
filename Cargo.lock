@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "alloc"
 version = "0.1.0"
+dependencies = [
+ "mutex",
+]
 
 [[package]]
 name = "byteorder"
