@@ -12,7 +12,7 @@ fn main() {
     println!("cargo:rustc-link-arg=-Taarch64.lds");
 
     // xtaskから呼ばれているかのチェック
-    if !std::env::var("XTASK_BUILD").is_ok() {
+    if std::env::var("XTASK_BUILD").is_err() {
         panic!("
             Do not use `cargo build` directly.\n            Instead, run `cargo xtask build` or `cargo xbuild` from the workspace root.
             ");

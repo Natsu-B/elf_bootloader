@@ -2,10 +2,9 @@
 // xtask/src/main.rs
 
 use core::panic;
-use std::{
-    fs,
-    process::{Command, Stdio},
-};
+use std::fs;
+use std::process::Command;
+use std::process::Stdio;
 
 // cargo metadataの関連する部分の構造体を定義
 #[derive(Debug, serde::Deserialize)]
@@ -74,8 +73,6 @@ fn build(args: &[String]) -> Result<String, &'static str> {
         cmd.arg("build")
             .arg("-p")
             .arg(name)
-            .arg("-Z")
-            .arg("build-std=core,compiler_builtins")
             .arg("--target")
             .arg("aarch64-unknown-none")
             .args(args)

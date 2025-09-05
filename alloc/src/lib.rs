@@ -37,7 +37,7 @@ macro_rules! pr_debug {
 macro_rules! levels {
     ($max:expr) => {
         ($max.trailing_zeros() as usize
-            - crate::intrusive_linked_list::MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize
+            - $crate::intrusive_linked_list::MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize
             + 1)
     };
 }

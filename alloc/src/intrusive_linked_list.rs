@@ -57,19 +57,19 @@ impl IntrusiveLinkedList {
 
     pub(crate) fn remove_if(&mut self, ptr: usize) -> bool {
         let mut intrusive_linked_list_ptr = self.next;
-        if let Some(intrusive_linked_list) = intrusive_linked_list_ptr {
-            if intrusive_linked_list.as_ptr() as usize == ptr {
-                self.next = unsafe { intrusive_linked_list.as_ref().next };
-                return true;
-            }
+        if let Some(intrusive_linked_list) = intrusive_linked_list_ptr
+            && intrusive_linked_list.as_ptr() as usize == ptr
+        {
+            self.next = unsafe { intrusive_linked_list.as_ref().next };
+            return true;
         }
         while let Some(mut intrusive_linked_list) = intrusive_linked_list_ptr {
-            if let Some(intrusive_linked_list_next) = unsafe { intrusive_linked_list.as_mut().next } {
-                if intrusive_linked_list_next.as_ptr() as usize == ptr {
-                    unsafe { intrusive_linked_list.as_mut() }.next =
-                        unsafe { intrusive_linked_list_next.as_ref().next };
-                    return true;
-                }
+            if let Some(intrusive_linked_list_next) = unsafe { intrusive_linked_list.as_mut().next }
+                && intrusive_linked_list_next.as_ptr() as usize == ptr
+            {
+                unsafe { intrusive_linked_list.as_mut() }.next =
+                    unsafe { intrusive_linked_list_next.as_ref().next };
+                return true;
             }
             intrusive_linked_list_ptr = unsafe { intrusive_linked_list.as_mut().next };
         }

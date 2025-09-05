@@ -7,20 +7,22 @@
 pub mod print;
 pub mod interfaces;
 mod systimer;
-use crate::interfaces::pl011::{Pl011Uart, UartNum};
-use crate::print::{DEBUG_UART, NonSyncUnsafeCell};
+use crate::interfaces::pl011::Pl011Uart;
+use crate::interfaces::pl011::UartNum;
+use crate::print::DEBUG_UART;
+use crate::print::NonSyncUnsafeCell;
+use core::arch::asm;
+use core::arch::global_asm;
+use core::cell::OnceCell;
 use core::ffi::CStr;
 use core::fmt::Write;
 use core::iter::Once;
+use core::ops::ControlFlow;
+use core::panic::PanicInfo;
 use core::ptr::slice_from_raw_parts;
 use core::slice;
-use core::{
-    arch::{asm, global_asm},
-    cell::OnceCell,
-    ops::ControlFlow,
-    panic::PanicInfo,
-};
-use dtb::{self, DtbParser};
+use dtb::DtbParser;
+use dtb::{self};
 use heapless::String;
 use systimer::SystemTimer;
 use tock_registers::debug;

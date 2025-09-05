@@ -1,11 +1,12 @@
 #![cfg_attr(not(test), no_std)]
 
-use core::{
-    ffi::{CStr, c_char},
-    ops::ControlFlow, usize,
-};
+use core::ffi::CStr;
+use core::ffi::c_char;
+use core::ops::ControlFlow;
 #[cfg(test)]
-use std::{collections::HashMap, string::String};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::string::String;
 
 #[cfg(alloc)]
 enum DeviceProperty {
@@ -29,7 +30,9 @@ pub use dtb_parser::DtbParser;
 
 mod dtb_parser {
     use super::*;
-    use big_endian::{CharStringIter, Dtb, FdtProperty};
+    use big_endian::CharStringIter;
+    use big_endian::Dtb;
+    use big_endian::FdtProperty;
 
     struct SimpleDeviceNode<'a> {
         parent: Option<&'a SimpleDeviceNode<'a>>,
@@ -207,7 +210,7 @@ mod dtb_parser {
             if let Some(s) = self.parent {
                 return s.calculate_address_internal(&address_child);
             }
-            return Ok(address_child);
+            Ok(address_child)
         }
     }
 
@@ -238,7 +241,7 @@ mod dtb_parser {
                 .parent
                 .map(|parent| (parent.address_cells + parent.size_cells) * size_of::<u32>() as u32)
                 .unwrap();
-            return Ok(Some(result));
+            Ok(Some(result))
         }
     }
 
@@ -265,7 +268,7 @@ mod dtb_parser {
         pub fn init(dtb_address: usize) -> Result<Self, &'static str> {
             let dtb = Dtb::new(dtb_address)?;
             let parser = Self { dtb_header: dtb };
-            return Ok(parser);
+            Ok(parser)
         }
         fn skip_nop(&self, address: &mut usize) {
             while *address < self.dtb_header.get_struct_end_address()
@@ -307,7 +310,7 @@ mod dtb_parser {
             //     );
             //     return Err("failed to parse all of the dtb node");
             // }
-            return Ok(());
+            Ok(())
         }
 
         fn find_node_recursive<F>(
@@ -321,7 +324,7 @@ mod dtb_parser {
         where
             F: FnMut((usize, usize)) -> ControlFlow<()>,
         {
-            if Self::get_types(&pointer) != Self::FDT_BEGIN_NODE {
+            if Self::get_types(pointer) != Self::FDT_BEGIN_NODE {
                 return Err("pointer is not begin node");
             }
             let mut prop = SimpleDeviceNode::new(node_info);
@@ -479,9 +482,7 @@ mod dtb_parser {
             // reads null-terminated strings and covert to &str
             pub fn read_char_str(address: usize) -> Result<&'static str, &'static str> {
                 let str = unsafe { CStr::from_ptr(address as *const c_char) };
-                Ok(str
-                    .to_str()
-                    .map_err(|_| "failed to convert &Cstr to &str")?)
+                str.to_str().map_err(|_| "failed to convert &Cstr to &str")
             }
             // read 'reg' property value
             pub fn read_regs(address: usize, size: u32) -> Result<(usize, usize), &'static str> {

@@ -20,8 +20,7 @@ where
     allocated: usize,
 }
 
-impl<'a, const MAX_ALLOCATABLE_BYTES: usize> fmt::Debug
-    for BuddyAllocator<'a, MAX_ALLOCATABLE_BYTES>
+impl<const MAX_ALLOCATABLE_BYTES: usize> fmt::Debug for BuddyAllocator<'_, MAX_ALLOCATABLE_BYTES>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
@@ -45,17 +44,14 @@ where
         - Self::MINIMUM_ALLOCATABLE_BYTES_LEVELS
         + 1;
 
-    #[inline(always)]
     fn level2size(level: usize) -> usize {
         1 << (level + Self::MINIMUM_ALLOCATABLE_BYTES_LEVELS)
     }
 
-    #[inline(always)]
     fn size2level_next_power(size: usize) -> usize {
         Self::size2level(size.next_power_of_two())
     }
 
-    #[inline(always)]
     // Assumes that size is a power of 2.
     fn size2level(size: usize) -> usize {
         size.trailing_zeros() as usize - Self::MINIMUM_ALLOCATABLE_BYTES_LEVELS
@@ -149,7 +145,7 @@ where
 
         while level + 1 < Self::LEVELS {
             let block_size = Self::level2size(level);
-            let buddy_addr = if ptr % Self::level2size(level + 1) == 0 {
+            let buddy_addr = if ptr.is_multiple_of(Self::level2size(level + 1)) {
                 ptr + block_size
             } else {
                 ptr - block_size

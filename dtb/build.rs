@@ -1,8 +1,7 @@
 use core::panic;
-use std::io::Stdout;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::{env, fs};
+use std::fs;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -64,5 +63,5 @@ fn command_installed(command_name: &str) -> bool {
         .stdout(Stdio::null())
         .stdin(Stdio::null())
         .status()
-        .map_or(false, |status| status.success())
+        .is_ok_and(|status| status.success())
 }

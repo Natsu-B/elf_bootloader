@@ -1,4 +1,3 @@
-use crate::pr_debug;
 use core::fmt;
 use core::ops::Deref;
 use core::ops::DerefMut;
@@ -282,7 +281,7 @@ impl MemoryBlock {
 
         let mut region_idx: usize = 0;
 
-        for reserved_region in reserved_regions.iter() {
+        for reserved_region in reserved_regions {
             // Advance `region_idx` to find the region that could contain the reserved_region.
             while region_idx < self.region_size as usize
                 && regions[region_idx].end() <= reserved_region.address
@@ -308,7 +307,6 @@ impl MemoryBlock {
                 (true, true) => {
                     regions.copy_within((region_idx + 1)..(self.region_size as usize), region_idx);
                     self.region_size -= 1;
-                    continue;
                 }
                 // Case 2: The reserved region is at the beginning of the available region.
                 (true, false) => {

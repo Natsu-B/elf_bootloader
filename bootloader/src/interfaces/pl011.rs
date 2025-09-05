@@ -1,10 +1,13 @@
 use core::fmt;
 
-use tock_registers::{
-    interfaces::{ReadWriteable, Readable, Writeable},
-    register_bitfields, register_structs,
-    registers::{ReadOnly, ReadWrite, WriteOnly},
-};
+use tock_registers::interfaces::ReadWriteable;
+use tock_registers::interfaces::Readable;
+use tock_registers::interfaces::Writeable;
+use tock_registers::register_bitfields;
+use tock_registers::register_structs;
+use tock_registers::registers::ReadOnly;
+use tock_registers::registers::ReadWrite;
+use tock_registers::registers::WriteOnly;
 
 #[derive(PartialEq)]
 pub enum UartNum {

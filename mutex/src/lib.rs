@@ -1,8 +1,10 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::cell::UnsafeCell;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::ops::Deref;
+use core::ops::DerefMut;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::Ordering;
 
 // 基本的に単コアのみで動作を前提としている
 

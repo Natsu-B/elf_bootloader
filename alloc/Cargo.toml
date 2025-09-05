@@ -16,5 +16,10 @@ pedantic = "warn"
 [dependencies]
 mutex = { path = "../mutex" }
 
+[profile.release]
+panic = 'abort'
+[profile.dev]
+panic = 'abort'
+
 [features]
 debug-assertions = []

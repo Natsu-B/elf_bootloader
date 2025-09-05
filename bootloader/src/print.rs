@@ -1,6 +1,9 @@
-use crate::interfaces::pl011::{Pl011Uart, UartNum};
-use core::cell::{OnceCell, UnsafeCell};
-use core::fmt::{self, Write};
+use crate::interfaces::pl011::Pl011Uart;
+use crate::interfaces::pl011::UartNum;
+use core::cell::OnceCell;
+use core::cell::UnsafeCell;
+use core::fmt::Write;
+use core::fmt::{self};
 
 // A wrapper for UnsafeCell that is !Send but is Sync.
 // This is safe to use in a single-threaded environment for statics.

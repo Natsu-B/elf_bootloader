@@ -1,10 +1,9 @@
 // system timer
 
 use crate::println;
-use core::{
-    arch::asm,
-    num::{NonZero, NonZeroU64},
-};
+use core::arch::asm;
+use core::num::NonZero;
+use core::num::NonZeroU64;
 
 pub struct SystemTimer {
     counter_frequency: Option<NonZeroU64>,
