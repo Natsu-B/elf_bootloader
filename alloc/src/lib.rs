@@ -1,12 +1,14 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, doctest)), no_std)]
 #![feature(generic_const_exprs)]
 #![cfg_attr(not(test), feature(alloc_error_handler))]
 
+extern crate alloc;
 mod buddy_allocator;
 mod intrusive_linked_list;
 mod range_list_allocator;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
+use core::cell::OnceCell;
 
 use mutex::SpinLock;
 
@@ -39,23 +41,34 @@ macro_rules! levels {
             + 1)
     };
 }
+
+#[cfg(not(test))]
+#[global_allocator]
+pub static ALLOCATOR: MemoryAllocator<'static, 4096> = MemoryAllocator {
+    range_list_allocator: SpinLock::new(OnceCell::new()),
+    buddy_allocator: SpinLock::new(OnceCell::new()),
+};
+
 struct MemoryAllocator<'a, const MAX_ALLOCATABLE_BYTES: usize>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
-    range_list_allocator: SpinLock<MemoryBlock>,
-    buddy_allocator: SpinLock<BuddyAllocator<'a, MAX_ALLOCATABLE_BYTES>>,
+    range_list_allocator: SpinLock<OnceCell<MemoryBlock>>,
+    buddy_allocator: SpinLock<OnceCell<BuddyAllocator<'a, MAX_ALLOCATABLE_BYTES>>>,
 }
 
-unsafe impl<'a, const MAX_ALLOCATABLE_BYTES: usize> Sync
-    for MemoryAllocator<'a, MAX_ALLOCATABLE_BYTES>
-where
-    [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
+unsafe impl<const MAX_ALLOCATABLE_BYTES: usize> Sync for MemoryAllocator<'_, MAX_ALLOCATABLE_BYTES> where
+    [(); levels!(MAX_ALLOCATABLE_BYTES)]:
 {
 }
 
-unsafe impl<'a, const MAX_ALLOCATABLE_BYTES: usize> GlobalAlloc
-    for MemoryAllocator<'a, MAX_ALLOCATABLE_BYTES>
+impl<const MAX_ALLOCATABLE_BYTES: usize> MemoryAllocator<'_, MAX_ALLOCATABLE_BYTES> where
+    [(); levels!(MAX_ALLOCATABLE_BYTES)]:
+{
+}
+
+unsafe impl<const MAX_ALLOCATABLE_BYTES: usize> GlobalAlloc
+    for MemoryAllocator<'_, MAX_ALLOCATABLE_BYTES>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {

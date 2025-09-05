@@ -1,18 +1,43 @@
 use crate::pr_debug;
 use core::fmt;
+use core::ops::Deref;
+use core::ops::DerefMut;
 
-static mut GLOBAL_REGIONS: [MemoryRegions; 128] = [MemoryRegions {
-    address: 0,
-    size: 0,
-}; 128];
-static mut GLOBAL_RESERVED_REGIONS: [MemoryRegions; 128] = [MemoryRegions {
-    address: 0,
-    size: 0,
-}; 128];
+#[cfg(not(doctest))]
+use alloc::boxed::Box;
+#[cfg(doctest)]
+use std::boxed::Box;
+
+enum RegionData {
+    Global([MemoryRegions; 128]),
+    Heap(Box<[MemoryRegions]>),
+}
+
+struct RegionContainer(RegionData);
+
+impl Deref for RegionContainer {
+    type Target = [MemoryRegions];
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            RegionData::Global(slice) => slice,
+            RegionData::Heap(heap) => heap.as_ref(),
+        }
+    }
+}
+
+impl DerefMut for RegionContainer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.0 {
+            RegionData::Global(slice) => slice,
+            RegionData::Heap(heap) => heap.as_mut(),
+        }
+    }
+}
 
 pub(crate) struct MemoryBlock {
-    regions: &'static mut [MemoryRegions],
-    reserved_regions: &'static mut [MemoryRegions],
+    regions: RegionContainer,
+    reserved_regions: RegionContainer,
     region_size: u32,
     reserved_region_size: u32,
     region_capacity: u32,
@@ -36,8 +61,18 @@ impl fmt::Debug for MemoryBlock {
 impl MemoryBlock {
     pub fn init() -> MemoryBlock {
         MemoryBlock {
-            regions: unsafe { &mut *(&raw mut GLOBAL_REGIONS) },
-            reserved_regions: unsafe { &mut *(&raw mut GLOBAL_RESERVED_REGIONS) },
+            regions: RegionContainer(RegionData::Global(
+                [MemoryRegions {
+                    address: 0,
+                    size: 0,
+                }; 128],
+            )),
+            reserved_regions: RegionContainer(RegionData::Global(
+                [MemoryRegions {
+                    address: 0,
+                    size: 0,
+                }; 128],
+            )),
             region_size: 0,
             reserved_region_size: 0,
             region_capacity: 128,
