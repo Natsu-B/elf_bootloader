@@ -1,6 +1,9 @@
+use core::alloc::Layout;
 use core::fmt;
 use core::ops::Deref;
 use core::ops::DerefMut;
+use core::ptr::copy_nonoverlapping;
+use core::slice;
 
 #[cfg(not(doctest))]
 use alloc::boxed::Box;
@@ -9,7 +12,7 @@ use std::boxed::Box;
 
 enum RegionData {
     Global([MemoryRegions; 128]),
-    Heap(Box<[MemoryRegions]>),
+    Heap(&'static mut [MemoryRegions]),
 }
 
 struct RegionContainer(RegionData);
@@ -20,7 +23,7 @@ impl Deref for RegionContainer {
     fn deref(&self) -> &Self::Target {
         match &self.0 {
             RegionData::Global(slice) => slice,
-            RegionData::Heap(heap) => heap.as_ref(),
+            RegionData::Heap(heap) => heap,
         }
     }
 }
@@ -29,7 +32,7 @@ impl DerefMut for RegionContainer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.0 {
             RegionData::Global(slice) => slice,
-            RegionData::Heap(heap) => heap.as_mut(),
+            RegionData::Heap(heap) => heap,
         }
     }
 }
@@ -88,19 +91,95 @@ impl MemoryBlock {
         self.add_region_internal(true, region)
     }
 
-    fn merge_memory_region<'a>(
-        memory_region: &'a mut [MemoryRegions],
-        pre_index: usize,
-        size_ref: &'a mut u32,
-    ) -> &'a mut [MemoryRegions] {
-        memory_region[pre_index] =
-            MemoryRegions::merge_regions(&memory_region[pre_index], &memory_region[pre_index + 1]);
-        memory_region.copy_within(pre_index + 2..*size_ref as usize, pre_index + 1);
-        memory_region[*size_ref as usize - 1] = MemoryRegions {
-            address: 0,
-            size: 0,
-        };
-        memory_region
+    fn insert_region(
+        regions_slice: &mut [MemoryRegions],
+        size_ref: &mut u32,
+        insertion_point: usize,
+        region_to_insert: &MemoryRegions,
+    ) {
+        #[cfg(debug_assertions)]
+        {
+            if insertion_point > 0 {
+                let pre_region = &regions_slice[insertion_point - 1];
+                assert!(pre_region.end() <= region_to_insert.address);
+            }
+            if insertion_point < *size_ref as usize {
+                let next_region = &regions_slice[insertion_point];
+                assert!(region_to_insert.end() <= next_region.address);
+            }
+        }
+
+        regions_slice.copy_within(insertion_point..*size_ref as usize, insertion_point + 1);
+        regions_slice[insertion_point] = *region_to_insert;
+        *size_ref += 1;
+    }
+
+    fn add_and_merge_region(
+        regions_slice: &mut [MemoryRegions],
+        size_ref: &mut u32,
+        x: usize, // insertion_point
+        region: &MemoryRegions,
+    ) {
+        let mut pre_region_overlaps = false;
+        let mut next_region_overlaps = false;
+
+        // Check for overlap with pre_region
+        if x > 0 {
+            let pre_region = &regions_slice[x - 1];
+            if region.address <= pre_region.end() {
+                pre_region_overlaps = true;
+            }
+        }
+
+        // Check for overlap with next_region
+        if x < *size_ref as usize {
+            let next_region = &regions_slice[x];
+            if region.end() >= next_region.address {
+                next_region_overlaps = true;
+            }
+        }
+
+        match (pre_region_overlaps, next_region_overlaps) {
+            (false, false) => {
+                // No overlap, just insert the new region
+                MemoryBlock::insert_region(regions_slice, size_ref, x, region);
+            }
+            (true, false) => {
+                // Overlap with pre_region only
+                let pre_region = &mut regions_slice[x - 1];
+                let new_end = region.end();
+                let pre_region_end = pre_region.end();
+
+                if new_end > pre_region_end {
+                    pre_region.size = new_end - pre_region.address;
+                }
+            }
+            (false, true) => {
+                // Overlap with next_region only
+                let next_region = &mut regions_slice[x];
+                let old_end = next_region.end();
+                let new_end = region.end();
+
+                next_region.address = region.address;
+                next_region.size = old_end.max(new_end) - region.address;
+            }
+            (true, true) => {
+                // Overlap with both pre_region and next_region
+                let next_region = regions_slice[x];
+                let pre_region = &mut regions_slice[x - 1];
+
+                let new_end = pre_region.end().max(region.end()).max(next_region.end());
+
+                pre_region.size = new_end - pre_region.address;
+
+                regions_slice.copy_within(x + 1..*size_ref as usize, x);
+                regions_slice[*size_ref as usize - 1] = MemoryRegions {
+                    address: 0,
+                    size: 0,
+                };
+                *size_ref -= 1;
+            }
+        }
     }
 
     fn add_region_internal(
@@ -188,70 +267,7 @@ impl MemoryBlock {
                 Ok(())
             }
             Err(x) => {
-                let mut pre_region_overlaps = false;
-                let mut next_region_overlaps = false;
-
-                // Check for overlap with pre_region
-                if x > 0 {
-                    let pre_region = &regions_slice[x - 1];
-                    if region.address <= pre_region.address + pre_region.size {
-                        pre_region_overlaps = true;
-                    }
-                }
-
-                // Check for overlap with next_region
-                if x < *size_ref as usize {
-                    let next_region = &regions_slice[x];
-                    if region.address + region.size >= next_region.address {
-                        next_region_overlaps = true;
-                    }
-                }
-
-                match (pre_region_overlaps, next_region_overlaps) {
-                    (false, false) => {
-                        // No overlap, just insert the new region
-                        regions_slice.copy_within(x..*size_ref as usize, x + 1);
-                        regions_slice[x] = *region;
-                        *size_ref += 1;
-                    }
-                    (true, false) => {
-                        // Overlap with pre_region only
-                        let pre_region = &mut regions_slice[x - 1];
-                        let new_end = region.address + region.size;
-                        let pre_region_end = pre_region.address + pre_region.size;
-
-                        if new_end > pre_region_end {
-                            pre_region.size = new_end - pre_region.address;
-                        }
-                    }
-                    (false, true) => {
-                        // Overlap with next_region only
-                        let next_region = &mut regions_slice[x];
-                        let old_end = next_region.address + next_region.size;
-                        let new_end = region.address + region.size;
-
-                        next_region.address = region.address;
-                        next_region.size = old_end.max(new_end) - region.address;
-                    }
-                    (true, true) => {
-                        // Overlap with both pre_region and next_region
-                        let next_region = regions_slice[x];
-                        let pre_region = &mut regions_slice[x - 1];
-
-                        let new_end = (pre_region.address + pre_region.size)
-                            .max(region.address + region.size)
-                            .max(next_region.address + next_region.size);
-
-                        pre_region.size = new_end - pre_region.address;
-
-                        regions_slice.copy_within(x + 1..*size_ref as usize, x);
-                        regions_slice[*size_ref as usize - 1] = MemoryRegions {
-                            address: 0,
-                            size: 0,
-                        };
-                        *size_ref -= 1;
-                    }
-                }
+                MemoryBlock::add_and_merge_region(regions_slice, size_ref, x, region);
                 Ok(())
             }
         }
@@ -348,6 +364,110 @@ impl MemoryBlock {
         self.allocatable = true;
         Ok(())
     }
+
+    fn allocate_region_internal(&mut self, size: usize, alignment: usize) -> Option<usize> {
+        let regions = &mut self.regions;
+        let mut reserved_regions = &mut self.reserved_regions;
+        for mut i in 0..self.region_size as usize {
+            let address = regions[i].address;
+            let address_multiple_of = address.next_multiple_of(alignment);
+            let end_addr = regions[i].end();
+            if address_multiple_of + size <= regions[i].end() {
+                if !address.is_multiple_of(alignment) {
+                    let size = address_multiple_of - address;
+                    regions.copy_within(i..self.region_size as usize, i + 1);
+                    regions[i] = MemoryRegions { address, size };
+                    regions[i + 1].address = address_multiple_of;
+                    regions[i + 1].size -= size;
+                    i += 1;
+                    self.region_size += 1;
+                }
+                let new_addr = address_multiple_of + size;
+                if new_addr != regions[i].end() {
+                    regions[i].address = new_addr;
+                    regions[i].size = end_addr - new_addr;
+                } else {
+                    // The region is consumed completely.
+                    regions.copy_within(i + 1..self.region_size as usize, i);
+                    self.region_size -= 1;
+                }
+                let search_result = &mut reserved_regions[0..self.reserved_region_size as usize]
+                    .binary_search_by_key(&address_multiple_of, |r| r.address)
+                    .unwrap_err();
+                MemoryBlock::add_and_merge_region(
+                    &mut reserved_regions,
+                    &mut self.reserved_region_size,
+                    *search_result,
+                    &MemoryRegions {
+                        address: address_multiple_of,
+                        size,
+                    },
+                );
+                return Some(address_multiple_of);
+            }
+        }
+        None
+    }
+
+    fn overflow_wrapping(&mut self) {
+        let allocate_size = (self.region_capacity + self.reserved_region_capacity) as usize
+            * 2
+            * core::mem::size_of::<MemoryRegions>();
+        let new_region = self
+            .allocate_region_internal(allocate_size, 4096)
+            .expect("out of memory");
+
+        let new_regions_capacity = self.region_capacity * 2;
+        let new_reserved_capacity = self.reserved_region_capacity * 2;
+
+        let new_regions_ptr = new_region as *mut MemoryRegions;
+        let new_reserved_ptr = (new_region
+            + new_regions_capacity as usize * core::mem::size_of::<MemoryRegions>())
+            as *mut MemoryRegions;
+
+        unsafe {
+            copy_nonoverlapping(
+                self.regions.as_ptr(),
+                new_regions_ptr,
+                self.region_size as usize,
+            );
+            self.regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
+                new_regions_ptr,
+                new_regions_capacity as usize,
+            )));
+
+            copy_nonoverlapping(
+                self.reserved_regions.as_ptr(),
+                new_reserved_ptr,
+                self.reserved_region_size as usize,
+            );
+            self.reserved_regions = RegionContainer(RegionData::Heap(slice::from_raw_parts_mut(
+                new_reserved_ptr,
+                new_reserved_capacity as usize,
+            )));
+        }
+        self.region_capacity = new_regions_capacity;
+        self.reserved_region_capacity = new_reserved_capacity;
+    }
+
+    pub fn allocate_region(&mut self, layout: Layout) -> Option<usize> {
+        if !self.allocatable {
+            return None;
+        }
+        if self.region_size + 10 > self.region_capacity
+            || self.reserved_region_size + 10 > self.reserved_region_capacity
+        {
+            self.overflow_wrapping();
+        }
+        self.allocate_region_internal(layout.size(), layout.align())
+    }
+
+    pub fn deallocate_region(&mut self, ptr: usize, layout: Layout) {
+        if !self.allocatable {
+            return;
+        }
+        todo!()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -357,12 +477,6 @@ pub struct MemoryRegions {
 }
 
 impl MemoryRegions {
-    fn merge_regions(first: &Self, second: &Self) -> Self {
-        Self {
-            address: first.address,
-            size: second.size + second.address - first.address,
-        }
-    }
     fn end(&self) -> usize {
         self.address + self.size
     }
@@ -384,6 +498,11 @@ macro_rules! debug_assert {
 
 #[cfg(test)]
 mod tests {
+    use core::panic;
+    use std::alloc::alloc;
+
+    use crate::pr_debug;
+
     use super::*;
 
     #[test]
@@ -796,5 +915,169 @@ mod tests {
                 size: 0xC00
             }
         );
+    }
+
+    #[test]
+    fn test_allocate_region_before_check_regions() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
+        assert_eq!(allocator.allocate_region(layout), None);
+    }
+
+    #[test]
+    fn test_allocate_region_simple() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
+        let ptr = allocator.allocate_region(layout);
+        assert_eq!(ptr, Some(0x1000));
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1100,
+                size: 0xF00
+            }
+        );
+    }
+
+    #[test]
+    fn test_allocate_region_no_sufficient_space() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x100,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let layout = Layout::from_size_align(0x200, 0x10).unwrap();
+        assert_eq!(allocator.allocate_region(layout), None);
+    }
+
+    #[test]
+    fn test_allocate_region_respects_reserved_region() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x100,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
+        let ptr = allocator.allocate_region(layout);
+        assert_eq!(ptr, Some(0x1100));
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1200,
+                size: 0xE00
+            }
+        );
+    }
+
+    #[test]
+    fn test_allocate_region_with_alignment() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1001,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let layout = Layout::from_size_align(0x100, 0x100).unwrap();
+        let ptr = allocator.allocate_region(layout);
+        assert_eq!(ptr, Some(0x1100));
+
+        // Check that the original region is split correctly
+        assert_eq!(allocator.region_size, 2);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1001,
+                size: 0xFF
+            }
+        );
+        assert_eq!(
+            allocator.regions[1],
+            MemoryRegions {
+                address: 0x1200,
+                size: 0xE01
+            }
+        );
+    }
+
+    #[test]
+    fn test_overflow_wrapping() {
+        let heap = unsafe { alloc(Layout::from_size_align_unchecked(0x200000, 0x1000)) };
+        let mut allocator = MemoryBlock::init();
+        // Add a large region with an unaligned address.
+        allocator
+            .add_region(&MemoryRegions {
+                address: heap as usize,
+                size: 0x200000, // 2MB
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let initial_region_capacity = allocator.region_capacity;
+        let initial_reserved_capacity = allocator.reserved_region_capacity;
+        assert_eq!(initial_region_capacity, 128);
+
+        // We need to increase region_size. Each allocation with a specific alignment
+        // on an unaligned region will split it, increasing region_size by 1.
+        // The overflow_wrapping is triggered when region_size + 10 > region_capacity.
+        // So we need to reach region_size = 119 to trigger it on the next allocation.
+        // Initial region_size is 1. We need 118 splits.
+        for _ in 0..119 {
+            let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
+            assert!(allocator.allocate_region(layout).is_some());
+            // Each allocation creates a split, increasing region_size.
+        }
+        // After 118 allocations, region_size should be 119.
+        assert_eq!(allocator.region_size, 119);
+        assert_eq!(allocator.region_capacity, initial_region_capacity);
+        // This allocation should trigger overflow_wrapping.
+        let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
+        assert!(allocator.allocate_region(layout).is_some());
+        // Verify that the capacities have been doubled.
+        assert_eq!(allocator.region_capacity, initial_region_capacity * 2);
+        assert_eq!(
+            allocator.reserved_region_capacity,
+            initial_reserved_capacity * 2
+        );
+
+        // region_size should be 120 now.
+        assert_eq!(allocator.region_size, 120);
+
+        // Verify that we can still allocate after wrapping.
+        let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
+        assert!(allocator.allocate_region(layout).is_some());
+        assert_eq!(allocator.region_size, 121);
     }
 }

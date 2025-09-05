@@ -9,18 +9,18 @@ use crate::intrusive_linked_list::MINIMUM_ALLOCATABLE_BYTES;
 use crate::pr_debug;
 
 // Assumes that MAX_ALLOCATABLE_BYTES is a power of 2.
-pub(crate) struct BuddyAllocator<'a, const MAX_ALLOCATABLE_BYTES: usize>
+pub(crate) struct BuddyAllocator<const MAX_ALLOCATABLE_BYTES: usize>
 where
-    [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
+    [(); levels!(MAX_ALLOCATABLE_BYTES)]: ,
 {
     free_list: [IntrusiveLinkedList; levels!(MAX_ALLOCATABLE_BYTES)],
-    // Assumes that the function can fetch memory of the size and alignment of MAX_ALLOCATABLE_BYTES.
-    alloc_heap: Option<&'a mut dyn FnMut() -> Option<usize>>,
+    // A function that can fetch memory of the size and alignment of MAX_ALLOCATABLE_BYTES.
+    alloc_heap: Option<&'static (dyn Fn() -> Option<usize> + 'static)>,
     total_size: usize,
     allocated: usize,
 }
 
-impl<const MAX_ALLOCATABLE_BYTES: usize> fmt::Debug for BuddyAllocator<'_, MAX_ALLOCATABLE_BYTES>
+impl<const MAX_ALLOCATABLE_BYTES: usize> fmt::Debug for BuddyAllocator<MAX_ALLOCATABLE_BYTES>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
@@ -33,7 +33,7 @@ where
     }
 }
 
-impl<'a, const MAX_ALLOCATABLE_BYTES: usize> BuddyAllocator<'a, MAX_ALLOCATABLE_BYTES>
+impl<const MAX_ALLOCATABLE_BYTES: usize> BuddyAllocator<MAX_ALLOCATABLE_BYTES>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
@@ -57,7 +57,7 @@ where
         size.trailing_zeros() as usize - Self::MINIMUM_ALLOCATABLE_BYTES_LEVELS
     }
 
-    pub(crate) fn new(heap_allocator: Option<&'a mut dyn FnMut() -> Option<usize>>) -> Self {
+    pub(crate) fn new(heap_allocator: Option<&'static (dyn Fn() -> Option<usize> + 'static)>) -> Self {
         pr_debug!("buddy_allocator: init");
         Self {
             free_list: core::array::from_fn(|_| IntrusiveLinkedList::new()),
@@ -84,7 +84,7 @@ where
 
     pub(crate) fn change_allocator(
         &mut self,
-        heap_allocator: Option<&'a mut dyn FnMut() -> Option<usize>>,
+        heap_allocator: Option<&'static (dyn Fn() -> Option<usize> + 'static)>,
     ) {
         self.alloc_heap = heap_allocator;
     }
@@ -360,14 +360,15 @@ mod tests {
     }
     #[test]
     fn test_out_of_memory() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         // Test the case where the external allocator is called but returns None.
-        let mut external_heap_called = RefCell::new(false);
-        let mut heap_allocator = || -> Option<usize> {
-            *external_heap_called.borrow_mut() = true;
+        static EXTERNAL_HEAP_CALLED: AtomicBool = AtomicBool::new(false);
+        static HEAP_ALLOCATOR: fn() -> Option<usize> = || {
+            EXTERNAL_HEAP_CALLED.store(true, Ordering::SeqCst);
             None // Simulate always returning None.
         };
 
-        let mut allocator = BuddyAllocator::<MAX_ALLOC>::new(Some(&mut heap_allocator));
+        let mut allocator = BuddyAllocator::<MAX_ALLOC>::new(Some(&HEAP_ALLOCATOR));
 
         // Set up the heap.
         #[repr(align(4096))]
@@ -380,13 +381,13 @@ mod tests {
         let layout = Layout::from_size_align(MAX_ALLOC, 8).unwrap();
         let ptr = allocator.alloc(layout);
         assert!(ptr.is_ok());
-        assert!(!(*external_heap_called.borrow())); // Not called at this point.
+        assert!(!EXTERNAL_HEAP_CALLED.load(Ordering::SeqCst)); // Not called at this point.
 
         // The second allocation will fail because there is no memory and the external allocator will return None.
         let layout2 = Layout::from_size_align(8, 8).unwrap();
         let ptr2 = allocator.alloc(layout2);
         assert!(ptr2.is_err());
-        assert!(*external_heap_called.borrow()); // Verify that the external allocator was called.
+        assert!(EXTERNAL_HEAP_CALLED.load(Ordering::SeqCst)); // Verify that the external allocator was called.
     }
 
     #[test]
