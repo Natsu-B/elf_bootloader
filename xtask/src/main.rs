@@ -106,26 +106,20 @@ fn build(args: &[String]) -> Result<String, &'static str> {
     binary_dir.push("debug");
     binary_dir.push("elf-hypervisor");
     let mut binary_new_dir = std::env::current_dir().unwrap();
-    binary_new_dir.push("build");
+    binary_new_dir.push("bin");
     let _ = fs::create_dir(binary_new_dir.clone());
-    binary_new_dir.push("elf-hypervisor");
+    binary_new_dir.push("elf-hypervisor.elf");
     std::fs::copy(binary_dir, binary_new_dir.clone()).expect("failed to move builded binary");
     Ok(binary_new_dir.to_string_lossy().into_owned())
 }
 
 fn run(args: &[String]) -> Result<(), &'static str> {
-    let tmp = build(args)?;
-    println!("{tmp}\n\n\n");
-    Command::new("rust-objcopy")
-        .arg("-O")
-        .arg("binary")
-        .arg(tmp)
-        .arg("build/kernel8.img")
-        .spawn()
-        .expect("failed to make build/kernel8.img")
-        .wait()
-        .unwrap();
-    Ok(())
+    let binary_path = build(args)?;
+
+    eprintln!("\n--- Running ./run.sh ---");
+    use std::os::unix::process::CommandExt;
+    let _ = Command::new("./run.sh").arg(&binary_path).args(args).exec();
+    unreachable!();
 }
 
 fn test(args: &[String]) {
