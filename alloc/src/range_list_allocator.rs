@@ -372,7 +372,6 @@ impl MemoryBlock {
 
     fn allocate_region_internal(&mut self, size: usize, alignment: usize) -> Option<usize> {
         let regions = &mut self.regions;
-        let mut reserved_regions = &mut self.reserved_regions;
         for mut i in 0..self.region_size as usize {
             let address = regions[i].address;
             let address_multiple_of = address.next_multiple_of(alignment);
@@ -396,22 +395,120 @@ impl MemoryBlock {
                     regions.copy_within(i + 1..self.region_size as usize, i);
                     self.region_size -= 1;
                 }
-                let search_result = &mut reserved_regions[0..self.reserved_region_size as usize]
-                    .binary_search_by_key(&address_multiple_of, |r| r.address)
-                    .unwrap_err();
-                MemoryBlock::add_and_merge_region(
-                    &mut reserved_regions,
-                    &mut self.reserved_region_size,
-                    *search_result,
-                    &MemoryRegions {
-                        address: address_multiple_of,
-                        size,
-                    },
-                );
+                self.add_reserved_alloc_record(address_multiple_of, size);
                 return Some(address_multiple_of);
             }
         }
         None
+    }
+
+    fn ensure_overflow_headroom(&mut self) {
+        if self.region_size + 10 > self.region_capacity
+            || self.reserved_region_size + 10 > self.reserved_region_capacity
+        {
+            self.overflow_wrapping();
+        }
+    }
+
+    // Record allocation into reserved list: reserved := reserved ∪ [addr, addr+size)
+    fn add_reserved_alloc_record(&mut self, address: usize, size: usize) {
+        let insertion_point = self.reserved_regions[0..self.reserved_region_size as usize]
+            .binary_search_by_key(&address, |r| r.address)
+            .unwrap_or_else(|x| x);
+        MemoryBlock::add_and_merge_region(
+            &mut self.reserved_regions,
+            &mut self.reserved_region_size,
+            insertion_point,
+            &MemoryRegions { address, size },
+        );
+    }
+
+    // Remove allocation range from reserved list: reserved := reserved \ [addr, addr+size)
+    fn remove_reserved_alloc_record(&mut self, addr: usize, size: usize) {
+        self.ensure_overflow_headroom();
+        if size == 0 {
+            return;
+        }
+        let reserved = &mut self.reserved_regions;
+        let rsize = &mut self.reserved_region_size;
+        let valid_reserved = &mut reserved[0..*rsize as usize];
+        let search = valid_reserved.binary_search_by_key(&addr, |r| r.address);
+        match search {
+            Ok(i) => {
+                let region = &mut reserved[i];
+                if size == region.size {
+                    reserved.copy_within(i + 1..*rsize as usize, i);
+                    reserved[*rsize as usize - 1] = MemoryRegions {
+                        address: 0,
+                        size: 0,
+                    };
+                    *rsize -= 1;
+                } else if size < region.size {
+                    region.address += size;
+                    region.size -= size;
+                } else {
+                    reserved.copy_within(i + 1..*rsize as usize, i);
+                    reserved[*rsize as usize - 1] = MemoryRegions {
+                        address: 0,
+                        size: 0,
+                    };
+                    *rsize -= 1;
+                }
+            }
+            Err(x) => {
+                if x == 0 {
+                    return;
+                }
+                let i = x - 1;
+                let region = &mut reserved[i];
+                let region_end = region.end();
+                let dealloc_end = addr + size;
+                if addr >= region.address && dealloc_end <= region_end {
+                    let starts_at_same = addr == region.address;
+                    let ends_at_same = dealloc_end == region_end;
+                    match (starts_at_same, ends_at_same) {
+                        (true, true) => {
+                            reserved.copy_within(i + 1..*rsize as usize, i);
+                            reserved[*rsize as usize - 1] = MemoryRegions {
+                                address: 0,
+                                size: 0,
+                            };
+                            *rsize -= 1;
+                        }
+                        (true, false) => {
+                            region.address += size;
+                            region.size -= size;
+                        }
+                        (false, true) => {
+                            region.size = addr - region.address;
+                        }
+                        (false, false) => {
+                            let original_end = region_end;
+                            region.size = addr - region.address;
+                            let insert_idx = i + 1;
+                            reserved.copy_within(insert_idx..*rsize as usize, insert_idx + 1);
+                            reserved[insert_idx] = MemoryRegions {
+                                address: dealloc_end,
+                                size: original_end - dealloc_end,
+                            };
+                            *rsize += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_free_region_merge(&mut self, address: usize, size: usize) {
+        let insertion_point = self.regions[0..self.region_size as usize]
+            .binary_search_by_key(&address, |r| r.address)
+            .unwrap_or_else(|x| x);
+        MemoryBlock::add_and_merge_region(
+            &mut self.regions,
+            &mut self.region_size,
+            insertion_point,
+            &MemoryRegions { address, size },
+        );
     }
 
     fn overflow_wrapping(&mut self) {
@@ -459,11 +556,7 @@ impl MemoryBlock {
         if !self.allocatable {
             return None;
         }
-        if self.region_size + 10 > self.region_capacity
-            || self.reserved_region_size + 10 > self.reserved_region_capacity
-        {
-            self.overflow_wrapping();
-        }
+        self.ensure_overflow_headroom();
         self.allocate_region_internal(layout.size(), layout.align())
     }
 
@@ -471,7 +564,17 @@ impl MemoryBlock {
         if !self.allocatable {
             return;
         }
-        todo!()
+        let addr = ptr;
+        let size = layout.size();
+        if size == 0 {
+            return; // Nothing to do
+        }
+        // Ensure headroom for metadata operations
+        self.ensure_overflow_headroom();
+
+        // Remove from reserved list and return to free list
+        self.remove_reserved_alloc_record(addr, size);
+        self.add_free_region_merge(addr, size);
     }
 }
 
@@ -1089,5 +1192,157 @@ mod tests {
         let layout = Layout::from_size_align(0x10, 0x1000).unwrap();
         assert!(allocator.allocate_region(layout).is_some());
         assert_eq!(allocator.region_size, 121);
+    }
+
+    #[test]
+    fn test_deallocate_region_simple_roundtrip() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let layout = Layout::from_size_align(0x100, 0x10).unwrap();
+        let ptr = allocator.allocate_region(layout).expect("alloc failed");
+        assert_eq!(ptr, 0x1000);
+        // After alloc: regions becomes [0x1100, 0xF00]
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1100,
+                size: 0xF00
+            }
+        );
+
+        // Deallocate and expect full region restored
+        allocator.deallocate_region(ptr, layout);
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x1000
+            }
+        );
+    }
+
+    #[test]
+    fn test_deallocate_region_adjacent_allocations_merge_back() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        let l = Layout::from_size_align(0x100, 0x100).unwrap();
+        let p1 = allocator.allocate_region(l).unwrap(); // 0x1000..0x1100
+        let p2 = allocator.allocate_region(l).unwrap(); // 0x1100..0x1200
+        assert_eq!(p1, 0x1000);
+        assert_eq!(p2, 0x1100);
+
+        // Now free regions should begin at 0x1200..0x2000 (single region)
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1200,
+                size: 0xE00
+            }
+        );
+
+        // Deallocate first block; should create a separate free region at 0x1000..0x1100
+        allocator.deallocate_region(p1, l);
+        assert_eq!(allocator.region_size, 2);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x100
+            }
+        );
+        assert_eq!(
+            allocator.regions[1],
+            MemoryRegions {
+                address: 0x1200,
+                size: 0xE00
+            }
+        );
+
+        // Deallocate second block; free regions should merge into a single 0x1000..0x2000
+        allocator.deallocate_region(p2, l);
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x1000
+            }
+        );
+    }
+
+    #[test]
+    fn test_deallocate_region_middle_split_reserved() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        // Allocate three adjacent blocks so reserved merges into one
+        let l = Layout::from_size_align(0x100, 0x100).unwrap();
+        let p1 = allocator.allocate_region(l).unwrap(); // 0x1000..0x1100
+        let p2 = allocator.allocate_region(l).unwrap(); // 0x1100..0x1200
+        let p3 = allocator.allocate_region(l).unwrap(); // 0x1200..0x1300
+        assert_eq!((p1, p2, p3), (0x1000, 0x1100, 0x1200));
+
+        // Free list: [0x1300, 0xD00]
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1300,
+                size: 0xD00
+            }
+        );
+
+        // Dealloc middle block; reserved should split, free list gains 0x1100..0x1200 as a new region
+        allocator.deallocate_region(p2, l);
+        assert_eq!(allocator.region_size, 2);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1100,
+                size: 0x100
+            }
+        );
+        assert_eq!(
+            allocator.regions[1],
+            MemoryRegions {
+                address: 0x1300,
+                size: 0xD00
+            }
+        );
+
+        // Dealloc ends; after both, the free list should merge fully back
+        allocator.deallocate_region(p1, l);
+        allocator.deallocate_region(p3, l);
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x1000
+            }
+        );
     }
 }
