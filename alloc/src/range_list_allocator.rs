@@ -83,11 +83,16 @@ impl MemoryBlock {
         }
     }
 
-    pub fn add_region(&mut self, region: &MemoryRegions) -> Result<(), &str> {
+    // Indicates whether allocation from regions is enabled (i.e., finalized).
+    pub(crate) fn is_finalized(&self) -> bool {
+        self.allocatable
+    }
+
+    pub fn add_region(&mut self, region: &MemoryRegions) -> Result<(), &'static str> {
         self.add_region_internal(false, region)
     }
 
-    pub fn add_reserved_region(&mut self, region: &MemoryRegions) -> Result<(), &str> {
+    pub fn add_reserved_region(&mut self, region: &MemoryRegions) -> Result<(), &'static str> {
         self.add_region_internal(true, region)
     }
 
@@ -186,7 +191,7 @@ impl MemoryBlock {
         &mut self,
         is_reserved: bool,
         region: &MemoryRegions,
-    ) -> Result<(), &str> {
+    ) -> Result<(), &'static str> {
         // Get mutable slices and references to sizes
         let (regions_slice, size_ref, capacity) = if is_reserved {
             (
@@ -477,6 +482,11 @@ pub struct MemoryRegions {
 }
 
 impl MemoryRegions {
+    // Internal constructor for building regions from raw parts.
+    pub(crate) fn from_parts(address: usize, size: usize) -> Self {
+        Self { address, size }
+    }
+
     fn end(&self) -> usize {
         self.address + self.size
     }

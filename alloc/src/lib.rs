@@ -16,6 +16,7 @@ use mutex::SpinLock;
 
 use crate::buddy_allocator::BuddyAllocator;
 use crate::range_list_allocator::MemoryBlock;
+use crate::range_list_allocator::MemoryRegions;
 
 #[cfg(all(not(feature = "debug-assertions"), not(test)))]
 #[macro_export]
@@ -148,7 +149,60 @@ where
 #[cfg(not(test))]
 #[alloc_error_handler]
 fn panic(layout: Layout) -> ! {
-    loop {
-        core::hint::spin_loop();
+    pr_debug!("allocator panicked!!: {:?}", layout);
+    loop {}
+}
+
+// -----------------------
+// Public API (non-test)
+// -----------------------
+#[cfg(not(test))]
+/// Initialize the global allocator state. Safe to call multiple times.
+pub fn init() {
+    GLOBAL_ALLOCATOR.init();
+}
+
+#[cfg(not(test))]
+/// Add an available memory region before finalization.
+/// Returns Err if called after finalization.
+pub fn add_available_region(address: usize, size: usize) -> Result<(), &'static str> {
+    let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
+    if let Some(block) = guard.get_mut() {
+        if block.is_finalized() {
+            return Err("allocator already finalized");
+        }
+        block.add_region(&MemoryRegions::from_parts(address, size))
+    } else {
+        Err("allocator not initialized")
+    }
+}
+
+#[cfg(not(test))]
+/// Add a reserved memory region before finalization.
+/// Returns Err if called after finalization.
+pub fn add_reserved_region(address: usize, size: usize) -> Result<(), &'static str> {
+    let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
+    if let Some(block) = guard.get_mut() {
+        if block.is_finalized() {
+            return Err("allocator already finalized");
+        }
+        block.add_reserved_region(&MemoryRegions::from_parts(address, size))
+    } else {
+        Err("allocator not initialized")
+    }
+}
+
+#[cfg(not(test))]
+/// Finalize the allocator by subtracting reserved regions and enabling allocation.
+/// Safe to call multiple times; after the first success, it’s a no-op.
+pub fn finalize() -> Result<(), &'static str> {
+    let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
+    if let Some(block) = guard.get_mut() {
+        if block.is_finalized() {
+            return Ok(());
+        }
+        block.check_regions()
+    } else {
+        Err("allocator not initialized")
     }
 }
