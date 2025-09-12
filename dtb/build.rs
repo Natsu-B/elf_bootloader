@@ -1,67 +1,59 @@
-use core::panic;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::env;
 use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("--- check the environment");
-    if !command_installed("git") {
-        panic!("this test requires git");
-    }
-    if !command_installed("dtc") {
-        panic!("this test requires the device tree compiler(dtc)");
-    }
-    println!("--- start dtb tests ---");
-    println!("Creating test folder...");
-    if fs::create_dir("test").is_err() {
-        println!("Checking file...");
-        let dtb_path = Path::new("test/test.dtb");
-        if dtb_path.is_file() {
-            println!("file already exists, exiting...");
-            return;
-        }
-    }
-    println!("Downloading test.dts from https://gist.github.com/072176edd54cd207c1d800c25d384cd2.git");
-    if Command::new("git")
-        .arg("clone")
-        .arg("https://gist.github.com/072176edd54cd207c1d800c25d384cd2.git")
-        .arg("test")
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .status()
-        .is_err()
-    {
-        let dts_path = Path::new("test/test.dts");
-        if !dts_path.is_file() {
-            panic!("failed to fetch test.dts");
-        }
+    // Directory with DTS fixtures
+    let dts_dir = PathBuf::from("test/dts");
+    println!("cargo:rerun-if-changed=test/dts");
+    if !dts_dir.exists() {
+        return;
     }
 
-    println!("Compiling test.dts file to test.dtb...");
-    if Command::new("dtc")
-        .arg("-I")
-        .arg("dts")
-        .arg("-O")
-        .arg("dtb")
-        .arg("-o")
-        .arg("test/test.dtb")
-        .arg("test/test.dts")
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .status()
-        .is_err()
-    {
-        panic!("failed to compile dts file");
-    }
-    println!("exiting pre-test setup...");
-}
+    // OUT_DIR is provided by Cargo
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-fn command_installed(command_name: &str) -> bool {
-    Command::new(command_name)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    // Find all .dts files
+    let entries = fs::read_dir(&dts_dir).unwrap();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("dts") {
+            continue;
+        }
+        let file_name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let out_path = out_dir.join(format!("{}.dtb", file_name));
+
+        // Invalidate when source changes
+        println!("cargo:rerun-if-changed={}", path.display());
+
+        // Try to run dtc to build the dtb
+        let status = Command::new("dtc")
+            .args(["-O", "dtb", "-o"])
+            .arg(&out_path)
+            .arg(&path)
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                // Success
+            }
+            Ok(s) => {
+                // dtc returned error; fail the build so tests don't silently skip
+                panic!(
+                    "dtc failed (exit: {}), cannot build {}",
+                    s,
+                    out_path.display()
+                );
+            }
+            Err(e) => {
+                // dtc not present or failed to spawn; fail the build as requested
+                panic!(
+                    "failed to run dtc: {}. Required to build {}",
+                    e,
+                    out_path.display()
+                );
+            }
+        }
+    }
 }
