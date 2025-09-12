@@ -285,7 +285,6 @@ impl MemoryBlock {
     ///     are guaranteed by the caller to be pre-sorted by their base address.
     /// 2.  Each `reserved_region` must be fully contained within a single `region`.
     pub fn check_regions(&mut self) -> Result<(), &'static str> {
-        // --- 1. Initial Validation ---
         const MAX_REGIONS: usize = 120; // A safe upper limit to allow for splits.
         if self.region_size as usize > MAX_REGIONS
             || self.reserved_region_size as usize > MAX_REGIONS
@@ -365,6 +364,15 @@ impl MemoryBlock {
                 }
             }
         }
+
+        // clean reserved memory region
+        self.reserved_regions = RegionContainer(RegionData::Global(
+            [MemoryRegions {
+                address: 0,
+                size: 0,
+            }; 128],
+        ));
+        self.reserved_region_size = 0;
 
         self.allocatable = true;
         Ok(())
