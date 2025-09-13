@@ -193,6 +193,20 @@ pub fn add_reserved_region(address: usize, size: usize) -> Result<(), &'static s
 }
 
 #[cfg(not(test))]
+pub fn allocate_dynamic_reserved_region(
+    size: usize,
+    align: Option<usize>,
+    alloc_range: Option<(usize, usize)>,
+) -> Result<Option<usize>, &'static str> {
+    let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
+    if let Some(block) = guard.get_mut() {
+        block.add_reserved_region_dynamic(size, align, alloc_range)
+    } else {
+        Err("allocator not initialized")
+    }
+}
+
+#[cfg(not(test))]
 /// Finalize the allocator by subtracting reserved regions and enabling allocation.
 /// Safe to call multiple times; after the first success, it’s a no-op.
 pub fn finalize() -> Result<(), &'static str> {

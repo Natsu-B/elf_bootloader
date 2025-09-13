@@ -1,4 +1,6 @@
 use core::alloc::Layout;
+use core::cmp::max;
+use core::cmp::min;
 use core::fmt;
 use core::ops::Deref;
 use core::ops::DerefMut;
@@ -278,6 +280,86 @@ impl MemoryBlock {
         }
     }
 
+    pub fn add_reserved_region_dynamic(
+        &mut self,
+        size: usize,
+        align: Option<usize>,
+        alloc_range: Option<(usize, usize)>,
+    ) -> Result<Option<usize>, &'static str> {
+        // Enforce pre-finalize usage only
+        if self.allocatable {
+            return Err("allocator already finalized");
+        }
+        // Normalize inputs
+        if size == 0 {
+            return Ok(None);
+        }
+        let alignment = align.unwrap_or(1).max(1);
+
+        // Iterate free regions to find a fitting spot respecting range and alignment.
+        let regions_len = self.region_size as usize;
+        'regions: for i in 0..regions_len {
+            let mut reg_addr = self.regions[i].address;
+            let mut reg_end = self.regions[i].end();
+
+            let region_start = loop {
+                // Check if the region is suitable
+                let region_start = if let Some((range_start, range_size)) = alloc_range {
+                    let range_end = range_start + range_size;
+                    if range_end < reg_addr {
+                        return Ok(None);
+                    }
+                    if reg_end < range_start {
+                        continue 'regions;
+                    }
+                    let region_start = max(reg_addr, range_start).next_multiple_of(alignment);
+                    if region_start + size > range_end {
+                        continue 'regions;
+                    }
+                    region_start
+                } else {
+                    reg_addr.next_multiple_of(alignment)
+                };
+                if region_start + size > reg_end {
+                    continue 'regions;
+                }
+
+                // Check whether the region overlaps with reserved memory regions
+                let slice = &self.reserved_regions[0..self.reserved_region_size as usize];
+                let (prev_end, next_start) = match slice.binary_search_by_key(&region_start, |x| x.address) {
+                    Ok(i) => {
+                        let prev_end = slice[i].end();
+                        let next_start = if i + 1 < slice.len() { slice[i + 1].address } else { usize::MAX };
+                        (prev_end, next_start)
+                    }
+                    Err(i) => {
+                        let prev_end = if i > 0 { slice[i - 1].end() } else { 0 };
+                        let next_start = if i < slice.len() { slice[i].address } else { usize::MAX };
+                        (prev_end, next_start)
+                    }
+                };
+                if prev_end > region_start || region_start + size > next_start {
+                    reg_addr = max(reg_addr, prev_end);
+                    reg_end = min(reg_end, next_start);
+                    if reg_addr >= reg_end {
+                        continue 'regions;
+                    }
+                    continue;
+                }
+                break region_start;
+            };
+            // Found a candidate. Commit it differently depending on finalized state.
+            let new_region = MemoryRegions {
+                address: region_start,
+                size,
+            };
+            self.add_region_internal(true, &new_region)?;
+            return Ok(Some(region_start));
+        }
+
+        Ok(None)
+    }
+
     /// Subtracts the reserved memory regions from the available memory regions.
     ///
     /// This function operates under the following assumption:
@@ -433,7 +515,6 @@ impl MemoryBlock {
 
     // Remove allocation range from reserved list: reserved := reserved \ [addr, addr+size)
     fn remove_reserved_alloc_record(&mut self, addr: usize, size: usize) {
-        self.ensure_overflow_headroom();
         if size == 0 {
             return;
         }
@@ -1350,6 +1431,163 @@ mod tests {
             MemoryRegions {
                 address: 0x1000,
                 size: 0x1000
+            }
+        );
+    }
+
+    #[test]
+    fn test_add_reserved_region_dynamic_pre_finalize_basic() {
+        let mut allocator = MemoryBlock::init();
+        // Add a single free region [0x1000, 0x2000)
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+
+        // Request 0x100 bytes aligned to 0x100 within [0x1010, 0x1510)
+        let addr = allocator
+            .add_reserved_region_dynamic(0x100, Some(0x100), Some((0x1010, 0x500)))
+            .unwrap();
+
+        // Alignment rounds up 0x1010 to 0x1100
+        assert_eq!(addr, Some(0x1100));
+        assert_eq!(allocator.reserved_region_size, 1);
+        assert_eq!(
+            allocator.reserved_regions[0],
+            MemoryRegions {
+                address: 0x1100,
+                size: 0x100
+            }
+        );
+
+        // Finalize and ensure the reserved area is subtracted
+        allocator.check_regions().unwrap();
+        assert_eq!(allocator.region_size, 2);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x1000,
+                size: 0x100
+            }
+        );
+        assert_eq!(
+            allocator.regions[1],
+            MemoryRegions {
+                address: 0x1200,
+                size: 0xE00
+            }
+        );
+    }
+
+    #[test]
+    fn test_add_reserved_region_dynamic_pre_finalize_overlap_returns_none() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        // Pre-existing reserved at [0x1100, 0x1200)
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x1100,
+                size: 0x100,
+            })
+            .unwrap();
+
+        // Range [0x1080, 0x1280) rounds up to 0x1100 which overlaps, implementation skips this region
+        let addr = allocator
+            .add_reserved_region_dynamic(0x100, Some(0x100), Some((0x1080, 0x200)))
+            .unwrap();
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn test_add_reserved_region_dynamic_post_finalize_returns_err() {
+        let mut allocator = MemoryBlock::init();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x1000,
+            })
+            .unwrap();
+        allocator.check_regions().unwrap();
+
+        // After finalize, dynamic reserved add should return Err
+        let res = allocator.add_reserved_region_dynamic(0x100, Some(0x80), Some((0x1000, 0x1000)));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_add_reserved_region_dynamic_err_index_equal_len_should_succeed_when_fixed() {
+        let mut allocator = MemoryBlock::init();
+
+        // Two pre-existing reserved regions below the free region range
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x100,
+            })
+            .unwrap();
+        allocator
+            .add_reserved_region(&MemoryRegions {
+                address: 0x2000,
+                size: 0x100,
+            })
+            .unwrap();
+
+        // Free regions: provide small regions covering the two existing reserved
+        // areas so that finalization can succeed, plus a larger region after them
+        // to exercise Err(len) in binary_search for region_start = 0x5000.
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x1000,
+                size: 0x100, // covers [0x1000,0x1100)
+            })
+            .unwrap();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x2000,
+                size: 0x100, // covers [0x2000,0x2100)
+            })
+            .unwrap();
+        allocator
+            .add_region(&MemoryRegions {
+                address: 0x5000,
+                size: 0x1000, // [0x5000, 0x6000)
+            })
+            .unwrap();
+
+        // With a correct implementation, this returns Some(0x5000) and records
+        // the reservation into reserved_regions at the end.
+        let addr = allocator
+            .add_reserved_region_dynamic(0x80, Some(0x80), None)
+            .expect("unexpected Err from pre-finalize dynamic reserve");
+        assert_eq!(addr, Some(0x5000));
+
+        // Verify reservation recorded as the last reserved region
+        assert_eq!(allocator.reserved_region_size, 3);
+        assert_eq!(
+            allocator.reserved_regions[2],
+            MemoryRegions {
+                address: 0x5000,
+                size: 0x80
+            }
+        );
+
+        // Finalize; available region should have the reserved [0x5000,0x5080) subtracted
+        allocator.check_regions().unwrap();
+        // Two small regions are fully consumed by the earlier fixed reservations,
+        // the third region is partially consumed by the dynamic reservation.
+        assert_eq!(allocator.region_size, 1);
+        assert_eq!(
+            allocator.regions[0],
+            MemoryRegions {
+                address: 0x5080,
+                size: 0xF80
             }
         );
     }
