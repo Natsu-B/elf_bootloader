@@ -8,6 +8,7 @@ tock-registers = "0.10.0"
 heapless = "0.8.0"
 dtb = { path = "../dtb" }
 allocator = { path = "../allocator" }
+typestate = { path = "../typestate" }
 
 [profile.release]
 panic = 'abort'
