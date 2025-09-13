@@ -7,11 +7,6 @@ use core::ops::DerefMut;
 use core::ptr::copy_nonoverlapping;
 use core::slice;
 
-#[cfg(not(doctest))]
-use alloc::boxed::Box;
-#[cfg(doctest)]
-use std::boxed::Box;
-
 enum RegionData {
     Global([MemoryRegions; 128]),
     Heap(&'static mut [MemoryRegions]),
@@ -477,13 +472,13 @@ impl MemoryBlock {
                     self.region_size += 1;
                 }
                 let new_addr = address_multiple_of + size;
-                if new_addr != regions[i].end() {
-                    regions[i].address = new_addr;
-                    regions[i].size = end_addr - new_addr;
-                } else {
+                if new_addr == regions[i].end() {
                     // The region is consumed completely.
                     regions.copy_within(i + 1..self.region_size as usize, i);
                     self.region_size -= 1;
+                } else {
+                    regions[i].address = new_addr;
+                    regions[i].size = end_addr - new_addr;
                 }
                 self.add_reserved_alloc_record(address_multiple_of, size);
                 return Some(address_multiple_of);

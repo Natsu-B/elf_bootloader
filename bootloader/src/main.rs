@@ -17,12 +17,12 @@ use crate::systimer::SystemTimer;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::ffi::CStr;
+use core::ffi::c_char;
 use core::fmt::Write;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::slice;
 use core::time::Duration;
-use dtb;
 use dtb::DtbParser;
 use heapless::String;
 
@@ -38,13 +38,13 @@ static PL011_UART_ADDR: NonSyncUnsafeCell<usize> = NonSyncUnsafeCell::new(0x900_
 extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let args = unsafe { slice::from_raw_parts(argv, argc) };
     let dtb = DtbParser::init(unsafe {
-        str_to_usize(CStr::from_ptr(args[0]).to_str().unwrap()).unwrap()
+        str_to_usize(CStr::from_ptr(args[0] as *const c_char).to_str().unwrap()).unwrap()
     })
     .unwrap();
     let debug_uart_cell = unsafe { &mut *DEBUG_UART.get() };
     dtb.find_node(None, Some("arm,pl011"), &mut |addr, _size| {
         unsafe { *PL011_UART_ADDR.get() = addr };
-        debug_uart_cell.set(Pl011Uart::new(addr as *const u32));
+        let _ = debug_uart_cell.set(Pl011Uart::new(addr as *const u32));
         ControlFlow::Break(())
     })
     .unwrap();
@@ -58,7 +58,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     dtb.find_node(Some("memory"), None, &mut |addr, size| {
         allocator::add_available_region(addr, size).unwrap();
         ControlFlow::Continue(())
-    });
+    })
+    .unwrap();
     dtb.find_memory_reservation_block(&mut |addr, size| {
         allocator::add_reserved_region(addr, size).unwrap();
         ControlFlow::Continue(())
@@ -78,8 +79,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
                 Err(())
             }
         },
-    );
-    allocator::finalize();
+    )
+    .unwrap();
+    allocator::finalize().unwrap();
     println!("allocator setup success!!!");
     let mut vector_test = Vec::new();
     let mut i = 0;
@@ -125,7 +127,7 @@ fn panic(info: &PanicInfo) -> ! {
     debug_uart.init(UartNum::Debug, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
     let mut s: String<10000> = String::new();
-    write!(s, "panicked: {}", info);
+    let _ = write!(s, "panicked: {}", info);
     debug_uart.write(&s);
     loop {
         unsafe { asm!("wfi") };

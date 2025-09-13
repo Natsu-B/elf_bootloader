@@ -1,7 +1,6 @@
 [build]
-rustflags = ["-C", "link-args=/debug:dwarf"]
+#rustflags = ["-C", "link-args=/debug:dwarf"]
 
 
 [target.aarch64-unknown-none]
-rustflags = ["-C", "link-arg=--build-id=none"]
-runner = "qemu-system-aarch64 -M raspi3b -serial stdio -kernel"
+#rustflags = ["-C", "link-arg=--build-id=none"]

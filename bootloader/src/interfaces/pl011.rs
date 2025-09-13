@@ -150,7 +150,7 @@ impl Pl011Uart {
         };
         assert!(uart_clk > 368_6400); // UART_CLK > 3.6864MHz is required
         let divisor_i = uart_clk / baudrate / 16; // integer part(16bit)
-        let divisor_f = ((uart_clk * 8 / baudrate + 1) / 2) & 0b11_1111; // fractional part(6 bit)
+        let divisor_f = (uart_clk * 8 / baudrate).div_ceil(2) & 0b11_1111; // fractional part(6 bit)
         self.registers.integer_baud_rate.set(divisor_i);
         self.registers.fractional_baud_rate.set(divisor_f);
         // enable fifo

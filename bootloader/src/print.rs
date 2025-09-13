@@ -1,5 +1,4 @@
 use crate::interfaces::pl011::Pl011Uart;
-use crate::interfaces::pl011::UartNum;
 use core::cell::OnceCell;
 use core::cell::UnsafeCell;
 use core::fmt::Write;

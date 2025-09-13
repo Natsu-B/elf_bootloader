@@ -89,8 +89,8 @@ impl<T> RwLock<T> {
         loop {
             let current_state = self.read_count_write_lock_flag.load(Ordering::Relaxed);
             // If no write lock is held or requested, try to acquire a read lock.
-            if current_state & Self::WRITE_FLAG == 0 {
-                if self
+            if current_state & Self::WRITE_FLAG == 0
+                && self
                     .read_count_write_lock_flag
                     .compare_exchange_weak(
                         current_state,
@@ -102,7 +102,6 @@ impl<T> RwLock<T> {
                 {
                     return RwLockReadGuard { lock: self };
                 }
-            }
             core::hint::spin_loop();
         }
     }

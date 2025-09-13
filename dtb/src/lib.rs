@@ -678,7 +678,7 @@ mod dtb_parser {
                         && let Some(data) = data
                     {
                         let (address_cells, size_cells) =
-                            unsafe { *&(**parent).assume_parent_and_get_property() }?;
+                            unsafe { (**parent).assume_parent_and_get_property() }?;
                         if address_cells > 2 || size_cells > 2 {
                             return Err(
                                 "reserved-memory: address-cells/size-cells > 2 not supported",
@@ -688,7 +688,7 @@ mod dtb_parser {
                             ReservedMemoryData::Static { reg } => {
                                 let stride =
                                     (address_cells + size_cells) as usize * size_of::<u32>();
-                                if reg.len == 0 || (reg.len as usize) % stride != 0 {
+                                if reg.len == 0 || !(reg.len as usize).is_multiple_of(stride) {
                                     return Err(
                                         "reserved-memory static: 'reg' length not multiple of stride",
                                     );
@@ -738,7 +738,7 @@ mod dtb_parser {
                                 }
                                 if alloc_ranges.as_ref().is_some_and(|x| {
                                     let stride = ac_bytes + sc_bytes;
-                                    (x.len as usize) == 0 || (x.len as usize) % stride != 0
+                                    (x.len as usize) == 0 || !(x.len as usize).is_multiple_of(stride)
                                 }) {
                                     return Err(
                                         "reserved-memory dynamic: 'alloc-ranges' length not multiple of stride",
