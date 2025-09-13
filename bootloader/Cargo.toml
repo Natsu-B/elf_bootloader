@@ -7,6 +7,7 @@ edition = "2024"
 tock-registers = "0.10.0"
 heapless = "0.8.0"
 dtb = { path = "../dtb" }
+allocator = { path = "../allocator" }
 
 [profile.release]
 panic = 'abort'
