@@ -1,6 +1,5 @@
 [workspace]
-members = ["alloc", "bootloader", "dtb", "mutex", "xtask"]
-workspace.resolver = "3"
+members = ["allocator", "bootloader", "dtb", "mutex", "xtask"]
 build-std-features = ["compiler-builtins-mem"]
 
 [profile.release]

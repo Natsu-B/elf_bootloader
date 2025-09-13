@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "alloc"
+name = "allocator"
 version = "0.1.0"
 dependencies = [
  "mutex",
@@ -34,6 +34,7 @@ version = "0.1.0"
 name = "elf-hypervisor"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "dtb",
  "heapless",
  "tock-registers",
