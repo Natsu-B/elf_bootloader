@@ -61,6 +61,30 @@ where
     }
 }
 
+impl<T: Copy + RawReg> Le<T> {
+    #[inline]
+    pub fn read(&self) -> T {
+        unsafe { read_volatile(&self.0) }.from_le()
+    }
+
+    #[inline]
+    pub fn write(&mut self, val: T) {
+        unsafe { write_volatile(&mut self.0, val.to_le()) };
+    }
+}
+
+impl<T: Copy + RawReg> Be<T> {
+    #[inline]
+    pub fn read(&self) -> T {
+        unsafe { read_volatile(&self.0) }.from_be()
+    }
+
+    #[inline]
+    pub fn write(&mut self, val: T) {
+        unsafe { write_volatile(&mut self.0, val.to_be()) };
+    }
+}
+
 impl<T: Copy + RawReg> Readable for ReadOnly<Le<T>> {
     type T = T;
 
