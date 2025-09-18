@@ -6,6 +6,7 @@ version = 4
 name = "allocator"
 version = "0.1.0"
 dependencies = [
+ "intrusive_linked_list",
  "mutex",
 ]
 
@@ -48,6 +49,10 @@ dependencies = [
  "hash32",
  "stable_deref_trait",
 ]
+
+[[package]]
+name = "intrusive_linked_list"
+version = "0.1.0"
 
 [[package]]
 name = "itoa"
@@ -147,6 +152,15 @@ checksum = "b0293f99756f16ff352cc78c99673766a305bdb5ed7652e78df649e9967c885a"
 [[package]]
 name = "typestate"
 version = "0.1.0"
+
+[[package]]
+name = "typestate_macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "unicode-ident"

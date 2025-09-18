@@ -1,5 +1,14 @@
 [workspace]
-members = ["allocator", "bootloader", "dtb", "mutex", "xtask"]
+members = [
+    "allocator",
+    "bootloader",
+    "dtb",
+    "mutex",
+    "xtask",
+    "typestate",
+    "typestate_macro",
+    "intrusive_linked_list",
+]
 build-std-features = ["compiler-builtins-mem"]
 
 [profile.release]

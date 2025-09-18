@@ -15,6 +15,7 @@ pedantic = "warn"
 
 [dependencies]
 mutex = { path = "../mutex" }
+intrusive_linked_list = { path = "../intrusive_linked_list" }
 
 [profile.release]
 panic = 'abort'

@@ -1,12 +1,11 @@
+#![cfg_attr(not(test), no_std)]
+
 use core::fmt;
-use core::mem::size_of;
 use core::ptr::NonNull;
 
-pub(crate) const MINIMUM_ALLOCATABLE_BYTES: usize = size_of::<IntrusiveLinkedList>();
-
 #[repr(C)]
-pub(crate) struct IntrusiveLinkedList {
-    pub(crate) next: Option<NonNull<IntrusiveLinkedList>>,
+pub struct IntrusiveLinkedList {
+    next: Option<NonNull<IntrusiveLinkedList>>,
 }
 
 impl fmt::Debug for IntrusiveLinkedList {
@@ -22,22 +21,22 @@ impl fmt::Debug for IntrusiveLinkedList {
 }
 
 impl IntrusiveLinkedList {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self { next: None }
     }
 
-    pub(crate) fn is_none(&self) -> bool {
+    pub fn is_none(&self) -> bool {
         self.next.is_none()
     }
 
-    pub(crate) unsafe fn push(&mut self, ptr: usize) {
+    pub unsafe fn push(&mut self, ptr: usize) {
         let mut intrusive_linked_list =
             unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
         unsafe { intrusive_linked_list.as_mut() }.next = self.next.take();
         self.next = Some(intrusive_linked_list);
     }
 
-    pub(crate) unsafe fn push_back(&mut self, ptr: usize) {
+    pub unsafe fn push_back(&mut self, ptr: usize) {
         let mut new_node = unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
         unsafe { new_node.as_mut().next = None };
 
@@ -48,14 +47,14 @@ impl IntrusiveLinkedList {
         *last_node = Some(new_node);
     }
 
-    pub(crate) fn pop(&mut self) -> Option<usize> {
+    pub fn pop(&mut self) -> Option<usize> {
         self.next.map(|intrusive_linked_list| {
             self.next = unsafe { intrusive_linked_list.as_ref().next };
             intrusive_linked_list.as_ptr() as usize
         })
     }
 
-    pub(crate) fn remove_if(&mut self, ptr: usize) -> bool {
+    pub fn remove_if(&mut self, ptr: usize) -> bool {
         let mut intrusive_linked_list_ptr = self.next;
         if let Some(intrusive_linked_list) = intrusive_linked_list_ptr
             && intrusive_linked_list.as_ptr() as usize == ptr
@@ -76,7 +75,7 @@ impl IntrusiveLinkedList {
         false
     }
 
-    pub(crate) unsafe fn add_with_sort(&mut self, ptr: usize) {
+    pub unsafe fn add_with_sort(&mut self, ptr: usize) {
         let mut new_intrusive_linked_list =
             unsafe { NonNull::new_unchecked(ptr as *mut IntrusiveLinkedList) };
 
@@ -98,8 +97,7 @@ impl IntrusiveLinkedList {
         unsafe { prev.as_mut() }.next = Some(new_intrusive_linked_list);
     }
 
-    #[cfg(test)]
-    pub(crate) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         let mut counter = 0;
         let mut intrusive_linked_list = self.next;
         while let Some(tmp) = intrusive_linked_list {
@@ -108,14 +106,15 @@ impl IntrusiveLinkedList {
         }
         counter
     }
+
+    pub fn get_next(&self) -> Option<NonNull<IntrusiveLinkedList>> {
+        self.next
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use core::panic;
-
-    use crate::pr_debug;
-
     use super::*;
 
     #[test]
@@ -198,7 +197,6 @@ mod tests {
         // Remove next
         assert!(list.remove_if(ptr1));
 
-        pr_debug!("{:#?}", list);
         assert_eq!(list.size(), 2);
         assert_eq!(list.pop(), Some(ptr2));
         assert_eq!(list.pop(), Some(ptr3));
@@ -213,7 +211,6 @@ mod tests {
         // Remove middle
         assert!(list.remove_if(ptr2));
 
-        pr_debug!("{:#?}", list);
         assert_eq!(list.size(), 2);
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), Some(ptr3));
@@ -228,7 +225,6 @@ mod tests {
         // Remove tail
         assert!(list.remove_if(ptr3));
 
-        pr_debug!("{:#?}", list);
         assert_eq!(list.size(), 2);
         assert_eq!(list.pop(), Some(ptr1));
         assert_eq!(list.pop(), Some(ptr2));

@@ -6,6 +6,9 @@ use core::ops::Deref;
 use core::ops::DerefMut;
 use core::ptr::copy_nonoverlapping;
 use core::slice;
+use intrusive_linked_list::IntrusiveLinkedList;
+
+pub(crate) const MINIMUM_ALLOCATABLE_BYTES: usize = size_of::<IntrusiveLinkedList>();
 
 enum RegionData {
     Global([MemoryRegions; 128]),
@@ -321,18 +324,27 @@ impl MemoryBlock {
 
                 // Check whether the region overlaps with reserved memory regions
                 let slice = &self.reserved_regions[0..self.reserved_region_size as usize];
-                let (prev_end, next_start) = match slice.binary_search_by_key(&region_start, |x| x.address) {
-                    Ok(i) => {
-                        let prev_end = slice[i].end();
-                        let next_start = if i + 1 < slice.len() { slice[i + 1].address } else { usize::MAX };
-                        (prev_end, next_start)
-                    }
-                    Err(i) => {
-                        let prev_end = if i > 0 { slice[i - 1].end() } else { 0 };
-                        let next_start = if i < slice.len() { slice[i].address } else { usize::MAX };
-                        (prev_end, next_start)
-                    }
-                };
+                let (prev_end, next_start) =
+                    match slice.binary_search_by_key(&region_start, |x| x.address) {
+                        Ok(i) => {
+                            let prev_end = slice[i].end();
+                            let next_start = if i + 1 < slice.len() {
+                                slice[i + 1].address
+                            } else {
+                                usize::MAX
+                            };
+                            (prev_end, next_start)
+                        }
+                        Err(i) => {
+                            let prev_end = if i > 0 { slice[i - 1].end() } else { 0 };
+                            let next_start = if i < slice.len() {
+                                slice[i].address
+                            } else {
+                                usize::MAX
+                            };
+                            (prev_end, next_start)
+                        }
+                    };
                 if prev_end > region_start || region_start + size > next_start {
                     reg_addr = max(reg_addr, prev_end);
                     reg_end = min(reg_end, next_start);

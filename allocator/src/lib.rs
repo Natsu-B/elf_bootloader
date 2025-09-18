@@ -4,7 +4,6 @@
 
 extern crate alloc;
 mod buddy_allocator;
-mod intrusive_linked_list;
 mod range_list_allocator;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
@@ -40,7 +39,7 @@ macro_rules! pr_debug {
 macro_rules! levels {
     ($max:expr) => {
         ($max.trailing_zeros() as usize
-            - $crate::intrusive_linked_list::MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize
+            - $crate::range_list_allocator::MINIMUM_ALLOCATABLE_BYTES.trailing_zeros() as usize
             + 1)
     };
 }

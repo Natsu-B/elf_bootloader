@@ -1,17 +1,17 @@
 use crate::levels;
+use crate::range_list_allocator::MINIMUM_ALLOCATABLE_BYTES;
 use core::alloc::Layout;
 use core::cmp::max;
 use core::cmp::min;
 use core::fmt;
 
-use crate::intrusive_linked_list::IntrusiveLinkedList;
-use crate::intrusive_linked_list::MINIMUM_ALLOCATABLE_BYTES;
 use crate::pr_debug;
+use intrusive_linked_list::*;
 
 // Assumes that MAX_ALLOCATABLE_BYTES is a power of 2.
 pub(crate) struct BuddyAllocator<const MAX_ALLOCATABLE_BYTES: usize>
 where
-    [(); levels!(MAX_ALLOCATABLE_BYTES)]: ,
+    [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
     free_list: [IntrusiveLinkedList; levels!(MAX_ALLOCATABLE_BYTES)],
     // A function that can fetch memory of the size and alignment of MAX_ALLOCATABLE_BYTES.
@@ -57,7 +57,9 @@ where
         size.trailing_zeros() as usize - Self::MINIMUM_ALLOCATABLE_BYTES_LEVELS
     }
 
-    pub(crate) fn new(heap_allocator: Option<&'static (dyn Fn() -> Option<usize> + 'static)>) -> Self {
+    pub(crate) fn new(
+        heap_allocator: Option<&'static (dyn Fn() -> Option<usize> + 'static)>,
+    ) -> Self {
         pr_debug!("buddy_allocator: init");
         Self {
             free_list: core::array::from_fn(|_| IntrusiveLinkedList::new()),
@@ -202,11 +204,11 @@ mod tests {
             assert_eq!(allocator.free_list[i].size(), 0);
         }
         assert_eq!(allocator.free_list[top_level].size(), HEAP_SIZE / MAX_ALLOC);
-        let mut current = allocator.free_list[top_level].next;
+        let mut current = allocator.free_list[top_level].get_next();
         for i in 0..(HEAP_SIZE / MAX_ALLOC) {
             let node = current.expect("Node should exist");
             assert_eq!(node.as_ptr() as usize, heap_addr + i * MAX_ALLOC);
-            current = unsafe { node.as_ref().next };
+            current = unsafe { node.as_ref().get_next() };
         }
     }
 
@@ -263,10 +265,10 @@ mod tests {
         assert_eq!(allocator.allocated, 0);
         let top_level = BuddyAllocator::<MAX_SMALL_ALLOC>::LEVELS - 1;
         let mut count = 0;
-        let mut current = allocator.free_list[top_level].next;
+        let mut current = allocator.free_list[top_level].get_next();
         while let Some(node) = current {
             count += 1;
-            current = unsafe { node.as_ref().next };
+            current = unsafe { node.as_ref().get_next() };
         }
         assert_eq!(count, 2);
     }
@@ -360,7 +362,8 @@ mod tests {
     }
     #[test]
     fn test_out_of_memory() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
         // Test the case where the external allocator is called but returns None.
         static EXTERNAL_HEAP_CALLED: AtomicBool = AtomicBool::new(false);
         static HEAP_ALLOCATOR: fn() -> Option<usize> = || {
