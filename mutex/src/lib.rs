@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use core::cell::UnsafeCell;
+use core::fmt;
 use core::ops::Deref;
 use core::ops::DerefMut;
 use core::sync::atomic::AtomicBool;
@@ -36,6 +37,32 @@ impl<T> SpinLock<T> {
             core::hint::spin_loop();
         }
         SpinLockGuard { lock: self }
+    }
+
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        if self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(SpinLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for SpinLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(_g) = self.try_lock() {
+            f.debug_struct("SpinLock")
+                .field("data", unsafe { &*self.data.get() })
+                .finish()
+        } else {
+            f.debug_struct("SpinLock")
+                .field("data", &"<locked>")
+                .finish()
+        }
     }
 }
 
@@ -99,9 +126,9 @@ impl<T> RwLock<T> {
                         Ordering::Relaxed,
                     )
                     .is_ok()
-                {
-                    return RwLockReadGuard { lock: self };
-                }
+            {
+                return RwLockReadGuard { lock: self };
+            }
             core::hint::spin_loop();
         }
     }
