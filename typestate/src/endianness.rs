@@ -264,3 +264,15 @@ impl<T: RawReg> Writable for ReadWrite<Be<T>> {
         unsafe { write_volatile(&mut self.0.0, val.to_be()) };
     }
 }
+
+impl<T: RawReg> Le<T> {
+    pub fn new(t: T) -> Self {
+        Self(t.to_le())
+    }
+}
+
+impl<T: RawReg> Be<T> {
+    pub fn new(t: T) -> Self {
+        Self(t.to_be())
+    }
+}
