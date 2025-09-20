@@ -1,0 +1,22 @@
+[package]
+name = "block-device"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+block-device-api = { path = "../block-device-api" }
+virtio = { path = "../../../virtio" }
+typestate = { path = "../../../typestate" }
+mutex = { path = "../../../mutex" }
+typestate_macro = { path = "../../../typestate_macro" }
+
+[dev-dependencies]
+aarch64_test = { path = "../../../aarch64_test" }
+
+[lib]
+doctest = false
+
+[[test]]
+name = "virtio_blk_modern"
+path = "tests/virtio_blk_modern.rs"
+harness = false

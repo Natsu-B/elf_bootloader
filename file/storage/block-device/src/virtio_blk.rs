@@ -1,0 +1,238 @@
+use core::cell::OnceCell;
+use core::mem::MaybeUninit;
+use core::mem::size_of;
+
+use block_device_api::BlockDevice;
+use block_device_api::IoError;
+use block_device_api::Lba;
+use typestate::Le;
+use virtio::VirtIoCore;
+use virtio::VirtioErr;
+use virtio::device_type::VirtIoDeviceTypes;
+mod configuration;
+mod operation;
+use configuration::VirtioBlkConfig;
+use virtio::VirtIoDevice;
+use virtio::VirtioFeatures;
+use virtio::mmio::VirtIoMmio;
+use virtio::queue::VirtqDescFlags;
+
+use crate::virtio_blk::operation::VirtioBlkReq;
+use crate::virtio_blk::operation::VirtioBlkReqStatus;
+use crate::virtio_blk::operation::VirtioBlkReqType;
+
+pub struct VirtIoBlk {
+    virtio: VirtIoCore<VirtIoMmio>,
+    is_readonly: OnceCell<bool>,
+    _configuration_space: &'static VirtioBlkConfig,
+}
+
+unsafe impl Sync for VirtIoBlk {}
+unsafe impl Send for VirtIoBlk {}
+
+impl VirtIoBlk {
+    #![allow(unused)]
+    const VIRTIO_BLK_F_SIZE_MAX: u32 = 1 << 1;
+    const VIRTIO_BLK_F_SEG_MAX: u32 = 1 << 2;
+    const VIRTIO_BLK_F_GEOMETRY: u32 = 1 << 4;
+    const VIRTIO_BLK_F_RO: u32 = 1 << 5;
+    const VIRTIO_BLK_F_BLK_SIZE: u32 = 1 << 6;
+    const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
+    const VIRTIO_BLK_F_TOPOLOGY: u32 = 1 << 10;
+    const VIRTIO_BLK_F_CONFIG_WCE: u32 = 1 << 11;
+    const VIRTIO_BLK_F_MQ: u32 = 1 << 12;
+    const VIRTIO_BLK_F_DISCARD: u32 = 1 << 13;
+    const VIRTIO_BLK_F_WRITE_ZEROES: u32 = 1 << 14;
+    const VIRTIO_BLK_F_LIFETIME: u32 = 1 << 15;
+    const VIRTIO_BLK_F_SECURE_ERASE: u32 = 1 << 16;
+    const VIRTIO_BLK_F_ZONED: u32 = 1 << 17;
+}
+
+struct VirtIoBlkAdapter {
+    is_read_only: OnceCell<bool>,
+}
+impl VirtIoBlkAdapter {
+    fn new() -> Self {
+        Self {
+            is_read_only: OnceCell::new(),
+        }
+    }
+    fn is_read_only(&self) -> bool {
+        *self.is_read_only.get().unwrap()
+    }
+}
+impl VirtIoDevice for VirtIoBlkAdapter {
+    fn driver_features(
+        &self,
+        _select: u32,
+        _device_feature: VirtioFeatures,
+    ) -> Result<VirtioFeatures, VirtioErr> {
+        Ok(VirtioFeatures(0))
+    }
+
+    fn num_of_queue(&self) -> Result<u32, VirtioErr> {
+        Ok(1)
+    }
+}
+
+impl VirtIoBlk {
+    pub fn new(addr: usize) -> Result<Self, IoError> {
+        let virtio = VirtIoCore::new_mmio(addr).unwrap();
+        if virtio.get_device() != VirtIoDeviceTypes::BlockDevice {
+            return Err(IoError::Unsupported);
+        }
+        let configuration_space =
+            unsafe { &*(virtio.get_configuration_addr() as *mut VirtioBlkConfig) };
+        Ok(Self {
+            virtio,
+            is_readonly: OnceCell::new(),
+            _configuration_space: configuration_space,
+        })
+    }
+}
+
+impl BlockDevice for VirtIoBlk {
+    fn init(&mut self) -> Result<(), IoError> {
+        let adapter = VirtIoBlkAdapter::new();
+        self.virtio.init(&adapter).map_err(error_from)?;
+        self.is_readonly.set(adapter.is_read_only()).unwrap();
+        Ok(())
+    }
+
+    fn block_size(&self) -> usize {
+        512
+    }
+
+    fn num_blocks(&self) -> u64 {
+        todo!()
+    }
+
+    fn read_at(&self, lba: Lba, buf: &mut [MaybeUninit<u8>]) -> Result<(), IoError> {
+        self.submit_rw(false, lba, buf.as_mut_ptr() as usize, buf.len())
+    }
+
+    fn write_at(&self, lba: Lba, buf: &[u8]) -> Result<(), IoError> {
+        self.submit_rw(true, lba, buf.as_ptr() as usize, buf.len())
+    }
+
+    fn flush(&self) -> Result<(), IoError> {
+        Ok(())
+    }
+
+    fn max_io_bytes(&self) -> usize {
+        todo!()
+    }
+
+    fn is_read_only(&self) -> Result<bool, IoError> {
+        if let Some(readonly) = self.is_readonly.get() {
+            Ok(*readonly)
+        } else {
+            Err(IoError::NotReady)
+        }
+    }
+}
+
+impl VirtIoBlk {
+    // TODO free when error occurred
+    fn submit_rw(
+        &self,
+        is_write: bool,
+        lba: u64,
+        buf_ptr: usize,
+        buf_len: usize,
+    ) -> Result<(), IoError> {
+        let virtio_req = VirtioBlkReq {
+            reg_type: Le::new(if is_write {
+                VirtioBlkReqType::VIRTIO_BLK_T_OUT
+            } else {
+                VirtioBlkReqType::VIRTIO_BLK_T_IN
+            }),
+            reserved: Le::new(0),
+            sector: Le::new(lba),
+        };
+        let (first_desc_idx, first_desc_ptr) =
+            self.virtio.allocate_descriptor(0).map_err(error_from)?;
+        first_desc_ptr.addr = Le::new(&virtio_req as *const _ as u64);
+        first_desc_ptr.len = Le::new(size_of::<VirtioBlkReq>() as u32);
+        first_desc_ptr.flags = Le::new(VirtqDescFlags::VIRTQ_DESC_F_NEXT);
+
+        // buffer
+        let (second_desc_idx, second_desc_ptr) =
+            self.virtio.allocate_descriptor(0).map_err(error_from)?;
+        first_desc_ptr.next = Le::new(second_desc_idx);
+        second_desc_ptr.addr = Le::new(buf_ptr as u64);
+        second_desc_ptr.len = Le::new(buf_len as u32);
+        second_desc_ptr.flags = Le::new(if is_write {
+            VirtqDescFlags::VIRTQ_DESC_F_NEXT
+        } else {
+            VirtqDescFlags::VIRTQ_DESC_F_NEXT | VirtqDescFlags::VIRTQ_DESC_F_WRITE
+        });
+
+        // status
+        let mut status: Le<VirtioBlkReqStatus> = Le::new(VirtioBlkReqStatus::VIRTIO_BLK_S_RESERVED);
+        let (third_desc_idx, third_desc_ptr) =
+            self.virtio.allocate_descriptor(0).map_err(error_from)?;
+        second_desc_ptr.next = Le::new(third_desc_idx);
+        third_desc_ptr.addr = Le::new(&mut status as *mut _ as u64);
+        third_desc_ptr.len = Le::new(size_of::<u8>() as u32);
+        third_desc_ptr.flags = Le::new(VirtqDescFlags::VIRTQ_DESC_F_WRITE);
+
+        self.virtio
+            .set_and_notify(0, first_desc_idx)
+            .map_err(error_from)?;
+        let (idx, _len) = loop {
+            match self.virtio.pop_used(0).map_err(error_from)? {
+                Some(v) => break v,
+                None => continue,
+            }
+        };
+
+        if idx != first_desc_idx {
+            return Err(IoError::Io);
+        }
+
+        match status.read() {
+            VirtioBlkReqStatus::VIRTIO_BLK_S_OK => {}
+            VirtioBlkReqStatus::VIRTIO_BLK_S_IOERR => return Err(IoError::Io),
+            VirtioBlkReqStatus::VIRTIO_BLK_S_UNSUPP => return Err(IoError::Unsupported),
+            VirtioBlkReqStatus::VIRTIO_BLK_S_RESERVED => return Err(IoError::Io),
+            _ => unreachable!(),
+        }
+        core::hint::spin_loop();
+
+        self.virtio
+            .dequeue_used(0, first_desc_idx)
+            .map_err(error_from)?;
+        self.virtio
+            .dequeue_used(0, second_desc_idx)
+            .map_err(error_from)?;
+        self.virtio
+            .dequeue_used(0, third_desc_idx)
+            .map_err(error_from)?;
+
+        Ok(())
+    }
+}
+
+fn error_from(e: VirtioErr) -> IoError {
+    match e {
+        VirtioErr::BadMagic(_) => IoError::Protocol,
+        VirtioErr::UnsupportedVersion(_) => IoError::Unsupported,
+        VirtioErr::UnknownVirtioDevice(_) => IoError::Unsupported,
+        VirtioErr::UnsupportedDeviceFeature(_) | VirtioErr::UnsupportedDriverFeature(_) => {
+            IoError::Unsupported
+        }
+
+        VirtioErr::Invalid => IoError::InvalidParam,
+
+        // デバイスの状態が要求を受け付けられない（要リセット/未初期化）＝汎用的には NotReady
+        VirtioErr::DeviceNeedsReset => IoError::NotReady,
+        VirtioErr::DeviceUninitialized => IoError::NotReady,
+
+        // 送信できるディスクリプタが尽きた＝一時的に受け付け不能
+        VirtioErr::OutOfAvailableDesc => IoError::Busy,
+
+        // 内部キュー破損＝一般化して Corrupted
+        VirtioErr::QueueCorrupted => IoError::Corrupted,
+    }
+}

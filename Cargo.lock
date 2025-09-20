@@ -3,12 +3,32 @@
 version = 4
 
 [[package]]
+name = "aarch64_test"
+version = "0.1.0"
+
+[[package]]
 name = "allocator"
 version = "0.1.0"
 dependencies = [
  "intrusive_linked_list",
  "mutex",
 ]
+
+[[package]]
+name = "block-device"
+version = "0.1.0"
+dependencies = [
+ "aarch64_test",
+ "block-device-api",
+ "mutex",
+ "typestate",
+ "typestate_macro",
+ "virtio",
+]
+
+[[package]]
+name = "block-device-api"
+version = "0.1.0"
 
 [[package]]
 name = "byteorder"
@@ -29,6 +49,22 @@ dependencies = [
  "heapless",
  "tock-registers",
  "typestate",
+]
+
+[[package]]
+name = "file"
+version = "0.1.0"
+dependencies = [
+ "block-device",
+ "block-device-api",
+ "filesystem",
+]
+
+[[package]]
+name = "filesystem"
+version = "0.1.0"
+dependencies = [
+ "block-device-api",
 ]
 
 [[package]]
@@ -167,6 +203,17 @@ name = "unicode-ident"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
+
+[[package]]
+name = "virtio"
+version = "0.1.0"
+dependencies = [
+ "allocator",
+ "intrusive_linked_list",
+ "mutex",
+ "typestate",
+ "typestate_macro",
+]
 
 [[package]]
 name = "xtask"
