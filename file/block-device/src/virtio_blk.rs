@@ -86,7 +86,7 @@ impl VirtIoDevice for VirtIoBlkAdapter {
 
 impl VirtIoBlk {
     pub fn new(addr: usize) -> Result<Self, IoError> {
-        let virtio = VirtIoCore::new_mmio(addr).unwrap();
+        let virtio = VirtIoCore::new_mmio(addr).map_err(error_from)?;
         if virtio.get_device() != VirtIoDeviceTypes::BlockDevice {
             return Err(IoError::Unsupported);
         }
@@ -193,7 +193,73 @@ impl BlockDevice for VirtIoBlk {
     }
 
     fn flush(&self) -> Result<(), IoError> {
-        todo!()
+        if self.virtio.queues.is_none() {
+            return Err(IoError::NotReady);
+        }
+        let virtio_req = VirtioBlkReq {
+            reg_type: Le::new(VirtioBlkReqType::VIRTIO_BLK_T_FLUSH),
+            reserved: Le::new(0),
+            sector: Le::new(0),
+        };
+        let (first_desc_idx, first_desc_ptr) =
+            self.virtio.allocate_descriptor(0).map_err(error_from)?;
+        first_desc_ptr.addr = Le::new(&virtio_req as *const _ as u64);
+        first_desc_ptr.len = Le::new(size_of::<VirtioBlkReq>() as u32);
+        first_desc_ptr.flags = Le::new(VirtqDescFlags::VIRTQ_DESC_F_NEXT);
+
+        // status
+        let mut status: Le<VirtioBlkReqStatus> = Le::new(VirtioBlkReqStatus::VIRTIO_BLK_S_RESERVED);
+        let (second_desc_idx, second_desc_ptr) =
+            self.virtio.allocate_descriptor(0).map_err(error_from)?;
+        first_desc_ptr.next = Le::new(second_desc_idx);
+        second_desc_ptr.addr = Le::new(&mut status as *mut _ as u64);
+        second_desc_ptr.len = Le::new(size_of::<u8>() as u32);
+        second_desc_ptr.flags = Le::new(VirtqDescFlags::VIRTQ_DESC_F_WRITE);
+
+        // clean cache
+        let desc_size = size_of::<virtio::queue::VirtqDesc>();
+        clean_dcache_range(first_desc_ptr as *const _ as *const u8, desc_size);
+        clean_dcache_range(second_desc_ptr as *const _ as *const u8, desc_size);
+        clean_dcache_range(
+            &virtio_req as *const _ as *const u8,
+            size_of::<VirtioBlkReq>(),
+        );
+        clean_dcache_range(&status as *const _ as *const u8, size_of::<u8>());
+
+        self.virtio
+            .set_and_notify(0, first_desc_idx)
+            .map_err(error_from)?;
+        let (idx, _len) = loop {
+            match self.virtio.pop_used(0).map_err(error_from)? {
+                Some(v) => break v,
+                None => {
+                    core::hint::spin_loop();
+                    continue;
+                }
+            }
+        };
+
+        if idx != first_desc_idx {
+            return Err(IoError::Io);
+        }
+
+        invalidate_dcache_range(&status as *const _ as *const u8, size_of::<u8>());
+
+        match status.read() {
+            VirtioBlkReqStatus::VIRTIO_BLK_S_OK => {}
+            VirtioBlkReqStatus::VIRTIO_BLK_S_IOERR => return Err(IoError::Io),
+            VirtioBlkReqStatus::VIRTIO_BLK_S_UNSUPP => return Err(IoError::Unsupported),
+            VirtioBlkReqStatus::VIRTIO_BLK_S_RESERVED => return Err(IoError::Io),
+            _ => unreachable!(),
+        }
+
+        self.virtio
+            .dequeue_used(0, first_desc_idx)
+            .map_err(error_from)?;
+        self.virtio
+            .dequeue_used(0, second_desc_idx)
+            .map_err(error_from)?;
+        Ok(())
     }
 
     fn max_io_bytes(&self) -> Result<Option<usize>, IoError> {
@@ -306,7 +372,6 @@ impl VirtIoBlk {
             VirtioBlkReqStatus::VIRTIO_BLK_S_RESERVED => return Err(IoError::Io),
             _ => unreachable!(),
         }
-        core::hint::spin_loop();
 
         self.virtio
             .dequeue_used(0, first_desc_idx)

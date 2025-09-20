@@ -59,5 +59,6 @@ fn run() -> Result<(), &'static str> {
         "This is a simple test message. If you are reading these words, it means that the program is working correctly. There is nothing important here, only a demonstration to check the output. Please ignore this text, because it is written only for testing and debugging purposes. Thank you for your patience! In fact, this message has no real meaning other than to confirm that everything is running as expected. You might see it on your screen, in a console, or inside a log file. The exact place does not matter, bec",
         text
     );
+    device.flush().unwrap();
     Ok(())
 }
