@@ -7,6 +7,7 @@
 
 [target.aarch64-unknown-none]
 # linker = "aarch64-linux-gnu-ld"
+[target.aarch64-unknown-uefi]
 
 [alias]
 xbuild = "xtask build"

@@ -99,3 +99,4 @@ tests/rustdoc-gui/src/**.lock
 
 ## other
 /bin
+/test

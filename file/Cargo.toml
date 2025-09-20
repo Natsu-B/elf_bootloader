@@ -1,0 +1,9 @@
+[package]
+name = "file"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+block-device = { path = "block-device" }
+block-device-api = { path = "block-device-api" }
+filesystem = { path = "filesystem" }

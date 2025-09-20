@@ -1,6 +1,7 @@
 use typestate::Le;
 use typestate_macro::RawReg;
 
+#[repr(C)]
 #[allow(dead_code)]
 pub(crate) struct VirtioBlkReq {
     pub(crate) reg_type: Le<VirtioBlkReqType>,

@@ -20,6 +20,8 @@ use virtio::queue::VirtqDescFlags;
 use crate::virtio_blk::operation::VirtioBlkReq;
 use crate::virtio_blk::operation::VirtioBlkReqStatus;
 use crate::virtio_blk::operation::VirtioBlkReqType;
+use virtio::cache::clean_dcache_range;
+use virtio::cache::invalidate_dcache_range;
 
 pub struct VirtIoBlk {
     virtio: VirtIoCore<VirtIoMmio>,
@@ -32,20 +34,20 @@ unsafe impl Send for VirtIoBlk {}
 
 impl VirtIoBlk {
     #![allow(unused)]
-    const VIRTIO_BLK_F_SIZE_MAX: u32 = 1 << 1;
-    const VIRTIO_BLK_F_SEG_MAX: u32 = 1 << 2;
-    const VIRTIO_BLK_F_GEOMETRY: u32 = 1 << 4;
-    const VIRTIO_BLK_F_RO: u32 = 1 << 5;
-    const VIRTIO_BLK_F_BLK_SIZE: u32 = 1 << 6;
-    const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
-    const VIRTIO_BLK_F_TOPOLOGY: u32 = 1 << 10;
-    const VIRTIO_BLK_F_CONFIG_WCE: u32 = 1 << 11;
-    const VIRTIO_BLK_F_MQ: u32 = 1 << 12;
-    const VIRTIO_BLK_F_DISCARD: u32 = 1 << 13;
-    const VIRTIO_BLK_F_WRITE_ZEROES: u32 = 1 << 14;
-    const VIRTIO_BLK_F_LIFETIME: u32 = 1 << 15;
-    const VIRTIO_BLK_F_SECURE_ERASE: u32 = 1 << 16;
-    const VIRTIO_BLK_F_ZONED: u32 = 1 << 17;
+    const VIRTIO_BLK_F_SIZE_MAX: VirtioFeatures = VirtioFeatures(1 << 1);
+    const VIRTIO_BLK_F_SEG_MAX: VirtioFeatures = VirtioFeatures(1 << 2);
+    const VIRTIO_BLK_F_GEOMETRY: VirtioFeatures = VirtioFeatures(1 << 4);
+    const VIRTIO_BLK_F_RO: VirtioFeatures = VirtioFeatures(1 << 5);
+    const VIRTIO_BLK_F_BLK_SIZE: VirtioFeatures = VirtioFeatures(1 << 6);
+    const VIRTIO_BLK_F_FLUSH: VirtioFeatures = VirtioFeatures(1 << 9);
+    const VIRTIO_BLK_F_TOPOLOGY: VirtioFeatures = VirtioFeatures(1 << 10);
+    const VIRTIO_BLK_F_CONFIG_WCE: VirtioFeatures = VirtioFeatures(1 << 11);
+    const VIRTIO_BLK_F_MQ: VirtioFeatures = VirtioFeatures(1 << 12);
+    const VIRTIO_BLK_F_DISCARD: VirtioFeatures = VirtioFeatures(1 << 13);
+    const VIRTIO_BLK_F_WRITE_ZEROES: VirtioFeatures = VirtioFeatures(1 << 14);
+    const VIRTIO_BLK_F_LIFETIME: VirtioFeatures = VirtioFeatures(1 << 15);
+    const VIRTIO_BLK_F_SECURE_ERASE: VirtioFeatures = VirtioFeatures(1 << 16);
+    const VIRTIO_BLK_F_ZONED: VirtioFeatures = VirtioFeatures(1 << 17);
 }
 
 struct VirtIoBlkAdapter {
@@ -64,9 +66,16 @@ impl VirtIoBlkAdapter {
 impl VirtIoDevice for VirtIoBlkAdapter {
     fn driver_features(
         &self,
-        _select: u32,
-        _device_feature: VirtioFeatures,
+        select: u32,
+        device_feature: VirtioFeatures,
     ) -> Result<VirtioFeatures, VirtioErr> {
+        if select == 0 {
+            if device_feature & VirtIoBlk::VIRTIO_BLK_F_RO != VirtioFeatures(0) {
+                self.is_read_only.set(true).unwrap();
+            } else {
+                self.is_read_only.set(false).unwrap();
+            }
+        }
         Ok(VirtioFeatures(0))
     }
 
@@ -116,7 +125,7 @@ impl BlockDevice for VirtIoBlk {
     }
 
     fn flush(&self) -> Result<(), IoError> {
-        Ok(())
+        todo!()
     }
 
     fn max_io_bytes(&self) -> usize {
@@ -177,18 +186,43 @@ impl VirtIoBlk {
         third_desc_ptr.len = Le::new(size_of::<u8>() as u32);
         third_desc_ptr.flags = Le::new(VirtqDescFlags::VIRTQ_DESC_F_WRITE);
 
+        // Cache maintenance before notifying the device
+        // 1) Descriptors: device reads them
+        let desc_size = size_of::<virtio::queue::VirtqDesc>();
+        clean_dcache_range(first_desc_ptr as *const _ as *const u8, desc_size);
+        clean_dcache_range(second_desc_ptr as *const _ as *const u8, desc_size);
+        clean_dcache_range(third_desc_ptr as *const _ as *const u8, desc_size);
+        // 2) Request header
+        clean_dcache_range(
+            &virtio_req as *const _ as *const u8,
+            size_of::<VirtioBlkReq>(),
+        );
+        // 3) Data buffer
+        clean_dcache_range(buf_ptr as *const u8, buf_len);
+        // 4) Status byte (device writes)
+        clean_dcache_range(&status as *const _ as *const u8, size_of::<u8>());
+
         self.virtio
             .set_and_notify(0, first_desc_idx)
             .map_err(error_from)?;
         let (idx, _len) = loop {
             match self.virtio.pop_used(0).map_err(error_from)? {
                 Some(v) => break v,
-                None => continue,
+                None => {
+                    core::hint::spin_loop();
+                    continue;
+                }
             }
         };
 
         if idx != first_desc_idx {
             return Err(IoError::Io);
+        }
+
+        // Ensure device DMA writes (data and status) are visible before we read them.
+        invalidate_dcache_range(&status as *const _ as *const u8, size_of::<u8>());
+        if !is_write {
+            invalidate_dcache_range(buf_ptr as *const u8, buf_len);
         }
 
         match status.read() {

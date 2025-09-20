@@ -1,0 +1,11 @@
+# Test plan for cargo xtask xtest
+# Format:
+#   std  <package>
+#   uefi <package> <testname>
+
+std allocator
+std dtb
+std intrusive_linked_list
+std mutex
+
+uefi block-device virtio_blk_modern

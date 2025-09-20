@@ -7,6 +7,8 @@ use typestate::Le;
 use typestate_macro::RawReg;
 
 use crate::VirtioErr;
+use crate::cache::clean_dcache_range;
+use crate::cache::invalidate_dcache_range;
 
 #[derive(Debug)]
 pub struct VirtQueue {
@@ -111,6 +113,8 @@ impl VirtQueue {
         unsafe {
             (&*(slot as *const Le<u16>)).write(desc_idx);
         }
+        // Clean the cache line(s) containing this ring slot so device sees it.
+        clean_dcache_range(slot as *const u8, size_of::<Le<u16>>());
     }
 
     fn get_used_queue_idx(&self, used_idx: u16) -> &'static VirtqUsedElem {
@@ -135,28 +139,31 @@ impl VirtQueue {
 
     pub(crate) fn set_available_ring(&self, desc_idx: u16) -> Result<(), VirtioErr> {
         let mut idx = self.idx.lock();
-        let avail_idx = idx.avail_idx;
-        let delta = unsafe { &*(self.avail_paddr as *const VirtqAvail) }
-            .idx
-            .read()
-            .wrapping_sub(avail_idx);
-        if delta == 0 {
+        // Check queue fullness by tracking in-flight entries.
+        let in_flight = idx.avail_idx.wrapping_sub(idx.used_idx) as u32;
+        if in_flight >= self.size {
             return Err(VirtioErr::OutOfAvailableDesc);
         }
-        if delta as u32 > self.size {
-            return Err(VirtioErr::QueueCorrupted);
-        }
-        let ring_slot = avail_idx & (self.size as u16 - 1);
+
+        let ring_slot = idx.avail_idx & (self.size as u16 - 1);
         self.set_avail_queue_idx(ring_slot, desc_idx);
-        idx.avail_idx = idx.avail_idx.wrapping_add(1);
         core::sync::atomic::fence(Ordering::Release);
+
+        idx.avail_idx = idx.avail_idx.wrapping_add(1);
         self.avail().idx.write(idx.avail_idx);
+        core::sync::atomic::fence(Ordering::Release);
+        // Clean the avail header (including idx) so device observes the update.
+        clean_dcache_range(self.avail_paddr as *const u8, size_of::<VirtqAvail>());
         Ok(())
     }
 
     pub(crate) fn pop_used(&self) -> Result<Option<(u16 /* head id */, u32 /* len */)>, VirtioErr> {
         let mut idx = self.idx.lock();
         let used_idx = idx.used_idx;
+        core::sync::atomic::fence(Ordering::Acquire);
+
+        // Invalidate used header so we see device's updates to idx
+        invalidate_dcache_range(self.used_paddr as *const u8, size_of::<VirtqUsed>());
         let used = unsafe { &*(self.used_paddr as *const VirtqUsed) };
         let delta = used.idx.read().wrapping_sub(used_idx);
         if delta == 0 {
@@ -167,7 +174,10 @@ impl VirtQueue {
         }
         // used_idx % qsize = used_idx & (qsize - 1)
         let ring_idx = used_idx & (self.size as u16 - 1);
-        core::sync::atomic::fence(Ordering::Acquire);
+        // Invalidate this used ring element before reading it
+        let ring_start = self.used_paddr as usize + size_of::<VirtqUsed>();
+        let elem_ptr = (ring_start + ring_idx as usize * size_of::<VirtqUsedElem>()) as *const u8;
+        invalidate_dcache_range(elem_ptr, size_of::<VirtqUsedElem>());
         let virt_queue_elem = self.get_used_queue_idx(ring_idx);
         idx.used_idx = used_idx.wrapping_add(1);
         Ok(Some((

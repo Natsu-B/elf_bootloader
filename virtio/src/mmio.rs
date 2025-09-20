@@ -66,6 +66,7 @@ pub struct VirtIoMmio {
 
 impl VirtIoMmio {
     const VIRTIO_MAGIC_VALUE: u32 = 0x74726976;
+    const VIRTIO_SUPPORTED_VERSION_COMPATIBLE_MODE: u32 = 1;
     const VIRTIO_SUPPORTED_VERSION: u32 = 2;
 
     pub(crate) fn new_mmio(paddr: usize) -> Result<VirtIoMmio, VirtioErr> {
@@ -77,8 +78,10 @@ impl VirtIoMmio {
             }
 
             let version = (*registers).version.read();
-            if version != Self::VIRTIO_SUPPORTED_VERSION {
-                // not supported legacy interface
+            if version != Self::VIRTIO_SUPPORTED_VERSION
+                && version != Self::VIRTIO_SUPPORTED_VERSION_COMPATIBLE_MODE
+            {
+                // legacy interface not supported
                 return Err(VirtioErr::UnsupportedVersion(version));
             }
             let device = VirtIoDeviceTypes::try_from((*registers).device_id.read())?;
@@ -91,6 +94,10 @@ impl VirtIoMmio {
 }
 
 impl VirtioTransport for VirtIoMmio {
+    #[inline]
+    fn get_device_version(&self) -> u32 {
+        unsafe { (*self.registers.as_ptr()).version.read() }
+    }
     #[inline]
     fn get_device(&self) -> VirtIoDeviceTypes {
         self.device

@@ -1,14 +1,16 @@
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 #![allow(dead_code)]
 
 extern crate alloc;
 
+pub mod cache;
 pub mod device_type;
 pub mod mmio;
 pub mod queue;
 use alloc::alloc::alloc_zeroed;
 use alloc::boxed::Box;
 use core::alloc::Layout;
+use core::panic;
 use typestate_macro::RawReg;
 
 use crate::device_type::VirtIoDeviceTypes;
@@ -21,6 +23,7 @@ const VIRTIO_FEATURE_SEL_SIZE: usize = 4;
 pub trait VirtioTransport {
     fn get_device(&self) -> VirtIoDeviceTypes;
     fn get_configuration_addr(&self) -> usize;
+    fn get_device_version(&self) -> u32;
 
     // features
     fn set_status(&self, features: DeviceStatus);
@@ -43,7 +46,7 @@ pub trait VirtioTransport {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, RawReg)]
+#[derive(Clone, Copy, Debug, RawReg, PartialEq)]
 pub struct VirtioFeatures(pub u32);
 
 impl VirtioFeatures {
@@ -75,7 +78,7 @@ impl VirtioFeatures {
 }
 
 pub trait VirtIoDevice {
-    // should return only driver features (not include device-independent features)
+    // should return only driver features (not including device-independent features)
     fn driver_features(
         &self,
         select: u32,
@@ -126,9 +129,15 @@ impl<T: VirtioTransport> VirtIoCore<T> {
     fn device_independent_features(
         &self,
         select: usize,
-        _features: VirtioFeatures,
+        features: VirtioFeatures,
     ) -> Result<VirtioFeatures, VirtioErr> {
         if select == 1 {
+            // Require VERSION_1 feature to operate in modern mode
+            if features & VirtioFeatures::F_VERSION_1 == VirtioFeatures(0) {
+                return Err(VirtioErr::UnsupportedVersion(
+                    self.transport.get_device_version(),
+                ));
+            }
             Ok(VirtioFeatures::F_VERSION_1)
         } else {
             Ok(VirtioFeatures(0))
@@ -201,15 +210,19 @@ impl<T: VirtioTransport> VirtIoCore<T> {
                         16,
                     ))
                 } as usize;
+                let avail_hdr = core::mem::size_of::<crate::queue::VirtqAvail>();
+                let used_hdr = core::mem::size_of::<crate::queue::VirtqUsed>();
+                let avail_entries = core::mem::size_of::<typestate::Le<u16>>();
+                let used_entries = core::mem::size_of::<crate::queue::VirtqUsedElem>();
                 let available_ring = unsafe {
                     alloc_zeroed(Layout::from_size_align_unchecked(
-                        6 + 2 * queue_size as usize,
+                        avail_hdr + avail_entries * queue_size as usize,
                         2,
                     ))
                 } as usize;
                 let used_ring = unsafe {
                     alloc_zeroed(Layout::from_size_align_unchecked(
-                        6 + 8 * queue_size as usize,
+                        used_hdr + used_entries * queue_size as usize,
                         4,
                     ))
                 } as usize;
@@ -265,6 +278,9 @@ impl<T: VirtioTransport> VirtIoCore<T> {
             return Err(VirtioErr::DeviceUninitialized);
         };
         queue[queue_idx as usize].set_available_ring(desc_idx)?;
+        // Ensure descriptor/ring writes are globally visible before notifying the device.
+        // virtio requires a wmb() before MMIO notify; Release is sufficient here.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         self.transport.queue_notify(queue_idx);
         Ok(())
     }

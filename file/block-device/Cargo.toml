@@ -5,13 +5,13 @@ edition = "2024"
 
 [dependencies]
 block-device-api = { path = "../block-device-api" }
-virtio = { path = "../../../virtio" }
-typestate = { path = "../../../typestate" }
-mutex = { path = "../../../mutex" }
-typestate_macro = { path = "../../../typestate_macro" }
+virtio = { path = "../../virtio" }
+typestate = { path = "../../typestate" }
+mutex = { path = "../../mutex" }
+typestate_macro = { path = "../../typestate_macro" }
 
 [dev-dependencies]
-aarch64_test = { path = "../../../aarch64_test" }
+aarch64_test = { path = "../../aarch64_test" }
 
 [lib]
 doctest = false
