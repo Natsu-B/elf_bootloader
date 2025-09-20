@@ -40,6 +40,7 @@ fn run() -> Result<(), &'static str> {
     if device.is_read_only().unwrap() {
         return Err("device unexpectedly read-only");
     }
+    assert_eq!(device.num_blocks(), 3);
 
     let block_size = device.block_size();
     if block_size == 0 {

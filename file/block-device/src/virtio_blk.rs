@@ -26,7 +26,7 @@ use virtio::cache::invalidate_dcache_range;
 pub struct VirtIoBlk {
     virtio: VirtIoCore<VirtIoMmio>,
     is_readonly: OnceCell<bool>,
-    _configuration_space: &'static VirtioBlkConfig,
+    configuration_space: &'static VirtioBlkConfig,
 }
 
 unsafe impl Sync for VirtIoBlk {}
@@ -95,7 +95,7 @@ impl VirtIoBlk {
         Ok(Self {
             virtio,
             is_readonly: OnceCell::new(),
-            _configuration_space: configuration_space,
+            configuration_space,
         })
     }
 }
@@ -113,23 +113,97 @@ impl BlockDevice for VirtIoBlk {
     }
 
     fn num_blocks(&self) -> u64 {
-        todo!()
+        // virtio-blk reports capacity in 512-byte sectors.
+        // Our logical block size is 512, so this maps 1:1 to blocks.
+        self.configuration_space.capacity.read()
     }
 
     fn read_at(&self, lba: Lba, buf: &mut [MaybeUninit<u8>]) -> Result<(), IoError> {
-        self.submit_rw(false, lba, buf.as_mut_ptr() as usize, buf.len())
+        // Validate initialization state
+        if self.virtio.queues.is_none() {
+            return Err(IoError::NotReady);
+        }
+        // Validate parameters per BlockDevice contract
+        let bs = self.block_size();
+        let len = buf.len();
+        if len == 0 {
+            return Err(IoError::InvalidParam);
+        }
+        if len % bs != 0 {
+            return Err(IoError::Align);
+        }
+        let blocks = (len / bs) as u64;
+        if lba
+            .checked_add(blocks)
+            .filter(|end| *end <= self.num_blocks())
+            .is_none()
+        {
+            return Err(IoError::OutOfRange);
+        }
+        // Enforce an implementation/transport practical bound (virtq desc len is u32)
+        if len > u32::MAX as usize {
+            return Err(IoError::InvalidParam);
+        }
+        if let Some(max) = self.max_io_bytes()? {
+            if len > max {
+                return Err(IoError::InvalidParam);
+            }
+        }
+
+        self.submit_rw(false, lba, buf.as_mut_ptr() as usize, len)
     }
 
     fn write_at(&self, lba: Lba, buf: &[u8]) -> Result<(), IoError> {
-        self.submit_rw(true, lba, buf.as_ptr() as usize, buf.len())
+        // Validate initialization state
+        if self.virtio.queues.is_none() {
+            return Err(IoError::NotReady);
+        }
+        // Enforce read-only
+        if self.is_read_only()? {
+            return Err(IoError::ReadOnly);
+        }
+        // Validate parameters per BlockDevice contract
+        let bs = self.block_size();
+        let len = buf.len();
+        if len == 0 {
+            return Err(IoError::InvalidParam);
+        }
+        if len % bs != 0 {
+            return Err(IoError::Align);
+        }
+        let blocks = (len / bs) as u64;
+        if lba
+            .checked_add(blocks)
+            .filter(|end| *end <= self.num_blocks())
+            .is_none()
+        {
+            return Err(IoError::OutOfRange);
+        }
+        // Enforce an implementation/transport practical bound (virtq desc len is u32)
+        if len > u32::MAX as usize {
+            return Err(IoError::InvalidParam);
+        }
+        if let Some(max) = self.max_io_bytes()? {
+            if len > max {
+                return Err(IoError::InvalidParam);
+            }
+        }
+
+        self.submit_rw(true, lba, buf.as_ptr() as usize, len)
     }
 
     fn flush(&self) -> Result<(), IoError> {
         todo!()
     }
 
-    fn max_io_bytes(&self) -> usize {
-        todo!()
+    fn max_io_bytes(&self) -> Result<Option<usize>, IoError> {
+        if self.virtio.queues.is_none() {
+            return Err(IoError::NotReady);
+        }
+        // Features like SIZE_MAX/SEG_MAX are not negotiated in this driver yet.
+        // Per spec, corresponding fields are invalid when not negotiated.
+        // Report no explicit limit so upper layers can choose reasonable chunking.
+        Ok(None)
     }
 
     fn is_read_only(&self) -> Result<bool, IoError> {

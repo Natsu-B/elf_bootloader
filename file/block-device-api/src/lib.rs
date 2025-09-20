@@ -72,10 +72,13 @@ pub trait BlockDevice: Send + Sync {
     fn flush(&self) -> Result<(), IoError>;
 
     /// Returns the maximum number of bytes accepted in a single I/O request.
-    /// Defaults to `block_size()` (i.e., no special limit besides block alignment).
-    fn max_io_bytes(&self) -> usize {
-        self.block_size()
-    }
+    ///
+    /// Semantics:
+    /// - `Ok(Some(n))`: the driver exposes a known upper bound `n` (bytes).
+    /// - `Ok(None)`: no explicit bound is known/advertised; callers should use a
+    ///   conservative chunk size policy (e.g., 128–256 KiB) and respect block alignment.
+    /// - `Err(NotReady)`: the device is not initialized yet.
+    fn max_io_bytes(&self) -> Result<Option<usize>, IoError>;
 
     /// Indicates whether the device/media is read-only.
     fn is_read_only(&self) -> Result<bool, IoError>;
