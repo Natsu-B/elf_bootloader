@@ -1,5 +1,4 @@
 use quote::quote;
-use quote::ToTokens;
 use syn::DeriveInput;
 use syn::parse_macro_input;
 

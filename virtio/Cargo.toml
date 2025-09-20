@@ -1,0 +1,11 @@
+[package]
+name = "virtio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+typestate = { path = "../typestate" }
+typestate_macro = { path = "../typestate_macro" }
+allocator = { path = "../allocator" }
+mutex = { path = "../mutex" }
+intrusive_linked_list = { path = "../intrusive_linked_list" }

@@ -8,6 +8,9 @@ members = [
     "typestate",
     "typestate_macro",
     "intrusive_linked_list",
+    "file",
+    "virtio",
+    "aarch64_test",
 ]
 build-std-features = ["compiler-builtins-mem"]
 

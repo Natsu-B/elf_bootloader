@@ -1,3 +1,4 @@
+use core::cell::UnsafeCell;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 
@@ -7,27 +8,27 @@ use crate::RawReg;
 ///
 /// Reads are performed with `read_volatile`. Depending on the hardware,
 /// reading may have side effects (e.g., clear-on-read fields).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct ReadOnly<T>(pub(crate) T);
+pub struct ReadOnly<T>(pub(crate) UnsafeCell<T>);
 
 /// Readable register **without side effects** (safe to poll).
 ///
 /// Access still uses `read_volatile` to prevent elision/reordering, but this
 /// type expresses the contract that repeated reads do not change device state.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[repr(transparent)]
-pub struct ReadPure<T>(pub(crate) T);
+pub struct ReadPure<T>(pub(crate) UnsafeCell<T>);
 
 /// Write-only register (no read API exposed).
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct WriteOnly<T>(pub(crate) T);
+pub struct WriteOnly<T>(pub(crate) UnsafeCell<T>);
 
 /// Read/write register.
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct ReadWrite<T>(pub(crate) T);
+pub struct ReadWrite<T>(pub(crate) UnsafeCell<T>);
 
 /// Volatile-readable capability.
 ///
@@ -60,11 +61,11 @@ pub trait Writable {
     ///
     /// # Safety
     /// The caller must ensure this points at a valid MMIO location for `T`.
-    fn as_mut_ptr(&mut self) -> *mut Self::T;
+    fn as_mut_ptr(&self) -> *mut Self::T;
 
     /// Performs a single volatile write to the underlying address.
     #[inline]
-    fn write(&mut self, val: Self::T) {
+    fn write(&self, val: Self::T) {
         unsafe { write_volatile(self.as_mut_ptr(), val) }
     }
 }
@@ -73,7 +74,7 @@ impl<T: Copy + RawReg> Readable for ReadOnly<T> {
     type T = T;
     #[inline]
     fn as_ptr(&self) -> *const T {
-        &self.0
+        self.0.get()
     }
 }
 
@@ -81,7 +82,7 @@ impl<T: Copy + RawReg> Readable for ReadPure<T> {
     type T = T;
     #[inline]
     fn as_ptr(&self) -> *const T {
-        &self.0
+        self.0.get()
     }
 }
 
@@ -89,23 +90,23 @@ impl<T: Copy + RawReg> Readable for ReadWrite<T> {
     type T = T;
     #[inline]
     fn as_ptr(&self) -> *const T {
-        &self.0
+        self.0.get()
     }
 }
 
 impl<T: RawReg> Writable for WriteOnly<T> {
     type T = T;
     #[inline]
-    fn as_mut_ptr(&mut self) -> *mut T {
-        &mut self.0
+    fn as_mut_ptr(&self) -> *mut T {
+        self.0.get()
     }
 }
 
 impl<T: RawReg> Writable for ReadWrite<T> {
     type T = T;
     #[inline]
-    fn as_mut_ptr(&mut self) -> *mut T {
-        &mut self.0
+    fn as_mut_ptr(&self) -> *mut T {
+        self.0.get()
     }
 }
 
@@ -116,7 +117,7 @@ where
 {
     /// Sets the bits specified by `mask` (read-modify-write).
     #[inline]
-    pub fn set_bits(&mut self, mask: T) {
+    pub fn set_bits(&self, mask: T) {
         let current = self.read();
         self.write(current | mask);
     }
@@ -129,7 +130,7 @@ where
 {
     /// Clears the bits specified by `mask` (read-modify-write).
     #[inline]
-    pub fn clear_bits(&mut self, mask: T) {
+    pub fn clear_bits(&self, mask: T) {
         let current = self.read();
         self.write(current & !mask);
     }
@@ -142,7 +143,7 @@ where
 {
     /// Toggles the bits specified by `mask` (read-modify-write).
     #[inline]
-    pub fn toggle_bits(&mut self, mask: T) {
+    pub fn toggle_bits(&self, mask: T) {
         let current: <ReadWrite<T> as Readable>::T = self.read();
         self.write(current ^ mask);
     }

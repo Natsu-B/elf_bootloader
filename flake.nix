@@ -27,7 +27,7 @@
         devShells.default = pkgs.mkShell {
           packages = [
             (pkgs.rust-bin.nightly.latest.default.override {
-              targets = [ "aarch64-unknown-none" ];
+              targets = [ "aarch64-unknown-none" "aarch64-unknown-uefi" ];
               extensions = [ "rust-src" "llvm-tools-preview" ];
             })
             pkgs.qemu
