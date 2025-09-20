@@ -6,7 +6,7 @@ use core::cmp::min;
 use core::fmt;
 
 use crate::pr_debug;
-use intrusive_linked_list::*;
+use intrusive_linked_list::IntrusiveLinkedList;
 
 // Assumes that MAX_ALLOCATABLE_BYTES is a power of 2.
 pub(crate) struct BuddyAllocator<const MAX_ALLOCATABLE_BYTES: usize>

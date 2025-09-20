@@ -738,7 +738,8 @@ mod dtb_parser {
                                 }
                                 if alloc_ranges.as_ref().is_some_and(|x| {
                                     let stride = ac_bytes + sc_bytes;
-                                    (x.len as usize) == 0 || !(x.len as usize).is_multiple_of(stride)
+                                    (x.len as usize) == 0
+                                        || !(x.len as usize).is_multiple_of(stride)
                                 }) {
                                     return Err(
                                         "reserved-memory dynamic: 'alloc-ranges' length not multiple of stride",

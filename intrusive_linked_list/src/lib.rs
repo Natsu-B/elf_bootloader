@@ -20,6 +20,12 @@ impl fmt::Debug for IntrusiveLinkedList {
     }
 }
 
+impl Default for IntrusiveLinkedList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IntrusiveLinkedList {
     pub const fn new() -> Self {
         Self { next: None }
