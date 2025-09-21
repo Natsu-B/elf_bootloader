@@ -1,6 +1,6 @@
 #![no_std]
 
-#[cfg(feature = "allocator")]
+#[cfg(feature = "alloc")]
 extern crate alloc;
 use block_device_api::BlockDevice;
 use block_device_api::IoError;
@@ -37,8 +37,8 @@ impl PartitionIndex {
         let mut buffer = [MaybeUninit::uninit(); 512];
         block_device.read_at(0, &mut buffer).map_err(from_io_err)?;
         let boot_record = buffer.as_mut_ptr() as *mut MasterBootRecord;
-        let signature = unsafe { (*boot_record).boot_signature };
-        if signature[0] != 0x55 || signature[1] != 0xAA {
+        let signature = unsafe { &(*boot_record).boot_signature };
+        if signature.read() == 0xAA55 {
             return Ok(Self {
                 boot_sector: BootSector::Unknown,
             });
@@ -55,7 +55,7 @@ impl PartitionIndex {
         });
     }
 
-    #[cfg(feature = "allocator")]
+    #[cfg(feature = "alloc")]
     pub fn get_file<'a, D>(
         &self,
         block_device: &D,

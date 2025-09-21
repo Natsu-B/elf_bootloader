@@ -64,6 +64,7 @@ dependencies = [
 name = "filesystem"
 version = "0.1.0"
 dependencies = [
+ "allocator",
  "block-device-api",
  "typestate",
  "typestate_macro",

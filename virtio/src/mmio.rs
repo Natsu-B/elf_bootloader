@@ -72,7 +72,8 @@ impl VirtIoMmio {
     pub(crate) fn new_mmio(paddr: usize) -> Result<VirtIoMmio, VirtioErr> {
         // Safety: caller promises `paddr` points to a valid, device MMIO area
         // that stays mapped for the program lifetime.
-        let registers: &'static MmioDeviceRegister = unsafe { &*(paddr as *const MmioDeviceRegister) };
+        let registers: &'static MmioDeviceRegister =
+            unsafe { &*(paddr as *const MmioDeviceRegister) };
 
         let magic = registers.magic.read();
         if magic != Self::VIRTIO_MAGIC_VALUE {
@@ -154,25 +155,19 @@ impl VirtioTransport for VirtIoMmio {
 
     fn queue_set_descriptor(&self, paddr: usize) {
         let paddr = paddr as u64;
-        self.registers
-            .queue_desc_high
-            .write((paddr >> 32) as u32);
+        self.registers.queue_desc_high.write((paddr >> 32) as u32);
         self.registers.queue_desc_low.write(paddr as u32);
     }
 
     fn queue_set_available(&self, paddr: usize) {
         let paddr = paddr as u64;
-        self.registers
-            .queue_driver_high
-            .write((paddr >> 32) as u32);
+        self.registers.queue_driver_high.write((paddr >> 32) as u32);
         self.registers.queue_driver_low.write(paddr as u32);
     }
 
     fn queue_set_used(&self, paddr: usize) {
         let paddr = paddr as u64;
-        self.registers
-            .queue_device_high
-            .write((paddr >> 32) as u32);
+        self.registers.queue_device_high.write((paddr >> 32) as u32);
         self.registers.queue_device_low.write(paddr as u32);
     }
 

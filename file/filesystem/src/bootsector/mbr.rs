@@ -1,4 +1,5 @@
 use typestate::Le;
+use typestate::Unaligned;
 use typestate_macro::RawReg;
 
 #[allow(clippy::assertions_on_constants)]
@@ -11,7 +12,7 @@ pub(crate) struct MasterBootRecord {
     second_partition: MasterBootRecordPartitionTable,
     third_partition: MasterBootRecordPartitionTable,
     fourth_partition: MasterBootRecordPartitionTable,
-    pub(crate) boot_signature: [u8; 2],
+    pub(crate) boot_signature: Le<Unaligned<u16>>,
 }
 
 #[repr(C)]
@@ -20,8 +21,8 @@ pub(crate) struct MasterBootRecordPartitionTable {
     chs_first_sector: [u8; 3],
     pub(crate) kind: MasterBootRecordPartitionKind,
     chs_last_sector: [u8; 3],
-    lba_first_sector: [u8; 4],
-    num_of_total_sector: [u8; 4],
+    lba_first_sector: Le<Unaligned<u32>>,
+    num_of_total_sector: Le<Unaligned<u32>>,
 }
 
 #[repr(transparent)]
