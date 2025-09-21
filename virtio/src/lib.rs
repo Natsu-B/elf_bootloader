@@ -10,7 +10,6 @@ pub mod queue;
 use alloc::alloc::alloc_zeroed;
 use alloc::boxed::Box;
 use core::alloc::Layout;
-use core::panic;
 use typestate_macro::RawReg;
 
 use crate::device_type::VirtIoDeviceTypes;

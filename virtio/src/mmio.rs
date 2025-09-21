@@ -1,4 +1,4 @@
-use core::ptr::NonNull;
+use core::mem::size_of;
 
 use typestate::ReadPure;
 use typestate::ReadWrite;
@@ -60,7 +60,7 @@ struct MmioDeviceRegister {
 }
 
 pub struct VirtIoMmio {
-    registers: NonNull<MmioDeviceRegister>,
+    registers: &'static MmioDeviceRegister,
     device: VirtIoDeviceTypes,
 }
 
@@ -70,33 +70,31 @@ impl VirtIoMmio {
     const VIRTIO_SUPPORTED_VERSION: u32 = 2;
 
     pub(crate) fn new_mmio(paddr: usize) -> Result<VirtIoMmio, VirtioErr> {
-        let registers = paddr as *mut MmioDeviceRegister;
-        unsafe {
-            let magic = (*registers).magic.read();
-            if magic != Self::VIRTIO_MAGIC_VALUE {
-                return Err(VirtioErr::BadMagic(magic));
-            }
+        // Safety: caller promises `paddr` points to a valid, device MMIO area
+        // that stays mapped for the program lifetime.
+        let registers: &'static MmioDeviceRegister = unsafe { &*(paddr as *const MmioDeviceRegister) };
 
-            let version = (*registers).version.read();
-            if version != Self::VIRTIO_SUPPORTED_VERSION
-                && version != Self::VIRTIO_SUPPORTED_VERSION_COMPATIBLE_MODE
-            {
-                // legacy interface not supported
-                return Err(VirtioErr::UnsupportedVersion(version));
-            }
-            let device = VirtIoDeviceTypes::try_from((*registers).device_id.read())?;
-            Ok(Self {
-                device,
-                registers: NonNull::new_unchecked(registers as *mut MmioDeviceRegister),
-            })
+        let magic = registers.magic.read();
+        if magic != Self::VIRTIO_MAGIC_VALUE {
+            return Err(VirtioErr::BadMagic(magic));
         }
+
+        let version = registers.version.read();
+        if version != Self::VIRTIO_SUPPORTED_VERSION
+            && version != Self::VIRTIO_SUPPORTED_VERSION_COMPATIBLE_MODE
+        {
+            // legacy interface not supported
+            return Err(VirtioErr::UnsupportedVersion(version));
+        }
+        let device = VirtIoDeviceTypes::try_from(registers.device_id.read())?;
+        Ok(Self { device, registers })
     }
 }
 
 impl VirtioTransport for VirtIoMmio {
     #[inline]
     fn get_device_version(&self) -> u32 {
-        unsafe { (*self.registers.as_ptr()).version.read() }
+        self.registers.version.read()
     }
     #[inline]
     fn get_device(&self) -> VirtIoDeviceTypes {
@@ -105,106 +103,80 @@ impl VirtioTransport for VirtIoMmio {
 
     #[inline]
     fn get_configuration_addr(&self) -> usize {
-        self.registers.as_ptr() as usize + size_of::<MmioDeviceRegister>()
+        self.registers as *const MmioDeviceRegister as usize + size_of::<MmioDeviceRegister>()
     }
 
     #[inline]
     fn set_status(&self, features: DeviceStatus) {
-        unsafe { (*self.registers.as_ptr()).status.write(features) };
+        self.registers.status.write(features);
     }
 
     #[inline]
     fn bitmask_set_status(&self, features: DeviceStatus) {
-        unsafe {
-            (*self.registers.as_ptr()).status.set_bits(features);
-        }
+        self.registers.status.set_bits(features);
     }
 
     #[inline]
     fn get_status(&self) -> DeviceStatus {
-        unsafe { (*self.registers.as_ptr()).status.read() }
+        self.registers.status.read()
     }
 
     #[inline]
     fn get_device_features(&self, select: u32) -> VirtioFeatures {
-        unsafe {
-            (*self.registers.as_ptr()).device_features_sel.write(select);
-            (*self.registers.as_ptr()).device_features.read()
-        }
+        self.registers.device_features_sel.write(select);
+        self.registers.device_features.read()
     }
 
     fn set_driver_features(&self, select: u32, val: VirtioFeatures) {
-        unsafe {
-            (*self.registers.as_ptr()).driver_features_sel.write(select);
-            (*self.registers.as_ptr()).driver_features.write(val);
-        }
+        self.registers.driver_features_sel.write(select);
+        self.registers.driver_features.write(val);
     }
 
     fn select_queue(&self, index: u16) {
-        unsafe {
-            (*self.registers.as_ptr()).queue_sel.write(index as u32);
-        }
+        self.registers.queue_sel.write(index as u32);
     }
 
     fn is_queue_ready_equal_0(&self) -> bool {
-        unsafe { (*self.registers.as_ptr()).queue_ready.read() == 0 }
+        self.registers.queue_ready.read() == 0
     }
 
     fn enable_queue_ready(&self) {
-        unsafe {
-            (*self.registers.as_ptr()).queue_ready.write(0x01);
-        }
+        self.registers.queue_ready.write(0x01);
     }
 
     fn get_max_queue_size(&self) -> u32 {
-        unsafe { (*self.registers.as_ptr()).queue_size_max.read() }
+        self.registers.queue_size_max.read()
     }
 
     fn set_queue_size(&self, size: u32) {
-        unsafe {
-            (*self.registers.as_ptr()).queue_size.write(size);
-        }
+        self.registers.queue_size.write(size);
     }
 
     fn queue_set_descriptor(&self, paddr: usize) {
         let paddr = paddr as u64;
-        unsafe {
-            (*self.registers.as_ptr())
-                .queue_desc_high
-                .write((paddr >> 32) as u32);
-            (*self.registers.as_ptr())
-                .queue_desc_low
-                .write(paddr as u32);
-        }
+        self.registers
+            .queue_desc_high
+            .write((paddr >> 32) as u32);
+        self.registers.queue_desc_low.write(paddr as u32);
     }
 
     fn queue_set_available(&self, paddr: usize) {
         let paddr = paddr as u64;
-        unsafe {
-            (*self.registers.as_ptr())
-                .queue_driver_high
-                .write((paddr >> 32) as u32);
-            (*self.registers.as_ptr())
-                .queue_driver_low
-                .write(paddr as u32);
-        }
+        self.registers
+            .queue_driver_high
+            .write((paddr >> 32) as u32);
+        self.registers.queue_driver_low.write(paddr as u32);
     }
 
     fn queue_set_used(&self, paddr: usize) {
         let paddr = paddr as u64;
-        unsafe {
-            (*self.registers.as_ptr())
-                .queue_device_high
-                .write((paddr >> 32) as u32);
-            (*self.registers.as_ptr())
-                .queue_device_low
-                .write(paddr as u32);
-        }
+        self.registers
+            .queue_device_high
+            .write((paddr >> 32) as u32);
+        self.registers.queue_device_low.write(paddr as u32);
     }
 
     fn queue_notify(&self, index: u16) {
-        unsafe {
-            (*self.registers.as_ptr()).queue_notify.write(index as u32);
-        }
+        self.registers.queue_notify.write(index as u32);
     }
 }
