@@ -12,6 +12,8 @@
 //! - [`ReadPure<T>`]: readable **without side effects** (safe to poll). Still uses volatile reads.
 //! - [`WriteOnly<T>`]: writable, no read API is exposed.
 //! - [`ReadWrite<T>`]: both readable and writable.
+//! - [`Le<T>`] / [`Be<T>`]: endianness-aware wrappers that convert to host endianness on read/write.
+//! - [`Unaligned<T>`]: unaligned access helper that performs byte-wise volatile I/O.
 //!
 //! # Safety
 //! These wrappers do not validate that the underlying address actually maps to
@@ -20,6 +22,7 @@
 
 mod endianness;
 mod read_write;
+mod unaligned;
 
 pub use endianness::Be;
 pub use endianness::Le;
@@ -29,6 +32,7 @@ pub use read_write::ReadWrite;
 pub use read_write::Readable;
 pub use read_write::Writable;
 pub use read_write::WriteOnly;
+pub use unaligned::Unaligned;
 
 pub unsafe trait RawReg:
     Copy + core::ops::BitOr + core::ops::BitAnd + core::ops::Not + core::ops::BitXor
