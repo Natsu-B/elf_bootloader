@@ -40,14 +40,47 @@ use crate::WriteOnly;
 #[derive(Debug, Copy, Clone)]
 pub struct Unaligned<T>(T);
 
+#[macro_export]
+macro_rules! unalign_read {
+    ($v:expr => $ty:ty) => {
+        unsafe {
+            let _: $ty = $v;
+
+            <$ty>::read(::core::ptr::addr_of!($v))
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! unalign_write {
+    ($v:expr => WriteOnly<Unaligned<$t:ty>>, $val:expr) => {{
+        {
+            let _: &WriteOnly<Unaligned<$t>> = &$v;
+        }
+        unsafe { <WriteOnly<Unaligned<$t>>>::write(::core::ptr::addr_of_mut!($v), $val) };
+    }};
+    ($v:expr => ReadWrite<Unaligned<$t:ty>>, $val:expr) => {{
+        {
+            let _: &ReadWrite<Unaligned<$t>> = &$v;
+        }
+        unsafe { <ReadWrite<Unaligned<$t>>>::write(::core::ptr::addr_of_mut!($v), $val) };
+    }};
+    ($v:expr => $ty:ty, $val:expr) => {{
+        {
+            let _: &mut $ty = &mut $v;
+        }
+        unsafe { <$ty>::write(::core::ptr::addr_of_mut!($v), $val) };
+    }};
+}
+
 impl<T: Copy + RawReg> Unaligned<T> {
-    /// Reads from an unaligned location without invoking unaligned loads.
+    /// Reads from an unaligned location using unaligned-safe load.
     #[inline]
     pub unsafe fn read(ptr: *const Self) -> T {
         unsafe { read_unaligned(ptr) }.0
     }
 
-    /// Writes to an unaligned location without invoking unaligned stores.
+    /// Writes to an unaligned location using unaligned-safe store.
     #[inline]
     pub unsafe fn write(ptr: *mut Self, val: T) {
         unsafe { write_unaligned(ptr, Unaligned(val)) };
