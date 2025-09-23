@@ -1,4 +1,3 @@
-use core::cell::UnsafeCell;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 
@@ -15,44 +14,44 @@ use crate::read_write::WriteOnly;
 /// - `read()` converts the device-stored little-endian value into host
 ///   endianness and returns it.
 /// - `write()` converts the given host-endian value to little-endian before
-///   performing a volatile write.
+///   delegating the volatile write to the access wrapper.
 ///
 /// Combine with [`ReadOnly`]/[`ReadPure`]/[`ReadWrite`] to express readable /
 /// writable capabilities at the type level. Combine with [`Unaligned<T>`] to
-/// safely access unaligned MMIO locations using byte-wise volatile I/O.
+/// safely access unaligned MMIO locations using byte-wise I/O.
 ///
 /// Safety
 /// - This type does not validate address correctness, width, or ordering. Use
 ///   it only with valid MMIO addresses and observe the device's access rules.
 /// - Concurrent access may require external synchronization appropriate for the
 ///   device.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
-pub struct Le<U>(pub(crate) UnsafeCell<U>);
+pub struct Le<U: Copy + Clone>(pub(crate) U);
 
 /// Big-endian register wrapper.
 ///
 /// - `read()` converts the device-stored big-endian value into host endianness
 ///   and returns it.
 /// - `write()` converts the given host-endian value to big-endian before
-///   performing a volatile write.
+///   delegating the volatile write to the access wrapper.
 ///
 /// Notes and safety considerations are the same as for [`Le<T>`].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
-pub struct Be<U>(pub(crate) UnsafeCell<U>);
+pub struct Be<U: Copy + Clone>(pub(crate) U);
 
 impl<T: Copy + RawReg> Le<T> {
     /// Reads a little-endian value and returns it in host endianness.
     #[inline]
     pub fn read(&self) -> T {
-        unsafe { read_volatile(self.0.get()) }.from_le()
+        self.0.from_le()
     }
 
     /// Writes a host-endian value after converting it to little-endian.
     #[inline]
-    pub fn write(&self, val: T) {
-        unsafe { write_volatile(self.0.get(), val.to_le()) };
+    pub fn write(&mut self, val: T) {
+        self.0 = val.to_le();
     }
 }
 
@@ -60,13 +59,13 @@ impl<T: Copy + RawReg> Be<T> {
     /// Reads a big-endian value and returns it in host endianness.
     #[inline]
     pub fn read(&self) -> T {
-        unsafe { read_volatile(self.0.get()) }.from_be()
+        self.0.from_be()
     }
 
     /// Writes a host-endian value after converting it to big-endian.
     #[inline]
-    pub fn write(&self, val: T) {
-        unsafe { write_volatile(self.0.get(), val.to_be()) };
+    pub fn write(&mut self, val: T) {
+        self.0 = val.to_be();
     }
 }
 
@@ -75,12 +74,12 @@ impl<T: Copy + RawReg> Readable for ReadOnly<Le<T>> {
 
     #[inline]
     fn as_ptr(&self) -> *const Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile((*self.0.get()).0.get()) }.from_le()
+        unsafe { read_volatile(&(*self.0.get()).0) }.from_le()
     }
 }
 
@@ -89,12 +88,12 @@ impl<T: Copy + RawReg> Readable for ReadPure<Le<T>> {
 
     #[inline]
     fn as_ptr(&self) -> *const Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile((*self.0.get()).0.get()) }.from_le()
+        unsafe { read_volatile(&(*self.0.get()).0) }.from_le()
     }
 }
 
@@ -103,12 +102,12 @@ impl<T: Copy + RawReg> Readable for ReadWrite<Le<T>> {
 
     #[inline]
     fn as_ptr(&self) -> *const Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile((*self.0.get()).0.get()) }.from_le()
+        unsafe { read_volatile(&(*self.0.get()).0) }.from_le()
     }
 }
 
@@ -116,12 +115,12 @@ impl<T: RawReg> Writable for WriteOnly<Le<T>> {
     type T = T;
 
     fn as_mut_ptr(&self) -> *mut Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile((*self.0.get()).0.get(), val.to_le()) };
+        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_le()) };
     }
 }
 
@@ -129,12 +128,12 @@ impl<T: RawReg> Writable for ReadWrite<Le<T>> {
     type T = T;
 
     fn as_mut_ptr(&self) -> *mut Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile((*self.0.get()).0.get(), val.to_le()) };
+        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_le()) };
     }
 }
 
@@ -143,12 +142,12 @@ impl<T: Copy + RawReg> Readable for ReadOnly<Be<T>> {
 
     #[inline]
     fn as_ptr(&self) -> *const Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile((*self.0.get()).0.get()) }.from_be()
+        unsafe { read_volatile(&(*self.0.get()).0) }.from_be()
     }
 }
 
@@ -157,12 +156,12 @@ impl<T: Copy + RawReg> Readable for ReadPure<Be<T>> {
 
     #[inline]
     fn as_ptr(&self) -> *const Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile((*self.0.get()).0.get()) }.from_be()
+        unsafe { read_volatile(&(*self.0.get()).0) }.from_be()
     }
 }
 
@@ -171,12 +170,12 @@ impl<T: Copy + RawReg> Readable for ReadWrite<Be<T>> {
 
     #[inline]
     fn as_ptr(&self) -> *const Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn read(&self) -> Self::T {
-        unsafe { read_volatile((*self.0.get()).0.get()) }.from_be()
+        unsafe { read_volatile(&(*self.0.get()).0) }.from_be()
     }
 }
 
@@ -184,12 +183,12 @@ impl<T: RawReg> Writable for WriteOnly<Be<T>> {
     type T = T;
 
     fn as_mut_ptr(&self) -> *mut Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile((*self.0.get()).0.get(), val.to_be()) };
+        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_be()) };
     }
 }
 
@@ -197,23 +196,23 @@ impl<T: RawReg> Writable for ReadWrite<Be<T>> {
     type T = T;
 
     fn as_mut_ptr(&self) -> *mut Self::T {
-        todo!()
+        unreachable!()
     }
 
     #[inline]
     fn write(&self, val: Self::T) {
-        unsafe { write_volatile((*self.0.get()).0.get(), val.to_be()) };
+        unsafe { write_volatile(&mut (*self.0.get()).0, val.to_be()) };
     }
 }
 
 impl<T: RawReg> Le<T> {
     pub fn new(t: T) -> Self {
-        Self(UnsafeCell::new(t.from_le()))
+        Self(t.from_le())
     }
 }
 
 impl<T: RawReg> Be<T> {
     pub fn new(t: T) -> Self {
-        Self(UnsafeCell::new(t.from_be()))
+        Self(t.from_be())
     }
 }
