@@ -19,7 +19,7 @@ mod aarch64 {
         let line = cache_line_size();
         let start = (ptr as usize) & !(line - 1);
         // end is exclusive
-        let end = ((ptr as usize + len + line - 1) & !(line - 1));
+        let end = (ptr as usize + len + line - 1) & !(line - 1);
         (start, end, line)
     }
 

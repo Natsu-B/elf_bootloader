@@ -4,6 +4,11 @@ use core::sync::atomic::Ordering;
 use intrusive_linked_list::IntrusiveLinkedList;
 use mutex::SpinLock;
 use typestate::Le;
+use typestate::ReadPure;
+use typestate::ReadWrite;
+use typestate::Readable;
+use typestate::Writable;
+use typestate::WriteOnly;
 use typestate_macro::RawReg;
 
 use crate::VirtioErr;
@@ -49,8 +54,8 @@ impl VirtqDescFlags {
 
 #[repr(C)]
 pub(crate) struct VirtqAvail {
-    flags: Le<VirtqAvailFlags>,
-    idx: Le<u16>,
+    flags: ReadWrite<Le<VirtqAvailFlags>>,
+    idx: WriteOnly<Le<u16>>,
     // ring: [Le<u16>; NUM_OF_DESCRIPTORS],
     // used_event: Le<u16>,
 }
@@ -65,8 +70,8 @@ impl VirtqAvailFlags {
 
 #[repr(C)]
 pub(crate) struct VirtqUsed {
-    flags: Le<u16>,
-    idx: Le<u16>,
+    flags: ReadPure<Le<u16>>,
+    idx: ReadPure<Le<u16>>,
     // ring: [VirtqUsedElem; NUM_OF_DESCRIPTORS],
     // avail_event: Le<u16>,
 }
@@ -111,7 +116,7 @@ impl VirtQueue {
         let ring_start = self.avail_paddr as usize + size_of::<VirtqAvail>();
         let slot = ring_start + avail_idx as usize * size_of::<Le<u16>>();
         unsafe {
-            (&*(slot as *const Le<u16>)).write(desc_idx);
+            (&mut *(slot as *mut Le<u16>)).write(desc_idx);
         }
         // Clean the cache line(s) containing this ring slot so device sees it.
         clean_dcache_range(slot as *const u8, size_of::<Le<u16>>());
