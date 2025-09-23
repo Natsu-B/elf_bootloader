@@ -1,3 +1,4 @@
+use core::mem::size_of;
 use typestate::Le;
 use typestate::Unaligned;
 use typestate_macro::RawReg;
@@ -9,9 +10,9 @@ const _: () = assert!(size_of::<MasterBootRecord>() == 512);
 pub(crate) struct MasterBootRecord {
     loader: [u8; 446],
     pub(crate) first_partition: MasterBootRecordPartitionTable,
-    second_partition: MasterBootRecordPartitionTable,
-    third_partition: MasterBootRecordPartitionTable,
-    fourth_partition: MasterBootRecordPartitionTable,
+    pub(crate) second_partition: MasterBootRecordPartitionTable,
+    pub(crate) third_partition: MasterBootRecordPartitionTable,
+    pub(crate) fourth_partition: MasterBootRecordPartitionTable,
     pub(crate) boot_signature: Le<Unaligned<u16>>,
 }
 
@@ -21,8 +22,8 @@ pub(crate) struct MasterBootRecordPartitionTable {
     chs_first_sector: [u8; 3],
     pub(crate) kind: MasterBootRecordPartitionKind,
     chs_last_sector: [u8; 3],
-    lba_first_sector: Le<Unaligned<u32>>,
-    num_of_total_sector: Le<Unaligned<u32>>,
+    pub(crate) lba_first_sector: Le<Unaligned<u32>>,
+    pub(crate) num_of_total_sector: Le<Unaligned<u32>>,
 }
 
 #[repr(transparent)]
