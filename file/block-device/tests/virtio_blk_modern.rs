@@ -14,8 +14,6 @@ use core::mem::MaybeUninit;
 use core::slice;
 
 const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
-const MAX_BLOCK: usize = 512;
-const TEST_LBA: Lba = 1;
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {

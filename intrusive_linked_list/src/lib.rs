@@ -121,7 +121,6 @@ impl IntrusiveLinkedList {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::panic;
 
     #[test]
     fn test_push_and_pop() {

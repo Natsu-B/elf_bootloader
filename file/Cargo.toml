@@ -7,3 +7,15 @@ edition = "2024"
 block-device = { path = "block-device" }
 block-device-api = { path = "block-device-api" }
 filesystem = { path = "filesystem" }
+allocator = { path = "../allocator" }
+
+[dev-dependencies]
+aarch64_test = { path = "../aarch64_test" }
+
+[lib]
+doctest = false
+
+[[test]]
+name = "fat32_virtio"
+path = "tests/fat32_virtio.rs"
+harness = false

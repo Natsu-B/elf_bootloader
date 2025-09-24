@@ -6,19 +6,6 @@ use std::fs;
 use std::process::Command;
 use std::process::Stdio;
 
-// cargo metadataの関連する部分の構造体を定義
-#[derive(Debug, serde::Deserialize)]
-struct CargoMetadata {
-    packages: Vec<Package>,
-    workspace_members: Vec<String>, // これらのIDは'packages'内の'id'と一致します
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Package {
-    id: String,
-    name: String, // `cargo test -p <name>` で使用するパッケージ名
-}
-
 fn main() {
     let mut args = std::env::args().skip(1); // 実行ファイル名 (xtask) をスキップ
 
@@ -117,66 +104,49 @@ fn test(args: &[String]) {
 
     eprintln!("Detected host target: {}", host_tuple);
 
-    // Load optional plan (xtest.txt). If not present, build a default plan.
-    let repo_root = std::env::current_dir().expect("failed to get CWD");
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../");
     let plan_path = repo_root.join("xtest.txt");
     let plan = std::fs::read_to_string(&plan_path).ok();
 
     let mut std_crates: Vec<(String, Vec<String>)> = Vec::new();
-    let mut uefi_tests: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut uefi_tests: Vec<(String, String, String, Vec<String>)> = Vec::new();
 
-    if let Some(plan_text) = plan {
-        for (lineno, line) in plan_text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            match parts.next() {
-                Some("std") => {
-                    if let Some(pkg) = parts.next() {
-                        std_crates.push((pkg.to_string(), Vec::new()));
-                    } else {
-                        eprintln!("xtest.txt:{}: missing package after 'std'", lineno + 1);
-                    }
-                }
-                Some("uefi") => {
-                    let (pkg, testname) = (parts.next(), parts.next());
-                    match (pkg, testname) {
-                        (Some(p), Some(t)) => {
-                            uefi_tests.push((p.to_string(), t.to_string(), Vec::new()))
-                        }
-                        _ => eprintln!(
-                            "xtest.txt:{}: expected: uefi <package> <testname>",
-                            lineno + 1
-                        ),
-                    }
-                }
-                Some(other) => {
-                    eprintln!(
-                        "xtest.txt:{}: unknown kind '{}'; expected 'std' or 'uefi'",
-                        lineno + 1,
-                        other
-                    );
-                }
-                None => {}
-            }
+    let plan_text = plan.expect("require xtest.txt");
+    for (lineno, line) in plan_text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-    } else {
-        // Default: run std tests for all members except xtask and block-device; then run UEFI test for block-device
-        let mut members = get_workspace_members().expect("Failed to get workspace members");
-        members.retain(|n| n != "xtask");
-        for name in members {
-            if name == "block-device" {
-                continue;
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("std") => {
+                if let Some(pkg) = parts.next() {
+                    std_crates.push((pkg.to_string(), Vec::new()));
+                } else {
+                    eprintln!("xtest.txt:{}: missing package after 'std'", lineno + 1);
+                }
             }
-            std_crates.push((name, Vec::new()));
+            Some("uefi") => {
+                let (pkg, testname, testscript) = (parts.next(), parts.next(), parts.next());
+                match (pkg, testname, testscript) {
+                    (Some(p), Some(t), Some(s)) => {
+                        uefi_tests.push((p.to_string(), t.to_string(), s.to_string(), Vec::new()))
+                    }
+                    _ => eprintln!(
+                        "xtest.txt:{}: expected: uefi <package> <testname> <testscript>",
+                        lineno + 1
+                    ),
+                }
+            }
+            Some(other) => {
+                eprintln!(
+                    "xtest.txt:{}: unknown kind '{}'; expected 'std' or 'uefi'",
+                    lineno + 1,
+                    other
+                );
+            }
+            None => {}
         }
-        uefi_tests.push((
-            "block-device".to_string(),
-            "virtio_blk_modern".to_string(),
-            Vec::new(),
-        ));
     }
 
     // Helper: build 'timeout' wrapper if available
@@ -208,7 +178,7 @@ fn test(args: &[String]) {
     for (pkg, extra) in std_crates {
         eprintln!("\n--- Running host tests for: {} ---", pkg);
         let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(&prefix.remove(0));
+            let mut c = Command::new(prefix.remove(0));
             for p in prefix {
                 c.arg(p);
             }
@@ -247,17 +217,17 @@ fn test(args: &[String]) {
     }
 
     // Run UEFI tests (rely on runner's internal timeout)
-    let runner_path = repo_root.join("file/block-device/scripts/run_qemu.sh");
-    let runner = runner_path
-        .to_str()
-        .expect("runner path contains invalid UTF-8");
-    for (pkg, testname, extra) in uefi_tests {
+    for (pkg, testname, testscript, extra) in uefi_tests {
+        let runner_path = repo_root.join(testscript);
+        let runner = runner_path
+            .to_str()
+            .expect("runner path contains invalid UTF-8");
         eprintln!(
             "\n--- Running UEFI test for: {}::{}, runner: {} ---",
             pkg, testname, runner
         );
         let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(&prefix.remove(0));
+            let mut c = Command::new(prefix.remove(0));
             for p in prefix {
                 c.arg(p);
             }
@@ -317,40 +287,4 @@ fn test(args: &[String]) {
     } else {
         eprintln!("All tests passed (host + UEFI)");
     }
-}
-
-/// `cargo metadata` を実行し、ワークスペースのメンバーの名前を Vec<String> で返します。
-fn get_workspace_members() -> Result<Vec<String>, String> {
-    let output = Command::new("cargo")
-        .arg("metadata")
-        .arg("--no-deps") // 依存関係は不要なので出力サイズを削減
-        .arg("--format-version")
-        .arg("1") // メタデータフォーマットのバージョン指定
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn cargo metadata: {}", e))?
-        .wait_with_output()
-        .map_err(|e| format!("Failed to wait for cargo metadata: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "cargo metadata failed with status: {:?}\nStderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let metadata: CargoMetadata = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse cargo metadata JSON: {}", e))?;
-
-    let mut member_names = Vec::new();
-    for member_id in metadata.workspace_members {
-        if let Some(pkg) = metadata.packages.iter().find(|p| p.id == member_id) {
-            member_names.push(pkg.name.clone());
-        }
-    }
-    // xtask自身をリストから除外する
-    member_names.retain(|name| name != "xtask");
-    Ok(member_names)
 }

@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-block-device-api = {path = "../block-device-api"}
+block-device-api = { path = "../block-device-api" }
+typestate = { path = "../../typestate" }
+typestate_macro = { path = "../../typestate_macro" }
+allocator = { path = "../../allocator" }
+mutex = { path = "../../mutex" }

@@ -6,6 +6,7 @@ use block_device_api::BlockDevice;
 use block_device_api::IoError;
 use block_device_api::Lba;
 use typestate::Le;
+use typestate::Readable;
 use virtio::VirtIoCore;
 use virtio::VirtioErr;
 use virtio::device_type::VirtIoDeviceTypes;

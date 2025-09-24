@@ -1,11 +1,12 @@
 # Test plan for cargo xtask xtest
 # Format:
 #   std  <package>
-#   uefi <package> <testname>
+#   uefi <package> <testname> <testscript>
 
 std allocator
 std dtb
 std intrusive_linked_list
 std mutex
 
-uefi block-device virtio_blk_modern
+uefi block-device virtio_blk_modern file/block-device/scripts/run_qemu.sh
+uefi file fat32_virtio file/scripts/run_fat32_virtio_test.sh

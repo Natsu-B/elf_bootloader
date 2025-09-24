@@ -4,14 +4,20 @@
 //! This crate provides small wrapper types around MMIO registers that encode
 //! readable / writable capabilities at the type level (typestate).
 //!
-//! All reads and writes are performed with volatile operations to prevent the
-//! compiler from eliding or reordering access to memory-mapped registers.
+//! Volatile memory access is performed **only** by the access-capability
+//! wrappers (`ReadOnly`/`ReadPure`/`WriteOnly`/`ReadWrite`). Composition
+//! wrappers (`Le<T>`/`Be<T>`/`Unaligned<T>`) adapt value representation and
+//! delegate actual MMIO to the access wrappers, ensuring a clear separation
+//! of responsibilities.
 //!
 //! # Typestates
 //! - [`ReadOnly<T>`]: readable, no write API is exposed. Reads **may** have side effects.
-//! - [`ReadPure<T>`]: readable **without side effects** (safe to poll). Still uses volatile reads.
+//! - [`ReadPure<T>`]: readable **without side effects** (safe to poll). Volatile
+//!   reads are still performed, but only via the access wrapper.
 //! - [`WriteOnly<T>`]: writable, no read API is exposed.
 //! - [`ReadWrite<T>`]: both readable and writable.
+//! - [`Le<T>`] / [`Be<T>`]: endianness-aware wrappers that convert to host endianness.
+//! - [`Unaligned<T>`]: unaligned access helper that performs byte-wise I/O via access wrappers.
 //!
 //! # Safety
 //! These wrappers do not validate that the underlying address actually maps to
@@ -20,6 +26,7 @@
 
 mod endianness;
 mod read_write;
+mod unaligned;
 
 pub use endianness::Be;
 pub use endianness::Le;
@@ -29,6 +36,7 @@ pub use read_write::ReadWrite;
 pub use read_write::Readable;
 pub use read_write::Writable;
 pub use read_write::WriteOnly;
+pub use unaligned::Unaligned;
 
 pub unsafe trait RawReg:
     Copy + core::ops::BitOr + core::ops::BitAnd + core::ops::Not + core::ops::BitXor
@@ -42,6 +50,8 @@ pub unsafe trait RawReg:
     fn from_be(self) -> Self;
 }
 
+pub unsafe trait BytePod: Copy + 'static {}
+
 macro_rules! impl_raw { ($($t:ty),* $(,)?) => {$(
     unsafe impl RawReg for $t {
         type Raw = $t;
@@ -52,7 +62,11 @@ macro_rules! impl_raw { ($($t:ty),* $(,)?) => {$(
         #[inline] fn to_be(self)->Self{Self::to_be(self)}
         #[inline] fn from_be(self)->Self{Self::from_be(self)}
     }
+    unsafe impl BytePod for $t {}
 )*}}
 impl_raw!(
     u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
 );
+
+unsafe impl<T: BytePod> BytePod for Le<T> {}
+unsafe impl<T: BytePod> BytePod for Be<T> {}
