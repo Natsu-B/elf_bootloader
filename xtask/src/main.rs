@@ -178,7 +178,7 @@ fn test(args: &[String]) {
     for (pkg, extra) in std_crates {
         eprintln!("\n--- Running host tests for: {} ---", pkg);
         let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(&prefix.remove(0));
+            let mut c = Command::new(prefix.remove(0));
             for p in prefix {
                 c.arg(p);
             }
@@ -227,7 +227,7 @@ fn test(args: &[String]) {
             pkg, testname, runner
         );
         let mut cmd = if let Some(mut prefix) = timeout_prefix(30) {
-            let mut c = Command::new(&prefix.remove(0));
+            let mut c = Command::new(prefix.remove(0));
             for p in prefix {
                 c.arg(p);
             }

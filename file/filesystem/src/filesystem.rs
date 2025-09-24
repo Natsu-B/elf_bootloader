@@ -1,7 +1,4 @@
-use core::ffi::CStr;
 use core::mem::MaybeUninit;
-use core::ops::ControlFlow;
-use core::ptr::addr_of;
 use core::usize;
 
 use alloc::boxed::Box;
@@ -19,8 +16,6 @@ use crate::from_io_err;
 pub(crate) mod fat32;
 
 pub(crate) mod file_system {
-    use core::panic;
-
     use typestate::Le;
     use typestate::Unaligned;
     use typestate::unalign_read;
@@ -53,12 +48,8 @@ pub(crate) mod file_system {
             // partition is fat12 or fat16
             return Err(FileSystemErr::UnsupportedFileSystem);
         }
-        let root_dir_sectors = ((unalign_read!(fat32_boot_sector.bpb_root_ent_cnt => Le<Unaligned<u16>>)
-            as u32
-            * 32)
-            + (unalign_read!(fat32_boot_sector.bpb_bytes_per_sec => Le<Unaligned<u16>>) as u32
-                - 1))
-            / unalign_read!(fat32_boot_sector.bpb_bytes_per_sec => Le<Unaligned<u16>>) as u32;
+        let root_dir_sectors = (unalign_read!(fat32_boot_sector.bpb_root_ent_cnt => Le<Unaligned<u16>>)
+            as u32 * 32).div_ceil(unalign_read!(fat32_boot_sector.bpb_bytes_per_sec => Le<Unaligned<u16>>) as u32);
         let data_sec = unalign_read!(fat32_boot_sector.bpb_tot_sec_32 => Le<Unaligned<u32>>)
             - (unalign_read!(fat32_boot_sector.bpb_rsvd_sec_cnt => Le<Unaligned<u16>>) as u32
                 + (fat32_boot_sector.bpb_num_fats as u32

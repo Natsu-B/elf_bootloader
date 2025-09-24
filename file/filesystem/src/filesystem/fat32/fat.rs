@@ -8,7 +8,6 @@ use typestate_macro::BytePod;
 use crate::FileSystemErr;
 use crate::aligned_box::AlignedSliceBox;
 use crate::filesystem::fat32::FAT32FileSystem;
-use crate::filesystem::fat32::fat;
 use crate::from_io_err;
 
 #[repr(transparent)]

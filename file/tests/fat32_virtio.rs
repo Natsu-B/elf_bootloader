@@ -27,7 +27,7 @@ extern "C" fn efi_main() -> ! {
 
 fn run() -> Result<(), &'static str> {
     println!("Starting fat32_virtio test");
-    let mut device = StorageDevice::new_virtio(VIRTIO_MMIO_BASE).unwrap();
+    let device = StorageDevice::new_virtio(VIRTIO_MMIO_BASE).unwrap();
     println!("fat32_virtio init success");
     let handle = device
         .open(0, "/hello.txt", &file::OpenOptions::Read)
@@ -36,7 +36,7 @@ fn run() -> Result<(), &'static str> {
     let txt = str::from_utf8(&txt).unwrap();
     println!("device text: {}", txt);
     assert_eq!("HelloWorld, from FAT32 txt file!!!", txt);
-    handle.flush();
+    handle.flush().unwrap();
     assert_eq!(handle.size().unwrap(), txt.len() as u64);
     let handle = device
         .open(

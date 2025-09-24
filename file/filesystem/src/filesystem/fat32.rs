@@ -2,7 +2,6 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use block_device_api::BlockDevice;
 use core::mem::MaybeUninit;
-use core::panic;
 use typestate::Le;
 use typestate::Unaligned;
 use typestate::unalign_read;
@@ -141,7 +140,7 @@ impl FAT32FileSystem {
                 _ => return Ok(None),
             }
         }
-        return Ok(Some(unsafe { (ret8.assume_init(), ret3) }));
+        Ok(Some(unsafe { (ret8.assume_init(), ret3) }))
     }
 
     fn calculate_next_dir(sde: &FAT32ByteDirectoryEntry) -> DirMeta {
@@ -165,7 +164,7 @@ impl FAT32FileSystem {
             _ => unreachable!(),
         };
 
-        let mut ascii_bytes = ascii.as_bytes();
+        let ascii_bytes = ascii.as_bytes();
         let mut idx = 0;
 
         for pair in &mut chunks {
@@ -179,14 +178,14 @@ impl FAT32FileSystem {
                 0xFFFF => {
                     continue;
                 }
-                0x0000..=0x007F => {
+                0x0001..=0x007F => {
                     if idx >= ascii_bytes.len() {
                         *ascii = core::str::from_utf8(&ascii_bytes[idx..]).unwrap();
                         return Ok(false);
                     }
                     let a = ascii_bytes[idx];
                     let u8v = u as u8;
-                    if a.to_ascii_uppercase() != u8v.to_ascii_uppercase() {
+                    if !a.eq_ignore_ascii_case(&u8v) {
                         *ascii = core::str::from_utf8(&ascii_bytes[idx..]).unwrap();
                         return Ok(false);
                     }
@@ -294,10 +293,8 @@ impl FAT32FileSystem {
                                 if !last {
                                     return Err(FileSystemErr::Corrupted);
                                 }
-                            } else {
-                                if last {
-                                    return Err(FileSystemErr::Corrupted);
-                                }
+                            } else if last {
+                                return Err(FileSystemErr::Corrupted);
                             }
                             if lde_ref.ldir_chksum != check_sum || lde_ref.ldir_fst_clus_lo != 0 {
                                 return Err(FileSystemErr::Corrupted);
@@ -344,7 +341,7 @@ impl FileSystemTrait for FAT32FileSystem {
     ) -> Result<FileHandle, FileSystemErr> {
         let mut path = path.chars();
         match path.next() {
-            Some(c) if c == '/' => {}
+            Some('/') => {}
             Some(_) => return Err(FileSystemErr::NotRootDir),
             None => return Err(FileSystemErr::InvalidInput),
         }
@@ -422,7 +419,7 @@ impl FileSystemTrait for FAT32FileSystem {
         meta: &DirMeta,
     ) -> Result<u64, FileSystemErr> {
         let file_size = meta.file_size as u64;
-        let bs = block_device.block_size() as usize;
+        let bs = block_device.block_size();
         let spc = self.sectors_per_cluster as usize;
         let bpc = (bs * spc) as u64;
 
@@ -441,7 +438,7 @@ impl FileSystemTrait for FAT32FileSystem {
         let start_byte_in_sector = cluster_off % bs;
 
         let total_bytes_from_first_sector = start_byte_in_sector + to_read;
-        let sectors_needed = (total_bytes_from_first_sector + bs - 1) / bs;
+        let sectors_needed = total_bytes_from_first_sector.div_ceil(bs);
 
         let mut tmp = Box::new_uninit_slice(sectors_needed * bs);
 

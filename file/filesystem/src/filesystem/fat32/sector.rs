@@ -1,5 +1,7 @@
-use core::ffi::c_char;
+#![allow(unused)]
 
+use core::ffi::c_char;
+use core::mem::size_of;
 use typestate::Le;
 use typestate::Unaligned;
 use typestate_macro::RawReg;
@@ -103,9 +105,6 @@ impl FAT32DirectoryEntryAttribute {
     #[inline]
     pub(crate) fn is_sde(ptr: usize) -> bool {
         let ptr = (ptr + Self::OFFSET) as *const FAT32DirectoryEntryAttribute;
-        match unsafe { *ptr } {
-            Self::ATTR_LONG_NAME => false,
-            _ => true,
-        }
+        unsafe { *ptr != Self::ATTR_LONG_NAME }
     }
 }

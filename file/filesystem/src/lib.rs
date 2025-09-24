@@ -58,7 +58,7 @@ impl PartitionIndex {
             });
         }
         let kind = unsafe { core::ptr::addr_of!((*boot_record).first_partition.kind).read() };
-        return Ok(Self {
+        Ok(Self {
             boot_sector: buffer,
             sector_kind: match kind {
                 MasterBootRecordPartitionKind::TYPE_GPT => {
@@ -69,7 +69,7 @@ impl PartitionIndex {
                 _ => BootSector::MBR,
             },
             partitions: SpinLock::new(Vec::with_capacity(2)),
-        });
+        })
     }
 
     /// Semantics

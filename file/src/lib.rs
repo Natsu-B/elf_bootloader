@@ -1,8 +1,6 @@
 #![no_std]
 
 extern crate alloc;
-use core::cell::OnceCell;
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use block_device::VirtIoBlk;
