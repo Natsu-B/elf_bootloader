@@ -116,7 +116,7 @@ impl FAT32FileSystem {
                 i if i.is_ascii_alphanumeric() => true,
                 b'.' | b'$' | b'%' | b'`' | b'-' | b'_' | b'@' | b'~' | b'\'' | b'!' | b'('
                 | b')' | b'{' | b'}' | b'^' | b'#' | b'&' => true,
-                b'+' | b',' | b';' | b'=' | b'[' | b']' => false,
+                b'+' | b',' | b';' | b'=' | b'[' | b']' | b' ' => false,
                 _ => return Err(FileSystemErr::InvalidInput),
             } {
                 return Ok(None);
@@ -303,22 +303,40 @@ impl FAT32FileSystem {
                             {
                                 continue 'outer;
                             }
-                            if file_name.is_empty() && j == lde - 1 {
-                                return Ok(Some(Self::calculate_next_dir(sde)));
+                            if file_name.is_empty()
+                                || file_name.bytes().all(|c| c == b' ' || c == b'.')
+                            {
+                                if j == lde - 1 {
+                                    return Ok(Some(Self::calculate_next_dir(sde)));
+                                } else {
+                                    continue 'outer;
+                                }
                             }
                             if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name2, &mut file_name)?
                             {
                                 continue 'outer;
                             }
-                            if file_name.is_empty() && j == lde - 1 {
-                                return Ok(Some(Self::calculate_next_dir(sde)));
+                            if file_name.is_empty()
+                                || file_name.bytes().all(|c| c == b' ' || c == b'.')
+                            {
+                                if j == lde - 1 {
+                                    return Ok(Some(Self::calculate_next_dir(sde)));
+                                } else {
+                                    continue 'outer;
+                                }
                             }
                             if !Self::compare_utf16_and_ascii(&lde_ref.ldir_name3, &mut file_name)?
                             {
                                 continue 'outer;
                             }
-                            if file_name.is_empty() && j == lde - 1 {
-                                return Ok(Some(Self::calculate_next_dir(sde)));
+                            if file_name.is_empty()
+                                || file_name.bytes().all(|c| c == b' ' || c == b'.')
+                            {
+                                if j == lde - 1 {
+                                    return Ok(Some(Self::calculate_next_dir(sde)));
+                                } else {
+                                    continue 'outer;
+                                }
                             }
                         }
                     }
@@ -367,7 +385,9 @@ impl FileSystemTrait for FAT32FileSystem {
         if meta.is_dir {
             return Err(FileSystemErr::IsDir);
         }
-        if *opts == OpenOptions::Write && meta.is_readonly {
+        if *opts == OpenOptions::Write
+            && (meta.is_readonly || block_device.is_read_only().map_err(from_io_err)?)
+        {
             return Err(FileSystemErr::ReadOnly);
         }
         Ok(FileHandle {
