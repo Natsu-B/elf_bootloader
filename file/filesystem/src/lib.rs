@@ -231,6 +231,7 @@ pub enum FileSystemErr {
     NotRootDir,
     UnsupportedFileName,
     TooBigBuffer,
+    IncompleteRead,
 }
 
 pub(crate) fn from_io_err(err: IoError) -> FileSystemErr {

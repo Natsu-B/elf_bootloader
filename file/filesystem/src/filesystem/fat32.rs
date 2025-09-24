@@ -476,6 +476,10 @@ impl FileSystemTrait for FAT32FileSystem {
             sectors_remaining -= read_sectors;
         }
 
+        if sectors_remaining != 0 {
+            return Err(FileSystemErr::IncompleteRead);
+        }
+
         let start = start_byte_in_sector;
         let end = start + to_read;
         let src = unsafe { core::slice::from_raw_parts(tmp.as_ptr() as *const u8, tmp.len()) };
