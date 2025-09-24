@@ -52,7 +52,7 @@ impl StorageDevice {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageDeviceErr {
     IoErr(IoError),
     FileSystemErr(FileSystemErr),

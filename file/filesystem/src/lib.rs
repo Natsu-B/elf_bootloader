@@ -213,7 +213,7 @@ impl PartitionIndex {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSystemErr {
     BlockDeviceErr(IoError),
     UnknownPartition,

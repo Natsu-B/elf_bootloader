@@ -86,7 +86,7 @@ impl FAT32FileSystem {
         if bytes_per_sector != block_size as u16 {
             return Err(FileSystemErr::Corrupted); // hidden_sector may corrupted?
         }
-        if hidden_sector as u64 != first_sector {
+        if hidden_sector as u64 != first_sector || num_fats == 0 || reserved_sectors == 0 {
             return Err(FileSystemErr::Corrupted);
         }
         Ok(Self {
@@ -443,7 +443,7 @@ impl FileSystemTrait for FAT32FileSystem {
         let spc = self.sectors_per_cluster as usize;
         let bpc = (bs * spc) as u64;
 
-        if offset >= file_size {
+        if offset > file_size {
             return Err(FileSystemErr::InvalidInput);
         }
         let max_read = (file_size - offset) as usize;
