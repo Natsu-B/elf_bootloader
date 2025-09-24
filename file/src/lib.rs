@@ -14,7 +14,7 @@ pub use filesystem::filesystem::OpenOptions;
 
 pub struct StorageDevice {
     dev: Arc<dyn BlockDevice>,
-    partition: Box<PartitionIndex>, // TODO PartitionIndex can make smaller
+    partition: PartitionIndex,
 }
 
 impl StorageDevice {
@@ -23,9 +23,7 @@ impl StorageDevice {
         io.init().map_err(error_from_ioerror)?;
         let dev = Arc::new(io);
         Ok(Self {
-            partition: Box::new(
-                PartitionIndex::new(dev.as_ref()).map_err(error_from_file_system_err)?,
-            ),
+            partition: PartitionIndex::new(dev.as_ref()).map_err(error_from_file_system_err)?,
             dev,
         })
     }

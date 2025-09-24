@@ -31,6 +31,7 @@ pub(crate) struct MasterBootRecordPartitionTable {
 pub(crate) struct MasterBootRecordPartitionKind(u8);
 
 impl MasterBootRecordPartitionKind {
+    pub(crate) const UNUSED: Self = Self(0);
     pub(crate) const TYPE_FAT32: Self = Self(0x0C); // LBA
     pub(crate) const TYPE_GPT: Self = Self(0xEE);
 }

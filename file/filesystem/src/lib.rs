@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 use block_device_api::BlockDevice;
 use block_device_api::IoError;
 use core::mem::MaybeUninit;
+use core::num::ParseIntError;
+use core::ptr::addr_of;
+use core::ptr::read_unaligned;
 use mutex::SpinLock;
 use typestate::Le;
 use typestate::Unaligned;
@@ -19,21 +22,18 @@ use bootsector::mbr::MasterBootRecord;
 pub mod aligned_box;
 pub mod filesystem;
 
+use crate::aligned_box::AlignedSliceBox;
+use crate::bootsector::BootSector;
+use crate::bootsector::MBRConfig;
+use crate::bootsector::MBRPartition;
 use crate::bootsector::mbr::MasterBootRecordPartitionKind;
 use crate::filesystem::FileHandle;
 use crate::filesystem::FileSystemTrait;
 use crate::filesystem::OpenOptions;
 use crate::filesystem::file_system;
 
-enum BootSector {
-    MBR,
-    GPT,
-    Unknown,
-}
-
 pub struct PartitionIndex {
     sector_kind: BootSector,
-    boot_sector: [u8; 512], // TODO too big
     partitions: SpinLock<Vec<(u8, Arc<dyn FileSystemTrait>)>>,
 }
 
@@ -44,29 +44,51 @@ impl PartitionIndex {
     where
         D: BlockDevice,
     {
-        let mut buffer = [MaybeUninit::uninit(); 512];
+        let mut buffer =
+            AlignedSliceBox::<u8>::new_uninit_with_align(block_device.block_size(), 1).unwrap();
         block_device.read_at(0, &mut buffer).map_err(from_io_err)?;
-        let mut buffer = unsafe { MaybeUninit::array_assume_init(buffer) };
+        let mut buffer = unsafe { buffer.assume_init() };
         let boot_record = buffer.as_mut_ptr() as *mut MasterBootRecord;
         if unalign_read!((*boot_record).boot_signature => Le<Unaligned<u16>>)
             != Self::BOOT_SIGNATURE
         {
             return Ok(Self {
-                boot_sector: buffer,
                 sector_kind: BootSector::Unknown,
                 partitions: SpinLock::new(Vec::with_capacity(1)),
             });
         }
-        let kind = unsafe { core::ptr::addr_of!((*boot_record).first_partition.kind).read() };
+        let config = MBRConfig {
+            partition: [
+                MBRPartition {
+                    kind: unsafe { *addr_of!((*boot_record).first_partition.kind) },
+                    first_sector: unalign_read!((*boot_record).first_partition.lba_first_sector => Le<Unaligned<u32>>),
+                    total_sector: unalign_read!((*boot_record).first_partition.num_of_total_sector => Le<Unaligned<u32>>),
+                },
+                MBRPartition {
+                    kind: unsafe { *addr_of!((*boot_record).second_partition.kind) },
+                    first_sector: unalign_read!((*boot_record).second_partition.lba_first_sector => Le<Unaligned<u32>>),
+                    total_sector: unalign_read!((*boot_record).second_partition.num_of_total_sector => Le<Unaligned<u32>>),
+                },
+                MBRPartition {
+                    kind: unsafe { *addr_of!((*boot_record).third_partition.kind) },
+                    first_sector: unalign_read!((*boot_record).third_partition.lba_first_sector => Le<Unaligned<u32>>),
+                    total_sector: unalign_read!((*boot_record).third_partition.num_of_total_sector => Le<Unaligned<u32>>),
+                },
+                MBRPartition {
+                    kind: unsafe { *addr_of!((*boot_record).fourth_partition.kind) },
+                    first_sector: unalign_read!((*boot_record).fourth_partition.lba_first_sector => Le<Unaligned<u32>>),
+                    total_sector: unalign_read!((*boot_record).fourth_partition.num_of_total_sector => Le<Unaligned<u32>>),
+                },
+            ],
+        };
         Ok(Self {
-            boot_sector: buffer,
-            sector_kind: match kind {
+            sector_kind: match config.partition[0].kind {
                 MasterBootRecordPartitionKind::TYPE_GPT => {
                     // TODO GPT check
                     todo!();
                     BootSector::GPT
                 }
-                _ => BootSector::MBR,
+                _ => BootSector::MBR(config),
             },
             partitions: SpinLock::new(Vec::with_capacity(2)),
         })
@@ -80,43 +102,18 @@ impl PartitionIndex {
         block_device: &Arc<dyn BlockDevice>,
         partition_idx: u8,
     ) -> Result<(u64, u64), FileSystemErr> {
-        match self.sector_kind {
-            BootSector::MBR => {
-                let boot_record = self.boot_sector.as_ptr() as *const MasterBootRecord;
-                let (lba_first_ptr, total_sec_ptr) = match partition_idx {
-                    0 => unsafe {
-                        (
-                            core::ptr::addr_of!((*boot_record).first_partition.lba_first_sector),
-                            core::ptr::addr_of!((*boot_record).first_partition.num_of_total_sector),
-                        )
-                    },
-                    1 => unsafe {
-                        (
-                            core::ptr::addr_of!((*boot_record).second_partition.lba_first_sector),
-                            core::ptr::addr_of!(
-                                (*boot_record).second_partition.num_of_total_sector
-                            ),
-                        )
-                    },
-                    2 => unsafe {
-                        (
-                            core::ptr::addr_of!((*boot_record).third_partition.lba_first_sector),
-                            core::ptr::addr_of!((*boot_record).third_partition.num_of_total_sector),
-                        )
-                    },
-                    3 => unsafe {
-                        (
-                            core::ptr::addr_of!((*boot_record).fourth_partition.lba_first_sector),
-                            core::ptr::addr_of!(
-                                (*boot_record).fourth_partition.num_of_total_sector
-                            ),
-                        )
-                    },
-                    _ => return Err(FileSystemErr::UnknownPartition),
-                };
-                let start = unsafe { Le::<Unaligned<u32>>::read(lba_first_ptr) } as u64;
-                let total = unsafe { Le::<Unaligned<u32>>::read(total_sec_ptr) } as u64;
-                Ok((start, total))
+        match &self.sector_kind {
+            BootSector::MBR(x) => {
+                if partition_idx >= 4 {
+                    return Err(FileSystemErr::UnknownPartition);
+                }
+                if x.partition[partition_idx as usize].kind == MasterBootRecordPartitionKind::UNUSED
+                {
+                    return Err(FileSystemErr::UnusedPartition);
+                }
+                let start = x.partition[partition_idx as usize].first_sector;
+                let total = x.partition[partition_idx as usize].total_sector;
+                Ok((start as u64, total as u64))
             }
             BootSector::GPT => {
                 todo!()
@@ -142,6 +139,7 @@ impl PartitionIndex {
         };
         let (start_sector, total_sector) =
             self.get_partition_start_total_sector(block_device, partition_idx)?;
+        // TODO file system type hint when MBR
         let file_driver = file_system::new(block_device, start_sector, total_sector)?;
         self.partitions
             .lock()
@@ -217,6 +215,7 @@ impl PartitionIndex {
 pub enum FileSystemErr {
     BlockDeviceErr(IoError),
     UnknownPartition,
+    UnusedPartition,
     UnsupportedFileSystem,
     NotFound,
     AlreadyExists,
