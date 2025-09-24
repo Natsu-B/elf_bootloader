@@ -41,6 +41,14 @@ name = "dtb"
 version = "0.1.0"
 
 [[package]]
+name = "elf"
+version = "0.1.0"
+dependencies = [
+ "typestate",
+ "typestate_macro",
+]
+
+[[package]]
 name = "elf-hypervisor"
 version = "0.1.0"
 dependencies = [
