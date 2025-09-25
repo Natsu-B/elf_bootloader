@@ -8,6 +8,8 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DISK_IMG="$SCRIPT_DIR/../bin/fat32_virtio.img"
 DISK_MOUNT_DIR="$SCRIPT_DIR/../mnt/"
 
+mkdir -p "$SCRIPT_DIR/../bin"
+
 # make file ref( https://github.com/PG-MANA/MiniVisor/blob/main/tools/create_disk.sh )
 if [ ! -f $DISK_IMG ]; then
     dd if=/dev/zero of=$DISK_IMG  bs=1024 count=2048000

@@ -1,5 +1,5 @@
 OUTPUT_FORMAT(elf64-aarch64)
-ENTRY(main)
+ENTRY(_start)
 
 PHDRS
 {
@@ -13,7 +13,9 @@ _ALIGN_SIZE = 0x1000;
 _RAM_BASE   = 0x40400000;
 
 SECTIONS {
-  . = _RAM_BASE + SIZEOF_HEADERS;
+  . = _RAM_BASE;
+  _PROGRAM_START = .;
+  . = . + SIZEOF_HEADERS;
 
   .text : ALIGN(_ALIGN_SIZE) {
     *(.text .text.*)
@@ -36,4 +38,8 @@ SECTIONS {
   .got : ALIGN(_ALIGN_SIZE) {
     *(.got .got.*)
   }
+  _PROGRAM_END = .;
+
+  . = 0x50000000;
+  _STACK_TOP = .;
 }

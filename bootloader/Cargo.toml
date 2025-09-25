@@ -9,6 +9,8 @@ heapless = "0.8.0"
 dtb = { path = "../dtb" }
 allocator = { path = "../allocator" }
 typestate = { path = "../typestate" }
+file = { path = "../file" }
+elf = { path = "../elf" }
 
 [profile.release]
 panic = 'abort'

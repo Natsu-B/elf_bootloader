@@ -54,6 +54,8 @@ version = "0.1.0"
 dependencies = [
  "allocator",
  "dtb",
+ "elf",
+ "file",
  "heapless",
  "tock-registers",
  "typestate",

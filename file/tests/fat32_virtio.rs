@@ -60,5 +60,9 @@ fn run() -> Result<(), &'static str> {
             .unwrap_err(),
         StorageDeviceErr::FileSystemErr(FileSystemErr::NotFound)
     );
+    let efi = device
+        .open(0, "/EFI/BOOT/BOOTAA64.EFI", &file::OpenOptions::Read)
+        .unwrap();
+    efi.read(1).unwrap();
     Ok(())
 }
