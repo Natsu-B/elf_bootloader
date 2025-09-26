@@ -10,6 +10,8 @@ use block_device_api::BlockDevice;
 use block_device_api::IoError;
 use core::mem::MaybeUninit;
 use core::num::ParseIntError;
+use core::ops::Deref;
+use core::ops::DerefMut;
 use core::ptr::addr_of;
 use core::ptr::read_unaligned;
 use mutex::SpinLock;

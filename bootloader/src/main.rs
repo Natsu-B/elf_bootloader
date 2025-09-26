@@ -14,6 +14,7 @@ use crate::interfaces::pl011::UartNum;
 use crate::print::DEBUG_UART;
 use crate::print::NonSyncUnsafeCell;
 use crate::systimer::SystemTimer;
+use alloc::alloc::alloc;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::arch::asm;
@@ -21,15 +22,20 @@ use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::ffi::c_char;
 use core::fmt::Write;
+use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 use core::panic::PanicInfo;
 use core::ptr;
+use core::ptr::slice_from_raw_parts_mut;
 use core::slice;
 use core::time::Duration;
+use dtb::DtbGenerator;
 use dtb::DtbParser;
 use elf::Elf64;
+use file::OpenOptions;
 use file::StorageDevice;
 use heapless::String;
+use typestate::Le;
 
 unsafe extern "C" {
     static mut _BSS_START: usize;
@@ -41,10 +47,28 @@ unsafe extern "C" {
 
 static PL011_UART_ADDR: NonSyncUnsafeCell<usize> = NonSyncUnsafeCell::new(0x900_0000);
 
+#[repr(C)]
+struct LinuxHeader {
+    code0: u32,
+    code1: u32,
+    text_offset: Le<u64>,
+    image_size: Le<u64>,
+    flags: Le<u64>,
+    res2: u64,
+    res3: u64,
+    res4: u64,
+    magic: [u8; 4],
+    res5: u32,
+}
+
+impl LinuxHeader {
+    const MAGIC: [u8; 4] = [b'A', b'R', b'M', 0x64];
+}
+
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 extern "C" fn _start() {
-    naked_asm!("ldr x0, =_STACK_TOP\n", "mov sp, x0\n", "b main\n",)
+    naked_asm!("ldr x9, =_STACK_TOP\n", "mov sp, x9\n", "b main\n",)
 }
 
 #[unsafe(no_mangle)]
@@ -53,10 +77,10 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let stack_start = unsafe { &raw mut _STACK_TOP } as *const _ as usize;
 
     let args = unsafe { slice::from_raw_parts(argv, argc) };
-    let dtb = DtbParser::init(unsafe {
-        str_to_usize(CStr::from_ptr(args[0] as *const c_char).to_str().unwrap()).unwrap()
-    })
-    .unwrap();
+    let dtb_ptr =
+        str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
+            .unwrap();
+    let dtb = DtbParser::init(dtb_ptr).unwrap();
     let debug_uart_cell = unsafe { &mut *DEBUG_UART.get() };
     dtb.find_node(None, Some("arm,pl011"), &mut |addr, _size| {
         unsafe { *PL011_UART_ADDR.get() = addr };
@@ -67,6 +91,10 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     let debug_uart = debug_uart_cell.get_mut().unwrap();
     debug_uart.init(UartNum::Debug, 115200);
     debug_uart.write("debug uart starting...\r\n");
+    unsafe {
+        let m = core::ptr::read_volatile(dtb_ptr as *const u32);
+        println!("FDT magic @x0: 0x{:08X}", m); // 0xD00DFEED ならOK
+    }
     let mut systimer = SystemTimer::new();
     systimer.init();
     println!("setup allocator");
@@ -99,6 +127,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     .unwrap();
     println!("0x{:X}, 0x{:X}", program_start, stack_start);
     allocator::add_reserved_region(program_start, stack_start - program_start).unwrap();
+    allocator::add_reserved_region(dtb_ptr, dtb.get_size()).unwrap();
     allocator::finalize().unwrap();
     println!("allocator setup success!!!");
     let mut file_driver = None;
@@ -112,15 +141,147 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     })
     .unwrap();
     let file_driver = file_driver.unwrap();
-    let elf = file_driver
-        .open(0, "/elf-hypervisor.elf", &file::OpenOptions::Read)
+    let linux = file_driver
+        .open(0, "/image", &file::OpenOptions::Read)
         .unwrap();
-    println!("hoge");
-    let data = elf.read(8).unwrap();
-    println!("read success!!!");
-    let elf = unsafe { Elf64::new(&data).unwrap() };
-    println!("elf parser success!!!");
-    loop {}
+    println!("get linux header");
+    let mut linux_header: MaybeUninit<LinuxHeader> = MaybeUninit::uninit();
+    linux
+        .read_at(0, unsafe {
+            &mut *slice_from_raw_parts_mut(
+                &mut linux_header as *mut _ as *mut MaybeUninit<u8>,
+                size_of::<LinuxHeader>(),
+            )
+        })
+        .unwrap();
+    let linux_header = unsafe { linux_header.assume_init() };
+    // check
+    if linux_header.magic != LinuxHeader::MAGIC {
+        panic!("invalid linux header");
+    }
+    let image_size = linux_header.image_size.read() as usize;
+    let text_offset = linux_header.text_offset.read() as usize;
+    let linux_image = unsafe {
+        alloc(
+            Layout::from_size_align(
+                image_size + text_offset,
+                0x2 * 0x1000 * 0x1000, /* 2MiB */
+            )
+            .unwrap(),
+        )
+    };
+    if linux_image.is_null() {
+        panic!("allocation failed");
+    }
+    println!("load linux image");
+    linux
+        .read_at(0, unsafe {
+            &mut *slice_from_raw_parts_mut(
+                linux_image.add(text_offset) as *mut MaybeUninit<u8>,
+                linux.size().unwrap() as usize,
+            )
+        })
+        .unwrap();
+    let jump_addr = unsafe { linux_image.add(text_offset) };
+    let modified = file_driver
+        .open(0, "/qemu.dtb", &OpenOptions::Read)
+        .unwrap()
+        .read(8)
+        .unwrap();
+    let dtb_modified = DtbParser::init(modified.as_ptr() as usize).unwrap();
+
+    drop(file_driver);
+    println!("file system closed");
+    let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
+    println!("allocator closed");
+    reserved_memory.push((program_start, stack_start));
+
+    let new_dtb = DtbGenerator::new(&dtb_modified);
+    let dtb_size = new_dtb.get_required_size(reserved_memory.len());
+    let dtb_data = unsafe {
+        &mut *slice_from_raw_parts_mut(
+            alloc::alloc::alloc(Layout::from_size_align_unchecked(dtb_size.0, dtb_size.1)),
+            dtb_size.0,
+        )
+    };
+    new_dtb
+        .make_dtb(dtb_data, reserved_memory.as_ref())
+        .unwrap();
+    let base = (jump_addr as usize) - text_offset;
+    println!(
+        "base=0x{:X}, text_off=0x{:X}, entry=0x{:X}",
+        base, text_offset, jump_addr as usize
+    );
+    println!("base % 2MiB = 0x{:X}", base & ((2 * 1024 * 1024) - 1));
+    unsafe {
+        let p = jump_addr as *const u32;
+        let w0 = core::ptr::read_volatile(p);
+        let w1 = core::ptr::read_volatile(p.add(1));
+        println!("entry bytes: {:08X} {:08X}", w0, w1);
+    }
+
+    unsafe {
+        let mut el: u64;
+        core::arch::asm!("mrs {0}, CurrentEL", out(reg) el);
+        println!("CurrentEL = {}", (el >> 2) & 0b11);
+    }
+
+    unsafe {
+        let m = core::ptr::read_volatile(dtb_ptr as *const u32);
+        println!("FDT magic @x0: 0x{:08X}", m);
+    }
+    unsafe {
+        let magic = core::slice::from_raw_parts((jump_addr as *const u8).add(0x38), 4);
+        println!(
+            "Image magic: {:02X} {:02X} {:02X} {:02X}",
+            magic[0], magic[1], magic[2], magic[3]
+        );
+    }
+    unsafe {
+        core::arch::asm!(
+            "mrs x9, HCR_EL2",
+            "bic x9, x9, #(1 << 0)",
+            "orr x9, x9, #(1 << 31)",
+            "msr HCR_EL2, x9",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+
+        core::arch::asm!(
+            "tlbi alle2",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+
+        core::arch::asm!(
+            "mrs x9, SCTLR_EL2",
+            "bic x9, x9, #(1 << 0)",  // M = 0 (MMU off)
+            "bic x9, x9, #(1 << 2)",  // C = 0 (D-cache disable)
+            "bic x9, x9, #(1 << 12)", // I = 0 (I-cache disable)
+            "msr SCTLR_EL2, x9",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+
+    println!("jumping linux...");
+
+    unsafe {
+        core::arch::asm!("isb");
+        core::arch::asm!("dsb sy");
+    }
+
+    // jump linux
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
+
+        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
+            jump_addr as usize,
+        )(dtb_data.as_ptr() as usize, 0, 0, 0);
+    }
+    unreachable!();
 }
 
 fn str_to_usize(s: &str) -> Option<usize> {
@@ -153,7 +314,7 @@ fn panic(info: &PanicInfo) -> ! {
     let debug_uart = Pl011Uart::new(*tmp as *const u32);
     debug_uart.init(UartNum::Debug, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
-    let mut s: String<100> = String::new();
+    let mut s: String<1000> = String::new();
     let _ = write!(s, "panicked: {}", info);
     debug_uart.write(&s);
     loop {

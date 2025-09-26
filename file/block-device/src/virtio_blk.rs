@@ -298,6 +298,10 @@ impl BlockDevice for VirtIoBlk {
             Err(IoError::NotReady)
         }
     }
+
+    fn uninstall(&self) {
+        self.virtio.reset();
+    }
 }
 
 impl VirtIoBlk {

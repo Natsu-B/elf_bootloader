@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cmp::max;
 use core::cmp::min;
@@ -671,6 +672,49 @@ impl MemoryBlock {
         // Remove from reserved list and return to free list
         self.remove_reserved_alloc_record(addr, size);
         self.add_free_region_merge(addr, size);
+    }
+
+    pub fn trim_for_boot(
+        &mut self,
+        reserve_bytes: usize,
+    ) -> Result<Vec<(usize, usize)>, &'static str> {
+        if !self.allocatable {
+            return Err("allocator not allocatable");
+        }
+
+        self.ensure_overflow_headroom();
+        let allocate = self
+            .allocate_region_internal(reserve_bytes, 1)
+            .ok_or("allocation failed")?;
+
+        let mut vec = Vec::with_capacity(self.reserved_region_size as usize);
+
+        self.allocatable = false;
+
+        let reserved = match &self.reserved_regions.0 {
+            RegionData::Global(reserved) => reserved.as_slice(),
+            RegionData::Heap(items) => items,
+        };
+
+        for i in reserved.iter().take(self.reserved_region_size as usize) {
+            vec.push((i.address, i.size));
+        }
+
+        // clean memory region
+        self.regions = RegionContainer(RegionData::Global(
+            [MemoryRegions {
+                address: 0,
+                size: 0,
+            }; 128],
+        ));
+        self.region_size = 0;
+        self.region_capacity = 128;
+
+        self.allocatable = true;
+
+        self.remove_reserved_alloc_record(allocate, reserve_bytes);
+        self.add_free_region_merge(allocate, reserve_bytes);
+        Ok(vec)
     }
 }
 
