@@ -5,6 +5,7 @@
 extern crate alloc;
 mod buddy_allocator;
 mod range_list_allocator;
+use alloc::vec::Vec;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 use core::cell::OnceCell;
@@ -46,6 +47,12 @@ macro_rules! levels {
 
 #[cfg(not(test))]
 #[global_allocator]
+static GLOBAL_ALLOCATOR: MemoryAllocator<4096> = MemoryAllocator {
+    range_list_allocator: SpinLock::new(OnceCell::new()),
+    buddy_allocator: SpinLock::new(OnceCell::new()),
+};
+
+#[cfg(test)]
 static GLOBAL_ALLOCATOR: MemoryAllocator<4096> = MemoryAllocator {
     range_list_allocator: SpinLock::new(OnceCell::new()),
     buddy_allocator: SpinLock::new(OnceCell::new()),
@@ -152,16 +159,11 @@ fn panic(layout: Layout) -> ! {
     loop {}
 }
 
-// -----------------------
-// Public API (non-test)
-// -----------------------
-#[cfg(not(test))]
 /// Initialize the global allocator state. Safe to call multiple times.
 pub fn init() {
     GLOBAL_ALLOCATOR.init();
 }
 
-#[cfg(not(test))]
 /// Add an available memory region before finalization.
 /// Returns Err if called after finalization.
 pub fn add_available_region(address: usize, size: usize) -> Result<(), &'static str> {
@@ -176,7 +178,6 @@ pub fn add_available_region(address: usize, size: usize) -> Result<(), &'static 
     }
 }
 
-#[cfg(not(test))]
 /// Add a reserved memory region before finalization.
 /// Returns Err if called after finalization.
 pub fn add_reserved_region(address: usize, size: usize) -> Result<(), &'static str> {
@@ -191,7 +192,6 @@ pub fn add_reserved_region(address: usize, size: usize) -> Result<(), &'static s
     }
 }
 
-#[cfg(not(test))]
 pub fn allocate_dynamic_reserved_region(
     size: usize,
     align: Option<usize>,
@@ -205,7 +205,6 @@ pub fn allocate_dynamic_reserved_region(
     }
 }
 
-#[cfg(not(test))]
 /// Finalize the allocator by subtracting reserved regions and enabling allocation.
 /// Safe to call multiple times; after the first success, it’s a no-op.
 pub fn finalize() -> Result<(), &'static str> {
@@ -218,4 +217,19 @@ pub fn finalize() -> Result<(), &'static str> {
     } else {
         Err("allocator not initialized")
     }
+}
+
+/// Finalizes the global allocator for boot handoff.
+///
+/// This function is intended to be called just before transferring control
+/// to another kernel or ELF payload (e.g. Linux).
+pub fn trim_for_boot(reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
+    let mut guard = GLOBAL_ALLOCATOR.range_list_allocator.lock();
+    let Some(block) = guard.get_mut() else {
+        return Err("allocator not initialized");
+    };
+    if !block.is_finalized() {
+        return Err("allocator not finalized");
+    }
+    block.trim_for_boot(reserve_bytes)
 }
