@@ -4,14 +4,12 @@
 #![feature(maybe_uninit_slice)]
 
 extern crate alloc;
+use core::ptr::addr_of;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use block_device_api::BlockDevice;
 use block_device_api::IoError;
-use core::mem::MaybeUninit;
-use core::num::ParseIntError;
-use core::ptr::addr_of;
-use core::ptr::read_unaligned;
 use mutex::SpinLock;
 use typestate::Le;
 use typestate::Unaligned;

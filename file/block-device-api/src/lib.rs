@@ -82,4 +82,7 @@ pub trait BlockDevice: Send + Sync {
 
     /// Indicates whether the device/media is read-only.
     fn is_read_only(&self) -> Result<bool, IoError>;
+
+    /// Uninstall Device
+    fn uninstall(&self);
 }

@@ -28,16 +28,6 @@ impl StorageDevice {
         })
     }
 
-    // pub fn unmount(&self) -> Result<(), StorageDeviceErr> {
-    //     match Arc::try_unwrap(self.dev) {
-    //         Ok(inner) => {
-    //             todo!();
-    //             Ok(())
-    //         }
-    //         Err(still) => Err(StorageDeviceErr::StillUsed),
-    //     }
-    // }
-
     pub fn open(
         &self,
         partition_idx: u8,
@@ -47,6 +37,12 @@ impl StorageDevice {
         self.partition
             .open(&self.dev, partition_idx, path, opts)
             .map_err(error_from_file_system_err)
+    }
+}
+
+impl Drop for StorageDevice {
+    fn drop(&mut self) {
+        self.dev.uninstall();
     }
 }
 
