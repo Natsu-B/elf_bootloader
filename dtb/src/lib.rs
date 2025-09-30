@@ -4,6 +4,7 @@ use core::ffi::CStr;
 use core::ffi::c_char;
 use core::ops::ControlFlow;
 
+pub use dtb_parser::DtbGenerator;
 pub use dtb_parser::DtbParser;
 
 mod dtb_parser {
@@ -12,7 +13,10 @@ mod dtb_parser {
     use big_endian::Dtb;
     use big_endian::FdtProperty;
     use big_endian::FdtReserveEntry;
+    use core::iter::once;
+    use core::mem;
     use core::mem::size_of;
+    use core::ptr;
 
     trait DtbStructData: Sized {
         fn new(parent: Option<*const Self>) -> Self;
@@ -320,6 +324,9 @@ mod dtb_parser {
             let dtb = Dtb::new(dtb_address)?;
             let parser = Self { dtb_header: dtb };
             Ok(parser)
+        }
+        pub fn get_size(&self) -> usize {
+            self.dtb_header.get_total_size() as usize
         }
         fn skip_nop(&self, address: &mut usize) {
             while *address < self.dtb_header.get_struct_end_address()
@@ -811,6 +818,107 @@ mod dtb_parser {
         }
     }
 
+    pub struct DtbGenerator<'a> {
+        parser: &'a DtbParser,
+    }
+
+    impl<'a> DtbGenerator<'a> {
+        pub fn new(parser: &'a DtbParser) -> Self {
+            Self { parser }
+        }
+
+        pub fn get_required_size(
+            &self,
+            num_of_mem_reserved: usize,
+        ) -> (usize /* size */, usize /* alignment */) {
+            (
+                self.parser.dtb_header.get_total_size() as usize
+                    + num_of_mem_reserved * size_of::<big_endian::FdtReserveEntry>(),
+                8,
+            )
+        }
+
+        pub fn make_dtb(
+            &self,
+            dtb: &mut [u8],
+            reserved_memory: &[(usize /* addr */, usize /* size */)],
+        ) -> Result<(), &'static str> {
+            if dtb.len() < self.get_required_size(reserved_memory.len()).0 {
+                return Err("dtb memory too short");
+            }
+            // copy header region
+            unsafe {
+                ptr::copy(
+                    self.parser.dtb_header.get_fdt_address() as *const _,
+                    dtb.as_mut_ptr(),
+                    self.parser.dtb_header.get_memory_reservation_offset(),
+                )
+            };
+
+            // copy and create mem reservation block
+            let mut source = self
+                .parser
+                .dtb_header
+                .get_memory_reservation_start_address();
+            let mut destination =
+                dtb.as_ptr() as usize + self.parser.dtb_header.get_memory_reservation_offset();
+            while {
+                let addr = FdtReserveEntry::get_address(source);
+                let size = FdtReserveEntry::get_size(source);
+                !(addr == 0 && size == 0)
+            } {
+                unsafe {
+                    ptr::copy(
+                        source as *const u8,
+                        destination as *mut u8,
+                        size_of::<FdtReserveEntry>(),
+                    )
+                };
+                source += size_of::<FdtReserveEntry>();
+                destination += size_of::<FdtReserveEntry>();
+            }
+
+            for (addr, size) in reserved_memory.iter().chain(once(&(0, 0))) {
+                let mut reserve = unsafe { &mut *(destination as *mut FdtReserveEntry) };
+                reserve.write_address(*addr as u64);
+                reserve.write_size(*size as u64);
+
+                destination += size_of::<FdtReserveEntry>();
+            }
+
+            // copy struct
+            unsafe {
+                ptr::copy(
+                    self.parser.dtb_header.get_struct_start_address() as *const u8,
+                    destination as *mut u8,
+                    self.parser.dtb_header.get_struct_size(),
+                );
+            }
+            let struct_start_offset = destination - dtb.as_ptr() as usize;
+
+            destination =
+                (destination + self.parser.dtb_header.get_struct_size()).next_multiple_of(4);
+            // copy string
+            unsafe {
+                ptr::copy(
+                    self.parser.dtb_header.get_string_start_address() as *const u8,
+                    destination as *mut u8,
+                    self.parser.dtb_header.get_string_size(),
+                );
+            }
+            let string_start_offset = destination - dtb.as_ptr() as usize;
+
+            let header = unsafe { &mut *(dtb.as_mut_ptr() as *mut big_endian::FtdHeader) };
+            header.write_struct_offset(struct_start_offset as u32);
+            header.write_string_offset(string_start_offset as u32);
+            header.write_total_size(
+                (string_start_offset + self.parser.dtb_header.get_string_size()) as u32,
+            );
+
+            Ok(())
+        }
+    }
+
     mod big_endian {
         use core::ptr;
 
@@ -822,7 +930,7 @@ mod dtb_parser {
         use super::*;
         use crate::pr_debug;
         #[repr(C)]
-        struct FtdHeader {
+        pub struct FtdHeader {
             magic: u32,             // should contain 0xd00dfeed (big-endian)
             total_size: u32,        // total size of the DTB in bytes
             off_dt_struct: u32,     // structure block offset (byte)
@@ -834,6 +942,19 @@ mod dtb_parser {
             size_dt_strings: u32,   // strings block section
             size_dt_struct: u32,    // structure block section
         }
+
+        impl FtdHeader {
+            pub fn write_string_offset(&mut self, offset: u32) {
+                self.off_dt_strings = offset.to_be();
+            }
+            pub fn write_struct_offset(&mut self, offset: u32) {
+                self.off_dt_struct = offset.to_be();
+            }
+            pub fn write_total_size(&mut self, size: u32) {
+                self.total_size = size.to_be();
+            }
+        }
+
         #[repr(C)]
         pub struct FdtProperty {
             property_len: u32,
@@ -857,12 +978,18 @@ mod dtb_parser {
 
         impl FdtReserveEntry {
             pub fn get_address(ptr: usize) -> u64 {
-                u64::from_be(unsafe { ptr::read_unaligned(ptr as *const u64) })
+                u64::from_be(unsafe { *(ptr as *const u64) })
             }
             pub fn get_size(ptr: usize) -> u64 {
                 u64::from_be(unsafe {
-                    ptr::read_unaligned((ptr + 8/* address size */) as *const u64)
+                    *((ptr + 8/* address size */) as *const u64)
                 })
+            }
+            pub fn write_address(&mut self, addr: u64) {
+                self.address = addr.to_be();
+            }
+            pub fn write_size(&mut self, size: u64) {
+                self.size = size.to_be();
             }
         }
 
@@ -887,12 +1014,24 @@ mod dtb_parser {
                 }
                 Ok(ftb)
             }
+            pub fn get_fdt_address(&self) -> usize {
+                self.address as *const _ as usize
+            }
+            pub fn get_memory_reservation_offset(&self) -> usize {
+                u32::from_be(self.address.off_mem_rsvmap) as usize
+            }
+            pub fn get_total_size(&self) -> u32 {
+                u32::from_be(self.address.total_size)
+            }
             pub fn get_struct_start_address(&self) -> usize {
                 self.address as *const _ as usize
                     + u32::from_be(self.address.off_dt_struct) as usize
             }
             pub fn get_struct_end_address(&self) -> usize {
                 self.get_struct_start_address() + u32::from_be(self.address.size_dt_struct) as usize
+            }
+            pub fn get_struct_size(&self) -> usize {
+                u32::from_be(self.address.size_dt_struct) as usize
             }
             pub fn get_string_start_address(&self) -> usize {
                 self.address as *const _ as usize
@@ -901,6 +1040,9 @@ mod dtb_parser {
             pub fn get_string_end_address(&self) -> usize {
                 self.get_string_start_address()
                     + u32::from_be(self.address.size_dt_strings) as usize
+            }
+            pub fn get_string_size(&self) -> usize {
+                u32::from_be(self.address.size_dt_strings) as usize
             }
             pub fn get_memory_reservation_start_address(&self) -> usize {
                 self.address as *const _ as usize
