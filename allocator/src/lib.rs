@@ -71,7 +71,6 @@ unsafe impl<const MAX_ALLOCATABLE_BYTES: usize> Sync for MemoryAllocator<MAX_ALL
 {
 }
 
-#[cfg(not(test))]
 fn static_alloc_for_buddy() -> Option<usize> {
     GLOBAL_ALLOCATOR.alloc_for_buddy_allocator()
 }
@@ -80,7 +79,6 @@ impl<const MAX_ALLOCATABLE_BYTES: usize> MemoryAllocator<MAX_ALLOCATABLE_BYTES>
 where
     [(); levels!(MAX_ALLOCATABLE_BYTES)]:,
 {
-    #[cfg(not(test))]
     pub fn init(&'static self) {
         // Initialize the range list allocator.
         let range_list_allocator_guard = self.range_list_allocator.lock();
