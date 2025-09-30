@@ -297,6 +297,11 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         };
         queue[queue_idx as usize].dequeue_used(desc_idx)
     }
+
+    pub fn reset(&self) {
+        // reset virtio
+        self.transport.set_status(DeviceStatus::RESET);
+    }
 }
 
 #[derive(Debug)]
