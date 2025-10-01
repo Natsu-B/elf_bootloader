@@ -1,7 +1,6 @@
 #![no_std]
 
 extern crate alloc;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use block_device::VirtIoBlk;
 use block_device_api::BlockDevice;

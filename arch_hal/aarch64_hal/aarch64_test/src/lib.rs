@@ -2,9 +2,6 @@
 
 extern crate alloc;
 
-#[cfg(not(target_arch = "aarch64"))]
-compile_error!("This crate is intended to run on aarch64 targets only");
-
 use core::arch::asm;
 
 mod allocator {

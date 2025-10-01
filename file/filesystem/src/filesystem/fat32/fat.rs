@@ -54,9 +54,7 @@ impl<'a> Iterator for FAT32FATIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // TODO BPB_ExtFlags
-        let Some(cluster) = self.next_cluster else {
-            return None;
-        };
+        let cluster = self.next_cluster?;
         let spf = self.file_system.sectors_per_fat as u64;
         let bps = self.file_system.bytes_per_sector as u64;
 
@@ -101,7 +99,7 @@ impl<'a> Iterator for FAT32FATIter<'a> {
             }
             let data = unsafe { data.assume_init() };
             fat_buf = Some((data, fat_relative, read_sectors));
-            &fat_buf.as_ref().unwrap()
+            fat_buf.as_ref().unwrap()
         };
         let cache_start = fat.1 * bps;
         let cache_end = cache_start + fat.2 * bps;

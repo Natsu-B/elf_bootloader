@@ -533,23 +533,27 @@ impl MemoryBlock {
         match search {
             Ok(i) => {
                 let region = &mut reserved[i];
-                if size == region.size {
-                    reserved.copy_within(i + 1..*rsize as usize, i);
-                    reserved[*rsize as usize - 1] = MemoryRegions {
-                        address: 0,
-                        size: 0,
-                    };
-                    *rsize -= 1;
-                } else if size < region.size {
-                    region.address += size;
-                    region.size -= size;
-                } else {
-                    reserved.copy_within(i + 1..*rsize as usize, i);
-                    reserved[*rsize as usize - 1] = MemoryRegions {
-                        address: 0,
-                        size: 0,
-                    };
-                    *rsize -= 1;
+                match size.cmp(&region.size) {
+                    core::cmp::Ordering::Less => {
+                        region.address += size;
+                        region.size -= size;
+                    }
+                    core::cmp::Ordering::Equal => {
+                        reserved.copy_within(i + 1..*rsize as usize, i);
+                        reserved[*rsize as usize - 1] = MemoryRegions {
+                            address: 0,
+                            size: 0,
+                        };
+                        *rsize -= 1;
+                    }
+                    core::cmp::Ordering::Greater => {
+                        reserved.copy_within(i + 1..*rsize as usize, i);
+                        reserved[*rsize as usize - 1] = MemoryRegions {
+                            address: 0,
+                            size: 0,
+                        };
+                        *rsize -= 1;
+                    }
                 }
             }
             Err(x) => {

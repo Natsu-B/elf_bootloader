@@ -14,7 +14,7 @@ mod dtb_parser {
     use big_endian::FdtProperty;
     use big_endian::FdtReserveEntry;
     use core::iter::once;
-    use core::mem;
+
     use core::mem::size_of;
     use core::ptr;
 
@@ -788,7 +788,7 @@ mod dtb_parser {
                                     }
                                 } else {
                                     return dynamic(alloc_size, alignment, None)
-                                        .or_else(|()| Ok(ControlFlow::Continue(())));
+                                        .or(Ok(ControlFlow::Continue(())));
                                 }
                             }
                         }
@@ -879,7 +879,7 @@ mod dtb_parser {
             }
 
             for (addr, size) in reserved_memory.iter().chain(once(&(0, 0))) {
-                let mut reserve = unsafe { &mut *(destination as *mut FdtReserveEntry) };
+                let reserve = unsafe { &mut *(destination as *mut FdtReserveEntry) };
                 reserve.write_address(*addr as u64);
                 reserve.write_size(*size as u64);
 
@@ -920,7 +920,6 @@ mod dtb_parser {
     }
 
     mod big_endian {
-        use core::ptr;
 
         #[allow(clippy::assertions_on_constants)]
         const _: () = assert!(size_of::<FdtProperty>() == 8);
