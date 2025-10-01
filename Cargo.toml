@@ -10,7 +10,8 @@ members = [
     "intrusive_linked_list",
     "file",
     "virtio",
-    "aarch64_test", "elf",
+    "elf",
+    "arch_hal",
 ]
 build-std-features = ["compiler-builtins-mem"]
 

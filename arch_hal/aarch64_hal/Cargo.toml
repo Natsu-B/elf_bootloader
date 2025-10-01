@@ -1,0 +1,12 @@
+[package]
+name = "aarch64_hal"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+uefi-test = ["aarch64_test"]
+
+[dependencies]
+paging = { path = "./paging" }
+pl011 = { path = "./pl011" }
+aarch64_test = { path = "./aarch64_test", optional = true }

@@ -4,12 +4,11 @@
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("This test is intended to run on aarch64 targets only");
 
-use aarch64_test::exit_failure;
-use aarch64_test::exit_success;
-use aarch64_test::println;
+use arch_hal::exit_failure;
+use arch_hal::exit_success;
+use arch_hal::println;
 use block_device::VirtIoBlk;
 use block_device_api::BlockDevice;
-use block_device_api::Lba;
 use core::mem::MaybeUninit;
 use core::slice;
 

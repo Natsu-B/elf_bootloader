@@ -11,7 +11,7 @@ mutex = { path = "../../mutex" }
 typestate_macro = { path = "../../typestate_macro" }
 
 [dev-dependencies]
-aarch64_test = { path = "../../aarch64_test" }
+arch_hal = { path = "../../arch_hal", features = ["uefi-test"] }
 
 [lib]
 doctest = false
