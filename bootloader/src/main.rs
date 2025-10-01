@@ -4,20 +4,13 @@
 #![recursion_limit = "256"]
 
 extern crate alloc;
-
-#[macro_use]
-pub mod print;
-pub mod interfaces;
 mod systimer;
-use crate::interfaces::pl011::Pl011Uart;
-use crate::interfaces::pl011::UartNum;
-use crate::print::DEBUG_UART;
-use crate::print::NonSyncUnsafeCell;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
-use alloc::vec::Vec;
+use arch_hal::debug_uart;
+use arch_hal::pl011::Pl011Uart;
+use arch_hal::println;
 use core::alloc::Layout;
-use core::arch::asm;
 use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::ffi::c_char;
@@ -31,10 +24,8 @@ use core::slice;
 use core::time::Duration;
 use dtb::DtbGenerator;
 use dtb::DtbParser;
-use elf::Elf64;
 use file::OpenOptions;
 use file::StorageDevice;
-use heapless::String;
 use typestate::Le;
 
 unsafe extern "C" {
@@ -45,7 +36,7 @@ unsafe extern "C" {
     static mut _STACK_TOP: usize;
 }
 
-static PL011_UART_ADDR: NonSyncUnsafeCell<usize> = NonSyncUnsafeCell::new(0x900_0000);
+static PL011_UART_ADDR: usize = 0x900_0000;
 
 #[repr(C)]
 struct LinuxHeader {
@@ -81,16 +72,12 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         str_to_usize(unsafe { CStr::from_ptr(args[0] as *const c_char).to_str().unwrap() })
             .unwrap();
     let dtb = DtbParser::init(dtb_ptr).unwrap();
-    let debug_uart_cell = unsafe { &mut *DEBUG_UART.get() };
     dtb.find_node(None, Some("arm,pl011"), &mut |addr, _size| {
-        unsafe { *PL011_UART_ADDR.get() = addr };
-        let _ = debug_uart_cell.set(Pl011Uart::new(addr as *const u32));
+        debug_uart::init(addr);
         ControlFlow::Break(())
     })
     .unwrap();
-    let debug_uart = debug_uart_cell.get_mut().unwrap();
-    debug_uart.init(UartNum::Debug, 115200);
-    debug_uart.write("debug uart starting...\r\n");
+    println!("debug uart starting...\r\n");
     unsafe {
         let m = core::ptr::read_volatile(dtb_ptr as *const u32);
         println!("FDT magic @x0: 0x{:08X}", m); // 0xD00DFEED ならOK
@@ -310,14 +297,9 @@ fn str_to_usize(s: &str) -> Option<usize> {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let tmp = unsafe { &mut *PL011_UART_ADDR.get() };
-    let debug_uart = Pl011Uart::new(*tmp as *const u32);
-    debug_uart.init(UartNum::Debug, 115200);
+    let mut debug_uart = Pl011Uart::new(PL011_UART_ADDR);
+    debug_uart.init(4400_0000, 115200);
     debug_uart.write("core 0 panicked!!!\r\n");
-    let mut s: String<1000> = String::new();
-    let _ = write!(s, "panicked: {}", info);
-    debug_uart.write(&s);
-    loop {
-        unsafe { asm!("wfi") };
-    }
+    debug_uart.write_fmt(format_args!("PANIC: {}", info));
+    loop {}
 }

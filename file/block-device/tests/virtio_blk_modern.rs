@@ -4,6 +4,7 @@
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("This test is intended to run on aarch64 targets only");
 
+use arch_hal::debug_uart;
 use arch_hal::exit_failure;
 use arch_hal::exit_success;
 use arch_hal::println;
@@ -16,6 +17,7 @@ const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
+    debug_uart::init(0x900_0000);
     match run() {
         Ok(()) => {
             println!("virtio-blk modern interface test: PASS");
@@ -58,4 +60,10 @@ fn run() -> Result<(), &'static str> {
     );
     device.flush().unwrap();
     Ok(())
+}
+
+#[panic_handler]
+fn panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
+    println!("PANIC: {}", info);
+    exit_failure()
 }

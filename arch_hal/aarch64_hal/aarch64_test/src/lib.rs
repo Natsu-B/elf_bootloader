@@ -1,4 +1,3 @@
-#![feature(alloc_error_handler)]
 #![no_std]
 
 extern crate alloc;
@@ -7,7 +6,6 @@ extern crate alloc;
 compile_error!("This crate is intended to run on aarch64 targets only");
 
 use core::arch::asm;
-use core::fmt;
 
 mod allocator {
     use core::alloc::GlobalAlloc;
@@ -78,65 +76,6 @@ mod allocator {
     pub static ALLOCATOR: BumpAllocator = BumpAllocator::new();
 }
 
-mod pl011 {
-    use core::ptr::read_volatile;
-    use core::ptr::write_volatile;
-
-    // PrimeCell PL011 UART base address (defaults to QEMU virt)
-    const BASE_ADDRESS: usize = 0x0900_0000;
-    const DR: usize = 0x00;
-    const FR: usize = 0x18;
-    const FR_TXFF: u32 = 1 << 5;
-
-    #[inline(always)]
-    fn data_register() -> *mut u32 {
-        (BASE_ADDRESS + DR) as *mut u32
-    }
-
-    #[inline(always)]
-    fn flag_register() -> *const u32 {
-        (BASE_ADDRESS + FR) as *const u32
-    }
-
-    pub unsafe fn write_byte(byte: u8) {
-        while unsafe { read_volatile(flag_register()) } & FR_TXFF != 0 {}
-        unsafe { write_volatile(data_register(), byte as u32) };
-    }
-
-    pub unsafe fn write_bytes(bytes: &[u8]) {
-        for &byte in bytes {
-            if byte == b'\n' {
-                unsafe { write_byte(b'\r') };
-            }
-
-            unsafe { write_byte(byte) };
-        }
-    }
-}
-
-pub mod console {
-    use core::fmt::Write;
-    use core::fmt::{self};
-
-    pub(crate) fn print(args: fmt::Arguments<'_>) {
-        struct Writer;
-
-        impl Write for Writer {
-            fn write_str(&mut self, s: &str) -> fmt::Result {
-                unsafe { crate::pl011::write_bytes(s.as_bytes()) };
-                Ok(())
-            }
-        }
-
-        let mut writer = Writer;
-        let _ = fmt::write(&mut writer, args);
-
-        unsafe {
-            crate::pl011::write_bytes(b"\n");
-        }
-    }
-}
-
 pub fn exit_success() -> ! {
     exit_with_code(0)
 }
@@ -169,31 +108,4 @@ pub extern "C" fn exit_with_code(code: u32) -> ! {
             options(noreturn)
         );
     }
-}
-
-#[doc(hidden)]
-pub fn _print(args: fmt::Arguments<'_>) {
-    console::print(args);
-}
-
-#[macro_export]
-macro_rules! println {
-    () => {
-        $crate::_print(core::format_args!(""))
-    };
-    ($($arg:tt)*) => {
-        $crate::_print(core::format_args!($($arg)*))
-    };
-}
-
-#[panic_handler]
-fn panic_handler(info: &core::panic::PanicInfo<'_>) -> ! {
-    console::print(format_args!("PANIC: {}", info));
-    exit_failure()
-}
-
-#[alloc_error_handler]
-fn alloc_error(_layout: core::alloc::Layout) -> ! {
-    console::print(format_args!("ALLOC ERROR"));
-    exit_failure()
 }

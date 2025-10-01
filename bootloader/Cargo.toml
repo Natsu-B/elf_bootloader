@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tock-registers = "0.10.0"
-heapless = "0.8.0"
 dtb = { path = "../dtb" }
 allocator = { path = "../allocator" }
 typestate = { path = "../typestate" }
 file = { path = "../file" }
 elf = { path = "../elf" }
+arch_hal = { path = "../arch_hal" }
 
 [profile.release]
 panic = 'abort'

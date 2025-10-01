@@ -32,15 +32,17 @@ fn fetch_with_tools(url: &str, dest: &Path) -> Result<(), String> {
         .arg(dest)
         .arg(url)
         .status()
-        && status.success() {
-            return Ok(());
-        }
+        && status.success()
+    {
+        return Ok(());
+    }
 
     // Fallback to wget
     if let Ok(status) = Command::new("wget").arg("-O").arg(dest).arg(url).status()
-        && status.success() {
-            return Ok(());
-        }
+        && status.success()
+    {
+        return Ok(());
+    }
 
     Err("neither 'curl' nor 'wget' succeeded (or were found)".into())
 }

@@ -10,3 +10,4 @@ uefi-test = ["aarch64_test"]
 paging = { path = "./paging" }
 pl011 = { path = "./pl011" }
 aarch64_test = { path = "./aarch64_test", optional = true }
+mutex = { path = "../../mutex" }
