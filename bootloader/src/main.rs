@@ -7,6 +7,7 @@ extern crate alloc;
 mod systimer;
 use crate::systimer::SystemTimer;
 use alloc::alloc::alloc;
+use arch_hal::cpu;
 use arch_hal::debug_uart;
 use arch_hal::pl011::Pl011Uart;
 use arch_hal::println;
@@ -78,10 +79,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
     })
     .unwrap();
     println!("debug uart starting...\r\n");
-    unsafe {
-        let m = core::ptr::read_volatile(dtb_ptr as *const u32);
-        println!("FDT magic @x0: 0x{:08X}", m); // 0xD00DFEED ならOK
-    }
+    assert_eq!(cpu::get_current_el(), 2);
+
     let mut systimer = SystemTimer::new();
     systimer.init();
     println!("setup allocator");
@@ -112,7 +111,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         },
     )
     .unwrap();
-    println!("0x{:X}, 0x{:X}", program_start, stack_start);
     allocator::add_reserved_region(program_start, stack_start - program_start).unwrap();
     allocator::add_reserved_region(dtb_ptr, dtb.get_size()).unwrap();
     allocator::finalize().unwrap();
@@ -179,6 +177,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
 
     drop(file_driver);
     println!("file system closed");
+    // setup HCR_EL2
+    cpu::setup_hypervisor_registers();
     let mut reserved_memory = allocator::trim_for_boot(0x1000 * 0x1000 * 128).unwrap();
     println!("allocator closed");
     reserved_memory.push((program_start, stack_start));
@@ -195,35 +195,6 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         .make_dtb(dtb_data, reserved_memory.as_ref())
         .unwrap();
     let base = (jump_addr as usize) - text_offset;
-    println!(
-        "base=0x{:X}, text_off=0x{:X}, entry=0x{:X}",
-        base, text_offset, jump_addr as usize
-    );
-    println!("base % 2MiB = 0x{:X}", base & ((2 * 1024 * 1024) - 1));
-    unsafe {
-        let p = jump_addr as *const u32;
-        let w0 = core::ptr::read_volatile(p);
-        let w1 = core::ptr::read_volatile(p.add(1));
-        println!("entry bytes: {:08X} {:08X}", w0, w1);
-    }
-
-    unsafe {
-        let mut el: u64;
-        core::arch::asm!("mrs {0}, CurrentEL", out(reg) el);
-        println!("CurrentEL = {}", (el >> 2) & 0b11);
-    }
-
-    unsafe {
-        let m = core::ptr::read_volatile(dtb_ptr as *const u32);
-        println!("FDT magic @x0: 0x{:08X}", m);
-    }
-    unsafe {
-        let magic = core::slice::from_raw_parts((jump_addr as *const u8).add(0x38), 4);
-        println!(
-            "Image magic: {:02X} {:02X} {:02X} {:02X}",
-            magic[0], magic[1], magic[2], magic[3]
-        );
-    }
     unsafe {
         core::arch::asm!(
             "mrs x9, HCR_EL2",
@@ -260,15 +231,28 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         core::arch::asm!("dsb sy");
     }
 
-    // jump linux
+    const SPSR_EL2_M_EL1H: u64 = 0b0101; // EL1 with SP_EL1(EL1h)
     unsafe {
-        core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
-
-        core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
-            jump_addr as usize,
-        )(dtb_data.as_ptr() as usize, 0, 0, 0);
+        core::arch::asm!("msr spsr_el2, {}", in(reg)SPSR_EL2_M_EL1H);
+        core::arch::asm!("msr elr_el2, {}", in(reg)el1_main as *const fn() as usize as u64);
+        core::arch::asm!("eret", options(noreturn));
     }
-    unreachable!();
+}
+
+fn el1_main() -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+
+    // TODO
+    // // jump linux
+    // unsafe {
+    //     core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags));
+
+    //     core::mem::transmute::<usize, extern "C" fn(usize, usize, usize, usize)>(
+    //         jump_addr as usize,
+    //     )(dtb_data.as_ptr() as usize, 0, 0, 0);
+    // }
 }
 
 fn str_to_usize(s: &str) -> Option<usize> {

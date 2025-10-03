@@ -7,6 +7,7 @@ name = "aarch64_hal"
 version = "0.1.0"
 dependencies = [
  "aarch64_test",
+ "cpu",
  "mutex",
  "paging",
  "pl011",
@@ -45,6 +46,10 @@ dependencies = [
 
 [[package]]
 name = "block-device-api"
+version = "0.1.0"
+
+[[package]]
+name = "cpu"
 version = "0.1.0"
 
 [[package]]

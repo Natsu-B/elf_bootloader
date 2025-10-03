@@ -7,6 +7,7 @@ use core::fmt::{self};
 #[cfg(feature = "uefi-test")]
 pub use aarch64_test::*;
 
+pub use cpu;
 pub use paging;
 pub use pl011;
 

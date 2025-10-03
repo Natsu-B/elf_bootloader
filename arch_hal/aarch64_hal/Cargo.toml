@@ -9,5 +9,6 @@ uefi-test = ["aarch64_test"]
 [dependencies]
 paging = { path = "./paging" }
 pl011 = { path = "./pl011" }
+cpu = { path = "./cpu" }
 aarch64_test = { path = "./aarch64_test", optional = true }
 mutex = { path = "../../mutex" }
