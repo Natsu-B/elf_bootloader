@@ -109,6 +109,11 @@ version = "0.1.0"
 [[package]]
 name = "paging"
 version = "0.1.0"
+dependencies = [
+ "allocator",
+ "typestate",
+ "typestate_macro",
+]
 
 [[package]]
 name = "pl011"
