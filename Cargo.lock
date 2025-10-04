@@ -150,6 +150,9 @@ dependencies = [
 [[package]]
 name = "typestate"
 version = "0.1.0"
+dependencies = [
+ "typestate_macro",
+]
 
 [[package]]
 name = "typestate_macro"

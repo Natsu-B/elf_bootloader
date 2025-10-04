@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! MMIO typestate wrapper.
 //!
 //! This crate provides small wrapper types around MMIO registers that encode
@@ -19,11 +19,17 @@
 //! - [`Le<T>`] / [`Be<T>`]: endianness-aware wrappers that convert to host endianness.
 //! - [`Unaligned<T>`]: unaligned access helper that performs byte-wise I/O via access wrappers.
 //!
+//! # Bitfield Helpers
+//! - [`bitregs!`]: declarative macro for defining MMIO register layouts with
+//!   compile-time coverage and overlap checks, available via
+//!   [`crate::bitregs!`](crate::bitregs!) or the alias [`crate::bitflags!`](crate::bitflags!).
+//!
 //! # Safety
 //! These wrappers do not validate that the underlying address actually maps to
 //! device registers. It is **your** responsibility to place these wrappers at
 //! the correct, valid MMIO address and to follow the device's access rules.
 
+pub mod bitflags;
 mod endianness;
 mod read_write;
 mod unaligned;
