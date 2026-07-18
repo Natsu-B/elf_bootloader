@@ -227,7 +227,7 @@ fn plan_split_with_page(base_ipa: u64, total_size: u8, page_size: u64) -> Option
     Some(plan)
 }
 
-pub(crate) fn can_handle_plan(handler: &MmioHandler, plan: &SplitPlan, is_write: bool) -> bool {
+pub(crate) fn can_handle_plan(handler: &dyn MmioHandler, plan: &SplitPlan, is_write: bool) -> bool {
     plan.segments()
         .iter()
         .all(|seg| handler.can_split_subaccess(seg.ipa, seg.size, is_write))
@@ -420,7 +420,7 @@ fn split_plan_for_access(ipa: u64, size: u8) -> Option<Option<SplitPlan>> {
 pub fn execute_mmio(
     regs: &mut Registers,
     info: &DataAbortInfo,
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
     decoded: &MmioDecoded,
 ) -> EmulationOutcome {
     let regs_arr = regs.gprs_mut();
@@ -478,7 +478,7 @@ pub fn execute_mmio(
 pub fn try_emulate_mmio(
     regs: &mut Registers,
     info: &DataAbortInfo,
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
 ) -> EmulationOutcome {
     match decode_mmio(&*regs, info) {
         Some(decoded) => execute_mmio(regs, info, handler, &decoded),
@@ -1082,18 +1082,46 @@ mod tests {
         Ok(())
     }
 
+    struct TestMmioHandler {
+        read: fn(*const (), u64, u8) -> Result<u64, MmioError>,
+        write: fn(*const (), u64, u8, u64) -> Result<(), MmioError>,
+        probe: Option<fn(*const (), u64, u8, bool) -> bool>,
+        access_class: AccessClass,
+        split_policy: SplitPolicy,
+    }
+
+    impl MmioHandler for TestMmioHandler {
+        fn read(&self, ipa: u64, size: u8) -> Result<u64, MmioError> {
+            (self.read)(core::ptr::null(), ipa, size)
+        }
+
+        fn write(&self, ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
+            (self.write)(core::ptr::null(), ipa, size, value)
+        }
+
+        fn probe_subaccess(&self, ipa: u64, size: u8, is_write: bool) -> bool {
+            self.probe
+                .is_some_and(|probe| probe(core::ptr::null(), ipa, size, is_write))
+        }
+
+        fn access_class(&self) -> AccessClass {
+            self.access_class
+        }
+
+        fn split_policy(&self) -> SplitPolicy {
+            self.split_policy
+        }
+    }
+
     fn make_handler(
         probe: Option<fn(*const (), u64, u8, bool) -> bool>,
         read: fn(*const (), u64, u8) -> Result<u64, MmioError>,
         write: fn(*const (), u64, u8, u64) -> Result<(), MmioError>,
-    ) -> MmioHandler {
-        MmioHandler {
-            ctx: core::ptr::null(),
+    ) -> TestMmioHandler {
+        TestMmioHandler {
             read,
             write,
             probe,
-            read_pair: None,
-            write_pair: None,
             access_class: AccessClass::DeviceMmio,
             split_policy: SplitPolicy::OnlyIfProbe,
         }
@@ -1269,13 +1297,10 @@ mod tests {
             unsafe { LAST_WRITE = (ipa, size, value) };
             Ok(())
         }
-        let handler = MmioHandler {
-            ctx: core::ptr::null(),
+        let handler = TestMmioHandler {
             read: read_stub,
             write: write_record,
             probe: None,
-            read_pair: None,
-            write_pair: None,
             access_class: AccessClass::NormalMemory,
             split_policy: SplitPolicy::Never,
         };
@@ -1318,13 +1343,10 @@ mod tests {
         fn write_fail(_: *const (), _: u64, _: u8, _: u64) -> Result<(), MmioError> {
             Err(MmioError::Unhandled)
         }
-        let handler = MmioHandler {
-            ctx: core::ptr::null(),
+        let handler = TestMmioHandler {
             read: read_stub,
             write: write_fail,
             probe: None,
-            read_pair: None,
-            write_pair: None,
             access_class: AccessClass::NormalMemory,
             split_policy: SplitPolicy::Never,
         };
@@ -1369,13 +1391,10 @@ mod tests {
         fn write_stub(_: *const (), _: u64, _: u8, _: u64) -> Result<(), MmioError> {
             Ok(())
         }
-        let handler = MmioHandler {
-            ctx: core::ptr::null(),
+        let handler = TestMmioHandler {
             read: read_stub,
             write: write_stub,
             probe: None,
-            read_pair: None,
-            write_pair: None,
             access_class: AccessClass::NormalMemory,
             split_policy: SplitPolicy::Never,
         };

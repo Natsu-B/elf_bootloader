@@ -16,7 +16,7 @@ pub(crate) fn emulate_single(
     desc: &SingleDesc,
     ipa: u64,
     split: Option<&SplitPlan>,
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
 ) -> EmulationOutcome {
     let raw_total = match read_value(handler, ipa, desc.size, split) {
         Some(v) => v,
@@ -37,15 +37,15 @@ pub(crate) fn emulate_pair(
     ipa1: u64,
     split0: Option<&SplitPlan>,
     split1: Option<&SplitPlan>,
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
 ) -> EmulationOutcome {
     let use_pair_ops = split0.is_none()
         && split1.is_none()
         && (desc.size <= 1 || (ipa0 % desc.size as u64 == 0 && ipa1 % desc.size as u64 == 0));
 
     let (v0, v1) = if use_pair_ops {
-        if let Some(_) = handler.read_pair {
-            match handler.read_pair(ipa0, ipa1, desc.size) {
+        if let Some(result) = handler.read_pair(ipa0, ipa1, desc.size) {
+            match result {
                 Ok(v) => v,
                 Err(MmioError::Unhandled) | Err(MmioError::Fault) => {
                     return EmulationOutcome::NotHandled;
@@ -124,7 +124,7 @@ pub fn test_extend_loaded_value(
     extend_loaded_value(raw, size, sign_extend, rt_size)
 }
 
-fn assemble_split_value(handler: &MmioHandler, plan: &SplitPlan) -> Option<u64> {
+fn assemble_split_value(handler: &dyn MmioHandler, plan: &SplitPlan) -> Option<u64> {
     let mut total = 0u64;
     for seg in plan.segments() {
         let raw = match handler.read(seg.ipa, seg.size) {
@@ -137,12 +137,17 @@ fn assemble_split_value(handler: &MmioHandler, plan: &SplitPlan) -> Option<u64> 
     Some(total)
 }
 
-fn execute_split_load(handler: &MmioHandler, plan: &SplitPlan, total_size: u8) -> Option<u64> {
+fn execute_split_load(handler: &dyn MmioHandler, plan: &SplitPlan, total_size: u8) -> Option<u64> {
     let assembled = assemble_split_value(handler, plan)?;
     Some(mask_value(assembled, total_size))
 }
 
-fn read_value(handler: &MmioHandler, ipa: u64, size: u8, split: Option<&SplitPlan>) -> Option<u64> {
+fn read_value(
+    handler: &dyn MmioHandler,
+    ipa: u64,
+    size: u8,
+    split: Option<&SplitPlan>,
+) -> Option<u64> {
     if let Some(plan) = split {
         if !can_handle_plan(handler, plan, false) {
             return None;

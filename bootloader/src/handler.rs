@@ -40,16 +40,9 @@ use exceptions::synchronous_handler::InstructionAbortInfo;
 use exceptions::synchronous_handler::TrappedWfInfo;
 use gdb_remote::WatchpointKind;
 
-static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
-    ctx: core::ptr::null(),
-    read: passthrough_read,
-    write: passthrough_write,
-    probe: Some(passthrough_probe),
-    read_pair: None,
-    write_pair: None,
-    access_class: AccessClass::DeviceMmio,
-    split_policy: SplitPolicy::Never,
-};
+struct PassthroughMmio;
+
+static PASSTHROUGH_MMIO: PassthroughMmio = PassthroughMmio;
 
 static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
     ctx: core::ptr::null_mut(),
@@ -118,33 +111,43 @@ pub(crate) fn setup_handler() {
     psci::set_psci_handler(PsciFunctionId::CpuOnSmc32, deny_cpu_on_handler);
 }
 
-fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
-    unsafe {
-        Ok(match size {
-            1 => read_volatile(ipa as *const u8) as u64,
-            2 => read_volatile(ipa as *const u16) as u64,
-            4 => read_volatile(ipa as *const u32) as u64,
-            8 => read_volatile(ipa as *const u64),
-            _ => return Err(MmioError::Unhandled),
-        })
-    }
-}
-
-fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
-    unsafe {
-        match size {
-            1 => write_volatile(ipa as *mut u8, value as u8),
-            2 => write_volatile(ipa as *mut u16, value as u16),
-            4 => write_volatile(ipa as *mut u32, value as u32),
-            8 => write_volatile(ipa as *mut u64, value as u64),
-            _ => return Err(MmioError::Unhandled),
+impl MmioHandler for PassthroughMmio {
+    fn read(&self, ipa: u64, size: u8) -> Result<u64, MmioError> {
+        unsafe {
+            Ok(match size {
+                1 => read_volatile(ipa as *const u8) as u64,
+                2 => read_volatile(ipa as *const u16) as u64,
+                4 => read_volatile(ipa as *const u32) as u64,
+                8 => read_volatile(ipa as *const u64),
+                _ => return Err(MmioError::Unhandled),
+            })
         }
     }
-    Ok(())
-}
 
-fn passthrough_probe(_ctx: *const (), _ipa: u64, size: u8, _is_write: bool) -> bool {
-    matches!(size, 1 | 2 | 4 | 8)
+    fn write(&self, ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
+        unsafe {
+            match size {
+                1 => write_volatile(ipa as *mut u8, value as u8),
+                2 => write_volatile(ipa as *mut u16, value as u16),
+                4 => write_volatile(ipa as *mut u32, value as u32),
+                8 => write_volatile(ipa as *mut u64, value),
+                _ => return Err(MmioError::Unhandled),
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_subaccess(&self, _ipa: u64, size: u8, _is_write: bool) -> bool {
+        matches!(size, 1 | 2 | 4 | 8)
+    }
+
+    fn access_class(&self) -> AccessClass {
+        AccessClass::DeviceMmio
+    }
+
+    fn split_policy(&self) -> SplitPolicy {
+        SplitPolicy::Never
+    }
 }
 
 pub(crate) fn register_gic(gic: Gicv2, gdb_uart_intid: Option<u32>) {

@@ -16,7 +16,7 @@ pub(crate) fn emulate_single(
     desc: &SingleDesc,
     ipa: u64,
     split: Option<&SplitPlan>,
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
 ) -> EmulationOutcome {
     let value = read_reg(regs, desc.rt, desc.size);
 
@@ -34,7 +34,7 @@ pub(crate) fn emulate_pair(
     ipa1: u64,
     split0: Option<&SplitPlan>,
     split1: Option<&SplitPlan>,
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
 ) -> EmulationOutcome {
     let v0 = read_reg(regs, desc.rt, desc.size);
     let v1 = read_reg(regs, desc.rt2, desc.size);
@@ -44,11 +44,11 @@ pub(crate) fn emulate_pair(
         && (desc.size <= 1 || (ipa0 % desc.size as u64 == 0 && ipa1 % desc.size as u64 == 0));
 
     if use_pair_ops {
-        if let Some(_) = handler.write_pair {
+        if let Some(result) = handler.write_pair(ipa0, ipa1, desc.size, v0, v1) {
             // Execute as a single MMIO transaction when possible to avoid partial side effects.
             // If the hook is missing or fails, we do not attempt rollback and instead mark
             // the access as NotHandled so the upper layer can decide how to proceed.
-            match handler.write_pair(ipa0, ipa1, desc.size, v0, v1) {
+            match result {
                 Ok(()) => {}
                 Err(MmioError::Unhandled) | Err(MmioError::Fault) => {
                     return EmulationOutcome::NotHandled;
@@ -118,7 +118,7 @@ fn write_back_base(regs: &mut [u64; 32], rn: u8, val: u64) {
     }
 }
 
-fn execute_split_store(handler: &MmioHandler, plan: &SplitPlan, value_total: u64) -> bool {
+fn execute_split_store(handler: &dyn MmioHandler, plan: &SplitPlan, value_total: u64) -> bool {
     for seg in plan.segments() {
         let seg_mask = mask_for_size(seg.size);
         let seg_val = (value_total >> (seg.byte_offset as u64 * 8)) & seg_mask;
@@ -141,7 +141,7 @@ fn mask_for_size(size: u8) -> u64 {
 }
 
 fn write_value(
-    handler: &MmioHandler,
+    handler: &dyn MmioHandler,
     ipa: u64,
     size: u8,
     split: Option<&SplitPlan>,

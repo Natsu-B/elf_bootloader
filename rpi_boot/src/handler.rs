@@ -70,45 +70,57 @@ pub(crate) fn gic() -> Option<&'static Gicv2> {
     unsafe { &*GICV2_DRIVER.get() }.as_ref()
 }
 
-fn passthrough_read(_ctx: *const (), ipa: u64, size: u8) -> Result<u64, MmioError> {
-    // SAFETY: `passthrough_probe` admits only aligned device-MMIO-sized accesses for trapped
-    // identity-mapped regions; the access width is the decoded guest access size.
-    let value = unsafe {
-        match size {
-            1 => read_volatile(ipa as *const u8) as u64,
-            2 => read_volatile(ipa as *const u16) as u64,
-            4 => read_volatile(ipa as *const u32) as u64,
-            8 => read_volatile(ipa as *const u64),
-            _ => return Err(MmioError::Unhandled),
-        }
-    };
-    note_rp1_passthrough_mmio_access(ipa as usize, false);
-    Ok(value)
-}
+struct PassthroughMmio;
 
-fn passthrough_write(_ctx: *const (), ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
-    // SAFETY: `passthrough_probe` admits only aligned device-MMIO-sized accesses for trapped
-    // identity-mapped regions; the access width is the decoded guest access size.
-    unsafe {
-        match size {
-            1 => write_volatile(ipa as *mut u8, value as u8),
-            2 => write_volatile(ipa as *mut u16, value as u16),
-            4 => write_volatile(ipa as *mut u32, value as u32),
-            8 => write_volatile(ipa as *mut u64, value as u64),
-            _ => return Err(MmioError::Unhandled),
-        }
+impl MmioHandler for PassthroughMmio {
+    fn read(&self, ipa: u64, size: u8) -> Result<u64, MmioError> {
+        // SAFETY: `probe_subaccess` admits only aligned device-MMIO-sized accesses for trapped
+        // identity-mapped regions; the access width is the decoded guest access size.
+        let value = unsafe {
+            match size {
+                1 => read_volatile(ipa as *const u8) as u64,
+                2 => read_volatile(ipa as *const u16) as u64,
+                4 => read_volatile(ipa as *const u32) as u64,
+                8 => read_volatile(ipa as *const u64),
+                _ => return Err(MmioError::Unhandled),
+            }
+        };
+        note_rp1_passthrough_mmio_access(ipa as usize, false);
+        Ok(value)
     }
-    note_rp1_passthrough_mmio_access(ipa as usize, true);
-    Ok(())
-}
 
-fn passthrough_probe(_ctx: *const (), ipa: u64, size: u8, _is_write: bool) -> bool {
-    let addr = ipa as usize;
-    matches!(size, 1 | 2 | 4 | 8)
-        && !vgic::handles_gicd(addr)
-        && !vgic::handles_gicc_phys(addr)
-        && !is_hypervisor_uart_addr(addr)
-        && !virtio_blk::handles_mmio(addr)
+    fn write(&self, ipa: u64, size: u8, value: u64) -> Result<(), MmioError> {
+        // SAFETY: `probe_subaccess` admits only aligned device-MMIO-sized accesses for trapped
+        // identity-mapped regions; the access width is the decoded guest access size.
+        unsafe {
+            match size {
+                1 => write_volatile(ipa as *mut u8, value as u8),
+                2 => write_volatile(ipa as *mut u16, value as u16),
+                4 => write_volatile(ipa as *mut u32, value as u32),
+                8 => write_volatile(ipa as *mut u64, value),
+                _ => return Err(MmioError::Unhandled),
+            }
+        }
+        note_rp1_passthrough_mmio_access(ipa as usize, true);
+        Ok(())
+    }
+
+    fn probe_subaccess(&self, ipa: u64, size: u8, _is_write: bool) -> bool {
+        let addr = ipa as usize;
+        matches!(size, 1 | 2 | 4 | 8)
+            && !vgic::handles_gicd(addr)
+            && !vgic::handles_gicc_phys(addr)
+            && !is_hypervisor_uart_addr(addr)
+            && !virtio_blk::handles_mmio(addr)
+    }
+
+    fn access_class(&self) -> AccessClass {
+        AccessClass::DeviceMmio
+    }
+
+    fn split_policy(&self) -> SplitPolicy {
+        SplitPolicy::Never
+    }
 }
 
 fn read_guest_mmio_source_reg(
@@ -573,16 +585,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
     }
 }
 
-static PASSTHROUGH_MMIO: MmioHandler = MmioHandler {
-    ctx: core::ptr::null(),
-    read: passthrough_read,
-    write: passthrough_write,
-    probe: Some(passthrough_probe),
-    read_pair: None,
-    write_pair: None,
-    access_class: AccessClass::DeviceMmio,
-    split_policy: SplitPolicy::Never,
-};
+static PASSTHROUGH_MMIO: PassthroughMmio = PassthroughMmio;
 
 static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
     ctx: core::ptr::null_mut(),
