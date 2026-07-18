@@ -2,6 +2,7 @@ use crate::bcm2712::Bcm2712Error;
 use crate::bcm2712::rp1_interrupt;
 use common::PirqHookError;
 use common::PirqHookOp;
+use common::PirqLifecycleHook;
 use common::TriggerMode;
 use core::cell::SyncUnsafeCell;
 use core::mem::size_of;
@@ -267,16 +268,25 @@ pub fn is_guest_rp1_passthrough_spi(int_id: u32) -> bool {
     GUEST_RP1_PASSTHROUGH_SPIS.contains(&int_id)
 }
 
-pub fn pirq_hook(int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
-    if !is_guest_rp1_passthrough_spi(int_id) {
-        return Ok(());
-    }
+struct Bcm2712PirqLifecycleHook;
 
-    match op {
-        PirqHookOp::Configure {
-            trigger, enable, ..
-        } => rp1_msix_configure_source(int_id, trigger, enable),
-        PirqHookOp::Eoi => rp1_msix_iack_level_source(int_id),
-        PirqHookOp::Deactivate | PirqHookOp::Resample => Ok(()),
+impl PirqLifecycleHook for Bcm2712PirqLifecycleHook {
+    fn on_pirq_event(&self, int_id: u32, op: PirqHookOp) -> Result<(), PirqHookError> {
+        if !is_guest_rp1_passthrough_spi(int_id) {
+            return Ok(());
+        }
+
+        match op {
+            PirqHookOp::Configure {
+                trigger, enable, ..
+            } => rp1_msix_configure_source(int_id, trigger, enable),
+            PirqHookOp::Eoi => rp1_msix_iack_level_source(int_id),
+            PirqHookOp::Deactivate | PirqHookOp::Resample => Ok(()),
+        }
     }
 }
+
+static BCM2712_PIRQ_LIFECYCLE_HOOK: Bcm2712PirqLifecycleHook = Bcm2712PirqLifecycleHook;
+
+/// RP1 pIRQ lifecycle callback used by the virtual GIC.
+pub static PIRQ_LIFECYCLE_HOOK: &dyn PirqLifecycleHook = &BCM2712_PIRQ_LIFECYCLE_HOOK;

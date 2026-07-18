@@ -23,7 +23,7 @@ use crate::gicv2::Gicv2;
 use crate::gicv2::vgic_frontend::Gicv2AccessSize;
 use crate::gicv2::vgic_frontend::Gicv2DistIdRegs;
 use crate::gicv2::vgic_frontend::Gicv2Frontend;
-use common::PirqHookFn;
+use common::PirqLifecycleHook;
 use core::cell::SyncUnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
@@ -290,7 +290,10 @@ where
         self.apply_update(hw, update)
     }
 
-    pub fn set_pirq_hook(&self, hook: Option<PirqHookFn>) -> Result<(), GicError> {
+    pub fn set_pirq_hook(
+        &self,
+        hook: Option<&'static dyn PirqLifecycleHook>,
+    ) -> Result<(), GicError> {
         let vm = self.model()?;
         vm.set_pirq_hook(hook);
         Ok(())

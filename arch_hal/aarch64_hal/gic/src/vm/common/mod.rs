@@ -48,7 +48,7 @@ where
     pub(crate) routing: SpiRouting<VCPUS>,
     pub(crate) pirqs: PirqTable<VCPUS>,
     pub(crate) pirq_manager_ctx: *mut (),
-    pub(crate) pirq_hook: Option<common::PirqHookFn>,
+    pub(crate) pirq_hook: Option<&'static dyn common::PirqLifecycleHook>,
 }
 
 // SAFETY: `RoutingState` is only accessed through `routing_lock`, so moving it between threads is

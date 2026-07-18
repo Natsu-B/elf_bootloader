@@ -12,7 +12,7 @@ use arch_hal::gic::VgicHw;
 use arch_hal::gic::gicv2::Gicv2;
 use arch_hal::gic::gicv2::Gicv2AccessSize;
 use arch_hal::gic::gicv2::Gicv2DistIdRegs;
-use arch_hal::gic::vm::PirqHookFn;
+use arch_hal::gic::vm::PirqLifecycleHook;
 use arch_hal::gic::vm::manager::VgicDelegate;
 use arch_hal::gic::vm::manager::VgicManager;
 use arch_hal::println;
@@ -268,7 +268,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
     Ok(())
 }
 
-pub fn set_pirq_hook(hook: Option<PirqHookFn>) -> Result<(), GicError> {
+pub fn set_pirq_hook(hook: Option<&'static dyn PirqLifecycleHook>) -> Result<(), GicError> {
     VGIC.set_pirq_hook(hook)
 }
 

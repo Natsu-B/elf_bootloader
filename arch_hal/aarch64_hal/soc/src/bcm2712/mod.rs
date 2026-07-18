@@ -55,7 +55,7 @@ pub mod rp1_gem;
 pub mod rp1_interrupt;
 pub mod sdhc;
 #[cfg(target_arch = "aarch64")]
-pub use pirq_hook::pirq_hook;
+pub use pirq_hook::PIRQ_LIFECYCLE_HOOK;
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) struct MsiXTablePtr {

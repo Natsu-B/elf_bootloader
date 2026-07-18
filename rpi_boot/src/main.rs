@@ -709,7 +709,7 @@ extern "C" fn main() -> ! {
 
     println!("setup vgic...");
     vgic::init(gicv2, &gic_info, Some(uart_irq)).unwrap();
-    vgic::set_pirq_hook(Some(bcm2712::pirq_hook)).unwrap();
+    vgic::set_pirq_hook(Some(bcm2712::PIRQ_LIFECYCLE_HOOK)).unwrap();
     println!("vgic setup success!!!");
 
     // Arm the physical RP1 UART SPI only after the RP1 hook and vGIC passthrough are ready.

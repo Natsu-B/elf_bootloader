@@ -30,8 +30,8 @@ use crate::VgicVmInfo;
 use crate::VgicWork;
 use crate::vm::vcpu::GicVCpuGeneric;
 pub use ::common::PirqHookError;
-pub use ::common::PirqHookFn;
 pub use ::common::PirqHookOp;
+pub use ::common::PirqLifecycleHook;
 use aarch64_mutex::RawSpinLockIrqSave;
 
 pub(crate) mod common;
@@ -137,12 +137,12 @@ where
         routing.pirq_manager_ctx = ctx;
     }
 
-    pub(crate) fn set_pirq_hook(&self, hook: Option<PirqHookFn>) {
+    pub(crate) fn set_pirq_hook(&self, hook: Option<&'static dyn PirqLifecycleHook>) {
         let mut routing = self.common.routing_lock.lock_irqsave();
         routing.pirq_hook = hook;
     }
 
-    fn pirq_hook_snapshot(&self) -> (*mut (), Option<PirqHookFn>) {
+    fn pirq_hook_snapshot(&self) -> (*mut (), Option<&'static dyn PirqLifecycleHook>) {
         let routing = self.common.routing_lock.lock_irqsave();
         (routing.pirq_manager_ctx, routing.pirq_hook)
     }
@@ -249,7 +249,7 @@ where
             (attrs.group, attrs.priority, trigger)
         };
 
-        hook(
+        hook.on_pirq_event(
             pintid.0,
             PirqHookOp::Configure {
                 group: Self::irq_group_to_hook(group),
@@ -339,7 +339,8 @@ where
     fn call_pirq_signal_hook(&self, pintid: PIntId, op: PirqHookOp) -> Result<(), GicError> {
         let (_, hook) = self.pirq_hook_snapshot();
         if let Some(hook) = hook {
-            hook(pintid.0, op).map_err(Self::map_pirq_hook_error)?;
+            hook.on_pirq_event(pintid.0, op)
+                .map_err(Self::map_pirq_hook_error)?;
         }
         Ok(())
     }
