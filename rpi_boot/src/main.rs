@@ -19,6 +19,7 @@ mod dtb;
 mod handler;
 mod multicore;
 mod pcie;
+mod platform_irq;
 mod stack_overflow;
 mod vgic;
 mod virtio_blk;

@@ -18,7 +18,6 @@ use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
-use arch_hal::soc::bcm2712;
 use arch_hal::tls;
 use core::ffi::c_void;
 use core::ptr::read_volatile;
@@ -35,6 +34,10 @@ use mutex::pod::RawAtomicPod;
 use crate::GICV2_DRIVER;
 use crate::GUEST_PL011_UART0_ADDR;
 use crate::HYPERVISOR_PL011_UART1_ADDR;
+use crate::platform_irq;
+use crate::platform_irq::PassthroughMmioAccess;
+use crate::platform_irq::PassthroughMmioAccessKind;
+use crate::platform_irq::PirqSourceService;
 use crate::vgic;
 use crate::virtio_blk;
 
@@ -85,7 +88,10 @@ impl MmioHandler for PassthroughMmio {
                 _ => return Err(MmioError::Unhandled),
             }
         };
-        note_rp1_passthrough_mmio_access(ipa as usize, false);
+        note_passthrough_mmio_access(PassthroughMmioAccess {
+            address: ipa as usize,
+            kind: PassthroughMmioAccessKind::Read,
+        });
         Ok(value)
     }
 
@@ -101,7 +107,10 @@ impl MmioHandler for PassthroughMmio {
                 _ => return Err(MmioError::Unhandled),
             }
         }
-        note_rp1_passthrough_mmio_access(ipa as usize, true);
+        note_passthrough_mmio_access(PassthroughMmioAccess {
+            address: ipa as usize,
+            kind: PassthroughMmioAccessKind::Write,
+        });
         Ok(())
     }
 
@@ -321,10 +330,14 @@ fn data_abort_handler(
             }
         }
     }
-    note_rp1_passthrough_mmio_access(
-        address as usize,
-        write_access == WriteNotRead::WritingMemoryAbort,
-    );
+    let access_kind = match write_access {
+        WriteNotRead::ReadingMemoryAbort => PassthroughMmioAccessKind::Read,
+        WriteNotRead::WritingMemoryAbort => PassthroughMmioAccessKind::Write,
+    };
+    note_passthrough_mmio_access(PassthroughMmioAccess {
+        address: address as usize,
+        kind: access_kind,
+    });
     // advance elr_el2
     cpu::set_elr_el2(cpu::get_elr_el2() + 4);
 }
@@ -518,10 +531,31 @@ fn pirq_error_requires_panic(err: GicError) -> bool {
     matches!(err, GicError::UnsupportedIntId)
 }
 
-fn note_rp1_passthrough_mmio_access(addr: usize, is_write: bool) {
-    if let Err(err) = bcm2712::pirq_hook::after_passthrough_mmio_access(addr, is_write) {
+fn note_passthrough_mmio_access(access: PassthroughMmioAccess) {
+    note_passthrough_mmio_access_with(platform_irq::pirq_source_service(), access);
+}
+
+fn note_passthrough_mmio_access_with(
+    service: &dyn PirqSourceService,
+    access: PassthroughMmioAccess,
+) {
+    if let Err(err) = service.after_passthrough_access(access) {
         if IRQ_LOG_ONCE.fetch_or(LOG_RP1_MMIO_ERR, Ordering::Relaxed) & LOG_RP1_MMIO_ERR == 0 {
             println!("rp1: passthrough MMIO completion failed: {:?}", err);
+        }
+    }
+}
+
+fn note_host_irq_completion(completed_int_id: u32) {
+    note_host_irq_completion_with(platform_irq::pirq_source_service(), completed_int_id);
+}
+
+fn note_host_irq_completion_with(service: &dyn PirqSourceService, completed_int_id: u32) {
+    if let Err(err) = service.after_host_irq_completion(completed_int_id) {
+        if IRQ_LOG_ONCE.fetch_or(LOG_RP1_RESAMPLE_ERR, Ordering::Relaxed) & LOG_RP1_RESAMPLE_ERR
+            == 0
+        {
+            println!("rp1: level MSI-X resample failed: {:?}", err);
         }
     }
 }
@@ -576,13 +610,7 @@ fn irq_handler(_regs: &mut cpu::Registers) {
             }
         }
     }
-    if let Err(err) = bcm2712::pirq_hook::resample_level_sources(Some(irq.intid)) {
-        if IRQ_LOG_ONCE.fetch_or(LOG_RP1_RESAMPLE_ERR, Ordering::Relaxed) & LOG_RP1_RESAMPLE_ERR
-            == 0
-        {
-            println!("rp1: level MSI-X resample failed: {:?}", err);
-        }
-    }
+    note_host_irq_completion(irq.intid);
 }
 
 static PASSTHROUGH_MMIO: PassthroughMmio = PassthroughMmio;
@@ -671,6 +699,75 @@ fn unknown_psci_handler(fid_raw: u32, regs: &mut cpu::Registers) {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use core::sync::atomic::AtomicU8;
+    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::AtomicUsize;
+
+    struct RecordingPirqSourceService {
+        access_address: AtomicUsize,
+        access_kind: AtomicU8,
+        completed_int_id: AtomicU32,
+    }
+
+    impl RecordingPirqSourceService {
+        const fn new() -> Self {
+            Self {
+                access_address: AtomicUsize::new(0),
+                access_kind: AtomicU8::new(0),
+                completed_int_id: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl PirqSourceService for RecordingPirqSourceService {
+        fn after_passthrough_access(
+            &self,
+            access: PassthroughMmioAccess,
+        ) -> Result<(), arch_hal::common::PirqHookError> {
+            let kind = match access.kind {
+                PassthroughMmioAccessKind::Read => 1,
+                PassthroughMmioAccessKind::Write => 2,
+            };
+            self.access_address.store(access.address, Ordering::Relaxed);
+            self.access_kind.store(kind, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn after_host_irq_completion(
+            &self,
+            completed_int_id: u32,
+        ) -> Result<(), arch_hal::common::PirqHookError> {
+            self.completed_int_id
+                .store(completed_int_id, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test_case]
+    fn passthrough_completion_preserves_access_context() {
+        let service = RecordingPirqSourceService::new();
+        note_passthrough_mmio_access_with(
+            &service,
+            PassthroughMmioAccess {
+                address: 0x1c_0030_0044,
+                kind: PassthroughMmioAccessKind::Write,
+            },
+        );
+
+        assert_eq!(
+            service.access_address.load(Ordering::Relaxed),
+            0x1c_0030_0044
+        );
+        assert_eq!(service.access_kind.load(Ordering::Relaxed), 2);
+    }
+
+    #[test_case]
+    fn host_irq_completion_preserves_completed_intid() {
+        let service = RecordingPirqSourceService::new();
+        note_host_irq_completion_with(&service, 185);
+
+        assert_eq!(service.completed_int_id.load(Ordering::Relaxed), 185);
+    }
 
     #[test_case]
     fn maintenance_irq_still_requests_deactivate() {
