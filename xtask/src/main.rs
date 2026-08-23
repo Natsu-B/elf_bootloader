@@ -1720,6 +1720,9 @@ fn test(args: &[String]) {
         sudo_warmup();
     }
 
+    // Empty test names mark unit-plan entries in the shared U-Boot runner.
+    uboot_tests.extend(uboot_unit_for_sudo);
+
     // Run std tests (each with 30s timeout if available)
     for (pkg, extra) in std_crates {
         eprintln!("\n--- Running host tests for: {} ---", pkg);
@@ -1912,7 +1915,9 @@ fn test(args: &[String]) {
                 parts.push(existing);
             }
             parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
-            parts.push("-C debuginfo=0".to_string());
+            if !testname.is_empty() {
+                parts.push("-C debuginfo=0".to_string());
+            }
             parts.push("-C relocation-model=static".to_string());
             parts.push(format!("-C link-arg=-T{}", test_lds));
             parts.join(" ")
@@ -1927,7 +1932,19 @@ fn test(args: &[String]) {
         if !testname.is_empty() {
             cmd.arg("--test").arg(&testname);
         } else {
-            cmd.arg("--lib");
+            let has_explicit_target = extra.iter().any(|arg| {
+                arg == "--bin"
+                    || arg == "--test"
+                    || arg == "--example"
+                    || arg == "--bench"
+                    || arg.starts_with("--bin=")
+                    || arg.starts_with("--test=")
+                    || arg.starts_with("--example=")
+                    || arg.starts_with("--bench=")
+            });
+            if !has_explicit_target {
+                cmd.arg("--lib");
+            }
         }
 
         cmd.args(&extra)
@@ -1948,85 +1965,6 @@ fn test(args: &[String]) {
             passed.push(label);
         } else {
             eprintln!("Error: U-Boot test failed for {} with code {}", pkg, code);
-            failed.push((label, code));
-        }
-    }
-
-    // Run U-Boot unit (lib) tests
-    for (pkg, testscript, extra) in uboot_unit_tests {
-        let runner_path = repo_root.join(&testscript);
-        let runner = runner_path
-            .to_str()
-            .expect("runner path contains invalid UTF-8");
-
-        let test_lds_path = repo_root.join("test.lds");
-        let test_lds = test_lds_path
-            .to_str()
-            .expect("test linker path contains invalid UTF-8")
-            .to_string();
-
-        let label = format!("uboot-unit:{}", pkg);
-        eprintln!(
-            "\n--- Running U-Boot unit test for: {} (runner: {}) ---",
-            pkg, runner
-        );
-
-        let mut cmd = Command::new("cargo");
-
-        let target_dir = UbootTargetDir::new(&label);
-
-        let rustflags = {
-            let mut parts = Vec::new();
-            if let Ok(existing) = std::env::var("RUSTFLAGS") {
-                parts.push(existing);
-            }
-            parts.push("-C panic=abort -Zpanic_abort_tests".to_string());
-            parts.push("-C relocation-model=static".to_string());
-            parts.push(format!("-C link-arg=-T{}", test_lds));
-            parts.join(" ")
-        };
-
-        cmd.arg("test")
-            .arg("--target")
-            .arg("aarch64-unknown-none-softfloat")
-            .arg("-p")
-            .arg(&pkg);
-
-        let has_explicit_target = extra.iter().any(|arg| {
-            arg == "--bin"
-                || arg == "--test"
-                || arg == "--example"
-                || arg == "--bench"
-                || arg.starts_with("--bin=")
-                || arg.starts_with("--test=")
-                || arg.starts_with("--example=")
-                || arg.starts_with("--bench=")
-        });
-        if !has_explicit_target {
-            cmd.arg("--lib");
-        }
-
-        cmd.args(&extra)
-            .args(&test_args)
-            .env("CARGO_TARGET_AARCH64_UNKNOWN_NONE_SOFTFLOAT_RUNNER", runner)
-            .env("RUSTFLAGS", rustflags)
-            .env("CARGO_PROFILE_TEST_PANIC", "abort")
-            .env("CARGO_PROFILE_DEV_PANIC", "abort")
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", &target_dir.0)
-            .env("CARGO_TERM_COLOR", "always")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let code = run_guest_test_with_timeout(cmd, &label, 300, "U-Boot test");
-        if code == 0 {
-            passed.push(label);
-        } else {
-            eprintln!(
-                "Error: U-Boot unit test failed for {} with code {}",
-                pkg, code
-            );
             failed.push((label, code));
         }
     }
