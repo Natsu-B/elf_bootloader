@@ -231,38 +231,38 @@ where
         }
     }
 
-    fn write_bool_word(
+    // Apply one register-window transform and report exactly which stored bits changed.
+    fn update_bool_word(
         &mut self,
         scope: VgicIrqScope,
         base: usize,
-        bits: u32,
         field: BoolField,
-    ) -> Result<bool, GicError> {
+        update: impl FnOnce(u32) -> u32,
+    ) -> Result<u32, GicError> {
         match scope {
             VgicIrqScope::Local(vcpu) => {
                 let idx = self.vcpu_index(vcpu)?;
                 let Some((shift, valid_mask, word_mask)) = Self::local_window(base)? else {
-                    return Ok(false);
+                    return Ok(0);
                 };
                 let local = self.select_bool_local_mut(field);
                 let slot = &mut local[idx];
-                let write_bits = (bits & valid_mask) << shift;
-                let changed = ((*slot ^ write_bits) & word_mask) != 0;
-                *slot = (*slot & !word_mask) | write_bits;
-                Ok(changed)
+                let current = (*slot >> shift) & valid_mask;
+                let new = update(current) & valid_mask;
+                *slot = (*slot & !word_mask) | (new << shift);
+                Ok(current ^ new)
             }
             VgicIrqScope::Global => {
                 let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
-                    return Ok(false);
+                    return Ok(0);
                 };
                 let global = self.select_bool_global_mut(field);
                 let pair = Self::read_u64_pair(global, word_index);
-                let current_window = Self::read_window_from_pair(pair, shift);
-                let write_window = bits & valid_mask;
-                let changed = ((current_window ^ write_window) & valid_mask) != 0;
-                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, write_window);
+                let current = Self::read_window_from_pair(pair, shift) & valid_mask;
+                let new = update(current) & valid_mask;
+                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, new);
                 Self::write_u64_pair(global, word_index, new_pair);
-                Ok(changed)
+                Ok(current ^ new)
             }
         }
     }
@@ -310,80 +310,6 @@ where
                 } else {
                     *slot &= !bit;
                 }
-                Ok(changed)
-            }
-        }
-    }
-
-    fn write_set_bool_word_mask(
-        &mut self,
-        scope: VgicIrqScope,
-        base: usize,
-        bits: u32,
-        field: BoolField,
-    ) -> Result<u32, GicError> {
-        match scope {
-            VgicIrqScope::Local(vcpu) => {
-                let idx = self.vcpu_index(vcpu)?;
-                let Some((shift, valid_mask, _)) = Self::local_window(base)? else {
-                    return Ok(0);
-                };
-                let local = self.select_bool_local_mut(field);
-                let slot = &mut local[idx];
-                let set_segment = (bits & valid_mask) << shift;
-                let changed_segment = (!*slot) & set_segment;
-                *slot |= set_segment;
-                Ok((changed_segment >> shift) & valid_mask)
-            }
-            VgicIrqScope::Global => {
-                let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
-                    return Ok(0);
-                };
-                let global = self.select_bool_global_mut(field);
-                let pair = Self::read_u64_pair(global, word_index);
-                let current_window = Self::read_window_from_pair(pair, shift);
-                let set_window = bits & valid_mask;
-                let changed = (!current_window) & set_window & valid_mask;
-                let new_window = current_window | set_window;
-                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, new_window);
-                Self::write_u64_pair(global, word_index, new_pair);
-                Ok(changed)
-            }
-        }
-    }
-
-    fn write_clear_bool_word_mask(
-        &mut self,
-        scope: VgicIrqScope,
-        base: usize,
-        bits: u32,
-        field: BoolField,
-    ) -> Result<u32, GicError> {
-        match scope {
-            VgicIrqScope::Local(vcpu) => {
-                let idx = self.vcpu_index(vcpu)?;
-                let Some((shift, valid_mask, _)) = Self::local_window(base)? else {
-                    return Ok(0);
-                };
-                let local = self.select_bool_local_mut(field);
-                let slot = &mut local[idx];
-                let clear_segment = (bits & valid_mask) << shift;
-                let changed_segment = *slot & clear_segment;
-                *slot &= !clear_segment;
-                Ok((changed_segment >> shift) & valid_mask)
-            }
-            VgicIrqScope::Global => {
-                let Some((word_index, shift, valid_mask)) = Self::global_window(base)? else {
-                    return Ok(0);
-                };
-                let global = self.select_bool_global_mut(field);
-                let pair = Self::read_u64_pair(global, word_index);
-                let current_window = Self::read_window_from_pair(pair, shift);
-                let clear_window = bits & valid_mask;
-                let changed = current_window & clear_window & valid_mask;
-                let new_window = current_window & !clear_window;
-                let new_pair = Self::write_window_to_pair(pair, shift, valid_mask, new_window);
-                Self::write_u64_pair(global, word_index, new_pair);
                 Ok(changed)
             }
         }
@@ -581,7 +507,7 @@ where
         base: VIntId,
         value: u32,
     ) -> Result<bool, GicError> {
-        self.write_bool_word(scope, base.0 as usize, value, BoolField::Group)
+        Ok(self.update_bool_word(scope, base.0 as usize, BoolField::Group, |_| value)? != 0)
     }
 
     pub(crate) fn read_enable_word(
@@ -598,7 +524,9 @@ where
         base: VIntId,
         set_bits: u32,
     ) -> Result<u32, GicError> {
-        self.write_set_bool_word_mask(scope, base.0 as usize, set_bits, BoolField::Enable)
+        self.update_bool_word(scope, base.0 as usize, BoolField::Enable, |current| {
+            current | set_bits
+        })
     }
 
     pub(crate) fn write_clear_enable_word(
@@ -607,7 +535,9 @@ where
         base: VIntId,
         clear_bits: u32,
     ) -> Result<u32, GicError> {
-        self.write_clear_bool_word_mask(scope, base.0 as usize, clear_bits, BoolField::Enable)
+        self.update_bool_word(scope, base.0 as usize, BoolField::Enable, |current| {
+            current & !clear_bits
+        })
     }
 
     pub(crate) fn read_pending_word(
@@ -624,7 +554,9 @@ where
         base: VIntId,
         set_bits: u32,
     ) -> Result<u32, GicError> {
-        self.write_set_bool_word_mask(scope, base.0 as usize, set_bits, BoolField::Pending)
+        self.update_bool_word(scope, base.0 as usize, BoolField::Pending, |current| {
+            current | set_bits
+        })
     }
 
     pub(crate) fn write_clear_pending_word(
@@ -633,7 +565,9 @@ where
         base: VIntId,
         clear_bits: u32,
     ) -> Result<u32, GicError> {
-        self.write_clear_bool_word_mask(scope, base.0 as usize, clear_bits, BoolField::Pending)
+        self.update_bool_word(scope, base.0 as usize, BoolField::Pending, |current| {
+            current & !clear_bits
+        })
     }
 
     pub(crate) fn read_active_word(
@@ -650,7 +584,9 @@ where
         base: VIntId,
         set_bits: u32,
     ) -> Result<u32, GicError> {
-        self.write_set_bool_word_mask(scope, base.0 as usize, set_bits, BoolField::Active)
+        self.update_bool_word(scope, base.0 as usize, BoolField::Active, |current| {
+            current | set_bits
+        })
     }
 
     pub(crate) fn write_clear_active_word(
@@ -659,7 +595,9 @@ where
         base: VIntId,
         clear_bits: u32,
     ) -> Result<u32, GicError> {
-        self.write_clear_bool_word_mask(scope, base.0 as usize, clear_bits, BoolField::Active)
+        self.update_bool_word(scope, base.0 as usize, BoolField::Active, |current| {
+            current & !clear_bits
+        })
     }
 
     pub(crate) fn read_priority_word_raw(

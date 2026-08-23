@@ -1103,6 +1103,33 @@ mod tests {
 
     const TEST_VCPUS: usize = 4;
 
+    #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
+    fn bool_word_updates_report_changed_masks() {
+        let mut state = common::irq_state::IrqState::<TEST_VCPUS>::new(2);
+
+        // Exercise both the banked local state and the global SPI word path.
+        for (scope, base) in [
+            (VgicIrqScope::Local(VcpuId(1)), VIntId(0)),
+            (VgicIrqScope::Global, VIntId(32)),
+        ] {
+            assert!(state.write_group_word(scope, base, 0b0011).unwrap());
+            assert!(!state.write_group_word(scope, base, 0b0011).unwrap());
+            assert_eq!(
+                state.write_set_enable_word(scope, base, 0b0110).unwrap(),
+                0b0110
+            );
+            assert_eq!(state.write_set_enable_word(scope, base, 0b0010).unwrap(), 0);
+            assert_eq!(
+                state.write_clear_enable_word(scope, base, 0b0011).unwrap(),
+                0b0010
+            );
+            assert_eq!(
+                state.write_clear_enable_word(scope, base, 0b0010).unwrap(),
+                0
+            );
+        }
+    }
+
     struct EnqueueLog {
         count: usize,
         last: Option<VirtualInterrupt>,
