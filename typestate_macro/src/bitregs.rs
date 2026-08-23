@@ -500,9 +500,7 @@ fn parse_items(input: ParseStream<'_>) -> Result<Vec<Item>> {
             Item::Field(parse_field(input, attrs)?)
         };
         items.push(item);
-        if input.peek(Token![,]) {
-            input.parse::<Token![,]>()?;
-        }
+        let _ = input.parse::<Option<Token![,]>>()?;
     }
     Ok(items)
 }
@@ -544,9 +542,7 @@ fn parse_enum(input: ParseStream<'_>) -> Result<EnumDef> {
             name: variant,
             value,
         });
-        if body.peek(Token![,]) {
-            body.parse::<Token![,]>()?;
-        }
+        let _ = body.parse::<Option<Token![,]>>()?;
     }
     Ok(EnumDef { name, variants })
 }
@@ -599,9 +595,7 @@ fn parse_union(input: ParseStream<'_>, _attrs: Vec<Attribute>) -> Result<Union> 
             name: view_name,
             items: parse_items(&view_body)?,
         });
-        if body.peek(Token![,]) {
-            body.parse::<Token![,]>()?;
-        }
+        let _ = body.parse::<Option<Token![,]>>()?;
     }
     Ok(Union { name, range, views })
 }
