@@ -238,6 +238,15 @@ mod tests {
     #[repr(transparent)]
     struct MaskedU32(u32);
 
+    /// Small-width wrappers keep each derive entry point exercised.
+    #[derive(Clone, Copy, typestate_macro::U8)]
+    #[repr(transparent)]
+    struct TestU8(u8);
+
+    #[derive(Clone, Copy, typestate_macro::U16)]
+    #[repr(transparent)]
+    struct TestU16(u16);
+
     #[cfg(target_has_atomic = "64")]
     #[derive(Copy, Clone, typestate_macro::U64)]
     #[repr(C)]
@@ -251,6 +260,12 @@ mod tests {
         let a_off = core::mem::offset_of!(PaddedU64, a);
         let b_off = core::mem::offset_of!(PaddedU64, b);
         byte == a_off || (b_off..(b_off + core::mem::size_of::<u32>())).contains(&byte)
+    }
+
+    #[test]
+    fn derive_small_widths_round_trip_raw_values() {
+        assert_eq!(<TestU8 as AtomicPod>::to_raw(TestU8(0x5a)), 0x5a);
+        assert_eq!(<TestU16 as AtomicPod>::from_raw(0x1234).0, 0x1234);
     }
 
     #[cfg(target_has_atomic = "64")]

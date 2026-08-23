@@ -109,36 +109,20 @@ fn parse_repr_flags(ast: &DeriveInput) -> Result<(bool, bool, bool)> {
     Ok((has_c, has_transparent, has_packed))
 }
 
-fn derive_width(
-    input: TokenStream,
-    derive_name: &'static str,
-    raw_name: &'static str,
-    width_trait_name: &'static str,
-) -> TokenStream {
+fn derive_width(input: TokenStream, width: usize) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
     let ident = &ast.ident;
+    let derive_name = format!("U{width}");
+    let raw_name = format!("u{width}");
+    let raw_ty = format_ident!("{raw_name}");
+    let width_trait_ident = format_ident!("{derive_name}");
+    let width_bytes = width / 8;
 
     let mask = match parse_atomic_pod_mask(&ast) {
         Ok(mask) => mask,
         Err(e) => return e.to_compile_error().into(),
     };
 
-    let raw_ty: syn::Type = match syn::parse_str(raw_name) {
-        Ok(ty) => ty,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    let width_trait_ident = format_ident!("{width_trait_name}");
-    let width_bytes = match raw_name {
-        "u8" => 1usize,
-        "u16" => 2usize,
-        "u32" => 4usize,
-        "u64" => 8usize,
-        _ => {
-            return Error::new(ast.span(), "unsupported width for derive")
-                .to_compile_error()
-                .into();
-        }
-    };
     let mask_expr = mask.map(|mask| {
         quote! {
             & {
@@ -148,9 +132,9 @@ fn derive_width(
         }
     });
 
-    let transparent_path = check_transparent_single_tuple_struct(&ast, derive_name);
+    let transparent_path = check_transparent_single_tuple_struct(&ast, &derive_name);
     if let Ok(inner_ty) = transparent_path {
-        if let Err(e) = ensure_exact_primitive(&inner_ty, raw_name, derive_name) {
+        if let Err(e) = ensure_exact_primitive(&inner_ty, &raw_name, &derive_name) {
             return e.to_compile_error().into();
         }
 
@@ -429,23 +413,23 @@ pub fn derive_rawreg(input: TokenStream) -> TokenStream {
 /// Derives [`typestate::U8`] for 8-bit atomic-compatible types.
 #[proc_macro_derive(U8, attributes(atomic_pod))]
 pub fn derive_u8(input: TokenStream) -> TokenStream {
-    derive_width(input, "U8", "u8", "U8")
+    derive_width(input, 8)
 }
 
 /// Derives [`typestate::U16`] for 16-bit atomic-compatible types.
 #[proc_macro_derive(U16, attributes(atomic_pod))]
 pub fn derive_u16(input: TokenStream) -> TokenStream {
-    derive_width(input, "U16", "u16", "U16")
+    derive_width(input, 16)
 }
 
 /// Derives [`typestate::U32`] for 32-bit atomic-compatible types.
 #[proc_macro_derive(U32, attributes(atomic_pod))]
 pub fn derive_u32(input: TokenStream) -> TokenStream {
-    derive_width(input, "U32", "u32", "U32")
+    derive_width(input, 32)
 }
 
 /// Derives [`typestate::U64`] for 64-bit atomic-compatible types.
 #[proc_macro_derive(U64, attributes(atomic_pod))]
 pub fn derive_u64(input: TokenStream) -> TokenStream {
-    derive_width(input, "U64", "u64", "U64")
+    derive_width(input, 64)
 }
