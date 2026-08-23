@@ -169,53 +169,28 @@ macro_rules! impl_atomic_raw_int {
 }
 
 #[cfg(target_has_atomic = "8")]
-mod impl8 {
-    use super::*;
-    use core::sync::atomic::AtomicBool;
-    use core::sync::atomic::AtomicI8;
-    use core::sync::atomic::AtomicU8;
-
-    impl_atomic_raw!(bool, AtomicBool);
-    impl_atomic_raw_int!(u8, AtomicU8);
-    impl_atomic_raw_int!(i8, AtomicI8);
-}
+impl_atomic_raw!(bool, core::sync::atomic::AtomicBool);
+#[cfg(target_has_atomic = "8")]
+impl_atomic_raw_int!(u8, core::sync::atomic::AtomicU8);
+#[cfg(target_has_atomic = "8")]
+impl_atomic_raw_int!(i8, core::sync::atomic::AtomicI8);
 
 #[cfg(target_has_atomic = "16")]
-mod impl16 {
-    use super::*;
-    use core::sync::atomic::AtomicI16;
-    use core::sync::atomic::AtomicU16;
-
-    impl_atomic_raw_int!(u16, AtomicU16);
-    impl_atomic_raw_int!(i16, AtomicI16);
-}
+impl_atomic_raw_int!(u16, core::sync::atomic::AtomicU16);
+#[cfg(target_has_atomic = "16")]
+impl_atomic_raw_int!(i16, core::sync::atomic::AtomicI16);
 
 #[cfg(target_has_atomic = "32")]
-mod impl32 {
-    use super::*;
-    use core::sync::atomic::AtomicI32;
-    use core::sync::atomic::AtomicU32;
-
-    impl_atomic_raw_int!(u32, AtomicU32);
-    impl_atomic_raw_int!(i32, AtomicI32);
-}
+impl_atomic_raw_int!(u32, core::sync::atomic::AtomicU32);
+#[cfg(target_has_atomic = "32")]
+impl_atomic_raw_int!(i32, core::sync::atomic::AtomicI32);
 
 #[cfg(target_has_atomic = "64")]
-mod impl64 {
-    use super::*;
-    use core::sync::atomic::AtomicI64;
-    use core::sync::atomic::AtomicU64;
-
-    impl_atomic_raw_int!(u64, AtomicU64);
-    impl_atomic_raw_int!(i64, AtomicI64);
-}
+impl_atomic_raw_int!(u64, core::sync::atomic::AtomicU64);
+#[cfg(target_has_atomic = "64")]
+impl_atomic_raw_int!(i64, core::sync::atomic::AtomicI64);
 
 #[cfg(target_has_atomic = "ptr")]
-mod implptr {
-    use super::*;
-    use core::sync::atomic::AtomicIsize;
-    use core::sync::atomic::AtomicUsize;
-
-    impl_atomic_raw_int!(usize, AtomicUsize);
-    impl_atomic_raw_int!(isize, AtomicIsize);
-}
+impl_atomic_raw_int!(usize, core::sync::atomic::AtomicUsize);
+#[cfg(target_has_atomic = "ptr")]
+impl_atomic_raw_int!(isize, core::sync::atomic::AtomicIsize);
