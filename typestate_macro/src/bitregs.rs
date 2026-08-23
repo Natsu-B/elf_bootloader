@@ -103,10 +103,7 @@ impl Input {
 
                 /// Replaces the raw value without applying reserved-bit policy.
                 #[inline]
-                pub const fn with_bits(mut self, bits: #raw) -> Self {
-                    self.0 = bits;
-                    self
-                }
+                pub const fn with_bits(self, bits: #raw) -> Self { Self(bits) }
 
                 /// Returns the unshifted mask and offset for a field descriptor.
                 #[inline]
