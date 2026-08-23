@@ -634,18 +634,16 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_IGROUPR_OFFSET..GICD_IGROUPR_END => {
                 let base_intid = ((offset - GICD_IGROUPR_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model.read_group_word(scope, VIntId(base_intid))?
                     & word_mask(base_intid, 32)
             }
             GICD_ISENABLER_OFFSET..GICD_ISENABLER_END => {
                 let base_intid = ((offset - GICD_ISENABLER_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_enable_word(scope, VIntId(base_intid))?
@@ -653,9 +651,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_ICENABLER_OFFSET..GICD_ICENABLER_END => {
                 let base_intid = ((offset - GICD_ICENABLER_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_enable_word(scope, VIntId(base_intid))?
@@ -663,9 +660,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_ISPENDR_OFFSET..GICD_ISPENDR_END => {
                 let base_intid = ((offset - GICD_ISPENDR_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_pending_word(scope, VIntId(base_intid))?
@@ -673,9 +669,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_ICPENDR_OFFSET..GICD_ICPENDR_END => {
                 let base_intid = ((offset - GICD_ICPENDR_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_pending_word(scope, VIntId(base_intid))?
@@ -683,9 +678,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_ISACTIVER_OFFSET..GICD_ISACTIVER_END => {
                 let base_intid = ((offset - GICD_ISACTIVER_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_active_word(scope, VIntId(base_intid))?
@@ -693,9 +687,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_ICACTIVER_OFFSET..GICD_ICACTIVER_END => {
                 let base_intid = ((offset - GICD_ICACTIVER_OFFSET) / 4) * 32;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_active_word(scope, VIntId(base_intid))?
@@ -766,9 +759,8 @@ impl<'a, M: VgicVmModel> Gicv2Frontend<'a, M> {
             }
             GICD_ICFGR_OFFSET..GICD_ICFGR_END => {
                 let base_intid = ((offset - GICD_ICFGR_OFFSET) / 4) * 16;
-                let scope = match Self::scope_for_intid(vcpu, base_intid) {
-                    Some(scope) => scope,
-                    None => return Ok(0),
+                let Some(scope) = Self::scope_for_intid(vcpu, base_intid) else {
+                    return Ok(0);
                 };
                 self.vgic_model
                     .read_trigger_word(scope, VIntId(base_intid))?
