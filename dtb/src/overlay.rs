@@ -45,21 +45,11 @@ pub enum OverlayError {
     StrictViolation,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OverlayApplyOptions {
     pub update_symbols: bool,
     pub allow_custom_deletes: bool,
     pub strict: bool,
-}
-
-impl Default for OverlayApplyOptions {
-    fn default() -> Self {
-        Self {
-            update_symbols: false,
-            allow_custom_deletes: false,
-            strict: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
