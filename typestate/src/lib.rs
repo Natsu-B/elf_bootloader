@@ -238,6 +238,13 @@ mod tests {
     #[repr(transparent)]
     struct TestReg(u32);
 
+    /// Transparent wrapper used to verify derive-time canonicalization masks.
+    /// Only its low 16 bits are valid in atomic storage.
+    #[derive(Clone, Copy, typestate_macro::U32)]
+    #[atomic_pod(mask = 0x0000_FFFF)]
+    #[repr(transparent)]
+    struct MaskedU32(u32);
+
     #[cfg(target_has_atomic = "64")]
     #[derive(Copy, Clone, typestate_macro::U64)]
     #[repr(C)]
@@ -349,5 +356,16 @@ mod tests {
         value /= TestReg(4);
         value %= TestReg(4);
         assert_eq!(value, TestReg(2));
+    }
+
+    /// Confirms that packing and unpacking apply the same raw-value mask.
+    #[test]
+    fn derive_u32_transparent_mask_canonicalizes_raw() {
+        // Both conversion directions must produce a canonical representation.
+        assert_eq!(
+            <MaskedU32 as AtomicPod>::to_raw(MaskedU32(u32::MAX)),
+            0xFFFF
+        );
+        assert_eq!(<MaskedU32 as AtomicPod>::from_raw(u32::MAX).0, 0xFFFF);
     }
 }

@@ -158,21 +158,20 @@ fn derive_width(
                 .into();
         }
     };
+    let mask_expr = if let Some(mask_lit) = mask {
+        quote! {
+            let mask: #raw_ty = #mask_lit;
+            canon &= mask;
+        }
+    } else {
+        quote! {}
+    };
 
     let transparent_path = check_transparent_single_tuple_struct(&ast, derive_name);
     if let Ok(inner_ty) = transparent_path {
         if let Err(e) = ensure_exact_primitive(&inner_ty, raw_name, derive_name) {
             return e.to_compile_error().into();
         }
-
-        let mask_expr = if let Some(mask_lit) = mask {
-            quote! {
-                let mask: #raw_ty = #mask_lit;
-                canon &= mask;
-            }
-        } else {
-            quote! {}
-        };
 
         let expanded = quote! {
             const _: [(); ::core::mem::size_of::<#ident>()] =
@@ -257,15 +256,6 @@ fn derive_width(
         .map(|f| f.ident.as_ref().expect("named field"))
         .collect();
     let field_tys: Vec<_> = fields.iter().map(|f| &f.ty).collect();
-
-    let mask_expr = if let Some(mask_lit) = mask {
-        quote! {
-            let mask: #raw_ty = #mask_lit;
-            canon &= mask;
-        }
-    } else {
-        quote! {}
-    };
 
     let expanded = quote! {
         const _: () = {
