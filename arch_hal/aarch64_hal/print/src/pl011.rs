@@ -1,4 +1,8 @@
+use core::convert::Infallible;
 use core::fmt;
+use io_api::serial::SerialByteIo;
+use io_api::serial::SerialIrqCtrl;
+use io_api::serial::SerialRxIrq;
 
 use typestate::ReadOnly;
 use typestate::ReadWrite;
@@ -396,11 +400,8 @@ impl Pl011Uart {
 
     /// Stop EL2-side UART interrupt ownership while leaving the UART configured.
     pub fn detach_for_guest_passthrough(&self) {
-        let mask = UARTIMSC::new()
-            .set(UARTIMSC::rxim, 1)
-            .set(UARTIMSC::rtim, 1)
-            .set(UARTIMSC::txim, 1);
-        self.disable_interrupts(mask);
+        self.set_rx_irq_enabled(false);
+        self.set_tx_irq_enabled(false);
         self.clear_interrupts(UARTICR::all());
     }
 
@@ -479,6 +480,51 @@ unsafe impl Send for Pl011Uart {}
 // SAFETY: Pl011Uart provides interior mutability over MMIO registers; callers must ensure
 // any concurrent access is synchronized at a higher level (e.g. by masking IRQs or locks).
 unsafe impl Sync for Pl011Uart {}
+
+impl SerialByteIo for Pl011Uart {
+    type Error = Infallible;
+
+    fn try_read_byte(&self) -> Option<u8> {
+        Pl011Uart::try_read_byte(self)
+    }
+
+    fn try_write_byte(&self, byte: u8) -> bool {
+        Pl011Uart::try_write_byte(self, byte)
+    }
+
+    fn flush(&self) -> Result<(), Self::Error> {
+        Pl011Uart::flush(self);
+        Ok(())
+    }
+}
+
+impl SerialRxIrq for Pl011Uart {
+    fn handle_rx_irq(&self, on_byte: &mut dyn FnMut(u8)) {
+        Pl011Uart::handle_rx_irq(self, &mut |byte| on_byte(byte));
+    }
+}
+
+impl SerialIrqCtrl for Pl011Uart {
+    fn set_rx_irq_enabled(&self, enabled: bool) {
+        let mask = UARTIMSC::new()
+            .set(UARTIMSC::rxim, 1)
+            .set(UARTIMSC::rtim, 1);
+        if enabled {
+            self.enable_interrupts(mask);
+        } else {
+            self.disable_interrupts(mask);
+        }
+    }
+
+    fn set_tx_irq_enabled(&self, enabled: bool) {
+        let mask = UARTIMSC::new().set(UARTIMSC::txim, 1);
+        if enabled {
+            self.enable_interrupts(mask);
+        } else {
+            self.disable_interrupts(mask);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
