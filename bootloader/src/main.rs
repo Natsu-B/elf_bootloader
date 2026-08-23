@@ -1686,16 +1686,7 @@ fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
     if settings.is_empty() {
         // If nothing is mapped as Normal, map everything as Device (fallback).
         // This should not happen in normal boot, but avoids indexing panic.
-        let parange = match cpu::get_parange().unwrap() {
-            cpu::registers::PARange::PA32bits4GB => 32,
-            cpu::registers::PARange::PA36bits64GB => 36,
-            cpu::registers::PARange::PA40bits1TB => 40,
-            cpu::registers::PARange::PA42bits4TB => 42,
-            cpu::registers::PARange::PA44bits16TB => 44,
-            cpu::registers::PARange::PA48bits256TB => 48,
-            cpu::registers::PARange::PA52bits4PB => 48,
-            cpu::registers::PARange::PA56bits64PB => 48,
-        };
+        let parange = pa_bits_from_parange(cpu::get_parange().unwrap()).min(48);
         let ipa_space = 1usize << parange;
         settings.push(EL2Stage1PagingSetting {
             va: 0,
@@ -1719,16 +1710,7 @@ fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
     }
 
     let last = settings.last().unwrap();
-    let parange = match cpu::get_parange().unwrap() {
-        cpu::registers::PARange::PA32bits4GB => 32,
-        cpu::registers::PARange::PA36bits64GB => 36,
-        cpu::registers::PARange::PA40bits1TB => 40,
-        cpu::registers::PARange::PA42bits4TB => 42,
-        cpu::registers::PARange::PA44bits16TB => 44,
-        cpu::registers::PARange::PA48bits256TB => 48,
-        cpu::registers::PARange::PA52bits4PB => 48,
-        cpu::registers::PARange::PA56bits64PB => 48,
-    };
+    let parange = pa_bits_from_parange(cpu::get_parange().unwrap()).min(48);
     let ipa_space = 1usize << parange;
     settings.push(EL2Stage1PagingSetting {
         va: last.va + last.size,
