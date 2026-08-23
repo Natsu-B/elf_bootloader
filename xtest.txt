@@ -31,6 +31,7 @@ uboot-unit gic arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot-unit aarch64_mutex arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot-unit elf-hypervisor arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh --bin elf-hypervisor
 uboot-unit rpi_boot arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh --bin rpi_boot
+uboot net arp_roundtrip arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot gic gicv2_pending arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot gic gicv2_vgic_pending arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot gic vgic_types arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
