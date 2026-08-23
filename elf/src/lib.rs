@@ -631,17 +631,11 @@ fn usize_from_u64(value: u64) -> Result<usize, ElfErr> {
 }
 
 fn read_u16_le(data: &[u8], offset: usize) -> Result<u16, ElfErr> {
-    let bytes = data
-        .get(offset..offset.checked_add(2).ok_or(ElfErr::Invalid)?)
-        .ok_or(ElfErr::TooShort)?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    read_u16(data, offset, ElfEndian::Little)
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, ElfErr> {
-    let bytes = data
-        .get(offset..offset.checked_add(4).ok_or(ElfErr::Invalid)?)
-        .ok_or(ElfErr::TooShort)?;
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    read_u32(data, offset, ElfEndian::Little)
 }
 
 fn read_u16(data: &[u8], offset: usize, endian: ElfEndian) -> Result<u16, ElfErr> {
