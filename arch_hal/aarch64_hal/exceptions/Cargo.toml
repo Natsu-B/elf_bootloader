@@ -9,7 +9,6 @@ doctest = false
 [dependencies]
 cpu = { path = "../cpu" }
 typestate = { path = "../../../typestate" }
-typestate_macro = { path = "../../../typestate_macro" }
 print = { path = "../print" }
 psci = { path = "../psci" }
 common = { path = "../common" }

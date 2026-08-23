@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 typestate = { path = "../../../typestate" }
-typestate_macro = { path = "../../../typestate_macro" }
 pci = { path = "../../../pci" }
 dtb = { path = "../../../dtb" }
 print = { path = "../print" }
