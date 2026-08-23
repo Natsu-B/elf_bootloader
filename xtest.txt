@@ -19,6 +19,7 @@ std net
 std pci
 std soc
 std typestate
+std typestate_macro
 std xtask
 unit gdb_remote
 
