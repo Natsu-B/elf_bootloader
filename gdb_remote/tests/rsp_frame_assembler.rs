@@ -42,7 +42,7 @@ fn rsp_frame_resync_on_dollar() {
 
 #[test]
 fn rsp_frame_ctrl_c() {
-    let mut assembler = RspFrameAssembler::new();
+    let mut assembler = RspFrameAssembler::default();
     let event = assembler.push(0x03);
     assert_eq!(event, RspFrameEvent::CtrlC);
 }

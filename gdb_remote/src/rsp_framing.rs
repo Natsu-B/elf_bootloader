@@ -22,14 +22,16 @@ pub(crate) enum RspFrameByteKind {
     Checksum,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum RspFrameState {
+    #[default]
     Idle,
     InFrame,
     Checksum(u8),
 }
 
 /// RSP frame assembler state machine.
+#[derive(Default)]
 pub struct RspFrameAssembler {
     state: RspFrameState,
 }
@@ -59,17 +61,11 @@ impl RspFrameAssembler {
                     self.state = RspFrameState::InFrame;
                     (RspFrameEvent::NeedMore, RspFrameByteKind::None)
                 }
-                0x03 => {
-                    self.state = RspFrameState::Idle;
-                    (RspFrameEvent::CtrlC, RspFrameByteKind::None)
-                }
+                0x03 => (RspFrameEvent::CtrlC, RspFrameByteKind::None),
                 _ => (RspFrameEvent::Ignore, RspFrameByteKind::None),
             },
             RspFrameState::InFrame => match byte {
-                b'$' => {
-                    self.state = RspFrameState::InFrame;
-                    (RspFrameEvent::Resync, RspFrameByteKind::None)
-                }
+                b'$' => (RspFrameEvent::Resync, RspFrameByteKind::None),
                 b'#' => {
                     self.state = RspFrameState::Checksum(0);
                     (RspFrameEvent::NeedMore, RspFrameByteKind::None)
@@ -90,11 +86,5 @@ impl RspFrameAssembler {
                 }
             }
         }
-    }
-}
-
-impl Default for RspFrameAssembler {
-    fn default() -> Self {
-        Self::new()
     }
 }
