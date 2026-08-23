@@ -332,27 +332,23 @@ impl<const N: usize> HwWatchpointTable<N> {
         seg_base: u64,
         seg_bas: u8,
     ) -> Option<usize> {
-        for (i, e) in self.slots.iter().enumerate() {
-            if e.used
-                && e.req_addr == req_addr
-                && e.req_len == req_len
-                && e.req_kind == req_kind
-                && e.seg_base == seg_base
-                && e.seg_bas == seg_bas
-            {
-                return Some(i);
-            }
-        }
-        None
+        self.slots.iter().position(|entry| {
+            entry.used
+                && entry.req_addr == req_addr
+                && entry.req_len == req_len
+                && entry.req_kind == req_kind
+                && entry.seg_base == seg_base
+                && entry.seg_bas == seg_bas
+        })
     }
 
     fn alloc(&mut self) -> Option<usize> {
-        for (i, e) in self.slots.iter().enumerate() {
-            if !e.used {
-                return Some(i);
-            }
-        }
-        None
+        self.slots.iter().position(|entry| !entry.used)
+    }
+
+    /// Returns the first hardware slot not referenced by a used segment.
+    fn free_hw_slot(&self, limit: usize) -> Option<usize> {
+        (0..limit).find(|&slot| !self.slots.iter().any(|e| e.used && e.slot == slot))
     }
 }
 
@@ -713,21 +709,7 @@ impl<M: MemoryAccess, const N: usize> Aarch64GdbState<M, N> {
             };
 
             let hw_slots = core::cmp::min(cpu::watchpoint_count(), DEFAULT_HW_BREAKPOINTS);
-            let mut hw_index = None;
-            'hw: for i in 0..hw_slots {
-                let mut used = false;
-                for e in self.hw_watchpoints.slots.iter() {
-                    if e.used && e.slot == i {
-                        used = true;
-                        break;
-                    }
-                }
-                if !used {
-                    hw_index = Some(i);
-                    break 'hw;
-                }
-            }
-            let Some(hw_index) = hw_index else {
+            let Some(hw_index) = self.hw_watchpoints.free_hw_slot(hw_slots) else {
                 self.rollback_watchpoint_segments(&installed, installed_n);
                 return Err(Aarch64GdbError::HwBreakpointSlotsExhausted);
             };
@@ -2071,6 +2053,20 @@ fn write_extra_regs_from<E>(
     let mdscr = MDSCR_EL1::from_bits(read_u64(&src[off..off + 8])?);
     cpu::set_mdscr_el1(mdscr);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
+    fn watchpoint_table_skips_used_hardware_slots() {
+        let mut table = HwWatchpointTable::<2>::new();
+        table.slots[0].used = true;
+        table.slots[0].slot = 0;
+        assert_eq!(table.free_hw_slot(2), Some(1));
+    }
 }
 
 // Run crate tests under the shared bare-metal U-Boot/QEMU harness.
