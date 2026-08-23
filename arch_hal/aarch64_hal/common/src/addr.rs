@@ -1,86 +1,37 @@
-#[repr(transparent)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PhysAddr(usize);
+// Address domains share representation and arithmetic while remaining distinct types.
+macro_rules! define_addr {
+    ($($name:ident),+ $(,)?) => {$(
+        #[repr(transparent)]
+        #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        pub struct $name(usize);
 
-impl PhysAddr {
-    pub const fn new(value: usize) -> Self {
-        Self(value)
-    }
+        impl $name {
+            pub const fn new(value: usize) -> Self {
+                Self(value)
+            }
 
-    pub const fn as_usize(self) -> usize {
-        self.0
-    }
+            pub const fn as_usize(self) -> usize {
+                self.0
+            }
 
-    pub const fn checked_add(self, rhs: usize) -> Option<Self> {
-        match self.0.checked_add(rhs) {
-            Some(v) => Some(Self(v)),
-            None => None,
+            pub const fn checked_add(self, rhs: usize) -> Option<Self> {
+                match self.0.checked_add(rhs) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
+            }
+
+            pub const fn checked_sub(self, rhs: usize) -> Option<Self> {
+                match self.0.checked_sub(rhs) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
+            }
         }
-    }
-
-    pub const fn checked_sub(self, rhs: usize) -> Option<Self> {
-        match self.0.checked_sub(rhs) {
-            Some(v) => Some(Self(v)),
-            None => None,
-        }
-    }
+    )+};
 }
 
-#[repr(transparent)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct VirtAddr(usize);
-
-impl VirtAddr {
-    pub const fn new(value: usize) -> Self {
-        Self(value)
-    }
-
-    pub const fn as_usize(self) -> usize {
-        self.0
-    }
-
-    pub const fn checked_add(self, rhs: usize) -> Option<Self> {
-        match self.0.checked_add(rhs) {
-            Some(v) => Some(Self(v)),
-            None => None,
-        }
-    }
-
-    pub const fn checked_sub(self, rhs: usize) -> Option<Self> {
-        match self.0.checked_sub(rhs) {
-            Some(v) => Some(Self(v)),
-            None => None,
-        }
-    }
-}
-
-#[repr(transparent)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct IpaAddr(usize);
-
-impl IpaAddr {
-    pub const fn new(value: usize) -> Self {
-        Self(value)
-    }
-
-    pub const fn as_usize(self) -> usize {
-        self.0
-    }
-
-    pub const fn checked_add(self, rhs: usize) -> Option<Self> {
-        match self.0.checked_add(rhs) {
-            Some(v) => Some(Self(v)),
-            None => None,
-        }
-    }
-
-    pub const fn checked_sub(self, rhs: usize) -> Option<Self> {
-        match self.0.checked_sub(rhs) {
-            Some(v) => Some(Self(v)),
-            None => None,
-        }
-    }
-}
+define_addr!(PhysAddr, VirtAddr, IpaAddr);
 
 #[cfg(test)]
 mod tests {
