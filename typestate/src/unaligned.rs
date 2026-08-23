@@ -40,13 +40,13 @@ pub struct Unaligned<T>(T);
 /// Internal macro for unaligned volatile reads.
 ///
 /// Reads a value from an unaligned memory location using byte-wise I/O.
+/// Raw-pointer-derived places are evaluated inside the macro's unsafe block.
 #[macro_export]
 macro_rules! unalign_read {
     ($v:expr => $ty:ty) => {
         unsafe {
-            let _: $ty = $v;
-
-            <$ty>::read(::core::ptr::addr_of!($v))
+            let ptr: *const $ty = ::core::ptr::addr_of!($v);
+            <$ty>::read(ptr)
         }
     };
 }
@@ -56,68 +56,12 @@ macro_rules! unalign_read {
 /// Writes a value to an unaligned memory location using byte-wise I/O.
 #[macro_export]
 macro_rules! unalign_write {
-    ($v:expr => WriteOnly<Unaligned<$t:ty>>, $val:expr) => {{
-        {
-            let _: &WriteOnly<Unaligned<$t>> = &$v;
-        }
-        unsafe { <WriteOnly<Unaligned<$t>>>::write(::core::ptr::addr_of_mut!($v), $val) };
-    }};
-    ($v:expr => ReadWrite<Unaligned<$t:ty>>, $val:expr) => {{
-        {
-            let _: &ReadWrite<Unaligned<$t>> = &$v;
-        }
-        unsafe { <ReadWrite<Unaligned<$t>>>::write(::core::ptr::addr_of_mut!($v), $val) };
-    }};
-    ($v:expr => $ty:ty, $val:expr) => {{
-        {
-            let _: &mut $ty = &mut $v;
-        }
-        unsafe { <$ty>::write(::core::ptr::addr_of_mut!($v), $val) };
-    }};
-}
-
-impl<T: Copy + RawReg> Unaligned<T> {
-    /// Reads from an unaligned location using unaligned-safe load.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
-    /// - The memory need not be aligned for `T`.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { read_unaligned(ptr) }.0
-    }
-
-    /// Writes to an unaligned location using unaligned-safe store.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
-    /// - The memory need not be aligned for `T`.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe { write_unaligned(ptr, Unaligned(val)) };
-    }
-}
-
-impl<T: Copy + RawReg> Le<Unaligned<T>> {
-    /// Reads a little-endian value from an unaligned location.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { read_unaligned(ptr) }.0.0.from_le()
-    }
-
-    /// Writes a little-endian value to an unaligned location.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
+    ($v:expr => $ty:ty, $val:expr) => {
         unsafe {
-            write_unaligned(ptr, Le(Unaligned(val.to_le())));
+            let ptr: *mut $ty = ::core::ptr::addr_of_mut!($v);
+            <$ty>::write(ptr, $val);
         }
-    }
+    };
 }
 
 mod volatile {
@@ -150,34 +94,50 @@ mod volatile {
     }
 }
 
-impl<T: Copy + RawReg> Be<Unaligned<T>> {
-    /// Reads a big-endian value from an unaligned location.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { read_unaligned(ptr) }.0.0.from_be()
-    }
-
-    /// Writes a big-endian value to an unaligned location.
-    ///
-    /// # Safety
-    /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            write_unaligned(ptr, Be(Unaligned(val.to_be())));
-        }
-    }
-}
-
 /// Implements byte-wise volatile I/O for one unaligned storage representation.
 ///
 /// All wrapper layers are transparent; casting their raw pointer reaches `T`
 /// without a reference, then volatile helpers access it one byte at a time.
+/// Direct storage methods remain non-volatile and use unaligned loads/stores;
+/// only capability wrappers perform byte-wise volatile access.
 macro_rules! impl_unaligned_access {
     ($t:ident, $storage:ty, $from:ident, $to:ident) => {
+        impl<$t: Copy + RawReg> $storage {
+            /// Reads a value through an unaligned-safe load.
+            ///
+            /// Endianness conversion follows the storage representation.
+            /// Transparent wrapper layout preserves the pointed-to byte address.
+            /// This is a plain memory read; MMIO callers use capability wrappers.
+            ///
+            /// # Safety
+            /// - `ptr` must point to valid, readable memory for `size_of::<T>()` bytes.
+            /// - The memory need not be aligned for `T`.
+            /// - Every wrapper layer must retain `Unaligned<T>`'s transparent layout.
+            #[inline]
+            pub unsafe fn read(ptr: *const Self) -> $t {
+                let val = unsafe { read_unaligned(ptr.cast::<Unaligned<$t>>()) }.0;
+                impl_unaligned_access!(@convert val, $from)
+            }
+
+            /// Writes a value through an unaligned-safe store.
+            ///
+            /// Endianness conversion follows the storage representation.
+            /// Transparent wrapper layout preserves the pointed-to byte address.
+            /// This is a plain memory write; MMIO callers use capability wrappers.
+            ///
+            /// # Safety
+            /// - `ptr` must point to valid, writable memory for `size_of::<T>()` bytes.
+            /// - The memory need not be aligned for `T`.
+            /// - Every wrapper layer must retain `Unaligned<T>`'s transparent layout.
+            #[inline]
+            pub unsafe fn write(ptr: *mut Self, val: $t) {
+                let val = impl_unaligned_access!(@convert val, $to);
+                unsafe {
+                    write_unaligned(ptr.cast::<Unaligned<$t>>(), Unaligned(val));
+                }
+            }
+        }
+
         impl_unaligned_access!(@read $t, $storage, $from; ReadOnly, ReadPure, ReadWrite);
         impl_unaligned_access!(@write $t, $storage, $to; WriteOnly, ReadWrite);
     };
@@ -220,6 +180,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unalign_macros_evaluate_places_once_and_support_packed_fields() {
+        const VALUE: u32 = 0x1234_5678;
+        // The counter makes a second evaluation of the indexed place observable.
+        let calls = core::cell::Cell::new(0);
+        let index = || {
+            calls.set(calls.get() + 1);
+            0
+        };
+        let mut values = [Le(Unaligned(0u32))];
+
+        unalign_write!(values[index()] => Le<Unaligned<u32>>, VALUE);
+        assert_eq!(calls.replace(0), 1);
+        assert_eq!(unalign_read!(values[index()] => Le<Unaligned<u32>>), VALUE);
+        assert_eq!(calls.get(), 1);
+
+        // Packed fields ensure the macros never form an intermediate reference.
+        #[repr(C, packed)]
+        struct Packed {
+            write_only: WriteOnly<Unaligned<u32>>,
+            read_write: ReadWrite<Unaligned<u32>>,
+        }
+        let mut packed = Packed {
+            write_only: WriteOnly(core::cell::UnsafeCell::new(Unaligned(0))),
+            read_write: ReadWrite(core::cell::UnsafeCell::new(Unaligned(0))),
+        };
+        // Exercise both write-only and read/write inherent entry points.
+        unalign_write!(packed.write_only => WriteOnly<Unaligned<u32>>, VALUE);
+        unalign_write!(packed.read_write => ReadWrite<Unaligned<u32>>, VALUE);
+        assert_eq!(
+            unalign_read!(packed.read_write => ReadWrite<Unaligned<u32>>),
+            VALUE
+        );
+    }
+
+    #[test]
     fn access_wrappers_support_misaligned_buffers() {
         #[repr(align(4))]
         struct Buffer([u8; 5]);
@@ -228,6 +223,9 @@ mod tests {
         let data = unsafe { bytes.0.as_mut_ptr().add(1) };
         macro_rules! check {
             ($storage:ty, $expected:expr) => {{
+                unsafe { <$storage>::write(data.cast(), VALUE) };
+                assert_eq!(&bytes.0[1..], &$expected);
+                assert_eq!(unsafe { <$storage>::read(data.cast_const().cast()) }, VALUE);
                 unsafe { WriteOnly::<$storage>::write(data.cast(), VALUE) };
                 assert_eq!(&bytes.0[1..], &$expected);
                 let read = unsafe { ReadOnly::<$storage>::read(data.cast_const().cast()) };
