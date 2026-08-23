@@ -550,8 +550,7 @@ fn copy_required_same_path_subtree(
     path: &str,
     error: &'static str,
 ) -> Result<NodeId, &'static str> {
-    let source_id = source.find_node_by_path(path).ok_or(error)?;
-    copy_subtree_to_path(source, target, source_id, path)
+    copy_optional_same_path_subtree(source, target, path)?.ok_or(error)
 }
 
 fn copy_optional_same_path_subtree(
@@ -572,12 +571,7 @@ fn copy_required_soc_child(
     child_name: &str,
     error: &'static str,
 ) -> Result<NodeId, &'static str> {
-    let source_path = source_soc_child_path(source, child_name)?;
-    let source_id = source.find_node_by_path(&source_path).ok_or(error)?;
-    let target_path = format!("{TARGET_SOC_PATH}/{child_name}");
-    let target_id = copy_subtree_to_path(source, target, source_id, &target_path)?;
-    rewrite_soc_child_reg_from_source(source_parser, &source_path, target, target_id)?;
-    Ok(target_id)
+    copy_optional_soc_child(source, source_parser, target, child_name)?.ok_or(error)
 }
 
 fn copy_optional_soc_child(
