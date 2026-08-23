@@ -1,5 +1,4 @@
 use core::cell::SyncUnsafeCell;
-use core::ffi::c_void;
 
 use crate::emulation;
 use crate::emulation::hpfar_el2_written_for_abort;
@@ -30,18 +29,10 @@ pub struct InstructionAbortInfo {
     pub ifsc: Option<u64>,
 }
 
-#[derive(Copy, Clone)]
-pub struct DataAbortHandlerEntry {
-    pub ctx: *mut c_void,
-    pub handler: DataAbortHandler,
-}
-
-// SAFETY: The handler callbacks must be thread-safe, and
-// `ctx` must remain valid for concurrent access while the handler is in use.
-unsafe impl Sync for DataAbortHandlerEntry {}
-
-pub type DataAbortHandler =
-    fn(*mut c_void, &mut Registers, &DataAbortInfo, Option<&emulation::MmioDecoded>);
+/// Handles a decoded data abort.
+///
+/// Registered handlers must support concurrent invocation on multiple cores.
+pub type DataAbortHandler = fn(&mut Registers, &DataAbortInfo, Option<&emulation::MmioDecoded>);
 pub type DebugExceptionHandler = fn(&mut Registers, ExceptionClass);
 pub type SysRegTrapHandler = fn(&mut Registers, &SysRegTrapInfo);
 pub type TrappedWfHandler = fn(&mut Registers, &TrappedWfInfo);
@@ -102,15 +93,15 @@ static SYNCHRONOUS_HANDLER: SyncUnsafeCell<SynchronousHandler> =
     });
 
 struct SynchronousHandler {
-    data_abort_func: Option<DataAbortHandlerEntry>,
+    data_abort_func: Option<DataAbortHandler>,
     debug_func: Option<DebugExceptionHandler>,
     sysreg_trap_func: Option<SysRegTrapHandler>,
     instruction_abort_func: Option<InstructionAbortHandler>,
     trapped_wf_func: Option<TrappedWfHandler>,
 }
 
-pub fn set_data_abort_handler(entry: DataAbortHandlerEntry) {
-    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.data_abort_func = Some(entry);
+pub fn set_data_abort_handler(handler: DataAbortHandler) {
+    unsafe { &mut *SYNCHRONOUS_HANDLER.get() }.data_abort_func = Some(handler);
 }
 
 pub fn set_debug_handler(handler: DebugExceptionHandler) {
@@ -150,7 +141,7 @@ pub(crate) extern "C" fn synchronous_handler(reg: *mut Registers) {
                     let decoded = emulation::decode_mmio(&*reg, &info);
 
                     match unsafe { &*SYNCHRONOUS_HANDLER.get() }.data_abort_func {
-                        Some(entry) => (entry.handler)(entry.ctx, reg, &info, decoded.as_ref()),
+                        Some(handler) => handler(reg, &info, decoded.as_ref()),
                         None => panic!("Data Abort handler is not registered"),
                     }
                 }

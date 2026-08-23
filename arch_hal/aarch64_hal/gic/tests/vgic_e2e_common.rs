@@ -5,7 +5,6 @@ extern crate alloc;
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
 use core::arch::asm;
-use core::ffi::c_void;
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
@@ -16,7 +15,6 @@ use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::TI;
 use exceptions::registers::WriteNotRead;
-use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
 use exceptions::synchronous_handler::TrappedWfInfo;
 use gic::BinaryPoint;
@@ -222,11 +220,6 @@ enum TestPpi27Mode {
 static DELEGATE: TestVgicDelegate = TestVgicDelegate;
 static VGIC: VgicManager<1> = VgicManager::new(&DELEGATE, 0);
 
-static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
-    ctx: ptr::null_mut(),
-    handler: el2_data_abort_handler,
-};
-
 static HEAP_READY: AtomicBool = AtomicBool::new(false);
 static ALLOCATOR: allocator::DefaultAllocator = allocator::DefaultAllocator::new();
 
@@ -370,7 +363,7 @@ fn run_el2_with_ppi27_mode(
 }
 
 fn install_el2_handlers() {
-    exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
+    exceptions::synchronous_handler::set_data_abort_handler(el2_data_abort_handler);
     exceptions::irq_handler::set_irq_handler(el2_irq_handler);
     exceptions::synchronous_handler::set_trapped_wf_handler(el2_trapped_wf_handler);
 }
@@ -782,7 +775,6 @@ fn handle_test_ctrl_data_abort(regs: &mut cpu::Registers, info: &DataAbortInfo, 
 }
 
 fn el2_data_abort_handler(
-    _ctx: *mut c_void,
     regs: &mut cpu::Registers,
     info: &DataAbortInfo,
     _decoded: Option<&exceptions::emulation::MmioDecoded>,

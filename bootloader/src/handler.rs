@@ -26,7 +26,6 @@ use arch_hal::psci::PsciFunctionId;
 use arch_hal::psci::PsciReturnCode;
 use arch_hal::timer;
 use core::cell::SyncUnsafeCell;
-use core::ffi::c_void;
 use core::hint::spin_loop;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
@@ -34,7 +33,6 @@ use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::TI;
 use exceptions::registers::WriteNotRead;
-use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
 use exceptions::synchronous_handler::InstructionAbortInfo;
 use exceptions::synchronous_handler::TrappedWfInfo;
@@ -43,11 +41,6 @@ use gdb_remote::WatchpointKind;
 struct PassthroughMmio;
 
 static PASSTHROUGH_MMIO: PassthroughMmio = PassthroughMmio;
-
-static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
-    ctx: core::ptr::null_mut(),
-    handler: data_abort_handler,
-};
 
 static GICV2: SyncUnsafeCell<Option<Gicv2>> = SyncUnsafeCell::new(None);
 static GDB_UART_INTID: SyncUnsafeCell<Option<u32>> = SyncUnsafeCell::new(None);
@@ -93,7 +86,7 @@ impl MemfaultTrapSkipLog {
 }
 
 pub(crate) fn setup_handler() {
-    exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
+    exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
     exceptions::synchronous_handler::set_debug_handler(debug::handle_debug_exception);
     exceptions::synchronous_handler::set_sysreg_trap_handler(
         crate::vbar_watch::sysreg_trap_handler,
@@ -249,7 +242,6 @@ fn decoded_mmio_is_allowlisted(decoded: &MmioDecoded) -> bool {
 }
 
 fn data_abort_handler(
-    _ctx: *mut c_void,
     regs: &mut cpu::Registers,
     info: &DataAbortInfo,
     decoded: Option<&MmioDecoded>,

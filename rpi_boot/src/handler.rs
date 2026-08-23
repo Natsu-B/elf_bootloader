@@ -19,7 +19,6 @@ use arch_hal::psci::PsciReturnCode;
 use arch_hal::psci::default_psci_handler;
 use arch_hal::psci::{self};
 use arch_hal::tls;
-use core::ffi::c_void;
 use core::ptr::read_volatile;
 use core::ptr::write_volatile;
 use core::sync::atomic::Ordering;
@@ -27,7 +26,6 @@ use exceptions::registers::ESR_EL2;
 use exceptions::registers::InstructionRegisterSize;
 use exceptions::registers::SyndromeAccessSize;
 use exceptions::registers::WriteNotRead;
-use exceptions::synchronous_handler::DataAbortHandlerEntry;
 use exceptions::synchronous_handler::DataAbortInfo;
 use mutex::pod::RawAtomicPod;
 
@@ -42,7 +40,7 @@ use crate::vgic;
 use crate::virtio_blk;
 
 pub(crate) fn setup_handler() {
-    exceptions::synchronous_handler::set_data_abort_handler(DATA_ABORT_HANDLER);
+    exceptions::synchronous_handler::set_data_abort_handler(data_abort_handler);
     exceptions::irq_handler::set_irq_handler(irq_handler);
 
     // intercept guest PSCI CPU_ON for hypervisor-controlled AP bring-up.
@@ -171,7 +169,6 @@ fn write_guest_mmio_dest_reg(
 }
 
 fn data_abort_handler(
-    _ctx: *mut c_void,
     regs: &mut cpu::Registers,
     info: &DataAbortInfo,
     decoded: Option<&MmioDecoded>,
@@ -614,11 +611,6 @@ fn irq_handler(_regs: &mut cpu::Registers) {
 }
 
 static PASSTHROUGH_MMIO: PassthroughMmio = PassthroughMmio;
-
-static DATA_ABORT_HANDLER: DataAbortHandlerEntry = DataAbortHandlerEntry {
-    ctx: core::ptr::null_mut(),
-    handler: data_abort_handler,
-};
 
 fn log_uart_write(plan: &MmioDecoded, regs: &cpu::Registers) {
     let (ipa, desc) = match plan {
