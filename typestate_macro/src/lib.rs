@@ -77,17 +77,8 @@ fn parse_atomic_pod_mask(ast: &DeriveInput) -> Result<Option<syn::LitInt>> {
                 if mask.is_some() {
                     return Err(meta.error("duplicate `mask` in #[atomic_pod(...)]"));
                 }
-                let lit: syn::Lit = meta.value()?.parse()?;
-                match lit {
-                    syn::Lit::Int(mask_lit) => {
-                        mask = Some(mask_lit);
-                        Ok(())
-                    }
-                    other => Err(Error::new(
-                        other.span(),
-                        "`mask` must be an integer literal",
-                    )),
-                }
+                mask = Some(meta.value()?.parse()?);
+                Ok(())
             } else {
                 Err(meta.error("unsupported key in #[atomic_pod(...)] (expected `mask`)"))
             }
@@ -148,14 +139,14 @@ fn derive_width(
                 .into();
         }
     };
-    let mask_expr = if let Some(mask_lit) = mask {
+    let mask_expr = mask.map(|mask| {
         quote! {
-            let mask: #raw_ty = #mask_lit;
-            canon &= mask;
+            & {
+                let mask: #raw_ty = #mask;
+                mask
+            }
         }
-    } else {
-        quote! {}
-    };
+    });
 
     let transparent_path = check_transparent_single_tuple_struct(&ast, derive_name);
     if let Ok(inner_ty) = transparent_path {
@@ -184,9 +175,7 @@ fn derive_width(
 
                 #[inline]
                 fn canonicalize_raw(raw: Self::Raw) -> Self::Raw {
-                    let mut canon = raw;
-                    #mask_expr
-                    canon
+                    raw #mask_expr
                 }
             }
 
@@ -313,9 +302,7 @@ fn derive_width(
 
             #[inline]
             fn canonicalize_raw(raw: Self::Raw) -> Self::Raw {
-                let mut canon = raw & Self::__TYPESTATE_ATOMIC_POD_CANON_MASK;
-                #mask_expr
-                canon
+                (raw & Self::__TYPESTATE_ATOMIC_POD_CANON_MASK) #mask_expr
             }
         }
 
