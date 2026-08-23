@@ -695,6 +695,7 @@ impl Validator {
         let mut names = HashSet::new();
         for view in &union.views {
             ensure_unique_name(&mut names, &view.name, "view name")?;
+            // View policies validate layout; only root policies define register encoding.
             self.partition(&view.items, mask, view.name.span(), "union view")?;
         }
         Ok(())
