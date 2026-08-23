@@ -2030,42 +2030,30 @@ fn parse_be_u32_triplet(
 }
 
 fn find_gpio_controller_base(dtb: &DtbParser, phandle: u32) -> Result<usize, SdhcError> {
-    let mut found = None;
-    let walk = dtb.for_each_node_view(&mut |node| {
-        let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
-        let secondary = node
-            .property_u32_be("linux,phandle")
-            .map_err(WalkError::Dtb)?;
-        if primary != Some(phandle) && secondary != Some(phandle) {
-            return Ok(core::ops::ControlFlow::Continue(()));
-        }
-        if !node
-            .compatible_contains("brcm,brcmstb-gpio")
-            .map_err(WalkError::Dtb)?
-        {
-            return Err(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: invalid supply gpio controller",
-            )));
-        }
-        let (base, _size) = node
-            .reg_iter()
-            .map_err(WalkError::Dtb)?
-            .next()
-            .ok_or(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: missing supply gpio reg",
-            )))?
-            .map_err(WalkError::Dtb)?;
-        found = Some(base);
-        Ok(core::ops::ControlFlow::Break(()))
-    });
-    match walk {
-        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => found
-            .ok_or(SdhcError::DtbInvalid(
-                "sdhc: supply gpio controller not found",
-            )),
-        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
-        Err(WalkError::User(err)) => Err(err),
-    }
+    dtb.with_node_view_by_phandle(phandle, &mut |node| {
+        // Keep semantic errors typed while the DTB helper owns traversal errors.
+        Ok::<_, &'static str>((|| {
+            if !node
+                .compatible_contains("brcm,brcmstb-gpio")
+                .map_err(SdhcError::DtbParse)?
+            {
+                return Err(SdhcError::DtbInvalid(
+                    "sdhc: invalid supply gpio controller",
+                ));
+            }
+            let (base, _size) = node
+                .reg_iter()
+                .map_err(SdhcError::DtbParse)?
+                .next()
+                .ok_or(SdhcError::DtbInvalid("sdhc: missing supply gpio reg"))?
+                .map_err(SdhcError::DtbParse)?;
+            Ok(base)
+        })())
+    })
+    .map_err(SdhcError::DtbParse)?
+    .ok_or(SdhcError::DtbInvalid(
+        "sdhc: supply gpio controller not found",
+    ))?
 }
 
 fn parse_gpio_line_config(
@@ -2093,83 +2081,55 @@ fn parse_vqmmc_supply(
         return Ok(None);
     };
 
-    let mut found = None;
-    let walk = dtb.for_each_node_view(&mut |node| {
-        let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
-        let secondary = node
-            .property_u32_be("linux,phandle")
-            .map_err(WalkError::Dtb)?;
-        if primary != Some(supply_phandle) && secondary != Some(supply_phandle) {
-            return Ok(core::ops::ControlFlow::Continue(()));
-        }
-        if !node
-            .compatible_contains("regulator-gpio")
-            .map_err(WalkError::Dtb)?
-        {
-            return Err(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: invalid vqmmc regulator",
-            )));
-        }
-        let gpios = node
-            .property_bytes("gpios")
-            .map_err(WalkError::Dtb)?
-            .ok_or(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: missing vqmmc gpios property",
-            )))?;
-        let states = node
-            .property_bytes("states")
-            .map_err(WalkError::Dtb)?
-            .ok_or(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: missing vqmmc states property",
-            )))?;
-        if states.len() < (size_of::<u32>() * 2)
-            || !states.len().is_multiple_of(size_of::<u32>() * 2)
-        {
-            return Err(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: invalid vqmmc states property",
-            )));
-        }
-        let desired_uv = node
-            .property_u32_be("regulator-max-microvolt")
-            .map_err(WalkError::Dtb)?
-            .unwrap_or(SDHC_3V3_MICROVOLTS);
-        let settle_us = node
-            .property_u32_be("regulator-settling-time-us")
-            .map_err(WalkError::Dtb)?
-            .unwrap_or(0);
-        let mut fallback = None;
-        let mut selected = None;
-        for chunk in states.chunks_exact(size_of::<u32>() * 2) {
-            let microvolts = u32::from_be_bytes(chunk[0..4].try_into().map_err(|_| {
-                WalkError::User(SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"))
-            })?);
-            let gpio_state = u32::from_be_bytes(chunk[4..8].try_into().map_err(|_| {
-                WalkError::User(SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"))
-            })?);
-            fallback = Some(gpio_state != 0);
-            if microvolts == desired_uv {
-                selected = Some(gpio_state != 0);
-            }
-        }
-        found = Some((
-            GpioOutputConfig {
-                line: parse_gpio_line_config(dtb, gpios, "sdhc: invalid vqmmc gpios property")
-                    .map_err(WalkError::User)?,
-                logical_high: selected.or(fallback).ok_or(WalkError::User(
-                    SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"),
-                ))?,
-            },
-            settle_us,
-        ));
-        Ok(core::ops::ControlFlow::Break(()))
-    });
-    match walk {
-        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => found
-            .map(Some)
-            .ok_or(SdhcError::DtbInvalid("sdhc: vqmmc regulator not found")),
-        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
-        Err(WalkError::User(err)) => Err(err),
+    let node = dtb
+        .find_node_view_by_phandle(supply_phandle)
+        .map_err(SdhcError::DtbParse)?
+        .ok_or(SdhcError::DtbInvalid("sdhc: vqmmc regulator not found"))?;
+    if !node
+        .compatible_contains("regulator-gpio")
+        .map_err(SdhcError::DtbParse)?
+    {
+        return Err(SdhcError::DtbInvalid("sdhc: invalid vqmmc regulator"));
     }
+    let gpios = node
+        .property_bytes("gpios")
+        .map_err(SdhcError::DtbParse)?
+        .ok_or(SdhcError::DtbInvalid("sdhc: missing vqmmc gpios property"))?;
+    let states = node
+        .property_bytes("states")
+        .map_err(SdhcError::DtbParse)?
+        .ok_or(SdhcError::DtbInvalid("sdhc: missing vqmmc states property"))?;
+    if states.len() < (size_of::<u32>() * 2) || !states.len().is_multiple_of(size_of::<u32>() * 2) {
+        return Err(SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"));
+    }
+    let desired_uv = node
+        .property_u32_be("regulator-max-microvolt")
+        .map_err(SdhcError::DtbParse)?
+        .unwrap_or(SDHC_3V3_MICROVOLTS);
+    let settle_us = node
+        .property_u32_be("regulator-settling-time-us")
+        .map_err(SdhcError::DtbParse)?
+        .unwrap_or(0);
+    let mut fallback = None;
+    let mut selected = None;
+    let invalid_states = |_| SdhcError::DtbInvalid("sdhc: invalid vqmmc states property");
+    for chunk in states.chunks_exact(size_of::<u32>() * 2) {
+        let microvolts = u32::from_be_bytes(chunk[0..4].try_into().map_err(invalid_states)?);
+        let gpio_state = u32::from_be_bytes(chunk[4..8].try_into().map_err(invalid_states)?);
+        fallback = Some(gpio_state != 0);
+        if microvolts == desired_uv {
+            selected = Some(gpio_state != 0);
+        }
+    }
+    Ok(Some((
+        GpioOutputConfig {
+            line: parse_gpio_line_config(dtb, gpios, "sdhc: invalid vqmmc gpios property")?,
+            logical_high: selected
+                .or(fallback)
+                .ok_or(SdhcError::DtbInvalid("sdhc: invalid vqmmc states property"))?,
+        },
+        settle_us,
+    )))
 }
 
 fn parse_vmmc_supply(
@@ -2183,47 +2143,28 @@ fn parse_vmmc_supply(
         return Ok(None);
     };
 
-    let mut found = None;
-    let walk = dtb.for_each_node_view(&mut |node| {
-        let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
-        let secondary = node
-            .property_u32_be("linux,phandle")
-            .map_err(WalkError::Dtb)?;
-        if primary != Some(supply_phandle) && secondary != Some(supply_phandle) {
-            return Ok(core::ops::ControlFlow::Continue(()));
-        }
-        if !node
-            .compatible_contains("regulator-fixed")
-            .map_err(WalkError::Dtb)?
-        {
-            return Err(WalkError::User(SdhcError::DtbInvalid(
-                "sdhc: invalid vmmc regulator",
-            )));
-        }
-        let gpios = match node.property_bytes("gpios").map_err(WalkError::Dtb)? {
-            Some(bytes) => Some(bytes),
-            None => node.property_bytes("gpio").map_err(WalkError::Dtb)?,
-        }
-        .ok_or(WalkError::User(SdhcError::DtbInvalid(
-            "sdhc: missing vmmc gpio property",
-        )))?;
-        found = Some(GpioOutputConfig {
-            line: parse_gpio_line_config(dtb, gpios, "sdhc: invalid vmmc gpio property")
-                .map_err(WalkError::User)?,
-            logical_high: node
-                .property_bytes("enable-active-high")
-                .map_err(WalkError::Dtb)?
-                .is_some(),
-        });
-        Ok(core::ops::ControlFlow::Break(()))
-    });
-    match walk {
-        Ok(core::ops::ControlFlow::Break(())) | Ok(core::ops::ControlFlow::Continue(())) => found
-            .map(Some)
-            .ok_or(SdhcError::DtbInvalid("sdhc: vmmc regulator not found")),
-        Err(WalkError::Dtb(err)) => Err(SdhcError::DtbParse(err)),
-        Err(WalkError::User(err)) => Err(err),
+    let node = dtb
+        .find_node_view_by_phandle(supply_phandle)
+        .map_err(SdhcError::DtbParse)?
+        .ok_or(SdhcError::DtbInvalid("sdhc: vmmc regulator not found"))?;
+    if !node
+        .compatible_contains("regulator-fixed")
+        .map_err(SdhcError::DtbParse)?
+    {
+        return Err(SdhcError::DtbInvalid("sdhc: invalid vmmc regulator"));
     }
+    let gpios = match node.property_bytes("gpios").map_err(SdhcError::DtbParse)? {
+        Some(bytes) => Some(bytes),
+        None => node.property_bytes("gpio").map_err(SdhcError::DtbParse)?,
+    }
+    .ok_or(SdhcError::DtbInvalid("sdhc: missing vmmc gpio property"))?;
+    Ok(Some(GpioOutputConfig {
+        line: parse_gpio_line_config(dtb, gpios, "sdhc: invalid vmmc gpio property")?,
+        logical_high: node
+            .property_bytes("enable-active-high")
+            .map_err(SdhcError::DtbParse)?
+            .is_some(),
+    }))
 }
 
 fn parse_power_from_view(
@@ -2609,7 +2550,8 @@ mod tests {
             "compatible",
             string_list(&["brcm,brcmstb-gpio"]),
         );
-        set_property(&mut tree, gpio, "phandle", u32_prop(0x5a));
+        // Exercise the Linux alias together with standard phandles below.
+        set_property(&mut tree, gpio, "linux,phandle", u32_prop(0x5a));
         set_property(&mut tree, gpio, "reg", reg_prop(&[(0x10_7d51_7c00, 0x40)]));
 
         let vqmmc = tree
@@ -2656,7 +2598,7 @@ mod tests {
             "compatible",
             string_list(&["regulator-fixed"]),
         );
-        set_property(&mut tree, vmmc, "phandle", u32_prop(0x0c));
+        set_property(&mut tree, vmmc, "linux,phandle", u32_prop(0x0c));
         set_property(&mut tree, vmmc, "enable-active-high", Vec::new());
         set_property(&mut tree, vmmc, "gpios", u32_list_prop(&[0x5a, 0x04, 0x00]));
 
