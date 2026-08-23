@@ -24,7 +24,7 @@ if [ ! -f "$FIRMWARE" ]; then
 fi
 
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64}
-GDB_BIN=${GDB_BIN:-gdb}
+GDB_BIN=${GDB_BIN:-$(command -v gdb-multiarch || command -v gdb)}
 UART_PORT=${UART_PORT:-12355}
 UART_TRANSPORT=${UART_TRANSPORT:-auto}
 
