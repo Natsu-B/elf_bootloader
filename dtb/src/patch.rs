@@ -201,26 +201,9 @@ fn compatible_contains(node: &crate::ast::Node<'_>, compat: &str) -> bool {
 }
 
 fn string_list_contains(bytes: &[u8], needle: &str) -> bool {
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|i| start + i)
-            .unwrap_or(bytes.len());
-        if end > start {
-            if let Ok(entry) = core::str::from_utf8(&bytes[start..end]) {
-                if entry == needle {
-                    return true;
-                }
-            }
-        }
-        if end == bytes.len() {
-            break;
-        }
-        start = end + 1;
-    }
-    false
+    bytes.split(|&byte| byte == 0).any(|entry| {
+        !entry.is_empty() && core::str::from_utf8(entry).is_ok_and(|entry| entry == needle)
+    })
 }
 
 fn property_u32(
@@ -341,6 +324,13 @@ mod tests {
             NameRef::Owned(key.to_string()),
             ValueRef::Owned(value.to_be_bytes().to_vec()),
         );
+    }
+
+    #[test]
+    fn string_lists_skip_empty_and_invalid_entries() {
+        let entries = b"\0\xff\0arm,pl011";
+        assert!(string_list_contains(entries, "arm,pl011"));
+        assert!(!string_list_contains(entries, ""));
     }
 
     #[test]
