@@ -44,21 +44,18 @@ pub struct Be<U: Copy + Clone>(pub(crate) U);
 /// Implements one endian conversion across the supported MMIO access wrappers.
 macro_rules! impl_endian {
     (
-        $endian:ident($from:ident, $to:ident);
+        $endian:ident($order:literal, $from:ident, $to:ident);
         readable: [$($readable:ident),+];
         writable: [$($writable:ident),+];
-        read: $read_doc:literal;
-        write: $write_doc:literal;
-        new: $new_doc:literal;
     ) => {
         impl<T: Copy + RawReg> $endian<T> {
-            #[doc = $read_doc]
+            #[doc = concat!("Reads a ", $order, " value and returns it in host endianness.")]
             #[inline]
             pub fn read(&self) -> T {
                 self.0.$from()
             }
 
-            #[doc = $write_doc]
+            #[doc = concat!("Writes a host-endian value after converting it to ", $order, ".")]
             #[inline]
             pub fn write(&mut self, val: T) {
                 self.0 = val.$to();
@@ -98,7 +95,7 @@ macro_rules! impl_endian {
         )+
 
         impl<T: RawReg> $endian<T> {
-            #[doc = $new_doc]
+            #[doc = concat!("Creates a new ", $order, " wrapper from a host-endian value.")]
             pub fn new(t: T) -> Self {
                 Self(t.$from())
             }
@@ -107,21 +104,15 @@ macro_rules! impl_endian {
 }
 
 impl_endian! {
-    Le(from_le, to_le);
+    Le("little-endian", from_le, to_le);
     readable: [ReadOnly, ReadPure, ReadWrite];
     writable: [WriteOnly, ReadWrite];
-    read: "Reads a little-endian value and returns it in host endianness.";
-    write: "Writes a host-endian value after converting it to little-endian.";
-    new: "Creates a new little-endian wrapper from a host-endian value.";
 }
 
 impl_endian! {
-    Be(from_be, to_be);
+    Be("big-endian", from_be, to_be);
     readable: [ReadOnly, ReadPure, ReadWrite];
     writable: [WriteOnly, ReadWrite];
-    read: "Reads a big-endian value and returns it in host endianness.";
-    write: "Writes a host-endian value after converting it to big-endian.";
-    new: "Creates a new big-endian wrapper from a host-endian value.";
 }
 
 #[cfg(test)]
