@@ -826,26 +826,17 @@ impl MemoryBlock {
 
         self.allocatable = false;
 
-        let reserved = match &self.reserved_regions.0 {
-            RegionData::Global(reserved) => reserved.as_slice(),
-            RegionData::Heap(items) => items,
-        };
-
-        for i in reserved.iter().take(self.reserved_region_size as usize) {
-            vec.push((i.address, i.size));
+        for region in self
+            .reserved_regions
+            .iter()
+            .take(self.reserved_region_size as usize)
+        {
+            vec.push((region.address, region.size));
         }
 
         // clean memory region (free list)
-        match &mut self.regions.0 {
-            RegionData::Global(buf) => {
-                buf.fill(EMPTY_REGION);
-                self.region_capacity = buf.len() as u32; // = 128
-            }
-            RegionData::Heap(slice) => {
-                slice.fill(EMPTY_REGION);
-                self.region_capacity = slice.len() as u32;
-            }
-        }
+        self.regions.fill(EMPTY_REGION);
+        self.region_capacity = self.regions.len() as u32; // 128 for inline storage.
         self.region_size = 0;
 
         self.allocatable = true;
