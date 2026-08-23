@@ -23,7 +23,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 
-    // Best-effort: rerun build script when HEAD/index changes (works for normal repo/worktree).
+    // Best-effort: rerun the build script when HEAD or the index changes.
+    // Git resolves normal repositories and linked worktrees to their metadata directory.
     if let Some(git_dir) = run_git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from) {
         let head = git_dir.join("HEAD");
         if head.exists() {
