@@ -312,17 +312,13 @@ impl<T: VirtioTransport> VirtIoCore<T> {
         &self,
         queue_idx: u16,
     ) -> Result<(u16, &'static mut VirtqDesc), VirtioErr> {
-        let Some(queue) = &self.queues else {
-            return Err(VirtioErr::DeviceUninitialized);
-        };
+        let queue = self.queues.as_ref().ok_or(VirtioErr::DeviceUninitialized)?;
         queue[queue_idx as usize].allocate_descriptor()
     }
 
     /// Adds a descriptor to the available ring and notifies the device.
     pub fn set_and_notify(&self, queue_idx: u16, desc_idx: u16) -> Result<(), VirtioErr> {
-        let Some(queue) = &self.queues else {
-            return Err(VirtioErr::DeviceUninitialized);
-        };
+        let queue = self.queues.as_ref().ok_or(VirtioErr::DeviceUninitialized)?;
         queue[queue_idx as usize].set_available_ring(desc_idx)?;
         // Ensure descriptor/ring writes are globally visible before notifying the device.
         // virtio requires a wmb() before MMIO notify; Release is sufficient here.
@@ -333,17 +329,13 @@ impl<T: VirtioTransport> VirtIoCore<T> {
 
     /// Pops a completed entry from the used ring.
     pub fn pop_used(&self, queue_idx: u16) -> Result<Option<(u16, u32)>, VirtioErr> {
-        let Some(queue) = &self.queues else {
-            return Err(VirtioErr::DeviceUninitialized);
-        };
+        let queue = self.queues.as_ref().ok_or(VirtioErr::DeviceUninitialized)?;
         queue[queue_idx as usize].pop_used()
     }
 
     /// Releases a used descriptor back to the free pool.
     pub fn dequeue_used(&self, queue_idx: u16, desc_idx: u16) -> Result<(), VirtioErr> {
-        let Some(queue) = &self.queues else {
-            return Err(VirtioErr::DeviceUninitialized);
-        };
+        let queue = self.queues.as_ref().ok_or(VirtioErr::DeviceUninitialized)?;
         queue[queue_idx as usize].dequeue_used(desc_idx)
     }
 
