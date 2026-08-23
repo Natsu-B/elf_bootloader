@@ -11,6 +11,10 @@ use core::slice;
 use intrusive_linked_list::IntrusiveLinkedList;
 
 pub(crate) const MINIMUM_ALLOCATABLE_BYTES: usize = size_of::<IntrusiveLinkedList>();
+const EMPTY_REGION: MemoryRegions = MemoryRegions {
+    address: 0,
+    size: 0,
+};
 
 fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
     if alignment == 0 {
@@ -77,18 +81,8 @@ impl fmt::Debug for MemoryBlock {
 impl MemoryBlock {
     pub fn init() -> MemoryBlock {
         MemoryBlock {
-            regions: RegionContainer(RegionData::Global(
-                [MemoryRegions {
-                    address: 0,
-                    size: 0,
-                }; 128],
-            )),
-            reserved_regions: RegionContainer(RegionData::Global(
-                [MemoryRegions {
-                    address: 0,
-                    size: 0,
-                }; 128],
-            )),
+            regions: RegionContainer(RegionData::Global([EMPTY_REGION; 128])),
+            reserved_regions: RegionContainer(RegionData::Global([EMPTY_REGION; 128])),
             region_size: 0,
             reserved_region_size: 0,
             region_capacity: 128,
@@ -218,10 +212,7 @@ impl MemoryBlock {
                     .ok_or("region size underflow")?;
 
                 regions_slice.copy_within(x + 1..*size_ref as usize, x);
-                regions_slice[*size_ref as usize - 1] = MemoryRegions {
-                    address: 0,
-                    size: 0,
-                };
+                regions_slice[*size_ref as usize - 1] = EMPTY_REGION;
                 *size_ref -= 1;
             }
         }
@@ -309,10 +300,7 @@ impl MemoryBlock {
 
                             // Remove the next_region
                             regions_slice.copy_within(x + 2..*size_ref as usize, x + 1);
-                            regions_slice[*size_ref as usize - 1] = MemoryRegions {
-                                address: 0,
-                                size: 0,
-                            };
+                            regions_slice[*size_ref as usize - 1] = EMPTY_REGION;
                             *size_ref -= 1;
                         } else {
                             // No overlap, just update size.
@@ -513,12 +501,7 @@ impl MemoryBlock {
         }
 
         // clean reserved memory region
-        self.reserved_regions = RegionContainer(RegionData::Global(
-            [MemoryRegions {
-                address: 0,
-                size: 0,
-            }; 128],
-        ));
+        self.reserved_regions = RegionContainer(RegionData::Global([EMPTY_REGION; 128]));
         self.reserved_region_size = 0;
 
         self.allocatable = true;
@@ -550,10 +533,7 @@ impl MemoryBlock {
                 regions.copy_within((idx + 1)..(self.region_size as usize), idx);
                 self.region_size -= 1;
                 let last_idx = self.region_size as usize;
-                regions[last_idx] = MemoryRegions {
-                    address: 0,
-                    size: 0,
-                };
+                regions[last_idx] = EMPTY_REGION;
             }
             (true, false) => {
                 regions[idx].address += subtracted_size;
@@ -682,10 +662,7 @@ impl MemoryBlock {
                     }
                     core::cmp::Ordering::Equal | core::cmp::Ordering::Greater => {
                         reserved.copy_within(i + 1..*rsize as usize, i);
-                        reserved[*rsize as usize - 1] = MemoryRegions {
-                            address: 0,
-                            size: 0,
-                        };
+                        reserved[*rsize as usize - 1] = EMPTY_REGION;
                         *rsize -= 1;
                     }
                 }
@@ -704,10 +681,7 @@ impl MemoryBlock {
                     match (starts_at_same, ends_at_same) {
                         (true, true) => {
                             reserved.copy_within(i + 1..*rsize as usize, i);
-                            reserved[*rsize as usize - 1] = MemoryRegions {
-                                address: 0,
-                                size: 0,
-                            };
+                            reserved[*rsize as usize - 1] = EMPTY_REGION;
                             *rsize -= 1;
                         }
                         (true, false) => {
@@ -864,17 +838,11 @@ impl MemoryBlock {
         // clean memory region (free list)
         match &mut self.regions.0 {
             RegionData::Global(buf) => {
-                buf.fill(MemoryRegions {
-                    address: 0,
-                    size: 0,
-                });
+                buf.fill(EMPTY_REGION);
                 self.region_capacity = buf.len() as u32; // = 128
             }
             RegionData::Heap(slice) => {
-                slice.fill(MemoryRegions {
-                    address: 0,
-                    size: 0,
-                });
+                slice.fill(EMPTY_REGION);
                 self.region_capacity = slice.len() as u32;
             }
         }
