@@ -1283,14 +1283,6 @@ fn run_guest_test_with_timeout(
     exit_code
 }
 
-fn run_uefi_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> i32 {
-    run_guest_test_with_timeout(cmd, label, timeout_secs, "UEFI test")
-}
-
-fn run_uboot_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> i32 {
-    run_guest_test_with_timeout(cmd, label, timeout_secs, "U-Boot test")
-}
-
 /// Owns a fresh per-test Cargo target directory and removes it on scope exit.
 struct UbootTargetDir(PathBuf);
 
@@ -1874,7 +1866,7 @@ fn test(args: &[String]) {
         let code = if let Some(ref socket) = gdb_socket {
             run_uefi_test_with_backtrace(cmd, &label, socket, 120)
         } else {
-            run_uefi_test_with_timeout(cmd, &label, 120)
+            run_guest_test_with_timeout(cmd, &label, 120, "UEFI test")
         };
 
         if code == 0 {
@@ -1951,7 +1943,7 @@ fn test(args: &[String]) {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let code = run_uboot_test_with_timeout(cmd, &label, 300);
+        let code = run_guest_test_with_timeout(cmd, &label, 300, "U-Boot test");
         if code == 0 {
             passed.push(label);
         } else {
@@ -2027,7 +2019,7 @@ fn test(args: &[String]) {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let code = run_uboot_test_with_timeout(cmd, &label, 300);
+        let code = run_guest_test_with_timeout(cmd, &label, 300, "U-Boot test");
         if code == 0 {
             passed.push(label);
         } else {
