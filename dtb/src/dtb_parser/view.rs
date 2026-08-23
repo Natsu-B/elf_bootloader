@@ -250,35 +250,28 @@ impl<'dtb, 's> DtbNodeView<'dtb, 's> {
     }
 
     pub fn ranges_iter(&self) -> Result<Option<RangesIter<'_>>, &'static str> {
-        let Some(prop) = self.property_bytes(Self::PROP_RANGES)? else {
-            return Ok(None);
-        };
-        if prop.is_empty() {
-            return Ok(None); // empty ranges => identity; iterator not needed
-        }
-        let parent_address_cells =
-            self.parent_cells(Self::PROP_ADDRESS_CELLS, 2, "ranges: missing parent")?;
-        let child_address_cells = self.address_cells_result()?;
-        let child_size_cells = self.size_cells_result()?;
-
-        RangesIter::new(
-            child_address_cells,
-            parent_address_cells,
-            child_size_cells,
-            prop,
-        )
-        .map(Some)
+        self.mapping_ranges_iter(Self::PROP_RANGES, "ranges: missing parent")
     }
 
     pub fn dma_ranges_iter(&self) -> Result<Option<RangesIter<'_>>, &'static str> {
-        let Some(prop) = self.property_bytes(Self::PROP_DMA_RANGES)? else {
+        self.mapping_ranges_iter(Self::PROP_DMA_RANGES, "dma-ranges: missing parent")
+    }
+
+    // Build an iterator for a non-empty address mapping property.
+    fn mapping_ranges_iter(
+        &self,
+        property: &str,
+        missing_parent: &'static str,
+    ) -> Result<Option<RangesIter<'_>>, &'static str> {
+        // Missing and empty mapping properties both denote identity.
+        let Some(prop) = self
+            .property_bytes(property)?
+            .filter(|prop| !prop.is_empty())
+        else {
             return Ok(None);
         };
-        if prop.is_empty() {
-            return Ok(None); // empty dma-ranges => identity; iterator not needed
-        }
         let parent_address_cells =
-            self.parent_cells(Self::PROP_ADDRESS_CELLS, 2, "dma-ranges: missing parent")?;
+            self.parent_cells(Self::PROP_ADDRESS_CELLS, 2, missing_parent)?;
         let child_address_cells = self.address_cells_result()?;
         let child_size_cells = self.size_cells_result()?;
 
