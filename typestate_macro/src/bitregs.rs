@@ -58,7 +58,7 @@ impl Input {
     #[allow(clippy::too_many_lines)]
     fn expand(self) -> Result<TokenStream> {
         let (width, raw) = self.register.raw_type()?;
-        Validator::new(width).validate(&self.register)?;
+        let (res0, res1) = Validator::new(width).validate(&self.register)?;
 
         let Register {
             attrs,
@@ -69,7 +69,6 @@ impl Input {
         } = self.register;
         let crate_path = self.crate_path;
         let raw_impl = crate::expand_rawreg_impl(&name, &raw, &crate_path);
-        let (res0, res1) = reserved_masks(&items)?;
 
         let mut fields = Vec::new();
         collect_fields(&items, &mut fields);
@@ -595,8 +594,8 @@ impl Validator {
         }
     }
 
-    /// Validates the root register partition.
-    fn validate(mut self, register: &Register) -> Result<()> {
+    /// Validates the root register partition and returns its reserved-bit masks.
+    fn validate(mut self, register: &Register) -> Result<(u128, u128)> {
         self.partition(
             &register.items,
             low_mask(self.width),
@@ -605,15 +604,16 @@ impl Validator {
         )
     }
 
-    /// Validates non-overlap and complete coverage within one partition.
+    /// Validates one partition and returns the masks set by its reserved policies.
     fn partition(
         &mut self,
         items: &[Item],
         expected: u128,
         span: proc_macro2::Span,
         kind: &str,
-    ) -> Result<()> {
+    ) -> Result<(u128, u128)> {
         let mut covered = 0;
+        let mut reserved = (0, 0);
         for item in items {
             let (range, span) = item.layout();
             let mask = range.mask(self.width, expected)?;
@@ -626,7 +626,11 @@ impl Validator {
             covered |= mask;
             match item {
                 Item::Field(field) => self.field(field)?,
-                Item::Reserved(_) => {}
+                Item::Reserved(item) => match &item.policy {
+                    ReservedPolicy::Zero => reserved.0 |= mask,
+                    ReservedPolicy::One => reserved.1 |= mask,
+                    ReservedPolicy::Preserve => {}
+                },
                 Item::Union(union) => self.union(union, mask)?,
             }
         }
@@ -639,7 +643,7 @@ impl Validator {
                 ),
             ));
         }
-        Ok(())
+        Ok(reserved)
     }
 
     /// Validates a field name and its optional inline enum.
@@ -708,24 +712,6 @@ fn ensure_unique_name(names: &mut HashSet<String>, name: &Ident, kind: &str) -> 
 /// Returns an all-ones mask of the requested width.
 fn low_mask(width: u32) -> u128 {
     1_u128.checked_shl(width).unwrap_or(0).wrapping_sub(1)
-}
-
-/// Collects top-level reserved policies; view policies describe interpretations only.
-fn reserved_masks(items: &[Item]) -> Result<(u128, u128)> {
-    let mut res0 = 0;
-    let mut res1 = 0;
-    for item in items {
-        let Item::Reserved(item) = item else {
-            continue;
-        };
-        let mask = item.range.mask(128, u128::MAX)?;
-        match &item.policy {
-            ReservedPolicy::Zero => res0 |= mask,
-            ReservedPolicy::One => res1 |= mask,
-            ReservedPolicy::Preserve => {}
-        }
-    }
-    Ok((res0, res1))
 }
 
 /// Flattens all view fields because their descriptors share the register type.
