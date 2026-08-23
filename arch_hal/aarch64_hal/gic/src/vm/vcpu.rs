@@ -418,6 +418,34 @@ impl<
         inner.sw_empty_lrs |= 1u64 << idx;
         Ok(())
     }
+
+    // Synchronize tracked software LRs with the selected EOI-maintenance policy.
+    fn sync_sw_lr_eoi_policy<H: VgicHw>(
+        hw: &H,
+        inner: &mut Inner<MAX_VCPUS, MAX_INTIDS, MAX_LRS, PENDING_CAP>,
+        num_lrs: usize,
+        overflow: bool,
+    ) -> Result<bool, GicError> {
+        let mut eligible = false;
+        for idx in 0..num_lrs {
+            if inner.in_lr[idx].is_none() {
+                continue;
+            }
+            let mut irq = hw.read_lr(idx)?;
+            inner.lr_state[idx] = irq.state();
+            if irq.is_hw() || irq.state() == IrqState::Inactive {
+                continue;
+            }
+            eligible = true;
+            let want_eoi = overflow || irq.vintid() >= LOCAL_INTID_COUNT as u32;
+            if irq.eoi_maintenance() != want_eoi {
+                irq.set_eoi_maintenance(want_eoi);
+                hw.write_lr(idx, irq)?;
+                inner.lr_state[idx] = irq.state();
+            }
+        }
+        Ok(eligible)
+    }
 }
 
 impl<
@@ -700,71 +728,17 @@ impl<
             let pending_remaining = !inner.pending.is_empty();
             // Re-read after refill to drive overflow arming/disarming decisions.
             let empties_now = (hw.empty_lr_bitmap()? | inner.sw_empty_lrs) & mask;
-            match eoi_mode {
-                EoiMode::DropAndDeactivate => {
-                    if pending_remaining && empties_now == 0 {
-                        // Overflow: no empty LR, pending queue non-empty. Arm EOI-maintenance on
-                        // in-flight SW LRs and KEEP it armed until the condition clears.
-                        if !inner.overflow_armed {
-                            let mut have_sw_inflight = false;
-                            let mut have_sw_eoi_armed = false;
-                            for idx in 0..num_lrs {
-                                if inner.in_lr[idx].is_some() {
-                                    let mut irq = hw.read_lr(idx)?;
-                                    inner.lr_state[idx] = irq.state();
-                                    if !irq.is_hw() && irq.state() != IrqState::Inactive {
-                                        have_sw_inflight = true;
-                                        if !irq.eoi_maintenance() {
-                                            irq.set_eoi_maintenance(true);
-                                            hw.write_lr(idx, irq)?;
-                                            inner.lr_state[idx] = irq.state();
-                                        }
-                                        if irq.eoi_maintenance() {
-                                            have_sw_eoi_armed = true;
-                                        }
-                                    }
-                                }
-                            }
-                            inner.overflow_armed = have_sw_inflight && have_sw_eoi_armed;
-                        }
-                    } else if inner.overflow_armed {
-                        // Condition cleared: restore EOI-maintenance to the policy default.
-                        for idx in 0..num_lrs {
-                            if inner.in_lr[idx].is_some() {
-                                let mut irq = hw.read_lr(idx)?;
-                                inner.lr_state[idx] = irq.state();
-                                if !irq.is_hw() && irq.state() != IrqState::Inactive {
-                                    let want_eoi = irq.vintid() >= LOCAL_INTID_COUNT as u32;
-                                    if irq.eoi_maintenance() != want_eoi {
-                                        irq.set_eoi_maintenance(want_eoi);
-                                        hw.write_lr(idx, irq)?;
-                                        inner.lr_state[idx] = irq.state();
-                                    }
-                                }
-                            }
-                        }
-                        inner.overflow_armed = false;
-                    }
-                }
-                EoiMode::DropOnly => {
-                    if inner.overflow_armed {
-                        for idx in 0..num_lrs {
-                            if inner.in_lr[idx].is_some() {
-                                let mut irq = hw.read_lr(idx)?;
-                                inner.lr_state[idx] = irq.state();
-                                if !irq.is_hw() && irq.state() != IrqState::Inactive {
-                                    let want_eoi = irq.vintid() >= LOCAL_INTID_COUNT as u32;
-                                    if irq.eoi_maintenance() != want_eoi {
-                                        irq.set_eoi_maintenance(want_eoi);
-                                        hw.write_lr(idx, irq)?;
-                                        inner.lr_state[idx] = irq.state();
-                                    }
-                                }
-                            }
-                        }
-                        inner.overflow_armed = false;
-                    }
-                }
+            let should_arm = matches!(eoi_mode, EoiMode::DropAndDeactivate)
+                && pending_remaining
+                && empties_now == 0;
+            if should_arm && !inner.overflow_armed {
+                // Overflow: no empty LR, pending queue non-empty. Keep EOI maintenance armed on
+                // in-flight software LRs until the condition or EOI mode changes.
+                inner.overflow_armed = Self::sync_sw_lr_eoi_policy(hw, &mut inner, num_lrs, true)?;
+            } else if !should_arm && inner.overflow_armed {
+                // Restore the default policy: only global software interrupts request EOI events.
+                Self::sync_sw_lr_eoi_policy(hw, &mut inner, num_lrs, false)?;
+                inner.overflow_armed = false;
             }
             hw.set_underflow_irq(pending_remaining)?;
         }
@@ -1770,15 +1744,20 @@ mod tests {
         let vcpu = TestVcpu::with_id(VcpuId(0));
         let hw = FakeHw::new(1);
         vcpu.set_resident(cpu::get_current_core_id()).unwrap();
-        hw.set_eoi_mode(EoiMode::DropOnly);
         vcpu.enqueue(make_irq(1, 0x20, false, None)).unwrap();
         vcpu.enqueue(make_irq(2, 0x18, false, None)).unwrap();
 
         vcpu.refill_lrs(&hw).unwrap();
         {
             let st = hw.state.borrow();
-            assert!(!st.lrs[0].eoi_maintenance());
+            assert!(st.lrs[0].eoi_maintenance());
         }
+
+        hw.set_eoi_mode(EoiMode::DropOnly);
+        vcpu.refill_lrs(&hw).unwrap();
+        let st = hw.state.borrow();
+        assert!(!st.lrs[0].eoi_maintenance());
+        drop(st);
         let inner = vcpu.inner.lock_irqsave();
         assert!(!inner.overflow_armed);
     }
