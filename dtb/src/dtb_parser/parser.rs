@@ -469,24 +469,8 @@ impl DtbParser<Validated> {
         phandle: u32,
         key: &str,
     ) -> Result<Option<u32>, &'static str> {
-        let result = self.for_each_node_view(&mut |node| {
-            let primary = node.property_u32_be("phandle").map_err(WalkError::Dtb)?;
-            let secondary = node
-                .property_u32_be("linux,phandle")
-                .map_err(WalkError::Dtb)?;
-            if primary == Some(phandle) || secondary == Some(phandle) {
-                let value = node.property_u32_be(key).map_err(WalkError::Dtb)?;
-                return Ok(ControlFlow::Break(value));
-            }
-            Ok(ControlFlow::Continue(()))
-        });
-
-        match result {
-            Ok(ControlFlow::Continue(())) => Ok(None),
-            Ok(ControlFlow::Break(value)) => Ok(value),
-            Err(WalkError::Dtb(e)) => Err(e),
-            Err(WalkError::User(())) => Err("property_u32_by_phandle: unexpected user error"),
-        }
+        self.with_node_view_by_phandle(phandle, &mut |node| node.property_u32_be(key))
+            .map(Option::flatten)
     }
 
     pub fn find_reserved_memory_node<E, F, D>(

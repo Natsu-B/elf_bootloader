@@ -282,6 +282,11 @@ mod tests {
         assert!(found);
 
         let phandle = parent_phandle.expect("interrupt-parent: missing phandle");
+        // The scalar lookup must resolve the controller selected by the child's phandle.
+        assert_eq!(
+            parser.property_u32_be_by_phandle(phandle, "#interrupt-cells"),
+            Ok(Some(3))
+        );
         let result = parser.with_node_view_by_phandle(phandle, &mut |ctrl| {
             assert!(ctrl.parent_address_cells().is_ok());
             assert!(ctrl.parent_size_cells().is_ok());
