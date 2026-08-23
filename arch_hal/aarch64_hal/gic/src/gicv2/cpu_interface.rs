@@ -23,21 +23,7 @@ impl GicCpuInterface for Gicv2 {
     fn init_cpu_interface(&self) -> Result<GicCpuCaps, GicError> {
         let security_ext = self.is_security_extension_implemented();
         // disable cpu interface
-        if security_ext {
-            self.gicc
-                .ctlr
-                .clear_bits(GICC_CTLR::new().set(GICC_CTLR::enable_grp1_non_secure, 1));
-        } else {
-            self.gicc.ctlr.clear_bits(
-                GICC_CTLR::new()
-                    .set(GICC_CTLR::enable_grp0, 1)
-                    .set(GICC_CTLR::enable_grp1, 1)
-                    .set(GICC_CTLR::ack_ctl, 1),
-            );
-        }
-
-        cpu::dsb_sy();
-        cpu::isb();
+        self.disable_cpu_interface(security_ext);
 
         // initialize banked Distributor state for SGI/PPI targeting
         self.init_banked_sgi_ppi_state()?;
@@ -94,20 +80,14 @@ impl GicCpuInterface for Gicv2 {
             self.gicc.ctlr.read().get(GICC_CTLR::eoi_mode_ns) != 0
         };
 
-        let (supports_group0, supports_group1) = if security_ext {
-            (false, true)
-        } else {
-            (true, true)
-        };
-
         cpu::dsb_sy();
         cpu::isb();
 
         Ok(GicCpuCaps {
             priority_bits: priority.count_ones() as u8,
             binary_points_min: binary_point as u8,
-            supports_group0,
-            supports_group1,
+            supports_group0: !security_ext,
+            supports_group1: true,
             supports_separate_binary_points: !security_ext,
             supports_deactivate,
         })
@@ -116,20 +96,7 @@ impl GicCpuInterface for Gicv2 {
     fn configure(&self, cfg: &crate::GicCpuConfig) -> Result<(), GicError> {
         let security_ext = self.is_security_extension_implemented();
         // disable cpu interface for configuration
-        if security_ext {
-            self.gicc
-                .ctlr
-                .clear_bits(GICC_CTLR::new().set(GICC_CTLR::enable_grp1_non_secure, 1));
-        } else {
-            self.gicc.ctlr.clear_bits(
-                GICC_CTLR::new()
-                    .set(GICC_CTLR::enable_grp0, 1)
-                    .set(GICC_CTLR::enable_grp1, 1)
-                    .set(GICC_CTLR::ack_ctl, 1),
-            );
-        };
-        cpu::dsb_sy();
-        cpu::isb();
+        self.disable_cpu_interface(security_ext);
 
         // priority mask
         self.set_priority_mask(cfg.priority_mask)?;
@@ -325,6 +292,20 @@ impl Gicv2 {
         } else {
             self.shadow_group(intid)
         }
+    }
+
+    fn disable_cpu_interface(&self, security_ext: bool) {
+        let enable_bits = if security_ext {
+            GICC_CTLR::new().set(GICC_CTLR::enable_grp1_non_secure, 1)
+        } else {
+            GICC_CTLR::new()
+                .set(GICC_CTLR::enable_grp0, 1)
+                .set(GICC_CTLR::enable_grp1, 1)
+                .set(GICC_CTLR::ack_ctl, 1)
+        };
+        self.gicc.ctlr.clear_bits(enable_bits);
+        cpu::dsb_sy();
+        cpu::isb();
     }
 
     fn ack_via_iar<F>(&self, spurious_action: F) -> Result<Option<AckedIrq>, GicError>
