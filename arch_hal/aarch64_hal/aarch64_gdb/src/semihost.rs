@@ -679,10 +679,7 @@ fn write_semihost_read<M: MemoryAccess>(
     }
 
     let mut buf = [0u8; SEMIHOST_READ_MAX];
-    let mut truncated = false;
-    let mut actual_len = 0usize;
-
-    match kind {
+    let (actual_len, truncated) = match kind {
         SemihostOp::Write0 => {
             let addr = req
                 .buf_ptr
@@ -696,14 +693,12 @@ fn write_semihost_read<M: MemoryAccess>(
             mem.read(addr, &mut buf[..read_len])
                 .map_err(|_| "mem_read")?;
             if let Some(pos) = buf[..read_len].iter().position(|&b| b == 0) {
-                actual_len = pos;
                 guard.read_done = true;
                 guard.read_offset = guard.read_offset.saturating_add(pos as u64 + 1);
-                truncated = false;
+                (pos, false)
             } else {
-                actual_len = read_len;
                 guard.read_offset = guard.read_offset.saturating_add(read_len as u64);
-                truncated = true;
+                (read_len, true)
             }
         }
         SemihostOp::Open | SemihostOp::Write => {
@@ -719,20 +714,15 @@ fn write_semihost_read<M: MemoryAccess>(
             let addr = req.buf_ptr.checked_add(offset).ok_or("addr_overflow")?;
             mem.read(addr, &mut buf[..read_len])
                 .map_err(|_| "mem_read")?;
-            actual_len = read_len;
             guard.read_offset = offset + read_len as u64;
-            truncated = guard.read_offset < total_len;
+            (read_len, guard.read_offset < total_len)
         }
         SemihostOp::Close => return Err("bad_op"),
-    }
+    };
 
     let _ = out.try_write_str("hex:");
     let _ = push_hex_bytes(out, &buf[..actual_len]);
-    if truncated {
-        let _ = out.try_write_str(" truncated=1\n");
-    } else {
-        let _ = out.try_write_str("\n");
-    }
+    let _ = out.try_write_str(if truncated { " truncated=1\n" } else { "\n" });
     Ok(())
 }
 
@@ -912,6 +902,21 @@ mod tests {
         guard.fileio_enabled = true;
     }
 
+    fn test_request(op: u32, buf_ptr: u64) -> SemihostRequest {
+        SemihostRequest {
+            op: u64::from(op),
+            args_ptr: 0,
+            insn_addr: 0,
+            pc_after: 0,
+            kind: semihost_op(u64::from(op)),
+            handle: 0,
+            buf_ptr,
+            len: 0,
+            mode: 0,
+            decoded_ok: true,
+        }
+    }
+
     struct BufMem {
         base: u64,
         data: [u8; 128],
@@ -966,21 +971,11 @@ mod tests {
     fn resume_gate_transitions() {
         reset_for_test();
         let req = SemihostRequest {
-            op: 0x04,
-            args_ptr: 0,
             insn_addr: 0x1000,
             pc_after: 0x1004,
-            kind: Some(SemihostOp::Write0),
-            handle: 0,
-            buf_ptr: 0x2000,
-            len: 0,
-            mode: 0,
-            decoded_ok: true,
+            ..test_request(SYS_WRITE0, 0x2000)
         };
-        {
-            let mut guard = SEMIHOST.lock_irqsave();
-            guard.start_request(req);
-        }
+        SEMIHOST.lock_irqsave().start_request(req);
         assert!(matches!(resume_gate(), ResumeGate::Hold));
         {
             let mut guard = SEMIHOST.lock_irqsave();
@@ -1026,27 +1021,32 @@ mod tests {
     }
 
     #[test]
+    fn monitor_read_advances_write0_chunks() {
+        reset_for_test();
+        let mut mem = BufMem::new(0x1000);
+        mem.write_at(0, b"abcd\0");
+        let req = test_request(SYS_WRITE0, 0x1000);
+        SEMIHOST.lock_irqsave().start_request(req);
+
+        for expected in [
+            b"hex:616263 truncated=1\n".as_slice(),
+            b"hex:64\n",
+            b"hex:\n",
+        ] {
+            let mut out = [0u8; 64];
+            let len = monitor_command("hp semihost read 3", &mut out, &mut mem).unwrap();
+            assert_eq!(&out[..len], expected);
+        }
+    }
+
+    #[test]
     fn fileio_write0_builds_fwrite_with_len() {
         reset_for_test();
         let mut mem = BufMem::new(0x1000);
         mem.write_at(0, b"hi\0");
 
-        let req = SemihostRequest {
-            op: SYS_WRITE0 as u64,
-            args_ptr: 0,
-            insn_addr: 0,
-            pc_after: 0,
-            kind: Some(SemihostOp::Write0),
-            handle: 0,
-            buf_ptr: 0x1000,
-            len: 0,
-            mode: 0,
-            decoded_ok: true,
-        };
-        {
-            let mut guard = SEMIHOST.lock_irqsave();
-            guard.start_request(req);
-        }
+        let req = test_request(SYS_WRITE0, 0x1000);
+        SEMIHOST.lock_irqsave().start_request(req);
 
         let mut out = [0u8; 64];
         let len = fileio_try_build_request(&mut mem, &mut out)
@@ -1060,21 +1060,11 @@ mod tests {
         reset_for_test();
         let mut mem = DummyMem;
         let req = SemihostRequest {
-            op: SYS_OPEN as u64,
-            args_ptr: 0,
-            insn_addr: 0,
-            pc_after: 0,
-            kind: Some(SemihostOp::Open),
-            handle: 0,
-            buf_ptr: 0x2000,
             len: 0x10,
             mode: 4,
-            decoded_ok: true,
+            ..test_request(SYS_OPEN, 0x2000)
         };
-        {
-            let mut guard = SEMIHOST.lock_irqsave();
-            guard.start_request(req);
-        }
+        SEMIHOST.lock_irqsave().start_request(req);
 
         let mut out = [0u8; 64];
         let len = fileio_try_build_request(&mut mem, &mut out)
@@ -1084,10 +1074,7 @@ mod tests {
 
         reset_for_test();
         let req = SemihostRequest { mode: 7, ..req };
-        {
-            let mut guard = SEMIHOST.lock_irqsave();
-            guard.start_request(req);
-        }
+        SEMIHOST.lock_irqsave().start_request(req);
         let mut out = [0u8; 64];
         let built = fileio_try_build_request(&mut mem, &mut out).unwrap();
         assert!(built.is_none());
@@ -1102,21 +1089,11 @@ mod tests {
         reset_for_test();
         let mut mem = DummyMem;
         let req = SemihostRequest {
-            op: SYS_WRITE as u64,
-            args_ptr: 0,
-            insn_addr: 0,
-            pc_after: 0,
-            kind: Some(SemihostOp::Write),
             handle: 3,
-            buf_ptr: 0x3000,
             len: 10,
-            mode: 0,
-            decoded_ok: true,
+            ..test_request(SYS_WRITE, 0x3000)
         };
-        {
-            let mut guard = SEMIHOST.lock_irqsave();
-            guard.start_request(req);
-        }
+        SEMIHOST.lock_irqsave().start_request(req);
         let mut out = [0u8; 64];
         let _ = fileio_try_build_request(&mut mem, &mut out).unwrap();
         fileio_on_reply(7, 0).expect("fileio reply failed");
