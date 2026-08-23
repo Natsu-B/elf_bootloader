@@ -15,7 +15,7 @@ dtb = { path = "../dtb" }
 allocator = { path = "../allocator" }
 typestate = { path = "../typestate" }
 file = { path = "../file" }
-arch_hal = { path = "../arch_hal" }
+arch_hal = { path = "../arch_hal", features = ["emergency-stack"] }
 gdb_remote = { path = "../gdb_remote" }
 mutex = { path = "../mutex" }
 io-api = { path = "../io_api" }

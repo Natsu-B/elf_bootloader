@@ -36,9 +36,11 @@ struct SavedFrame {
     spsr_el2: u64,
 }
 
-// SAFETY: This function touches the emergency stack so it is ready for use.
-// - The buffer has 'static lifetime and is properly aligned (16-byte).
-// - It is mapped as Normal memory in the Stage-1 page tables with identity mapping.
+/// Touches both ends of the emergency stack so it is ready for exception handling.
+///
+/// # Safety
+///
+/// The caller must ensure Stage-1 maps the static buffer as identity-mapped Normal memory.
 pub unsafe fn init_emergency_stack() {
     let stack_base = EMERGENCY_STACK.get() as *const EmergencyStack as usize;
     let stack_top = stack_base + EMERGENCY_STACK_SIZE;

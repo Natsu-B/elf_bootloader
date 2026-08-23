@@ -40,7 +40,6 @@ mod monitor;
 #[cfg(any(feature = "rpi4_net", feature = "virtio_net"))]
 mod net;
 mod softirq;
-mod stack_overflow;
 mod vbar;
 mod vbar_watch;
 mod vgic;
@@ -567,7 +566,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> ! {
         // SAFETY: emergency stack is initialized after Stage-1 is enabled.
         // The stack is mapped as Normal memory with identity mapping.
         unsafe {
-            stack_overflow::init_emergency_stack();
+            arch_hal::init_emergency_stack();
         }
         println!("Emergency stack initialized");
 

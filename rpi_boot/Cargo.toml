@@ -9,7 +9,7 @@ allocator = { path = "../allocator" }
 typestate = { path = "../typestate" }
 file = { path = "../file" }
 block-device-api = { path = "../file/block-device-api" }
-arch_hal = { path = "../arch_hal" }
+arch_hal = { path = "../arch_hal", features = ["emergency-stack"] }
 mutex = { path = "../mutex" }
 
 [target.'cfg(target_arch = "aarch64")'.dev-dependencies]

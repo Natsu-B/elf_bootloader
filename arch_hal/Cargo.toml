@@ -8,4 +8,5 @@ aarch64_hal = { path = "./aarch64_hal", optional = true, default-features = fals
 
 [features]
 default = ["dep:aarch64_hal", "aarch64_hal/paging"]
+emergency-stack = ["dep:aarch64_hal", "aarch64_hal/emergency-stack"]
 uefi-test = ["dep:aarch64_hal", "aarch64_hal/uefi-test"]

@@ -20,7 +20,6 @@ mod handler;
 mod multicore;
 mod pcie;
 mod platform_irq;
-mod stack_overflow;
 mod vgic;
 mod virtio_blk;
 
@@ -629,7 +628,7 @@ extern "C" fn main() -> ! {
     // SAFETY: emergency stack is initialized after Stage-1 is enabled.
     // The stack is mapped as Normal memory with identity mapping.
     unsafe {
-        stack_overflow::init_emergency_stack();
+        arch_hal::init_emergency_stack();
     }
     println!("Emergency stack initialized");
     println!("paging success!!!");

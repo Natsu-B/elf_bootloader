@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 default = ["paging"]
+emergency-stack = []
 paging = ["dep:paging"]
 uefi-test = ["dep:aarch64_test"]
 
