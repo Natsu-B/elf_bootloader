@@ -15,6 +15,7 @@ use core::ptr::NonNull;
 /// The list does not own the nodes; callers are responsible for ensuring
 /// node memory remains valid while in the list.
 #[repr(C)]
+#[derive(Default)]
 pub struct IntrusiveLinkedList {
     /// Pointer to the next node in the list, or `None` if this is the tail.
     next: Option<NonNull<IntrusiveLinkedList>>,
@@ -31,12 +32,6 @@ impl fmt::Debug for IntrusiveLinkedList {
             current = unsafe { node.as_ref().next };
         }
         list.finish()
-    }
-}
-
-impl Default for IntrusiveLinkedList {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
