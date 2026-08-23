@@ -9,6 +9,7 @@ use cpu::registers::PARange;
 
 use crate::PAGE_TABLE_SIZE;
 use crate::PagingErr;
+use crate::new_table;
 use crate::registers::HCR_EL2;
 use crate::stage2::descriptor::Stage2_48bitLeafDescriptor;
 use crate::stage2::descriptor::Stage2_48bitTableDescriptor;
@@ -237,21 +238,8 @@ impl Stage2Paging {
                 }
             } else {
                 // table descriptor
-                let next_level_table_addr = unsafe {
-                    alloc::alloc::alloc(Layout::from_size_align_unchecked(
-                        PAGE_TABLE_SIZE,
-                        PAGE_TABLE_SIZE,
-                    ))
-                };
-                if next_level_table_addr.is_null() {
-                    return Err(PagingErr::OutOfMemory);
-                }
-                let next_level_table_addr = next_level_table_addr as usize;
-                let next_level_table =
-                    unsafe { slice::from_raw_parts_mut(next_level_table_addr as *mut u64, 512) };
-                for j in &mut *next_level_table {
-                    *j = 0;
-                }
+                let next_level_table = new_table()?;
+                let next_level_table_addr = next_level_table.as_ptr() as usize;
                 debug_assert_eq!(table[idx], 0);
                 table[idx] =
                     Stage2_48bitTableDescriptor::new_descriptor(next_level_table_addr as u64);
@@ -316,21 +304,8 @@ impl Stage2Paging {
                 }
             } else {
                 // table descriptor
-                let next_level_table_addr = unsafe {
-                    alloc::alloc::alloc(Layout::from_size_align_unchecked(
-                        PAGE_TABLE_SIZE,
-                        PAGE_TABLE_SIZE,
-                    ))
-                };
-                if next_level_table_addr.is_null() {
-                    return Err(PagingErr::OutOfMemory);
-                }
-                let next_level_table_addr = next_level_table_addr as usize;
-                let next_level_table =
-                    unsafe { slice::from_raw_parts_mut(next_level_table_addr as *mut u64, 512) };
-                for j in &mut *next_level_table {
-                    *j = 0;
-                }
+                let next_level_table = new_table()?;
+                let next_level_table_addr = next_level_table.as_ptr() as usize;
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] =

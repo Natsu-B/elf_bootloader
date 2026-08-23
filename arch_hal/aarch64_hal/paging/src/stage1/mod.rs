@@ -1,11 +1,9 @@
-use core::alloc::Layout;
-use core::slice;
-
 use cpu::get_sctlr_el2;
 use cpu::isb;
 
 use crate::PAGE_TABLE_SIZE;
 use crate::PagingErr;
+use crate::new_table;
 use crate::registers::HCR_EL2;
 use crate::stage1::descriptors::Stage1_48bitLeafDescriptor;
 use crate::stage1::descriptors::Stage1_48bitTableDescriptor;
@@ -144,7 +142,7 @@ impl EL2Stage1Paging {
         data: &[EL2Stage1PagingSetting],
         top_table_level: i8,
     ) -> Result<usize, PagingErr> {
-        let table = Self::new_table()?;
+        let table = new_table()?;
 
         let top_level_offset = (3 - top_table_level) as usize * 9 + 12;
         let top_level = 1 << top_level_offset;
@@ -181,7 +179,7 @@ impl EL2Stage1Paging {
                 }
             } else {
                 // table descriptor
-                let next_level_table = Self::new_table()?;
+                let next_level_table = new_table()?;
                 table[idx] =
                     Stage1_48bitTableDescriptor::new_descriptor(next_level_table.as_ptr() as u64);
                 let start_va = va & !(top_level - 1);
@@ -251,7 +249,7 @@ impl EL2Stage1Paging {
                 }
             } else {
                 // table descriptor
-                let next_level_table = Self::new_table()?;
+                let next_level_table = new_table()?;
                 for j in &mut *next_level_table {
                     *j = 0;
                 }
@@ -297,22 +295,5 @@ impl EL2Stage1Paging {
         *va = data[*i].va;
         *size = data[*i].size;
         Ok(())
-    }
-
-    fn new_table() -> Result<&'static mut [u64], PagingErr> {
-        let table_addr = unsafe {
-            alloc::alloc::alloc(Layout::from_size_align_unchecked(
-                PAGE_TABLE_SIZE,
-                PAGE_TABLE_SIZE,
-            ))
-        };
-        if table_addr.is_null() {
-            return Err(PagingErr::OutOfMemory);
-        }
-        let table = unsafe { slice::from_raw_parts_mut(table_addr as usize as *mut u64, 512) };
-        for i in table.into_iter() {
-            *i = 0;
-        }
-        Ok(table)
     }
 }
