@@ -110,7 +110,13 @@ fn parse_repr_flags(ast: &DeriveInput) -> Result<(bool, bool, bool)> {
 }
 
 fn derive_width(input: TokenStream, width: usize) -> TokenStream {
-    let ast = parse_macro_input!(input as DeriveInput);
+    derive_width_impl(input, width)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn derive_width_impl(input: TokenStream, width: usize) -> Result<TokenStream2> {
+    let ast: DeriveInput = syn::parse(input)?;
     let ident = &ast.ident;
     let derive_name = format!("U{width}");
     let raw_name = format!("u{width}");
@@ -118,10 +124,7 @@ fn derive_width(input: TokenStream, width: usize) -> TokenStream {
     let width_trait_ident = format_ident!("{derive_name}");
     let width_bytes = width / 8;
 
-    let mask = match parse_atomic_pod_mask(&ast) {
-        Ok(mask) => mask,
-        Err(e) => return e.to_compile_error().into(),
-    };
+    let mask = parse_atomic_pod_mask(&ast)?;
 
     let mask_expr = mask.map(|mask| {
         quote! {
@@ -134,11 +137,9 @@ fn derive_width(input: TokenStream, width: usize) -> TokenStream {
 
     let transparent_path = check_transparent_single_tuple_struct(&ast, &derive_name);
     if let Ok(inner_ty) = transparent_path {
-        if let Err(e) = ensure_exact_primitive(&inner_ty, &raw_name, &derive_name) {
-            return e.to_compile_error().into();
-        }
+        ensure_exact_primitive(&inner_ty, &raw_name, &derive_name)?;
 
-        let expanded = quote! {
+        return Ok(quote! {
             const _: [(); ::core::mem::size_of::<#ident>()] =
                 [(); ::core::mem::size_of::<#raw_ty>()];
             const _: [(); ::core::mem::align_of::<#ident>()] =
@@ -164,53 +165,41 @@ fn derive_width(input: TokenStream, width: usize) -> TokenStream {
             }
 
             unsafe impl ::typestate::#width_trait_ident for #ident {}
-        };
-        return expanded.into();
+        });
     }
 
-    let (has_c, _, has_packed) = match parse_repr_flags(&ast) {
-        Ok(flags) => flags,
-        Err(e) => return e.to_compile_error().into(),
-    };
+    let (has_c, _, has_packed) = parse_repr_flags(&ast)?;
     if !has_c {
-        return Error::new(
+        return Err(Error::new(
             ident.span(),
             format!(
                 "#[derive({derive_name})] supports #[repr(transparent)] single-field tuple structs \
                  or #[repr(C)] named-field structs"
             ),
-        )
-        .to_compile_error()
-        .into();
+        ));
     }
     if has_packed {
-        return Error::new(
+        return Err(Error::new(
             ident.span(),
             format!("#[derive({derive_name})] does not support repr(packed)"),
-        )
-        .to_compile_error()
-        .into();
+        ));
     }
 
     let fields = match &ast.data {
         syn::Data::Struct(s) => match &s.fields {
             syn::Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
             _ => {
-                return Error::new(
+                return Err(Error::new(
                     s.fields.span(),
                     format!("#[derive({derive_name})] requires a named-field struct for repr(C)"),
-                )
-                .to_compile_error()
-                .into();
+                ));
             }
         },
         _ => {
-            return Error::new(
+            return Err(Error::new(
                 ast.span(),
                 format!("#[derive({derive_name})] only supports structs"),
-            )
-            .to_compile_error()
-            .into();
+            ));
         }
     };
 
@@ -220,7 +209,7 @@ fn derive_width(input: TokenStream, width: usize) -> TokenStream {
         .collect();
     let field_tys: Vec<_> = fields.iter().map(|f| &f.ty).collect();
 
-    let expanded = quote! {
+    Ok(quote! {
         const _: () = {
             assert!(::core::mem::size_of::<#ident>() <= #width_bytes);
             #( assert!(
@@ -291,8 +280,7 @@ fn derive_width(input: TokenStream, width: usize) -> TokenStream {
         }
 
         unsafe impl ::typestate::#width_trait_ident for #ident {}
-    };
-    expanded.into()
+    })
 }
 
 /// Derives [`typestate::BytePod`] for transparent tuple structs.
