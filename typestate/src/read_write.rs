@@ -101,8 +101,7 @@ where
     /// Sets the bits specified by `mask` (read-modify-write).
     #[inline]
     pub fn set_bits(&self, mask: T) {
-        let current = self.read();
-        self.write(current | mask);
+        self.write(self.read() | mask);
     }
 }
 
@@ -114,8 +113,7 @@ where
     /// Clears the bits specified by `mask` (read-modify-write).
     #[inline]
     pub fn clear_bits(&self, mask: T) {
-        let current = self.read();
-        self.write(current & !mask);
+        self.write(self.read() & !mask);
     }
 }
 
@@ -127,8 +125,7 @@ where
     /// Toggles the bits specified by `mask` (read-modify-write).
     #[inline]
     pub fn toggle_bits(&self, mask: T) {
-        let current: <ReadWrite<T> as Readable>::T = self.read();
-        self.write(current ^ mask);
+        self.write(self.read() ^ mask);
     }
 }
 
@@ -147,8 +144,7 @@ where
     /// Not suitable for clear-on-read registers.
     #[inline]
     pub fn update_bits(&self, mask: <Self as Readable>::T, value: <Self as Readable>::T) {
-        let current = self.read();
-        self.write((current & !mask) | (value & mask));
+        self.write((self.read() & !mask) | (value & mask));
     }
 }
 
