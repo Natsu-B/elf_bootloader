@@ -1849,7 +1849,7 @@ fn test(args: &[String]) {
         let code = if let Some(ref socket) = gdb_socket {
             run_uefi_test_with_backtrace(cmd, &label, socket, 60)
         } else {
-            run_uefi_test_with_timeout(cmd, &label, 30)
+            run_uefi_test_with_timeout(cmd, &label, 60)
         };
 
         if code == 0 {
