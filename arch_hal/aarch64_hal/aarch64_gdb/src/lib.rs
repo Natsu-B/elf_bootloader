@@ -400,7 +400,7 @@ pub struct Aarch64GdbState<M, const N: usize = DEFAULT_SW_BREAKPOINTS> {
 
 impl<M, const N: usize> Aarch64GdbState<M, N> {
     pub fn new(mem: M) -> Self {
-        let mut state = Self {
+        let state = Self {
             mem,
             breakpoints: SwBreakpointTable::new(),
             hw_breakpoints: HwBreakpointTable::new(),
