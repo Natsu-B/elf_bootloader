@@ -11,7 +11,7 @@ bitregs! {
         pub id@[7:0],
         pub next_ptr@[15:8],
         pub table_size@[26:16],
-        reserved@[29:26],
+        reserved@[29:27],
         pub function_mask@[30:30],
         pub msi_x_enable@[31:31],
     }
