@@ -218,7 +218,5 @@ pub(crate) fn read_be_u16(data: &[u8], offset: usize) -> u16 {
 }
 
 pub(crate) fn write_be_u16(data: &mut [u8], offset: usize, value: u16) {
-    let bytes = value.to_be_bytes();
-    data[offset] = bytes[0];
-    data[offset + 1] = bytes[1];
+    data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
 }
