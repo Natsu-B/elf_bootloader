@@ -138,6 +138,7 @@ macro_rules! impl_atomic_raw {
 
 macro_rules! impl_atomic_raw_int {
     ($raw:ty, $atomic:ty) => {
+        impl_atomic_raw!($raw, $atomic);
         impl AtomicRawInt for $raw {
             #[inline(always)]
             fn fetch_add(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
@@ -175,8 +176,6 @@ mod impl8 {
     use core::sync::atomic::AtomicU8;
 
     impl_atomic_raw!(bool, AtomicBool);
-    impl_atomic_raw!(u8, AtomicU8);
-    impl_atomic_raw!(i8, AtomicI8);
     impl_atomic_raw_int!(u8, AtomicU8);
     impl_atomic_raw_int!(i8, AtomicI8);
 }
@@ -187,8 +186,6 @@ mod impl16 {
     use core::sync::atomic::AtomicI16;
     use core::sync::atomic::AtomicU16;
 
-    impl_atomic_raw!(u16, AtomicU16);
-    impl_atomic_raw!(i16, AtomicI16);
     impl_atomic_raw_int!(u16, AtomicU16);
     impl_atomic_raw_int!(i16, AtomicI16);
 }
@@ -199,8 +196,6 @@ mod impl32 {
     use core::sync::atomic::AtomicI32;
     use core::sync::atomic::AtomicU32;
 
-    impl_atomic_raw!(u32, AtomicU32);
-    impl_atomic_raw!(i32, AtomicI32);
     impl_atomic_raw_int!(u32, AtomicU32);
     impl_atomic_raw_int!(i32, AtomicI32);
 }
@@ -211,8 +206,6 @@ mod impl64 {
     use core::sync::atomic::AtomicI64;
     use core::sync::atomic::AtomicU64;
 
-    impl_atomic_raw!(u64, AtomicU64);
-    impl_atomic_raw!(i64, AtomicI64);
     impl_atomic_raw_int!(u64, AtomicU64);
     impl_atomic_raw_int!(i64, AtomicI64);
 }
@@ -223,8 +216,6 @@ mod implptr {
     use core::sync::atomic::AtomicIsize;
     use core::sync::atomic::AtomicUsize;
 
-    impl_atomic_raw!(usize, AtomicUsize);
-    impl_atomic_raw!(isize, AtomicIsize);
     impl_atomic_raw_int!(usize, AtomicUsize);
     impl_atomic_raw_int!(isize, AtomicIsize);
 }
