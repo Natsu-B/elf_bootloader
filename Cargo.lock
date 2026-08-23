@@ -101,7 +101,6 @@ name = "cpu"
 version = "0.1.0"
 dependencies = [
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -151,7 +150,6 @@ dependencies = [
  "print",
  "psci",
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -204,7 +202,6 @@ dependencies = [
  "print",
  "tls",
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -240,7 +237,6 @@ dependencies = [
  "exceptions",
  "print",
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -248,7 +244,6 @@ name = "pci"
 version = "0.1.0"
 dependencies = [
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -258,7 +253,6 @@ dependencies = [
  "io-api",
  "mutex",
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -301,7 +295,6 @@ dependencies = [
  "file",
  "mutex",
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
@@ -317,7 +310,6 @@ dependencies = [
  "print",
  "timer",
  "typestate",
- "typestate_macro",
 ]
 
 [[package]]
