@@ -102,6 +102,30 @@ where
         unsafe { <T::Raw as AtomicRaw>::from_ptr(ptr) }
     }
 
+    /// Applies a read-modify-write operation during the non-atomic bring-up phase.
+    ///
+    /// # Exclusivity
+    ///
+    /// Callers select this path only while raw atomics are disabled. The phase's
+    /// exclusivity invariant makes the plain load and store one logical update.
+    /// The update closure runs once within that exclusive interval.
+    ///
+    /// # Ordering
+    ///
+    /// No ordering is applied because this mode provides no synchronization.
+    ///
+    /// # Return value
+    ///
+    /// The original raw value is converted after the store to match `fetch_*`.
+    #[inline(always)]
+    fn non_atomic_fetch_update(&self, update: impl FnOnce(T::Raw) -> T::Raw) -> T {
+        // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
+        let old = unsafe { *self.raw.get() };
+        // SAFETY: The same exclusive access covers the matching write.
+        unsafe { *self.raw.get() = update(old) };
+        T::from_raw(old)
+    }
+
     /// Loads the value with the specified ordering.
     #[inline]
     pub fn load(&self, order: Ordering) -> T {
@@ -170,12 +194,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::fetch_or(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let new = old | val.to_raw();
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| old | val.to_raw())
         }
     }
 
@@ -189,12 +208,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::fetch_and(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let new = old & val.to_raw();
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| old & val.to_raw())
         }
     }
 
@@ -208,12 +222,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRaw>::fetch_xor(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let new = old ^ val.to_raw();
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| old ^ val.to_raw())
         }
     }
 }
@@ -233,12 +242,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRawInt>::fetch_add(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let new = (Wrapping(old) + Wrapping(val.to_raw())).0;
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| (Wrapping(old) + Wrapping(val.to_raw())).0)
         }
     }
 
@@ -253,12 +257,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRawInt>::fetch_sub(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let new = (Wrapping(old) - Wrapping(val.to_raw())).0;
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| (Wrapping(old) - Wrapping(val.to_raw())).0)
         }
     }
 
@@ -286,12 +285,7 @@ where
                 }
             }
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let new = (Wrapping(old) * Wrapping(val.to_raw())).0;
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| (Wrapping(old) * Wrapping(val.to_raw())).0)
         }
     }
 
@@ -305,13 +299,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRawInt>::fetch_min(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let val_raw = val.to_raw();
-            let new = core::cmp::min(old, val_raw);
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| core::cmp::min(old, val.to_raw()))
         }
     }
 
@@ -325,13 +313,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRawInt>::fetch_max(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let val_raw = val.to_raw();
-            let new = core::cmp::max(old, val_raw);
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| core::cmp::max(old, val.to_raw()))
         }
     }
 
@@ -345,13 +327,7 @@ where
             let a = self.atomic_ref();
             T::from_raw(<T::Raw as AtomicRawInt>::fetch_nand(a, val.to_raw(), order))
         } else {
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            let old = unsafe { *self.raw.get() };
-            let val_raw = val.to_raw();
-            let new = !(old & val_raw);
-            // SAFETY: Non-atomic bring-up phase must ensure exclusive access externally.
-            unsafe { *self.raw.get() = new };
-            T::from_raw(old)
+            self.non_atomic_fetch_update(|old| !(old & val.to_raw()))
         }
     }
 }
@@ -454,6 +430,17 @@ mod tests {
             let prev = pod.fetch_add(1u8, Ordering::Relaxed);
             assert_eq!(prev, 0xFF);
             assert_eq!(pod.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn raw_atomic_pod_non_atomic_fetch_bitwise() {
+        crate::with_raw_atomics_mode(false, || {
+            let pod = RawAtomicPod::new(0b1010u8);
+            assert_eq!(pod.fetch_or(0b0101, Ordering::Relaxed), 0b1010);
+            assert_eq!(pod.fetch_and(0b1100, Ordering::Relaxed), 0b1111);
+            assert_eq!(pod.fetch_xor(0b1010, Ordering::Relaxed), 0b1100);
+            assert_eq!(pod.load(Ordering::Relaxed), 0b0110);
         });
     }
 
