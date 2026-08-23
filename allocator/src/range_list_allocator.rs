@@ -159,7 +159,6 @@ impl MemoryBlock {
 
         // Check for overlap with pre_region
         if x > 0 {
-            let _pre_region = &regions_slice[x - 1];
             if let Some(pre_end) = pre_region_end
                 && region.address <= pre_end
             {
@@ -681,15 +680,7 @@ impl MemoryBlock {
                             .ok_or("region end overflow")?;
                         region.size = region.size.checked_sub(size).ok_or("region end overflow")?;
                     }
-                    core::cmp::Ordering::Equal => {
-                        reserved.copy_within(i + 1..*rsize as usize, i);
-                        reserved[*rsize as usize - 1] = MemoryRegions {
-                            address: 0,
-                            size: 0,
-                        };
-                        *rsize -= 1;
-                    }
-                    core::cmp::Ordering::Greater => {
+                    core::cmp::Ordering::Equal | core::cmp::Ordering::Greater => {
                         reserved.copy_within(i + 1..*rsize as usize, i);
                         reserved[*rsize as usize - 1] = MemoryRegions {
                             address: 0,
