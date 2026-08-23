@@ -98,26 +98,15 @@ impl IntrusiveLinkedList {
     ///
     /// Returns `true` if the node was found and removed, `false` otherwise.
     pub fn remove_if(&mut self, ptr: usize) -> bool {
-        if let Some(head) = self.next
-            && head.as_ptr() as usize == ptr
-        {
-            // SAFETY: head is valid as it was in the list.
-            self.next = unsafe { head.as_ref().next };
-            return true;
-        }
-
-        let mut current = self.next;
-        while let Some(mut node) = current {
-            // SAFETY: node is valid as it is in the list.
-            if let Some(next_node) = unsafe { node.as_mut().next }
-                && next_node.as_ptr() as usize == ptr
-            {
-                // SAFETY: Both nodes are valid.
-                unsafe { node.as_mut() }.next = unsafe { next_node.as_ref().next };
+        let mut link = &mut self.next;
+        while let Some(mut node) = *link {
+            if node.as_ptr() as usize == ptr {
+                // SAFETY: The current link points to a valid list node.
+                *link = unsafe { node.as_ref().next };
                 return true;
             }
-            // SAFETY: node is valid.
-            current = unsafe { node.as_mut().next };
+            // SAFETY: The current link points to a valid list node.
+            link = unsafe { &mut node.as_mut().next };
         }
         false
     }
