@@ -1087,31 +1087,26 @@ fn rewrite_bootargs(existing: Option<&str>, pl011_uart_addr: usize) -> String {
     let mut args = String::new();
     let mut saw_rootwait = false;
 
-    if let Some(existing) = existing {
-        for token in existing.split_whitespace() {
-            if token.starts_with("console=")
-                || token.starts_with("earlycon=")
-                || token.starts_with("root=")
-                || token.starts_with("systemd.unit=")
-                || token.starts_with("systemd.wants=")
-                || token.starts_with("virtio_mmio.device=")
-                || GUEST_SYSTEMD_MASK_TOKENS.contains(&token)
-                || GUEST_SYSTEMD_BOOT_TOKENS.contains(&token)
-                || token == "plymouth.ignore-serial-console"
-            {
+    for token in existing.unwrap_or_default().split_whitespace() {
+        if token.starts_with("console=")
+            || token.starts_with("earlycon=")
+            || token.starts_with("root=")
+            || token.starts_with("systemd.unit=")
+            || token.starts_with("systemd.wants=")
+            || token.starts_with("virtio_mmio.device=")
+            || GUEST_SYSTEMD_MASK_TOKENS.contains(&token)
+            || GUEST_SYSTEMD_BOOT_TOKENS.contains(&token)
+            || token == "plymouth.ignore-serial-console"
+        {
+            continue;
+        }
+        if token == "rootwait" {
+            if saw_rootwait {
                 continue;
             }
-            if token == "rootwait" {
-                if saw_rootwait {
-                    continue;
-                }
-                saw_rootwait = true;
-            }
-            if !args.is_empty() {
-                args.push(' ');
-            }
-            args.push_str(token);
+            saw_rootwait = true;
         }
+        append_bootarg_token(&mut args, token);
     }
 
     let earlycon = format!("earlycon=pl011,0x{pl011_uart_addr:x}");
