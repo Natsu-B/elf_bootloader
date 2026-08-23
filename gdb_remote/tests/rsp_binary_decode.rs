@@ -1,12 +1,17 @@
 use core::convert::Infallible;
 use gdb_remote::GdbServer;
-use gdb_remote::ProcessResult;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
 use gdb_remote::decode_rsp_binary;
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
+#[path = "support/rsp.rs"]
+mod rsp;
+
+use rsp::drain_tx;
+use rsp::encode_packet;
+use rsp::feed_bytes;
+use rsp::next_payload;
 
 #[test]
 fn rsp_binary_decodes_escapes() {
@@ -38,13 +43,13 @@ fn rsp_binary_len_mismatch_returns_error() {
 
     let payload = b"X0,4:abc";
     let mut packet = [0u8; 64];
-    let packet_len = encode_packet(&mut packet, payload);
-    feed_bytes(&mut server, &mut target, &packet[..packet_len]);
+    let packet_len = encode_packet(&mut packet, payload).expect("packet buffer should fit");
+    assert!(feed_bytes(&mut server, &mut target, &packet[..packet_len]));
 
     let mut tx = [0u8; 128];
     let tx_len = drain_tx(&mut server, &mut tx);
     let mut payload_buf = [0u8; 16];
-    let Some(reply_len) = next_payload(&tx[..tx_len], &mut payload_buf) else {
+    let Some(reply_len) = next_payload(&tx[..tx_len], &mut 0, &mut payload_buf) else {
         panic!("missing reply payload");
     };
 
@@ -66,8 +71,8 @@ fn rsp_binary_x_write_ok_and_idempotent() {
     idx += encoded.len();
 
     let mut packet = [0u8; 64];
-    let packet_len = encode_packet(&mut packet, &payload[..idx]);
-    feed_bytes(&mut server, &mut target, &packet[..packet_len]);
+    let packet_len = encode_packet(&mut packet, &payload[..idx]).expect("packet buffer should fit");
+    assert!(feed_bytes(&mut server, &mut target, &packet[..packet_len]));
 
     assert_eq!(target.write_calls, 1);
     assert_eq!(target.last_addr, 0);
@@ -77,12 +82,12 @@ fn rsp_binary_x_write_ok_and_idempotent() {
     let mut tx = [0u8; 128];
     let tx_len = drain_tx(&mut server, &mut tx);
     let mut payload_buf = [0u8; 16];
-    let Some(reply_len) = next_payload(&tx[..tx_len], &mut payload_buf) else {
+    let Some(reply_len) = next_payload(&tx[..tx_len], &mut 0, &mut payload_buf) else {
         panic!("missing reply payload");
     };
     assert_eq!(&payload_buf[..reply_len], b"OK");
 
-    feed_bytes(&mut server, &mut target, &packet[..packet_len]);
+    assert!(feed_bytes(&mut server, &mut target, &packet[..packet_len]));
     assert_eq!(target.write_calls, 2);
     assert_eq!(&target.last_data[..target.last_len], b"#$}*");
 }
@@ -152,82 +157,4 @@ impl Target for DummyTarget {
     fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
         Ok(())
     }
-}
-
-fn encode_packet(buf: &mut [u8], payload: &[u8]) -> usize {
-    let needed = payload.len().saturating_add(4);
-    assert!(needed <= buf.len());
-
-    let mut idx = 0usize;
-    buf[idx] = b'$';
-    idx += 1;
-    buf[idx..idx + payload.len()].copy_from_slice(payload);
-    idx += payload.len();
-    buf[idx] = b'#';
-    idx += 1;
-
-    let sum = checksum(payload);
-    buf[idx] = HEX[(sum >> 4) as usize];
-    buf[idx + 1] = HEX[(sum & 0xF) as usize];
-    idx += 2;
-
-    idx
-}
-
-fn checksum(payload: &[u8]) -> u8 {
-    let mut sum = 0u8;
-    for &b in payload {
-        sum = sum.wrapping_add(b);
-    }
-    sum
-}
-
-fn feed_bytes<T: Target, const MAX: usize, const TX: usize>(
-    server: &mut GdbServer<MAX, TX>,
-    target: &mut T,
-    bytes: &[u8],
-) {
-    for &byte in bytes {
-        match server.on_rx_byte_irq(target, byte) {
-            Ok(ProcessResult::None) => {}
-            Ok(_) => panic!("unexpected result"),
-            Err(_) => panic!("unexpected error"),
-        }
-    }
-}
-
-fn drain_tx<const MAX: usize, const TX: usize>(
-    server: &mut GdbServer<MAX, TX>,
-    out: &mut [u8],
-) -> usize {
-    let mut idx = 0usize;
-    while let Some(byte) = server.pop_tx_byte_irq() {
-        if idx >= out.len() {
-            break;
-        }
-        out[idx] = byte;
-        idx += 1;
-    }
-    idx
-}
-
-fn next_payload(tx: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut idx = 0usize;
-    while idx < tx.len() && tx[idx] != b'$' {
-        idx += 1;
-    }
-    if idx >= tx.len() {
-        return None;
-    }
-    idx += 1;
-    let start = idx;
-    while idx < tx.len() && tx[idx] != b'#' {
-        idx += 1;
-    }
-    if idx >= tx.len() {
-        return None;
-    }
-    let len = (idx - start).min(out.len());
-    out[..len].copy_from_slice(&tx[start..start + len]);
-    Some(len)
 }
