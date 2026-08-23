@@ -517,27 +517,16 @@ fn is_emulatable_stage2_dfsc(esr: &ESR_EL2) -> bool {
     if esr.get(ESR_EL2::s1ptw) != 0 {
         return false;
     }
-    matches!(
-        esr.get_enum::<_, DataFaultStatusCade>(ESR_EL2::dfsc),
-        Some(
-            DataFaultStatusCade::AddressSizeLevel0
-                | DataFaultStatusCade::AddressSizeLevel1
-                | DataFaultStatusCade::AddressSizeLevel2
-                | DataFaultStatusCade::AddressSizeLevel3
-                | DataFaultStatusCade::TranslationLevel0
-                | DataFaultStatusCade::TranslationLevel1
-                | DataFaultStatusCade::TranslationLevel2
-                | DataFaultStatusCade::TranslationLevel3
-                | DataFaultStatusCade::AccessFlagLevel0
-                | DataFaultStatusCade::AccessFlagLevel1
-                | DataFaultStatusCade::AccessFlagLevel2
-                | DataFaultStatusCade::AccessFlagLevel3
-                | DataFaultStatusCade::PermissionLevel0
-                | DataFaultStatusCade::PermissionLevel1
-                | DataFaultStatusCade::PermissionLevel2
-                | DataFaultStatusCade::PermissionLevel3,
+    hpfar_el2_written_for_abort(esr)
+        || matches!(
+            esr.get_enum::<_, DataFaultStatusCade>(ESR_EL2::dfsc),
+            Some(
+                DataFaultStatusCade::PermissionLevel0
+                    | DataFaultStatusCade::PermissionLevel1
+                    | DataFaultStatusCade::PermissionLevel2
+                    | DataFaultStatusCade::PermissionLevel3,
+            )
         )
-    )
 }
 
 fn hpfar_valid(esr: &ESR_EL2) -> bool {
@@ -914,10 +903,14 @@ mod tests {
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
     #[cfg_attr(all(test, not(target_arch = "aarch64")), test)]
     fn decode_mmio_rejects_s1ptw() {
-        let esr = esr_with_dfsc(DataFaultStatusCade::TranslationLevel0, true);
-        let regs = zero_regs();
-        let info = info_with_esr(esr, 0x1000, Some(0x2000));
-        assert!(decode_mmio(&regs, &info).is_none());
+        for dfsc in [
+            DataFaultStatusCade::TranslationLevel0,
+            DataFaultStatusCade::PermissionLevel0,
+        ] {
+            let esr = esr_with_dfsc(dfsc, true);
+            let info = info_with_esr(esr, 0x1000, Some(0x2000));
+            assert!(decode_mmio(&zero_regs(), &info).is_none());
+        }
     }
 
     #[cfg_attr(all(test, target_arch = "aarch64"), test_case)]
