@@ -757,39 +757,26 @@ where
             REG_QUEUE_NOTIFY => self.process_queue_notify(value)?,
             REG_INTERRUPT_ACK => self.ack_interrupt(value)?,
             REG_STATUS => self.write_status(value)?,
-            REG_QUEUE_DESC_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_addr = (self.queue.desc_addr & !0xffff_ffffu64) | value as u64;
-                }
+            REG_QUEUE_DESC_LOW if self.queue_sel == 0 => {
+                self.queue.desc_addr = (self.queue.desc_addr & !0xffff_ffffu64) | value as u64;
             }
-            REG_QUEUE_DESC_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_addr =
-                        (self.queue.desc_addr & 0xffff_ffffu64) | ((value as u64) << 32);
-                }
+            REG_QUEUE_DESC_HIGH if self.queue_sel == 0 => {
+                self.queue.desc_addr =
+                    (self.queue.desc_addr & 0xffff_ffffu64) | ((value as u64) << 32);
             }
-            REG_QUEUE_DRIVER_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_addr =
-                        (self.queue.avail_addr & !0xffff_ffffu64) | value as u64;
-                }
+            REG_QUEUE_DRIVER_LOW if self.queue_sel == 0 => {
+                self.queue.avail_addr = (self.queue.avail_addr & !0xffff_ffffu64) | value as u64;
             }
-            REG_QUEUE_DRIVER_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_addr =
-                        (self.queue.avail_addr & 0xffff_ffffu64) | ((value as u64) << 32);
-                }
+            REG_QUEUE_DRIVER_HIGH if self.queue_sel == 0 => {
+                self.queue.avail_addr =
+                    (self.queue.avail_addr & 0xffff_ffffu64) | ((value as u64) << 32);
             }
-            REG_QUEUE_DEVICE_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.used_addr = (self.queue.used_addr & !0xffff_ffffu64) | value as u64;
-                }
+            REG_QUEUE_DEVICE_LOW if self.queue_sel == 0 => {
+                self.queue.used_addr = (self.queue.used_addr & !0xffff_ffffu64) | value as u64;
             }
-            REG_QUEUE_DEVICE_HIGH => {
-                if self.queue_sel == 0 {
-                    self.queue.used_addr =
-                        (self.queue.used_addr & 0xffff_ffffu64) | ((value as u64) << 32);
-                }
+            REG_QUEUE_DEVICE_HIGH if self.queue_sel == 0 => {
+                self.queue.used_addr =
+                    (self.queue.used_addr & 0xffff_ffffu64) | ((value as u64) << 32);
             }
             _ => {}
         }
