@@ -1,15 +1,14 @@
 use crate::emulation::EmulationOutcome;
 use crate::emulation::PairDesc;
-use crate::emulation::SingleAddrMode;
 use crate::emulation::SingleDesc;
 use crate::emulation::SplitPlan;
-use crate::emulation::base_writeback;
+use crate::emulation::apply_pair_writeback;
+use crate::emulation::apply_writeback;
 use crate::emulation::can_handle_plan;
 use crate::emulation::crosses_stage2_page;
 use crate::memory_hook::MmioError;
 use crate::memory_hook::MmioHandler;
 use crate::registers::InstructionRegisterSize;
-use cpu::set_sp_el1;
 
 pub(crate) fn emulate_single(
     regs: &mut [u64; 32],
@@ -205,38 +204,6 @@ fn write_reg(regs: &mut [u64; 32], reg: u8, value: u64, reg_size: InstructionReg
         InstructionRegisterSize::Instruction64bit => value,
     };
     regs[reg as usize] = val;
-}
-
-fn apply_writeback(regs: &mut [u64; 32], rn: u8, offset: i64, mode: SingleAddrMode) {
-    if matches!(mode, SingleAddrMode::PostIndex | SingleAddrMode::PreIndex) {
-        let base = base_writeback(regs, rn);
-        let new_base = base.wrapping_add(offset as u64);
-        write_back_base(regs, rn, new_base);
-    }
-}
-
-fn apply_pair_writeback(
-    regs: &mut [u64; 32],
-    rn: u8,
-    offset: i64,
-    mode: crate::emulation::Writeback,
-) {
-    if matches!(
-        mode,
-        crate::emulation::Writeback::Post | crate::emulation::Writeback::Pre
-    ) {
-        let base = base_writeback(regs, rn);
-        let new_base = base.wrapping_add(offset as u64);
-        write_back_base(regs, rn, new_base);
-    }
-}
-
-fn write_back_base(regs: &mut [u64; 32], rn: u8, val: u64) {
-    if rn == 31 {
-        set_sp_el1(val);
-    } else {
-        regs[rn as usize] = val;
-    }
 }
 
 #[cfg(test)]

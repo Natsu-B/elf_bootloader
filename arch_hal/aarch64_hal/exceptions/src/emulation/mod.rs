@@ -14,6 +14,7 @@ use cpu::get_sp_el1;
 use cpu::read_guest_insn_u32_at_el1_pc;
 #[cfg(not(test))]
 use cpu::set_elr_el2;
+use cpu::set_sp_el1;
 use cpu::va_to_ipa_el2_read;
 use cpu::va_to_ipa_el2_write;
 
@@ -168,6 +169,31 @@ pub(crate) fn base_writeback(regs: &[u64; 32], rn: u8) -> u64 {
         get_sp_el1()
     } else {
         regs[rn as usize]
+    }
+}
+
+/// Applies base writeback for single-register pre/post-index addressing.
+fn apply_writeback(regs: &mut [u64; 32], rn: u8, offset: i64, mode: SingleAddrMode) {
+    if matches!(mode, SingleAddrMode::PostIndex | SingleAddrMode::PreIndex) {
+        let base = base_writeback(regs, rn).wrapping_add(offset as u64);
+        write_back_base(regs, rn, base);
+    }
+}
+
+/// Applies base writeback for pair pre/post-index addressing.
+fn apply_pair_writeback(regs: &mut [u64; 32], rn: u8, offset: i64, mode: Writeback) {
+    if matches!(mode, Writeback::Post | Writeback::Pre) {
+        let base = base_writeback(regs, rn).wrapping_add(offset as u64);
+        write_back_base(regs, rn, base);
+    }
+}
+
+/// Writes a decoded base value to SP_EL1 or its general-purpose register.
+fn write_back_base(regs: &mut [u64; 32], rn: u8, val: u64) {
+    if rn == 31 {
+        set_sp_el1(val);
+    } else {
+        regs[rn as usize] = val;
     }
 }
 
