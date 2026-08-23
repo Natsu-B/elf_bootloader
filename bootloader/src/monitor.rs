@@ -362,6 +362,11 @@ fn write_error(out: &mut OutBuf<'_>, reason: &str) {
     let _ = write!(out, "error={}", reason);
 }
 
+fn error_response(out: &mut OutBuf<'_>, reason: &str) -> Option<usize> {
+    write_error(out, reason);
+    Some(out.len())
+}
+
 fn memfault_kind_label(kind: WatchpointKind) -> &'static str {
     match kind {
         WatchpointKind::Read => "read",
@@ -659,14 +664,12 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
             Some(area) => match area {
                 "gdb" => {
                     let Some(cmd) = parts.next() else {
-                        write_error(&mut out, "bad_args");
-                        return Some(out.len());
+                        return error_response(&mut out, "bad_args");
                     };
                     match cmd {
                         "stop-counters" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             let counters = aarch64_gdb::stop_reply_counters();
                             let _ = write!(
@@ -676,16 +679,12 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                             );
                             Some(out.len())
                         }
-                        _ => {
-                            write_error(&mut out, "bad_args");
-                            Some(out.len())
-                        }
+                        _ => error_response(&mut out, "bad_args"),
                     }
                 }
                 "memfault?" => {
                     if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
+                        return error_response(&mut out, "extra_args");
                     }
                     let snapshot = snapshot_state();
                     if snapshot.pending {
@@ -703,14 +702,12 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                 }
                 "memfault" => {
                     let Some(cmd) = parts.next() else {
-                        write_error(&mut out, "bad_args");
-                        return Some(out.len());
+                        return error_response(&mut out, "bad_args");
                     };
                     match cmd {
                         "last" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             let snapshot = snapshot_state();
                             if let Some(info) = snapshot.last {
@@ -727,8 +724,7 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         }
                         "clear" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             clear_pending();
                             let _ = write!(out, "ok");
@@ -736,14 +732,12 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         }
                         "policy" => {
                             let Some(subcmd) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "bad_args");
                             };
                             match subcmd {
                                 "get" => {
                                     if parts.next().is_some() {
-                                        write_error(&mut out, "extra_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "extra_args");
                                     }
                                     let snapshot = snapshot_state();
                                     let _ = write!(out, "policy={}", snapshot.policy.as_str());
@@ -751,53 +745,41 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                                 }
                                 "set" => {
                                     let Some(policy_str) = parts.next() else {
-                                        write_error(&mut out, "bad_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_args");
                                     };
                                     if parts.next().is_some() {
-                                        write_error(&mut out, "extra_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "extra_args");
                                     }
                                     let Some(policy) = MemfaultPolicy::parse(policy_str) else {
-                                        write_error(&mut out, "bad_policy");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_policy");
                                     };
                                     set_policy(policy);
                                     let _ = write!(out, "ok policy={}", policy.as_str());
                                     Some(out.len())
                                 }
-                                _ => {
-                                    write_error(&mut out, "bad_args");
-                                    Some(out.len())
-                                }
+                                _ => error_response(&mut out, "bad_args"),
                             }
                         }
                         "ignore" => {
                             let Some(subcmd) = parts.next() else {
-                                write_error(&mut out, "bad_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "bad_args");
                             };
                             match subcmd {
                                 action @ ("add" | "del") => {
                                     let Some(addr_str) = parts.next() else {
-                                        write_error(&mut out, "bad_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_args");
                                     };
                                     let Some(len_str) = parts.next() else {
-                                        write_error(&mut out, "bad_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_args");
                                     };
                                     if parts.next().is_some() {
-                                        write_error(&mut out, "extra_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "extra_args");
                                     }
                                     let Some(base) = parse_u64_token(addr_str) else {
-                                        write_error(&mut out, "bad_addr");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_addr");
                                     };
                                     let Some(len) = parse_u64_token(len_str) else {
-                                        write_error(&mut out, "bad_len");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_len");
                                     };
                                     let result = if action == "add" {
                                         add_ignore(base, len)
@@ -815,16 +797,13 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                                 }
                                 "add_last" => {
                                     let Some(len_str) = parts.next() else {
-                                        write_error(&mut out, "bad_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_args");
                                     };
                                     if parts.next().is_some() {
-                                        write_error(&mut out, "extra_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "extra_args");
                                     }
                                     let Some(len) = parse_u64_token(len_str) else {
-                                        write_error(&mut out, "bad_len");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "bad_len");
                                     };
                                     match add_ignore_last(len) {
                                         Ok(base) => {
@@ -837,29 +816,21 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                                 }
                                 "list" => {
                                     if parts.next().is_some() {
-                                        write_error(&mut out, "extra_args");
-                                        return Some(out.len());
+                                        return error_response(&mut out, "extra_args");
                                     }
                                     let snapshot = snapshot_state();
                                     write_ignore_list(&mut out, &snapshot.ignores);
                                     Some(out.len())
                                 }
-                                _ => {
-                                    write_error(&mut out, "bad_args");
-                                    Some(out.len())
-                                }
+                                _ => error_response(&mut out, "bad_args"),
                             }
                         }
-                        _ => {
-                            write_error(&mut out, "bad_args");
-                            Some(out.len())
-                        }
+                        _ => error_response(&mut out, "bad_args"),
                     }
                 }
                 "reset" => {
                     if parts.next().is_some() {
-                        write_error(&mut out, "extra_args");
-                        return Some(out.len());
+                        return error_response(&mut out, "extra_args");
                     }
                     match try_system_reset_via_psci() {
                         Ok(never) => match never {},
@@ -877,24 +848,21 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                     match cmd {
                         "status" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             write_vbar_status(&mut out);
                             Some(out.len())
                         }
                         "last" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             write_vbar_last(&mut out);
                             Some(out.len())
                         }
                         "clear" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             vbar_watch::clear_last_hit();
                             let _ = write!(out, "ok");
@@ -902,24 +870,21 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         }
                         "bt?" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             write_vbar_bt_meta(&mut out);
                             Some(out.len())
                         }
                         "bt" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             write_vbar_bt_dump(&mut out);
                             Some(out.len())
                         }
                         "check" => {
                             if parts.next().is_some() {
-                                write_error(&mut out, "extra_args");
-                                return Some(out.len());
+                                return error_response(&mut out, "extra_args");
                             }
                             vbar_watch::poll_vbar_el1_change();
                             write_vbar_status(&mut out);
@@ -931,10 +896,7 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                         }
                     }
                 }
-                _ => {
-                    write_error(&mut out, "bad_args");
-                    Some(out.len())
-                }
+                _ => error_response(&mut out, "bad_args"),
             },
         },
         _ => unreachable!(),
@@ -944,6 +906,22 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+
+    #[test_case]
+    fn invalid_monitor_commands_report_exact_errors() {
+        let mut out = [0u8; 64];
+        for (cmd, expected) in [
+            (b"hp gdb".as_slice(), b"error=bad_args".as_slice()),
+            (b"hp nope", b"error=bad_args"),
+            (b"hp gdb stop-counters extra", b"error=extra_args"),
+            (b"hp memfault policy set nope", b"error=bad_policy"),
+            (b"hp memfault ignore add nope 1", b"error=bad_addr"),
+            (b"hp memfault ignore add 1 nope", b"error=bad_len"),
+        ] {
+            let len = bootloader_monitor_handler(cmd, &mut out).unwrap();
+            assert_eq!(&out[..len], expected);
+        }
+    }
 
     #[test_case]
     fn ignore_add_and_del_share_range_parser() {
