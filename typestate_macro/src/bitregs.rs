@@ -69,14 +69,13 @@ impl Input {
         } = self.register;
         let crate_path = self.crate_path;
         let raw_impl = crate::expand_rawreg_impl(&name, &raw, &crate_path);
-        let (res0, res1) = reserved_masks(&items)?;
+        let (res0, res1) = reserved_masks(&items);
 
         let mut fields = Vec::new();
         collect_fields(&items, &mut fields);
         let expanded_fields = fields
             .into_iter()
-            .map(|field| field.expand(&name, &raw, &crate_path))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|field| field.expand(&name, &raw, &crate_path));
 
         Ok(quote! {
             #(#attrs)*
@@ -107,10 +106,7 @@ impl Input {
 
                 /// Returns the unshifted mask and offset for a field descriptor.
                 #[inline]
-                fn field_mask<F>() -> (u32, #raw)
-                where
-                    F: #crate_path::bitflags::FieldSpec<Self>,
-                {
+                fn field_mask<F: #crate_path::bitflags::FieldSpec<Self>>() -> (u32, #raw) {
                     let off = F::OFF;
                     let size = F::SZ;
                     let bits = (::core::mem::size_of::<#raw>() as u32) * 8;
@@ -133,10 +129,7 @@ impl Input {
 
                 /// Reads a field and shifts it to bit zero.
                 #[inline]
-                pub fn get<F>(&self, _field: F) -> #raw
-                where
-                    F: #crate_path::bitflags::FieldSpec<Self>,
-                {
+                pub fn get<F: #crate_path::bitflags::FieldSpec<Self>>(&self, _field: F) -> #raw {
                     let (off, mask) = Self::field_mask::<F>();
                     (self.0 >> off) & mask
                 }
@@ -163,17 +156,13 @@ impl Input {
 
                 /// Reads a field while retaining its register bit position.
                 #[inline]
-                pub fn get_raw<F>(&self, _field: F) -> #raw
-                where
-                    F: #crate_path::bitflags::FieldSpec<Self>,
-                {
-                    let (off, mask) = Self::field_mask::<F>();
-                    self.0 & (mask << off)
+                pub fn get_raw<F: #crate_path::bitflags::FieldSpec<Self>>(&self, field: F) -> #raw {
+                    self.get(field) << F::OFF
                 }
 
                 /// Writes a field value already shifted to its register bit position.
                 #[inline]
-                pub fn set_raw<F>(mut self, _field: F, value: #raw) -> Self
+                pub fn set_raw<F>(self, field: F, value: #raw) -> Self
                 where
                     F: #crate_path::bitflags::FieldSpec<Self>,
                 {
@@ -187,8 +176,7 @@ impl Input {
                         value,
                         positioned,
                     );
-                    self.0 = (self.0 & !positioned) | (value & positioned);
-                    self
+                    self.set(field, value >> off)
                 }
 
                 /// Reads a field and converts a recognized value to its enum.
@@ -286,21 +274,12 @@ enum Item {
 }
 
 impl Item {
-    /// Returns the range occupied by this item in its containing partition.
-    fn range(&self) -> &BitRange {
+    /// Returns the range and diagnostic span for this partition item.
+    fn layout(&self) -> (&BitRange, proc_macro2::Span) {
         match self {
-            Self::Field(field) => &field.range,
-            Self::Reserved(item) => &item.range,
-            Self::Union(union) => &union.range,
-        }
-    }
-
-    /// Returns the most useful input span for a layout diagnostic.
-    fn span(&self) -> proc_macro2::Span {
-        match self {
-            Self::Field(field) => field.name.span(),
-            Self::Reserved(item) => item.range.msb.span(),
-            Self::Union(union) => union.name.span(),
+            Self::Field(field) => (&field.range, field.name.span()),
+            Self::Reserved(item) => (&item.range, item.range.span),
+            Self::Union(union) => (&union.range, union.name.span()),
         }
     }
 }
@@ -316,24 +295,18 @@ struct FieldDef {
 
 impl FieldDef {
     /// Emits the associated descriptor and optional enum conversion API.
-    fn expand(
-        &self,
-        register: &Ident,
-        raw: &TokenStream,
-        crate_path: &TokenStream,
-    ) -> Result<TokenStream> {
+    fn expand(&self, register: &Ident, raw: &TokenStream, crate_path: &TokenStream) -> TokenStream {
         let attrs = &self.attrs;
         let vis = &self.vis;
         let name = &self.name;
-        let (msb, lsb) = self.range.values()?;
-        let size = msb - lsb + 1;
+        let lsb = self.range.lsb;
+        let size = self.range.width();
         let enum_tokens = self
             .values
             .as_ref()
-            .map(|values| values.expand(vis, name, raw))
-            .unwrap_or_default();
+            .map(|values| values.expand(vis, name, raw));
 
-        Ok(quote! {
+        quote! {
             impl #register {
                 #(#attrs)*
                 #[doc = concat!("Descriptor for the `", stringify!(#name), "` bitfield.")]
@@ -342,7 +315,7 @@ impl FieldDef {
                     #crate_path::bitflags::Field::new();
             }
             #enum_tokens
-        })
+        }
     }
 }
 
@@ -434,49 +407,54 @@ struct View {
 
 /// Inclusive MSB/LSB bit range.
 struct BitRange {
-    msb: LitInt,
-    lsb: LitInt,
+    msb: u32,
+    lsb: u32,
+    span: proc_macro2::Span,
 }
 
 impl Parse for BitRange {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let body;
         bracketed!(body in input);
-        let msb = body.parse()?;
+        let msb: LitInt = body.parse()?;
         body.parse::<Token![:]>()?;
-        let lsb = body.parse()?;
+        let lsb: LitInt = body.parse()?;
         if !body.is_empty() {
             return Err(body.error("bitregs: unexpected tokens in bit range"));
         }
-        Ok(Self { msb, lsb })
+        Ok(Self {
+            msb: msb.base10_parse()?,
+            lsb: lsb.base10_parse()?,
+            span: msb.span(),
+        })
     }
 }
 
 impl BitRange {
-    /// Parses the inclusive range endpoints.
-    fn values(&self) -> Result<(u32, u32)> {
-        Ok((self.msb.base10_parse()?, self.lsb.base10_parse()?))
+    /// Returns the number of bits in a validated range.
+    fn width(&self) -> u32 {
+        self.msb - self.lsb + 1
     }
 
     /// Validates and returns this range's register mask.
     fn mask(&self, width: u32, allowed: u128) -> Result<u128> {
-        let (msb, lsb) = self.values()?;
-        if msb < lsb {
+        let msb = self.msb;
+        if msb < self.lsb {
             return Err(Error::new(
-                self.msb.span(),
+                self.span,
                 "bitregs: range MSB must be greater than or equal to LSB",
             ));
         }
         if msb >= width {
             return Err(Error::new(
-                self.msb.span(),
+                self.span,
                 format!("bitregs: bit {msb} is outside the {width}-bit register"),
             ));
         }
-        let mask = low_mask(msb - lsb + 1) << lsb;
+        let mask = low_mask(self.width()) << self.lsb;
         if mask & allowed != mask {
             return Err(Error::new(
-                self.msb.span(),
+                self.span,
                 "bitregs: range is outside its containing register or union",
             ));
         }
@@ -490,9 +468,9 @@ fn parse_items(input: ParseStream<'_>) -> Result<Vec<Item>> {
     while !input.is_empty() {
         let attrs = input.call(Attribute::parse_outer)?;
         let item = if input.peek(Token![union]) {
-            Item::Union(parse_union(input, attrs)?)
+            Item::Union(parse_union(input)?)
         } else if input.peek(reserved) {
-            Item::Reserved(parse_reserved(input, attrs)?)
+            Item::Reserved(parse_reserved(input)?)
         } else {
             Item::Field(parse_field(input, attrs)?)
         };
@@ -545,7 +523,7 @@ fn parse_enum(input: ParseStream<'_>) -> Result<EnumDef> {
 }
 
 /// Parses a reserved range and its res0/res1/ignore policy.
-fn parse_reserved(input: ParseStream<'_>, _attrs: Vec<Attribute>) -> Result<Reserved> {
+fn parse_reserved(input: ParseStream<'_>) -> Result<Reserved> {
     input.parse::<reserved>()?;
     input.parse::<Token![@]>()?;
     let range = input.parse()?;
@@ -574,7 +552,7 @@ fn parse_reserved(input: ParseStream<'_>, _attrs: Vec<Attribute>) -> Result<Rese
 }
 
 /// Parses a union and its comma-optional view sequence.
-fn parse_union(input: ParseStream<'_>, _attrs: Vec<Attribute>) -> Result<Union> {
+fn parse_union(input: ParseStream<'_>) -> Result<Union> {
     input.parse::<Token![union]>()?;
     let name = input.parse()?;
     input.parse::<Token![@]>()?;
@@ -636,10 +614,11 @@ impl Validator {
     ) -> Result<()> {
         let mut covered = 0;
         for item in items {
-            let mask = item.range().mask(self.width, expected)?;
+            let (range, span) = item.layout();
+            let mask = range.mask(self.width, expected)?;
             if covered & mask != 0 {
                 return Err(Error::new(
-                    item.span(),
+                    span,
                     "bitregs: field, reserved range, or union overlaps another item",
                 ));
             }
@@ -676,8 +655,8 @@ impl Validator {
             ));
         }
 
-        let (msb, lsb) = field.range.values()?;
-        let maximum = low_mask(msb - lsb + 1);
+        let width = field.range.width();
+        let maximum = low_mask(width);
         let mut names = HashSet::new();
         let mut raw_values = HashSet::new();
         for variant in &values.variants {
@@ -686,7 +665,7 @@ impl Validator {
             if value > maximum {
                 return Err(Error::new(
                     variant.value.span(),
-                    format!("bitregs: enum value does not fit in {} bits", msb - lsb + 1),
+                    format!("bitregs: enum value does not fit in {width} bits"),
                 ));
             }
             if !raw_values.insert(value) {
@@ -727,29 +706,25 @@ fn ensure_unique_name(names: &mut HashSet<String>, name: &Ident, kind: &str) -> 
 
 /// Returns an all-ones mask of the requested width.
 fn low_mask(width: u32) -> u128 {
-    if width == 128 {
-        u128::MAX
-    } else {
-        (1_u128 << width) - 1
-    }
+    1_u128.checked_shl(width).unwrap_or(0).wrapping_sub(1)
 }
 
 /// Collects top-level reserved policies; view policies describe interpretations only.
-fn reserved_masks(items: &[Item]) -> Result<(u128, u128)> {
+fn reserved_masks(items: &[Item]) -> (u128, u128) {
     let mut res0 = 0;
     let mut res1 = 0;
     for item in items {
         let Item::Reserved(item) = item else {
             continue;
         };
-        let mask = item.range.mask(128, u128::MAX)?;
+        let mask = low_mask(item.range.width()) << item.range.lsb;
         match &item.policy {
             ReservedPolicy::Zero => res0 |= mask,
             ReservedPolicy::One => res1 |= mask,
             ReservedPolicy::Preserve => {}
         }
     }
-    Ok((res0, res1))
+    (res0, res1)
 }
 
 /// Flattens all view fields because their descriptors share the register type.
