@@ -88,9 +88,6 @@ pub fn resume() {
 
 /// Polls Ethernet RX, handles ARP, demultiplexes UDP streams, and invokes byte callbacks.
 pub fn poll(mut on_gdb_byte: impl FnMut(u8), mut on_dbg_byte: impl FnMut(u8)) {
-    if UDP_UART_PAUSED.load(Ordering::Acquire) {
-        return;
-    }
     let _ = with_state(|state| {
         loop {
             let recv_cap = max_rx_frame_len(state);
@@ -157,9 +154,6 @@ pub fn poll(mut on_gdb_byte: impl FnMut(u8), mut on_dbg_byte: impl FnMut(u8)) {
 ///
 /// Returns `false` when no peer is learned or TX cannot proceed.
 pub fn gdb_try_write_byte(byte: u8) -> bool {
-    if UDP_UART_PAUSED.load(Ordering::Acquire) {
-        return false;
-    }
     with_state(|state| {
         if state.gdb_peer.is_none() {
             return false;
@@ -188,17 +182,11 @@ pub fn gdb_try_write_byte(byte: u8) -> bool {
 
 /// Flushes pending GDB UDP TX payload.
 pub fn gdb_flush() {
-    if UDP_UART_PAUSED.load(Ordering::Acquire) {
-        return;
-    }
     let _ = with_state(flush_gdb_locked);
 }
 
 /// Best-effort debug/log mirror output over UDP.
 pub fn debug_write_str(s: &str) {
-    if UDP_UART_PAUSED.load(Ordering::Acquire) {
-        return;
-    }
     let _ = with_state(|state| {
         if state.debug_peer.is_none() {
             return;
@@ -224,14 +212,11 @@ pub fn debug_write_str(s: &str) {
 
 /// Flushes pending debug/log UDP payload.
 pub fn debug_flush() {
-    if UDP_UART_PAUSED.load(Ordering::Acquire) {
-        return;
-    }
     let _ = with_state(flush_debug_locked);
 }
 
 fn with_state<T>(f: impl FnOnce(&mut UdpUartState) -> T) -> Option<T> {
-    if !UDP_UART_READY.load(Ordering::Acquire) {
+    if UDP_UART_PAUSED.load(Ordering::Acquire) || !UDP_UART_READY.load(Ordering::Acquire) {
         return None;
     }
     let mut guard = UDP_UART_STATE.lock_irqsave();
