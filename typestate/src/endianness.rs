@@ -48,7 +48,7 @@ macro_rules! impl_endian {
         readable: [$($readable:ident),+];
         writable: [$($writable:ident),+];
     ) => {
-        impl<T: Copy + RawReg> $endian<T> {
+        impl<T: RawReg> $endian<T> {
             #[doc = concat!("Reads a ", $order, " value and returns it in host endianness.")]
             #[inline]
             pub fn read(&self) -> T {
@@ -59,6 +59,11 @@ macro_rules! impl_endian {
             #[inline]
             pub fn write(&mut self, val: T) {
                 self.0 = val.$to();
+            }
+
+            #[doc = concat!("Creates a new ", $order, " wrapper from a host-endian value.")]
+            pub fn new(t: T) -> Self {
+                Self(t.$from())
             }
         }
 
@@ -93,13 +98,6 @@ macro_rules! impl_endian {
                 }
             }
         )+
-
-        impl<T: RawReg> $endian<T> {
-            #[doc = concat!("Creates a new ", $order, " wrapper from a host-endian value.")]
-            pub fn new(t: T) -> Self {
-                Self(t.$from())
-            }
-        }
     };
 }
 
