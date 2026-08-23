@@ -778,7 +778,7 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                                 return Some(out.len());
                             };
                             match subcmd {
-                                "add" => {
+                                action @ ("add" | "del") => {
                                     let Some(addr_str) = parts.next() else {
                                         write_error(&mut out, "bad_args");
                                         return Some(out.len());
@@ -799,7 +799,12 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                                         write_error(&mut out, "bad_len");
                                         return Some(out.len());
                                     };
-                                    match add_ignore(base, len) {
+                                    let result = if action == "add" {
+                                        add_ignore(base, len)
+                                    } else {
+                                        del_ignore(base, len)
+                                    };
+                                    match result {
                                         Ok(()) => {
                                             let _ =
                                                 write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
@@ -823,36 +828,6 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
                                     };
                                     match add_ignore_last(len) {
                                         Ok(base) => {
-                                            let _ =
-                                                write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
-                                        }
-                                        Err(reason) => write_error(&mut out, reason),
-                                    }
-                                    Some(out.len())
-                                }
-                                "del" => {
-                                    let Some(addr_str) = parts.next() else {
-                                        write_error(&mut out, "bad_args");
-                                        return Some(out.len());
-                                    };
-                                    let Some(len_str) = parts.next() else {
-                                        write_error(&mut out, "bad_args");
-                                        return Some(out.len());
-                                    };
-                                    if parts.next().is_some() {
-                                        write_error(&mut out, "extra_args");
-                                        return Some(out.len());
-                                    }
-                                    let Some(base) = parse_u64_token(addr_str) else {
-                                        write_error(&mut out, "bad_addr");
-                                        return Some(out.len());
-                                    };
-                                    let Some(len) = parse_u64_token(len_str) else {
-                                        write_error(&mut out, "bad_len");
-                                        return Some(out.len());
-                                    };
-                                    match del_ignore(base, len) {
-                                        Ok(()) => {
                                             let _ =
                                                 write!(out, "ok addr=0x{:x} len=0x{:x}", base, len);
                                         }
@@ -963,5 +938,23 @@ pub fn bootloader_monitor_handler(cmd: &[u8], out: &mut [u8]) -> Option<usize> {
             },
         },
         _ => unreachable!(),
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn ignore_add_and_del_share_range_parser() {
+        let mut out = [0u8; 64];
+        for cmd in [
+            b"hp memfault ignore add 0x1b000000 0x1000".as_slice(),
+            b"hp memfault ignore del 0x1b000000 0x1000".as_slice(),
+        ] {
+            let len = bootloader_monitor_handler(cmd, &mut out).unwrap();
+            let response = core::str::from_utf8(&out[..len]).unwrap();
+            assert_eq!(response, "ok addr=0x1b000000 len=0x1000");
+        }
     }
 }
