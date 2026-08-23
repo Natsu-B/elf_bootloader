@@ -1,7 +1,4 @@
-use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::ptr::addr_of;
-use core::ptr::addr_of_mut;
 use core::ptr::read_unaligned;
 use core::ptr::write_unaligned;
 use core::ptr::{self};
@@ -175,173 +172,76 @@ impl<T: Copy + RawReg> Be<Unaligned<T>> {
     }
 }
 
-impl<T: Copy + RawReg> ReadOnly<Le<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
-            .from_le()
-    }
+/// Implements byte-wise volatile I/O for one unaligned storage representation.
+///
+/// All wrapper layers are transparent; casting their raw pointer reaches `T`
+/// without a reference, then volatile helpers access it one byte at a time.
+macro_rules! impl_unaligned_access {
+    ($t:ident, $storage:ty, $from:ident, $to:ident) => {
+        impl_unaligned_access!(@read $t, $storage, $from; ReadOnly, ReadPure, ReadWrite);
+        impl_unaligned_access!(@write $t, $storage, $to; WriteOnly, ReadWrite);
+    };
+    (@read $t:ident, $storage:ty, $from:ident; $($access:ident),+) => {
+        $(
+            impl<$t: Copy + RawReg> $access<$storage> {
+                /// # Safety
+                /// `ptr` must point to valid MMIO memory.
+                #[inline]
+                pub unsafe fn read(ptr: *const Self) -> $t {
+                    let val = unsafe { volatile::read::<$t>(ptr.cast()) };
+                    impl_unaligned_access!(@convert val, $from)
+                }
+            }
+        )+
+    };
+    (@write $t:ident, $storage:ty, $to:ident; $($access:ident),+) => {
+        $(
+            impl<$t: RawReg> $access<$storage> {
+                /// # Safety
+                /// `ptr` must point to valid, writable MMIO memory.
+                #[inline]
+                pub unsafe fn write(ptr: *mut Self, val: $t) {
+                    let val = impl_unaligned_access!(@convert val, $to);
+                    unsafe { volatile::write(ptr.cast::<$t>(), val) };
+                }
+            }
+        )+
+    };
+    (@convert $value:expr, native) => { $value };
+    (@convert $value:expr, $method:ident) => { $value.$method() };
 }
 
-impl<T: Copy + RawReg> ReadPure<Le<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
-            .from_le()
-    }
-}
+impl_unaligned_access!(T, Unaligned<T>, native, native);
+impl_unaligned_access!(T, Le<Unaligned<T>>, from_le, to_le);
+impl_unaligned_access!(T, Be<Unaligned<T>>, from_be, to_be);
 
-impl<T: Copy + RawReg> ReadWrite<Le<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
-            .from_le()
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl<T: RawReg> WriteOnly<Le<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid, writable MMIO memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            volatile::write(
-                addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
-                val.to_le(),
-            )
-        };
-    }
-}
+    #[test]
+    fn access_wrappers_support_misaligned_buffers() {
+        #[repr(align(4))]
+        struct Buffer([u8; 5]);
+        const VALUE: u32 = 0x1234_5678;
+        let mut bytes = Buffer([0; 5]);
+        let data = unsafe { bytes.0.as_mut_ptr().add(1) };
+        macro_rules! check {
+            ($storage:ty, $expected:expr) => {{
+                unsafe { WriteOnly::<$storage>::write(data.cast(), VALUE) };
+                assert_eq!(&bytes.0[1..], &$expected);
+                let read = unsafe { ReadOnly::<$storage>::read(data.cast_const().cast()) };
+                assert_eq!(read, VALUE);
+                let read = unsafe { ReadPure::<$storage>::read(data.cast_const().cast()) };
+                assert_eq!(read, VALUE);
+                unsafe { ReadWrite::<$storage>::write(data.cast(), VALUE) };
+                let read = unsafe { ReadWrite::<$storage>::read(data.cast_const().cast()) };
+                assert_eq!(read, VALUE);
+            }};
+        }
 
-impl<T: RawReg> ReadWrite<Le<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid, writable MMIO memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            volatile::write(
-                addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
-                val.to_le(),
-            )
-        };
-    }
-}
-
-impl<T: Copy + RawReg> ReadOnly<Be<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
-            .from_be()
-    }
-}
-
-impl<T: Copy + RawReg> ReadPure<Be<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
-            .from_be()
-    }
-}
-
-impl<T: Copy + RawReg> ReadWrite<Be<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0)) }
-            .from_be()
-    }
-}
-
-impl<T: RawReg> WriteOnly<Be<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid, writable MMIO memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            volatile::write(
-                addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
-                val.to_be(),
-            )
-        };
-    }
-}
-
-impl<T: RawReg> ReadWrite<Be<Unaligned<T>>> {
-    /// # Safety
-    /// `ptr` must point to valid, writable MMIO memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            volatile::write(
-                addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0.0),
-                val.to_be(),
-            )
-        };
-    }
-}
-
-impl<T: Copy + RawReg> ReadOnly<Unaligned<T>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0)) }
-    }
-}
-
-impl<T: Copy + RawReg> ReadPure<Unaligned<T>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0)) }
-    }
-}
-
-impl<T: Copy + RawReg> ReadWrite<Unaligned<T>> {
-    /// # Safety
-    /// `ptr` must point to valid MMIO memory.
-    #[inline]
-    pub unsafe fn read(ptr: *const Self) -> T {
-        unsafe { volatile::read(addr_of!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0)) }
-    }
-}
-
-impl<T: RawReg> WriteOnly<Unaligned<T>> {
-    /// # Safety
-    /// `ptr` must point to valid, writable MMIO memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            volatile::write(
-                addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0),
-                val,
-            )
-        };
-    }
-}
-
-impl<T: RawReg> ReadWrite<Unaligned<T>> {
-    /// # Safety
-    /// `ptr` must point to valid, writable MMIO memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut Self, val: T) {
-        unsafe {
-            volatile::write(
-                addr_of_mut!((*UnsafeCell::raw_get(addr_of!((*ptr).0))).0),
-                val,
-            )
-        };
+        check!(Unaligned<u32>, VALUE.to_ne_bytes());
+        check!(Le<Unaligned<u32>>, VALUE.to_le_bytes());
+        check!(Be<Unaligned<u32>>, VALUE.to_be_bytes());
     }
 }
