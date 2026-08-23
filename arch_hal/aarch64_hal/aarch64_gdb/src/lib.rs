@@ -1,6 +1,16 @@
 //! AArch64 GDB remote-target glue and debugger state management.
 
 #![no_std]
+#![cfg_attr(all(test, target_arch = "aarch64"), no_main)]
+#![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    test_runner(aarch64_unit_test::test_runner)
+)]
+#![cfg_attr(
+    all(test, target_arch = "aarch64"),
+    reexport_test_harness_main = "test_main"
+)]
 
 use aarch64_mutex::RawSpinLockIrqSave;
 use core::convert::Infallible;
@@ -2062,3 +2072,7 @@ fn write_extra_regs_from<E>(
     cpu::set_mdscr_el1(mdscr);
     Ok(())
 }
+
+// Run crate tests under the shared bare-metal U-Boot/QEMU harness.
+#[cfg(all(test, target_arch = "aarch64"))]
+aarch64_unit_test::uboot_unit_test_harness!(aarch64_unit_test::init_default_uart);

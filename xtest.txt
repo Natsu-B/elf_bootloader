@@ -30,6 +30,7 @@ uboot paging stage2_translation arch_hal/aarch64_hal/paging/scripts/run_stage_pa
 uboot-unit exceptions arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot-unit gic arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot-unit aarch64_mutex arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
+uboot-unit aarch64_gdb arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh
 uboot-unit elf-hypervisor arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh --bin elf-hypervisor
 uboot-unit rpi_boot arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh --bin rpi_boot
 uboot net arp_roundtrip arch_hal/aarch64_hal/gic/scripts/run_gicv2_pending_test.sh

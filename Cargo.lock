@@ -7,6 +7,8 @@ name = "aarch64_gdb"
 version = "0.1.0"
 dependencies = [
  "aarch64_mutex",
+ "aarch64_test",
+ "aarch64_unit_test",
  "cpu",
  "exceptions",
  "gdb_remote",

@@ -10,3 +10,7 @@ cpu = { path = "../cpu" }
 exceptions = { path = "../exceptions" }
 io-api = { path = "../../../io_api" }
 mutex = { path = "../../../mutex" }
+
+[target.'cfg(target_arch = "aarch64")'.dev-dependencies]
+aarch64_test = { path = "../aarch64_test" }
+aarch64_unit_test = { path = "../aarch64_unit_test" }

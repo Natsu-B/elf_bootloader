@@ -960,14 +960,16 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn hlt_decode_matches_semihost() {
         assert!(is_semihost_hlt(0xD45E_0000));
         assert!(!is_semihost_hlt(0xD440_0000));
         assert!(!is_semihost_hlt(0xD420_0000));
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn resume_gate_transitions() {
         reset_for_test();
         let req = SemihostRequest {
@@ -998,7 +1000,8 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn monitor_query_has_newline() {
         reset_for_test();
         let mut out = [0u8; 64];
@@ -1007,7 +1010,8 @@ mod tests {
         assert_eq!(&out[..len], b"no\n");
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn monitor_reply_requires_pending() {
         reset_for_test();
         let mut out = [0u8; 64];
@@ -1020,7 +1024,8 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn monitor_read_advances_write0_chunks() {
         reset_for_test();
         let mut mem = BufMem::new(0x1000);
@@ -1039,7 +1044,33 @@ mod tests {
         }
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
+    fn monitor_read_advances_bounded_chunks() {
+        for op in [SYS_OPEN, SYS_WRITE] {
+            reset_for_test();
+            let mut mem = BufMem::new(0x1000);
+            mem.write_at(0, b"abcd");
+            let req = SemihostRequest {
+                len: 4,
+                ..test_request(op, 0x1000)
+            };
+            SEMIHOST.lock_irqsave().start_request(req);
+
+            for expected in [
+                b"hex:616263 truncated=1\n".as_slice(),
+                b"hex:64\n",
+                b"hex:\n",
+            ] {
+                let mut out = [0u8; 64];
+                let len = monitor_command("hp semihost read 3", &mut out, &mut mem).unwrap();
+                assert_eq!(&out[..len], expected);
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn fileio_write0_builds_fwrite_with_len() {
         reset_for_test();
         let mut mem = BufMem::new(0x1000);
@@ -1055,7 +1086,8 @@ mod tests {
         assert_eq!(&out[..len], b"Fwrite,1,1000/2");
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn fileio_open_builds_and_rejects_unknown_mode() {
         reset_for_test();
         let mut mem = DummyMem;
@@ -1084,7 +1116,8 @@ mod tests {
         assert_eq!(completion.errno, EINVAL);
     }
 
-    #[test]
+    #[cfg_attr(target_arch = "aarch64", test_case)]
+    #[cfg_attr(not(target_arch = "aarch64"), test)]
     fn fileio_write_reply_maps_bytes_not_written() {
         reset_for_test();
         let mut mem = DummyMem;
