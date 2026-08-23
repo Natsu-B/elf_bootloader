@@ -28,8 +28,8 @@ struct BorrowedBlockDevice {
 
 impl StorageDevice {
     pub fn new_virtio(mmio: usize) -> Result<Self, StorageDeviceErr> {
-        let mut io = VirtIoBlk::new(mmio).map_err(error_from_ioerror)?;
-        io.init().map_err(error_from_ioerror)?;
+        let mut io = VirtIoBlk::new(mmio).map_err(StorageDeviceErr::IoErr)?;
+        io.init().map_err(StorageDeviceErr::IoErr)?;
         let dev = Arc::new(io);
         let partition = PartitionIndex::new(dev.as_ref())?;
         Ok(Self { partition, dev })
@@ -55,7 +55,7 @@ impl StorageDevice {
     ) -> Result<FileHandle, StorageDeviceErr> {
         self.partition
             .open(&self.dev, partition_idx, path, opts)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 
     pub fn create_file(
@@ -65,37 +65,37 @@ impl StorageDevice {
     ) -> Result<FileHandle, StorageDeviceErr> {
         self.partition
             .create_file(&self.dev, partition_idx, path)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 
     pub fn remove_file(&self, partition_idx: u8, path: &str) -> Result<(), StorageDeviceErr> {
         self.partition
             .remove_file(&self.dev, partition_idx, path)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 
     pub fn copy(&self, partition_idx: u8, from: &str, to: &str) -> Result<(), StorageDeviceErr> {
         self.partition
             .copy(&self.dev, partition_idx, from, to)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 
     pub fn rename(&self, partition_idx: u8, from: &str, to: &str) -> Result<(), StorageDeviceErr> {
         self.partition
             .rename(&self.dev, partition_idx, from, to)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 
     pub fn create_dir(&self, partition_idx: u8, path: &str) -> Result<(), StorageDeviceErr> {
         self.partition
             .create_dir(&self.dev, partition_idx, path)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 
     pub fn remove_dir(&self, partition_idx: u8, path: &str) -> Result<(), StorageDeviceErr> {
         self.partition
             .remove_dir(&self.dev, partition_idx, path)
-            .map_err(error_from_file_system_err)
+            .map_err(StorageDeviceErr::FileSystemErr)
     }
 }
 
@@ -150,12 +150,4 @@ pub enum StorageDeviceErr {
     IoErr(IoError),
     FileSystemErr(FileSystemErr),
     StillUsed,
-}
-
-fn error_from_ioerror(err: IoError) -> StorageDeviceErr {
-    StorageDeviceErr::IoErr(err)
-}
-
-fn error_from_file_system_err(err: FileSystemErr) -> StorageDeviceErr {
-    StorageDeviceErr::FileSystemErr(err)
 }
