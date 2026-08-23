@@ -960,3 +960,48 @@ fn panic(info: &PanicInfo) -> ! {
     debug_uart.write("\r\n=================================\r\n");
     loop {}
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use typestate::bitregs;
+
+    bitregs! {
+        /// Register layout used to exercise the generated field APIs in QEMU.
+        pub(super) struct BitregsSmoke: u32 {
+            pub mode@[1:0] as SmokeMode {
+                Idle = 0b00,
+                Run = 0b10,
+            },
+            // Both views address the same payload bits through different fields.
+            union data@[15:2] {
+                view split {
+                    pub low@[7:2],
+                    pub high@[15:8],
+                },
+                view packed {
+                    pub payload@[15:2],
+                },
+            },
+            pub enabled@[16:16],
+            reserved@[23:17] [res0],
+            reserved@[31:24] [res1],
+        }
+    }
+
+    #[test_case]
+    fn bitregs_generated_api_smoke() {
+        // Seed both reserved ranges opposite their required encoded values.
+        let register = BitregsSmoke::from_bits(0x00fe_ffff)
+            .set(BitregsSmoke::enabled, 1)
+            .set_enum(BitregsSmoke::mode, SmokeMode::Run)
+            .set(BitregsSmoke::low, 0x2a)
+            // Raw field values retain their register bit position.
+            .set_raw(BitregsSmoke::high, 0x5a00);
+
+        assert_eq!(register.get(BitregsSmoke::enabled), 1);
+        assert_eq!(register.get_enum(BitregsSmoke::mode), Some(SmokeMode::Run));
+        assert_eq!(register.get(BitregsSmoke::payload), 0x16aa);
+        assert_eq!(register.get_raw(BitregsSmoke::high), 0x5a00);
+        assert_eq!(register.bits(), 0xff01_5aaa);
+    }
+}
