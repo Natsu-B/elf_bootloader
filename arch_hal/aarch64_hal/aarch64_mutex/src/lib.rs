@@ -166,7 +166,6 @@ aarch64_unit_test::uboot_unit_test_harness!(__unit_test_init);
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
-    use aarch64_unit_test::test_case;
     use core::arch::asm;
 
     fn clear_irq() {
