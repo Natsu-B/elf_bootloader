@@ -28,17 +28,7 @@ pub fn bitregs_impl(input: TokenStream) -> TokenStream {
 fn check_transparent_single_tuple_struct(ast: &DeriveInput, derive: &str) -> Result<syn::Type> {
     let ident = &ast.ident;
 
-    let mut is_transparent = false;
-    for attr in &ast.attrs {
-        if attr.path().is_ident("repr") {
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("transparent") {
-                    is_transparent = true;
-                }
-                Ok(())
-            })?;
-        }
-    }
+    let (_, is_transparent, _) = parse_repr_flags(ast)?;
     if !is_transparent {
         return Err(Error::new(
             ident.span(),
