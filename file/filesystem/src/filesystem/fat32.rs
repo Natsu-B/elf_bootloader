@@ -1785,10 +1785,7 @@ impl FileSystemTrait for FAT32FileSystem {
         if remaining == 0 {
             return Ok(0);
         }
-        let mut cluster_buf = Vec::with_capacity(cluster_size);
-        unsafe {
-            cluster_buf.set_len(cluster_size);
-        }
+        let mut cluster_buf = vec![0; cluster_size];
         while remaining > 0 {
             let cluster_index = if cluster_size == 0 {
                 0
