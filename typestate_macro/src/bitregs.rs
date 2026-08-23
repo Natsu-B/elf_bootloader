@@ -69,13 +69,14 @@ impl Input {
         } = self.register;
         let crate_path = self.crate_path;
         let raw_impl = crate::expand_rawreg_impl(&name, &raw, &crate_path);
-        let (res0, res1) = reserved_masks(&items);
+        let (res0, res1) = reserved_masks(&items)?;
 
         let mut fields = Vec::new();
         collect_fields(&items, &mut fields);
         let expanded_fields = fields
             .into_iter()
-            .map(|field| field.expand(&name, &raw, &crate_path));
+            .map(|field| field.expand(&name, &raw, &crate_path))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(quote! {
             #(#attrs)*
@@ -278,7 +279,7 @@ impl Item {
     fn layout(&self) -> (&BitRange, proc_macro2::Span) {
         match self {
             Self::Field(field) => (&field.range, field.name.span()),
-            Self::Reserved(item) => (&item.range, item.range.span),
+            Self::Reserved(item) => (&item.range, item.range.msb.span()),
             Self::Union(union) => (&union.range, union.name.span()),
         }
     }
@@ -295,18 +296,23 @@ struct FieldDef {
 
 impl FieldDef {
     /// Emits the associated descriptor and optional enum conversion API.
-    fn expand(&self, register: &Ident, raw: &TokenStream, crate_path: &TokenStream) -> TokenStream {
+    fn expand(
+        &self,
+        register: &Ident,
+        raw: &TokenStream,
+        crate_path: &TokenStream,
+    ) -> Result<TokenStream> {
         let attrs = &self.attrs;
         let vis = &self.vis;
         let name = &self.name;
-        let lsb = self.range.lsb;
-        let size = self.range.width();
+        let (msb, lsb) = self.range.values()?;
+        let size = msb - lsb + 1;
         let enum_tokens = self
             .values
             .as_ref()
             .map(|values| values.expand(vis, name, raw));
 
-        quote! {
+        Ok(quote! {
             impl #register {
                 #(#attrs)*
                 #[doc = concat!("Descriptor for the `", stringify!(#name), "` bitfield.")]
@@ -315,7 +321,7 @@ impl FieldDef {
                     #crate_path::bitflags::Field::new();
             }
             #enum_tokens
-        }
+        })
     }
 }
 
@@ -407,54 +413,49 @@ struct View {
 
 /// Inclusive MSB/LSB bit range.
 struct BitRange {
-    msb: u32,
-    lsb: u32,
-    span: proc_macro2::Span,
+    msb: LitInt,
+    lsb: LitInt,
 }
 
 impl Parse for BitRange {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let body;
         bracketed!(body in input);
-        let msb: LitInt = body.parse()?;
+        let msb = body.parse()?;
         body.parse::<Token![:]>()?;
-        let lsb: LitInt = body.parse()?;
+        let lsb = body.parse()?;
         if !body.is_empty() {
             return Err(body.error("bitregs: unexpected tokens in bit range"));
         }
-        Ok(Self {
-            msb: msb.base10_parse()?,
-            lsb: lsb.base10_parse()?,
-            span: msb.span(),
-        })
+        Ok(Self { msb, lsb })
     }
 }
 
 impl BitRange {
-    /// Returns the number of bits in a validated range.
-    fn width(&self) -> u32 {
-        self.msb - self.lsb + 1
+    /// Parses the inclusive range endpoints.
+    fn values(&self) -> Result<(u32, u32)> {
+        Ok((self.msb.base10_parse()?, self.lsb.base10_parse()?))
     }
 
     /// Validates and returns this range's register mask.
     fn mask(&self, width: u32, allowed: u128) -> Result<u128> {
-        let msb = self.msb;
-        if msb < self.lsb {
+        let (msb, lsb) = self.values()?;
+        if msb < lsb {
             return Err(Error::new(
-                self.span,
+                self.msb.span(),
                 "bitregs: range MSB must be greater than or equal to LSB",
             ));
         }
         if msb >= width {
             return Err(Error::new(
-                self.span,
+                self.msb.span(),
                 format!("bitregs: bit {msb} is outside the {width}-bit register"),
             ));
         }
-        let mask = low_mask(self.width()) << self.lsb;
+        let mask = low_mask(msb - lsb + 1) << lsb;
         if mask & allowed != mask {
             return Err(Error::new(
-                self.span,
+                self.msb.span(),
                 "bitregs: range is outside its containing register or union",
             ));
         }
@@ -655,8 +656,8 @@ impl Validator {
             ));
         }
 
-        let width = field.range.width();
-        let maximum = low_mask(width);
+        let (msb, lsb) = field.range.values()?;
+        let maximum = low_mask(msb - lsb + 1);
         let mut names = HashSet::new();
         let mut raw_values = HashSet::new();
         for variant in &values.variants {
@@ -665,7 +666,7 @@ impl Validator {
             if value > maximum {
                 return Err(Error::new(
                     variant.value.span(),
-                    format!("bitregs: enum value does not fit in {width} bits"),
+                    format!("bitregs: enum value does not fit in {} bits", msb - lsb + 1),
                 ));
             }
             if !raw_values.insert(value) {
@@ -710,21 +711,21 @@ fn low_mask(width: u32) -> u128 {
 }
 
 /// Collects top-level reserved policies; view policies describe interpretations only.
-fn reserved_masks(items: &[Item]) -> (u128, u128) {
+fn reserved_masks(items: &[Item]) -> Result<(u128, u128)> {
     let mut res0 = 0;
     let mut res1 = 0;
     for item in items {
         let Item::Reserved(item) = item else {
             continue;
         };
-        let mask = low_mask(item.range.width()) << item.range.lsb;
+        let mask = item.range.mask(128, u128::MAX)?;
         match &item.policy {
             ReservedPolicy::Zero => res0 |= mask,
             ReservedPolicy::One => res1 |= mask,
             ReservedPolicy::Preserve => {}
         }
     }
-    (res0, res1)
+    Ok((res0, res1))
 }
 
 /// Flattens all view fields because their descriptors share the register type.
@@ -787,6 +788,10 @@ mod tests {
             (
                 quote!([::typestate] struct R: u16 { reserved@[15:0] [reserved], }),
                 "reserved policy",
+            ),
+            (
+                quote!([::typestate] struct R: u8 { reserved@[4294967296:0], }),
+                "register type must be u16, u32, or u64",
             ),
             (
                 quote!([::typestate] struct R: u16 { union value@[15:0] {} }),
