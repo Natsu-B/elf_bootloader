@@ -4,10 +4,13 @@ PATH_TO_ELF="$1"
 
 # get absolute path
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+DISK_IMG="$SCRIPT_DIR/../bin/virtio_blk_test.img"
 
 rm -rf "$SCRIPT_DIR/../bin/EFI"
 mkdir -p "$SCRIPT_DIR/../bin/EFI/BOOT/"
 cp "${PATH_TO_ELF}" "$SCRIPT_DIR/../bin/EFI/BOOT/BOOTAA64.EFI"
+# QEMU writes to the device, so each run starts from a fresh fixture copy.
+cp "$SCRIPT_DIR/test.txt" "$DISK_IMG"
 
 QEMU_GDB_ARGS=""
 if [ -n "$XTASK_QEMU_GDB_SOCKET" ]; then
@@ -23,7 +26,7 @@ qemu-system-aarch64 \
   -nographic \
   -semihosting-config enable=on,target=native \
   -no-reboot -no-shutdown \
-  -drive id=drive0,file=$SCRIPT_DIR/test.txt,format=raw,if=none \
+  -drive id=drive0,file=$DISK_IMG,format=raw,if=none \
   -device virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0 \
   -drive file=fat:rw:$SCRIPT_DIR/../bin,format=raw,if=none,media=disk,id=disk \
   -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.1 \
@@ -31,9 +34,9 @@ qemu-system-aarch64 \
 
 RETCODE=$?
 
-if [ $RETCODE -eq 0 ]; then
+if [ "$RETCODE" -eq 0 ]; then
     exit 0
-elif [ $RETCODE -eq 1 ]; then
+else
     printf "\nFailed\n"
-    exit 1
+    exit "$RETCODE"
 fi
