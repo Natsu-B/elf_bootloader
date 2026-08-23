@@ -2280,21 +2280,7 @@ fn parse_hex_u32(buf: &[u8]) -> Option<u32> {
 }
 
 fn parse_dec_u8(buf: &[u8]) -> Option<u8> {
-    if buf.is_empty() {
-        return None;
-    }
-    let mut val: u32 = 0;
-    for &b in buf {
-        if !(b'0'..=b'9').contains(&b) {
-            return None;
-        }
-        val = val.checked_mul(10)?;
-        val = val.checked_add((b - b'0') as u32)?;
-        if val > u8::MAX as u32 {
-            return None;
-        }
-    }
-    Some(val as u8)
+    parse_dec_u64(buf).and_then(|v| u8::try_from(v).ok())
 }
 
 fn parse_dec_u64(buf: &[u8]) -> Option<u64> {
@@ -2590,6 +2576,7 @@ mod tests {
     use super::Target;
     use super::TargetError;
     use super::WatchpointKind;
+    use super::parse_dec_u8;
     use core::convert::Infallible;
     use std::vec::Vec;
 
@@ -2858,6 +2845,14 @@ mod tests {
             packets.iter().any(|packet| packet.payload == b"68690a"),
             "missing qRcmd output reply"
         );
+    }
+
+    #[test]
+    fn decimal_u8_parser_checks_bounds() {
+        assert_eq!(parse_dec_u8(b"0"), Some(0));
+        assert_eq!(parse_dec_u8(b"255"), Some(u8::MAX));
+        assert_eq!(parse_dec_u8(b"256"), None);
+        assert_eq!(parse_dec_u8(b"18446744073709551616"), None);
     }
 
     #[test]
