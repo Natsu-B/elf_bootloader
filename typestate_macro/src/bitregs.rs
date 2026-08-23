@@ -109,7 +109,7 @@ impl Input {
                 fn field_mask<F: #crate_path::bitflags::FieldSpec<Self>>() -> (u32, #raw) {
                     let off = F::OFF;
                     let size = F::SZ;
-                    let bits = (::core::mem::size_of::<#raw>() as u32) * 8;
+                    let bits = <#raw>::BITS;
                     ::core::assert!(
                         size > 0 && off < bits && size <= bits - off,
                         "bitregs: invalid field (reg={}, field={}, off={}, size={}, bits={})",
@@ -119,11 +119,7 @@ impl Input {
                         size,
                         bits,
                     );
-                    let mask = if size == bits {
-                        !0 as #raw
-                    } else {
-                        ((1 as #raw) << size) - 1
-                    };
+                    let mask = <#raw>::MAX >> (bits - size);
                     (off, mask)
                 }
 
@@ -359,7 +355,7 @@ impl EnumDef {
 
             impl From<#name> for #raw {
                 #[inline]
-                fn from(value: #name) -> #raw { value as u128 as #raw }
+                fn from(value: #name) -> #raw { value as #raw }
             }
 
             impl ::core::convert::TryFrom<#raw> for #name {
@@ -367,7 +363,7 @@ impl EnumDef {
 
                 #[inline]
                 fn try_from(value: #raw) -> ::core::result::Result<Self, Self::Error> {
-                    match value as u128 {
+                    match value {
                         #(#values => ::core::result::Result::Ok(Self::#names),)*
                         _ => ::core::result::Result::Err(()),
                     }

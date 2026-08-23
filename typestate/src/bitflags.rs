@@ -169,11 +169,8 @@ mod tests {
 
     #[test]
     fn reserved_policy_and_enum_round_trip() {
-        let timer = Timer::new()
-            .set(Timer::period, 0xaa)
-            .set(Timer::enable, 1)
-            .with_bits(0xff01_00aa);
-        assert_eq!(timer.bits(), 0xff01_00aa);
+        let timer = Timer::new().with_bits(0x0000_ffff);
+        assert_eq!(timer.bits(), 0xff00_00ff);
 
         let status = Status::new()
             .set_enum(Status::state, State::Done)
