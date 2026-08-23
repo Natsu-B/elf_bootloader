@@ -8,8 +8,6 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering;
 use core::task::Context;
 use core::task::Poll;
-use core::task::RawWaker;
-use core::task::RawWakerVTable;
 use core::task::Waker;
 use cpu::Registers;
 use cpu::registers::DBGWCR_EL1;
@@ -1336,31 +1334,6 @@ fn debug_stream() -> Option<&'static mut dyn PollByteStream<Error = Infallible>>
     Some(unsafe { &mut *ptr.0 })
 }
 
-// SAFETY: This callback never dereferences the pointer and returns the same
-// static no-op waker representation.
-unsafe fn noop_waker_clone(_ptr: *const ()) -> RawWaker {
-    RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
-}
-
-// SAFETY: No-op wake callback; pointer is intentionally unused.
-unsafe fn noop_waker_wake(_ptr: *const ()) {}
-// SAFETY: No-op wake-by-ref callback; pointer is intentionally unused.
-unsafe fn noop_waker_wake_by_ref(_ptr: *const ()) {}
-// SAFETY: No-op drop callback; pointer is intentionally unused.
-unsafe fn noop_waker_drop(_ptr: *const ()) {}
-
-static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    noop_waker_clone,
-    noop_waker_wake,
-    noop_waker_wake_by_ref,
-    noop_waker_drop,
-);
-
-fn noop_waker() -> Waker {
-    // SAFETY: vtable functions are no-ops and the data pointer is never dereferenced.
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
-}
-
 pub fn in_debug_stop() -> bool {
     IN_DEBUG_STOP.load(Ordering::Acquire)
 }
@@ -1499,8 +1472,13 @@ impl<M: MemoryAccess, const MAX_PKT: usize, const TX_CAP: usize, const N: usize>
             } else {
                 return;
             };
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        // Debug-stop I/O is polled synchronously without an executor.
+        // Receive and transmit are retried inside the stop loop.
+        // A pending operation does not suspend this task or require rescheduling.
+        // The waker remains borrowed only within this polling context.
+        // Debug transports must make progress when polled repeatedly.
+        // `Waker::noop` expresses that contract without an unsafe raw vtable.
+        let mut cx = Context::from_waker(Waker::noop());
         let _debug_stop = DebugStopGuard::new();
         self.state.suspend_hw_watchpoints();
         let mut semihost_trap = false;
