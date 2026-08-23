@@ -34,50 +34,40 @@ pub struct ArpRequestView {
     pub target_ip: Ipv4Addr,
 }
 
-/// Parses an ARP request frame for Ethernet/IPv4 (`htype=1`, `ptype=0x0800`).
-pub fn parse_arp_request(frame: &[u8]) -> Result<ArpRequestView, ParseError> {
-    let (eth_header, payload) = eth::parse_ethernet_ii(frame)?;
-    if eth_header.ethertype != eth::ETHERTYPE_ARP {
+fn parse_arp_frame(frame: &[u8]) -> Result<(eth::EthernetHeader, &[u8]), ParseError> {
+    let (header, payload) = eth::parse_ethernet_ii(frame)?;
+    if header.ethertype != eth::ETHERTYPE_ARP {
         return Err(ParseError::UnsupportedEthertype);
     }
     if payload.len() < ARP_PAYLOAD_LEN {
         return Err(ParseError::ArpPacketTooShort);
     }
-
-    let hw_type = read_be_u16(payload, 0);
-    let proto_type = read_be_u16(payload, 2);
-    let hlen = payload[4];
-    let plen = payload[5];
-    if hw_type != ARP_HWTYPE_ETHERNET
-        || proto_type != eth::ETHERTYPE_IPV4
-        || hlen != ARP_HLEN_ETHERNET
-        || plen != ARP_PLEN_IPV4
+    if read_be_u16(payload, 0) != ARP_HWTYPE_ETHERNET
+        || read_be_u16(payload, 2) != eth::ETHERTYPE_IPV4
+        || payload[4] != ARP_HLEN_ETHERNET
+        || payload[5] != ARP_PLEN_IPV4
     {
         return Err(ParseError::ArpUnsupportedFormat);
     }
+    Ok((header, payload))
+}
 
+fn arp_mac(payload: &[u8], offset: usize) -> MacAddr {
+    // ARP payload length is validated before fixed-width address fields are read.
+    MacAddr(payload[offset..offset + 6].try_into().unwrap())
+}
+
+/// Parses an ARP request frame for Ethernet/IPv4 (`htype=1`, `ptype=0x0800`).
+pub fn parse_arp_request(frame: &[u8]) -> Result<ArpRequestView, ParseError> {
+    let (eth_header, payload) = parse_arp_frame(frame)?;
     let operation = read_be_u16(payload, 6);
     if operation != ARP_OPERATION_REQUEST {
         return Err(ParseError::ArpNotRequest);
     }
 
-    let sender_mac = MacAddr([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-    ]);
+    let sender_mac = arp_mac(payload, 8);
     let sender_ip = [payload[14], payload[15], payload[16], payload[17]];
-    let target_mac = MacAddr([
-        payload[18],
-        payload[19],
-        payload[20],
-        payload[21],
-        payload[22],
-        payload[23],
-    ]);
+    let target_mac = arp_mac(payload, 18);
     let target_ip = [payload[24], payload[25], payload[26], payload[27]];
 
     Ok(ArpRequestView {
@@ -160,32 +150,12 @@ pub fn parse_arp_reply(
     local_ip: Ipv4Addr,
     requested_ip: Ipv4Addr,
 ) -> Result<MacAddr, ParseError> {
-    let (eth_header, payload) = eth::parse_ethernet_ii(frame)?;
-    if eth_header.ethertype != eth::ETHERTYPE_ARP {
-        return Err(ParseError::UnsupportedEthertype);
-    }
-    if payload.len() < ARP_PAYLOAD_LEN {
-        return Err(ParseError::ArpPacketTooShort);
-    }
-    if read_be_u16(payload, 0) != ARP_HWTYPE_ETHERNET
-        || read_be_u16(payload, 2) != eth::ETHERTYPE_IPV4
-        || payload[4] != ARP_HLEN_ETHERNET
-        || payload[5] != ARP_PLEN_IPV4
-    {
-        return Err(ParseError::ArpUnsupportedFormat);
-    }
+    let (eth_header, payload) = parse_arp_frame(frame)?;
     if read_be_u16(payload, 6) != ARP_OPERATION_REPLY {
         return Err(ParseError::ArpNotReply);
     }
 
-    let sender_mac = MacAddr([
-        payload[8],
-        payload[9],
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-    ]);
+    let sender_mac = arp_mac(payload, 8);
     let sender_ip = [payload[14], payload[15], payload[16], payload[17]];
     let target_ip = [payload[24], payload[25], payload[26], payload[27]];
     if sender_ip != requested_ip || target_ip != local_ip {
@@ -226,6 +196,17 @@ mod tests {
         assert_eq!(
             &frame[eth::HEADER_LEN + 24..eth::HEADER_LEN + 28],
             &SERVER_IP
+        );
+        assert_eq!(
+            parse_arp_request(&frame),
+            Ok(ArpRequestView {
+                src_mac: LOCAL_MAC,
+                dst_mac: MacAddr([0xff; 6]),
+                sender_mac: LOCAL_MAC,
+                sender_ip: LOCAL_IP,
+                target_mac: MacAddr([0; 6]),
+                target_ip: SERVER_IP,
+            })
         );
     }
 
