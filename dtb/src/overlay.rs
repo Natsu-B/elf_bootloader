@@ -660,43 +660,19 @@ fn parse_u32_list(bytes: &[u8]) -> Result<Vec<u32>, OverlayError> {
     if bytes.len() % 4 != 0 {
         return Err(OverlayError::MalformedFixup);
     }
-    let mut values = Vec::new();
-    let mut idx = 0;
-    while idx + 4 <= bytes.len() {
-        let v = read_be_u32(&bytes[idx..idx + 4]);
-        values.push(v);
-        idx += 4;
-    }
-    Ok(values)
+    Ok(bytes.chunks_exact(4).map(read_be_u32).collect())
 }
 
 fn decode_first_string(bytes: &[u8]) -> Option<&str> {
-    let list = parse_stringlist(bytes).ok()?;
-    list.get(0).copied()
+    parse_stringlist(bytes).ok()?.first().copied()
 }
 
 fn parse_stringlist(bytes: &[u8]) -> Result<Vec<&str>, OverlayError> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut result = Vec::new();
-    let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == 0 {
-            if i > start {
-                let slice = &bytes[start..i];
-                let s = core::str::from_utf8(slice).map_err(|_| OverlayError::MalformedOverlay)?;
-                result.push(s);
-            }
-            start = i + 1;
-        }
-    }
-    if start < bytes.len() {
-        let slice = &bytes[start..];
-        let s = core::str::from_utf8(slice).map_err(|_| OverlayError::MalformedOverlay)?;
-        result.push(s);
-    }
-    Ok(result)
+    bytes
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| core::str::from_utf8(entry).map_err(|_| OverlayError::MalformedOverlay))
+        .collect()
 }
 
 fn read_be_u32(bytes: &[u8]) -> u32 {
