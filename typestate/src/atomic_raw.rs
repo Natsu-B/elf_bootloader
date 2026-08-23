@@ -70,6 +70,18 @@ pub trait AtomicRawInt: AtomicRaw {
     fn fetch_nand(a: &Self::Atomic, v: Self, order: Ordering) -> Self;
 }
 
+/// Generates direct delegations to the matching standard atomic methods.
+macro_rules! delegate_atomic {
+    ($(fn $method:ident($($arg:ident: $ty:ty),*) -> $result:ty;)+) => {
+        $(
+            #[inline(always)]
+            fn $method(a: &Self::Atomic, $($arg: $ty),*) -> $result {
+                a.$method($($arg),*)
+            }
+        )+
+    };
+}
+
 macro_rules! impl_atomic_raw {
     ($raw:ty, $atomic:ty) => {
         impl AtomicRaw for $raw {
@@ -81,56 +93,19 @@ macro_rules! impl_atomic_raw {
                 unsafe { <$atomic>::from_ptr(ptr) }
             }
 
-            #[inline(always)]
-            fn load(a: &Self::Atomic, order: Ordering) -> Self {
-                a.load(order)
-            }
-
-            #[inline(always)]
-            fn store(a: &Self::Atomic, v: Self, order: Ordering) {
-                a.store(v, order)
-            }
-
-            #[inline(always)]
-            fn swap(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.swap(v, order)
-            }
-
-            #[inline(always)]
-            fn compare_exchange(
-                a: &Self::Atomic,
-                current: Self,
-                new: Self,
-                success: Ordering,
-                failure: Ordering,
-            ) -> Result<Self, Self> {
-                a.compare_exchange(current, new, success, failure)
-            }
-
-            #[inline(always)]
-            fn compare_exchange_weak(
-                a: &Self::Atomic,
-                current: Self,
-                new: Self,
-                success: Ordering,
-                failure: Ordering,
-            ) -> Result<Self, Self> {
-                a.compare_exchange_weak(current, new, success, failure)
-            }
-
-            #[inline(always)]
-            fn fetch_or(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_or(v, order)
-            }
-
-            #[inline(always)]
-            fn fetch_and(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_and(v, order)
-            }
-
-            #[inline(always)]
-            fn fetch_xor(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_xor(v, order)
+            delegate_atomic! {
+                fn load(order: Ordering) -> Self;
+                fn store(v: Self, order: Ordering) -> ();
+                fn swap(v: Self, order: Ordering) -> Self;
+                fn compare_exchange(
+                    current: Self, new: Self, success: Ordering, failure: Ordering
+                ) -> Result<Self, Self>;
+                fn compare_exchange_weak(
+                    current: Self, new: Self, success: Ordering, failure: Ordering
+                ) -> Result<Self, Self>;
+                fn fetch_or(v: Self, order: Ordering) -> Self;
+                fn fetch_and(v: Self, order: Ordering) -> Self;
+                fn fetch_xor(v: Self, order: Ordering) -> Self;
             }
         }
     };
@@ -140,29 +115,12 @@ macro_rules! impl_atomic_raw_int {
     ($raw:ty, $atomic:ty) => {
         impl_atomic_raw!($raw, $atomic);
         impl AtomicRawInt for $raw {
-            #[inline(always)]
-            fn fetch_add(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_add(v, order)
-            }
-
-            #[inline(always)]
-            fn fetch_sub(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_sub(v, order)
-            }
-
-            #[inline(always)]
-            fn fetch_min(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_min(v, order)
-            }
-
-            #[inline(always)]
-            fn fetch_max(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_max(v, order)
-            }
-
-            #[inline(always)]
-            fn fetch_nand(a: &Self::Atomic, v: Self, order: Ordering) -> Self {
-                a.fetch_nand(v, order)
+            delegate_atomic! {
+                fn fetch_add(v: Self, order: Ordering) -> Self;
+                fn fetch_sub(v: Self, order: Ordering) -> Self;
+                fn fetch_min(v: Self, order: Ordering) -> Self;
+                fn fetch_max(v: Self, order: Ordering) -> Self;
+                fn fetch_nand(v: Self, order: Ordering) -> Self;
             }
         }
     };
