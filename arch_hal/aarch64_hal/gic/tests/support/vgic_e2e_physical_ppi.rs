@@ -3,7 +3,7 @@ use core::arch::global_asm;
 use core::arch::naked_asm;
 use core::ptr;
 
-#[path = "vgic_e2e_common.rs"]
+#[path = "../vgic_e2e_common.rs"]
 mod common;
 
 unsafe extern "C" {
