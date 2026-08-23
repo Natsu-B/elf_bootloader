@@ -194,21 +194,14 @@ unsafe impl<T: 'static> AtomicPod for Option<core::ptr::NonNull<T>> {
 
     #[inline]
     fn to_raw(self) -> Self::Raw {
-        match self {
-            None => 0,
-            Some(ptr) => ptr.as_ptr() as usize,
-        }
+        self.map_or(0, |ptr| ptr.as_ptr() as usize)
     }
 
     #[inline]
     fn from_raw(raw: Self::Raw) -> Self {
-        if raw == 0 {
-            None
-        } else {
-            // SAFETY: non-zero integers can represent non-null pointer values.
-            // The pointer may be dangling; dereference validity is external.
-            Some(unsafe { core::ptr::NonNull::new_unchecked(raw as *mut T) })
-        }
+        // Non-zero integers can represent non-null pointer values.
+        // The pointer may be dangling; dereference validity is external.
+        core::ptr::NonNull::new(raw as *mut T)
     }
 
     #[inline]
