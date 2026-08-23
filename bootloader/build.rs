@@ -12,31 +12,6 @@ fn run_git(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn resolve_git_dir_from(repo_dir: &PathBuf) -> Option<PathBuf> {
-    let mut cur = repo_dir.clone();
-    loop {
-        let dot_git = cur.join(".git");
-        if dot_git.is_dir() {
-            return Some(dot_git);
-        }
-        if dot_git.is_file() {
-            // Worktree style: ".git" file contains "gitdir: <path>"
-            let s = fs::read_to_string(&dot_git).ok()?;
-            let line = s.lines().next()?.trim();
-            let p = line.strip_prefix("gitdir:")?.trim();
-            let gitdir = if PathBuf::from(p).is_absolute() {
-                PathBuf::from(p)
-            } else {
-                cur.join(p)
-            };
-            return Some(gitdir);
-        }
-        if !cur.pop() {
-            return None;
-        }
-    }
-}
-
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let crate_dir = PathBuf::from(crate_dir);
@@ -49,7 +24,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 
     // Best-effort: rerun build script when HEAD/index changes (works for normal repo/worktree).
-    if let Some(git_dir) = resolve_git_dir_from(&crate_dir) {
+    if let Some(git_dir) = run_git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from) {
         let head = git_dir.join("HEAD");
         if head.exists() {
             println!("cargo:rerun-if-changed={}", head.display());
