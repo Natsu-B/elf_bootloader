@@ -20,15 +20,10 @@ pub struct MirrorOps {
     pub flush: fn(),
 }
 
+#[derive(Default)]
 pub struct DebugUart {
     uart: OnceCell<Pl011Uart>,
     mirror: Option<MirrorOps>,
-}
-
-impl Default for DebugUart {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl DebugUart {
