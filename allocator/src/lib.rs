@@ -121,13 +121,9 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// Allocates a block for the buddy allocator from the range-list allocator.
     pub fn alloc_for_buddy_allocator(&self) -> Option<usize> {
         let mut range_list_allocator_guard = self.range_list_allocator.lock();
-        if let Some(range_list_allocator) = range_list_allocator_guard.get_mut() {
-            let layout =
-                Layout::from_size_align(MAX_ALLOCATABLE_BYTES, MAX_ALLOCATABLE_BYTES).ok()?;
-            range_list_allocator.allocate_region(layout.size(), layout.align())
-        } else {
-            None
-        }
+        let range_list_allocator = range_list_allocator_guard.get_mut()?;
+        let layout = Layout::from_size_align(MAX_ALLOCATABLE_BYTES, MAX_ALLOCATABLE_BYTES).ok()?;
+        range_list_allocator.allocate_region(layout.size(), layout.align())
     }
 }
 
@@ -179,14 +175,11 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// Returns `Err` if called after finalization or if allocator is not initialized.
     pub fn add_available_region(&self, address: usize, size: usize) -> Result<(), &'static str> {
         let mut guard = self.range_list_allocator.lock();
-        if let Some(block) = guard.get_mut() {
-            if block.is_finalized() {
-                return Err("allocator already finalized");
-            }
-            block.add_region(&MemoryRegions::from_parts(address, size))
-        } else {
-            Err("allocator not initialized")
+        let block = guard.get_mut().ok_or("allocator not initialized")?;
+        if block.is_finalized() {
+            return Err("allocator already finalized");
         }
+        block.add_region(&MemoryRegions::from_parts(address, size))
     }
 
     /// Add a reserved memory region before finalization.
@@ -195,14 +188,11 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// Returns `Err` if called after finalization or if allocator is not initialized.
     pub fn add_reserved_region(&self, address: usize, size: usize) -> Result<(), &'static str> {
         let mut guard = self.range_list_allocator.lock();
-        if let Some(block) = guard.get_mut() {
-            if block.is_finalized() {
-                return Err("allocator already finalized");
-            }
-            block.add_reserved_region(&MemoryRegions::from_parts(address, size))
-        } else {
-            Err("allocator not initialized")
+        let block = guard.get_mut().ok_or("allocator not initialized")?;
+        if block.is_finalized() {
+            return Err("allocator already finalized");
         }
+        block.add_reserved_region(&MemoryRegions::from_parts(address, size))
     }
 
     /// Allocates a reserved region dynamically.
@@ -216,11 +206,8 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         alloc_range: Option<(usize, usize)>,
     ) -> Result<Option<usize>, &'static str> {
         let mut guard = self.range_list_allocator.lock();
-        if let Some(block) = guard.get_mut() {
-            block.add_reserved_region_dynamic(size, align, alloc_range)
-        } else {
-            Err("allocator not initialized")
-        }
+        let block = guard.get_mut().ok_or("allocator not initialized")?;
+        block.add_reserved_region_dynamic(size, align, alloc_range)
     }
 
     /// Finalize the allocator by subtracting reserved regions and enabling allocation.
@@ -230,15 +217,12 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// Safe to call multiple times; after the first success, it’s a no-op.
     pub fn finalize(&self) -> Result<(), &'static str> {
         let mut guard = self.range_list_allocator.lock();
-        if let Some(block) = guard.get_mut() {
-            if block.is_finalized() {
-                return Ok(());
-            }
-            // Do not force-align free regions; just reconcile regions.
-            block.check_regions()
-        } else {
-            Err("allocator not initialized")
+        let block = guard.get_mut().ok_or("allocator not initialized")?;
+        if block.is_finalized() {
+            return Ok(());
         }
+        // Do not force-align free regions; just reconcile regions.
+        block.check_regions()
     }
 
     /// Allocates memory with specified size and alignment.
@@ -251,9 +235,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         align: usize,
     ) -> Result<usize, &'static str> {
         let mut guard = self.range_list_allocator.lock();
-        let Some(block) = guard.get_mut() else {
-            return Err("allocator not initialized");
-        };
+        let block = guard.get_mut().ok_or("allocator not initialized")?;
         if !block.is_finalized() {
             return Err("allocator not finalized");
         }
@@ -282,9 +264,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// Returns `Err` if allocator is not initialized or not finalized.
     pub fn trim_for_boot(&self, reserve_bytes: usize) -> Result<Vec<(usize, usize)>, &'static str> {
         let mut guard = self.range_list_allocator.lock();
-        let Some(block) = guard.get_mut() else {
-            return Err("allocator not initialized");
-        };
+        let block = guard.get_mut().ok_or("allocator not initialized")?;
         if !block.is_finalized() {
             return Err("allocator not finalized");
         }
@@ -297,9 +277,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
     /// Returns `Err` if allocator is not initialized.
     pub fn for_each_free_region<F: FnMut(usize, usize)>(&self, f: F) -> Result<(), &'static str> {
         let guard = self.range_list_allocator.lock();
-        let Some(block) = guard.get() else {
-            return Err("allocator not initialized");
-        };
+        let block = guard.get().ok_or("allocator not initialized")?;
         block.for_each_free_region(f);
         Ok(())
     }
@@ -313,9 +291,7 @@ impl<const MAX_ALLOCATABLE_BYTES: usize, const LEVELS: usize>
         f: F,
     ) -> Result<(), &'static str> {
         let guard = self.range_list_allocator.lock();
-        let Some(block) = guard.get() else {
-            return Err("allocator not initialized");
-        };
+        let block = guard.get().ok_or("allocator not initialized")?;
         block.for_each_reserved_region(f);
         Ok(())
     }
