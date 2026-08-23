@@ -43,9 +43,7 @@ where
         match targets {
             VSpiRouting::Targets(mask) => {
                 let entry = VSpiRouting::Targets(mask);
-                let changed = self.spi_route[idx] != entry;
-                self.spi_route[idx] = entry;
-                Ok(changed)
+                Ok(core::mem::replace(&mut self.spi_route[idx], entry) != entry)
             }
             VSpiRouting::Specific(_) | VSpiRouting::AnyParticipating => {
                 Err(GicError::UnsupportedFeature)

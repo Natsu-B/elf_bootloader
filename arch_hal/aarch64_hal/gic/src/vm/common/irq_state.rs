@@ -435,28 +435,23 @@ where
         if !Self::intid_in_range(intid) {
             return Err(GicError::UnsupportedIntId);
         }
-        let changed = match scope {
+        Ok(match scope {
             VgicIrqScope::Local(vcpu) => {
                 if intid >= LOCAL_INTID_COUNT {
                     return Err(GicError::UnsupportedIntId);
                 }
                 let idx = self.vcpu_index(vcpu)?;
                 let slot = &mut self.priority_local[idx][intid];
-                let changed = *slot != priority;
-                *slot = priority;
-                changed
+                core::mem::replace(slot, priority) != priority
             }
             VgicIrqScope::Global => {
                 if intid < LOCAL_INTID_COUNT {
                     return Err(GicError::UnsupportedIntId);
                 }
-                let slot = &mut self.priority_global[intid - LOCAL_INTID_COUNT];
-                let changed = *slot != priority;
-                *slot = priority;
-                changed
+                let idx = intid - LOCAL_INTID_COUNT;
+                core::mem::replace(&mut self.priority_global[idx], priority) != priority
             }
-        };
-        Ok(changed)
+        })
     }
 
     pub(crate) fn set_trigger(
@@ -469,28 +464,23 @@ where
         if !Self::intid_in_range(intid) {
             return Err(GicError::UnsupportedIntId);
         }
-        let changed = match scope {
+        Ok(match scope {
             VgicIrqScope::Local(vcpu) => {
                 if intid >= LOCAL_INTID_COUNT {
                     return Err(GicError::UnsupportedIntId);
                 }
                 let idx = self.vcpu_index(vcpu)?;
                 let slot = &mut self.trigger_local[idx][intid];
-                let changed = *slot != trigger;
-                *slot = trigger;
-                changed
+                core::mem::replace(slot, trigger) != trigger
             }
             VgicIrqScope::Global => {
                 if intid < LOCAL_INTID_COUNT {
                     return Err(GicError::UnsupportedIntId);
                 }
-                let slot = &mut self.trigger_global[intid - LOCAL_INTID_COUNT];
-                let changed = *slot != trigger;
-                *slot = trigger;
-                changed
+                let idx = intid - LOCAL_INTID_COUNT;
+                core::mem::replace(&mut self.trigger_global[idx], trigger) != trigger
             }
-        };
-        Ok(changed)
+        })
     }
 
     pub(crate) fn read_group_word(
