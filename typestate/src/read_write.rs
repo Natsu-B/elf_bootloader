@@ -72,45 +72,26 @@ pub trait Writable {
     }
 }
 
-impl<T: Copy + RawReg> Readable for ReadOnly<T> {
-    type T = T;
-    #[inline]
-    fn as_ptr(&self) -> *const T {
-        self.0.get()
-    }
+/// Implements direct pointer access for the capability wrappers.
+macro_rules! impl_access {
+    (read $($wrapper:ident),+ $(,)?) => {$(
+        impl<T: Copy + RawReg> Readable for $wrapper<T> {
+            type T = T;
+            #[inline]
+            fn as_ptr(&self) -> *const T { self.0.get() }
+        }
+    )+};
+    (write $($wrapper:ident),+ $(,)?) => {$(
+        impl<T: RawReg> Writable for $wrapper<T> {
+            type T = T;
+            #[inline]
+            fn as_mut_ptr(&self) -> *mut T { self.0.get() }
+        }
+    )+};
 }
 
-impl<T: Copy + RawReg> Readable for ReadPure<T> {
-    type T = T;
-    #[inline]
-    fn as_ptr(&self) -> *const T {
-        self.0.get()
-    }
-}
-
-impl<T: Copy + RawReg> Readable for ReadWrite<T> {
-    type T = T;
-    #[inline]
-    fn as_ptr(&self) -> *const T {
-        self.0.get()
-    }
-}
-
-impl<T: RawReg> Writable for WriteOnly<T> {
-    type T = T;
-    #[inline]
-    fn as_mut_ptr(&self) -> *mut T {
-        self.0.get()
-    }
-}
-
-impl<T: RawReg> Writable for ReadWrite<T> {
-    type T = T;
-    #[inline]
-    fn as_mut_ptr(&self) -> *mut T {
-        self.0.get()
-    }
-}
+impl_access!(read ReadOnly, ReadPure, ReadWrite);
+impl_access!(write WriteOnly, ReadWrite);
 
 impl<T> ReadWrite<T>
 where
