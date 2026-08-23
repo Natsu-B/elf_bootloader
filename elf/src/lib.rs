@@ -534,9 +534,6 @@ fn validate_ident(data: &[u8], class: ElfClass, endian: ElfEndian) -> Result<(),
     if data.len() < ELF_IDENT_LEN {
         return Err(ElfErr::TooShort);
     }
-    if !is_elf(data) {
-        return Err(ElfErr::InvalidMagic);
-    }
     if elf_class(data)? != class {
         return Err(ElfErr::Unsupported);
     }
@@ -550,9 +547,6 @@ fn validate_ident(data: &[u8], class: ElfClass, endian: ElfEndian) -> Result<(),
 fn validate_ident_64(data: &[u8]) -> Result<(), ElfErr> {
     if data.len() < ELF_IDENT_LEN {
         return Err(ElfErr::TooShort);
-    }
-    if !is_elf(data) {
-        return Err(ElfErr::InvalidMagic);
     }
     if elf_class(data)? != ElfClass::Elf64 || data[6] != EV_CURRENT as u8 {
         return Err(ElfErr::Unsupported);
