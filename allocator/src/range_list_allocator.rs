@@ -1560,6 +1560,16 @@ mod tests {
         // Verify that we can still allocate after wrapping.
         assert!(allocator.allocate_region(0x10, 0x1000).is_some());
         assert_eq!(allocator.region_size, 121);
+
+        let capacity = allocator.region_capacity;
+        allocator.trim_for_boot(0x10).unwrap();
+        assert_eq!(allocator.region_capacity, capacity);
+        assert_eq!(allocator.region_size, 1);
+        assert!(
+            allocator.regions[1..]
+                .iter()
+                .all(|region| *region == EMPTY_REGION)
+        );
     }
 
     #[test]
