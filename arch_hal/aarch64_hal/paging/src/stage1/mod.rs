@@ -1,5 +1,4 @@
 use cpu::get_sctlr_el2;
-use cpu::isb;
 
 use crate::PAGE_TABLE_SIZE;
 use crate::PagingErr;
@@ -250,9 +249,6 @@ impl EL2Stage1Paging {
             } else {
                 // table descriptor
                 let next_level_table = new_table()?;
-                for j in &mut *next_level_table {
-                    *j = 0;
-                }
                 let idx = (*va - start_va) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] =

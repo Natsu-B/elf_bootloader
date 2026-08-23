@@ -3,7 +3,6 @@ use core::alloc::Layout;
 use core::cell::SyncUnsafeCell;
 use core::mem;
 use core::slice;
-use cpu::isb;
 
 use cpu::registers::PARange;
 
@@ -197,9 +196,7 @@ impl Stage2Paging {
         let table =
             unsafe { slice::from_raw_parts_mut(table_addr as *mut u64, num_of_tables * 512) };
         // initialize page table
-        for i in &mut *table {
-            *i = 0;
-        }
+        table.fill(0);
 
         let top_level_offset = (3 - top_table_level) as usize * 9 + 12;
         let top_level = 1 << top_level_offset;
@@ -239,10 +236,9 @@ impl Stage2Paging {
             } else {
                 // table descriptor
                 let next_level_table = new_table()?;
-                let next_level_table_addr = next_level_table.as_ptr() as usize;
                 debug_assert_eq!(table[idx], 0);
                 table[idx] =
-                    Stage2_48bitTableDescriptor::new_descriptor(next_level_table_addr as u64);
+                    Stage2_48bitTableDescriptor::new_descriptor(next_level_table.as_ptr() as u64);
                 let start_ipa = ipa & !(top_level - 1);
                 Self::setup_stage2_translation_recursive(
                     &mut i,
@@ -276,7 +272,6 @@ impl Stage2Paging {
         let table_limit = start_ipa + table_level_size * 512;
 
         while *i < data.len() && *ipa < table_limit {
-            let setting = &data[*i];
             // is block descriptor
             if table_level == 3
                 || ((*pa | *ipa) & (table_level_size - 1) == 0 && *size >= table_level_size)
@@ -305,11 +300,10 @@ impl Stage2Paging {
             } else {
                 // table descriptor
                 let next_level_table = new_table()?;
-                let next_level_table_addr = next_level_table.as_ptr() as usize;
                 let idx = (*ipa - start_ipa) >> table_level_offset;
                 debug_assert_eq!(table_addr[idx], 0);
                 table_addr[idx] =
-                    Stage2_48bitTableDescriptor::new_descriptor(next_level_table_addr as u64);
+                    Stage2_48bitTableDescriptor::new_descriptor(next_level_table.as_ptr() as u64);
                 let start_ipa = *ipa & !(table_level_size - 1);
                 Self::setup_stage2_translation_recursive(
                     i,
