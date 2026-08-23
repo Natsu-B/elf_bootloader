@@ -962,6 +962,7 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
+    use typestate::RawReg;
     use typestate::bitregs;
 
     bitregs! {
@@ -1002,5 +1003,10 @@ mod tests {
         assert_eq!(register.get(BitregsSmoke::payload), 0x16aa);
         assert_eq!(register.get_raw(BitregsSmoke::high), 0x5a00);
         assert_eq!(register.bits(), 0xff01_5aaa);
+
+        // Generated RawReg conversions preserve the register while swapping raw bytes.
+        let big_endian = register.to_be();
+        assert_eq!(big_endian.to_raw(), register.to_raw().to_be());
+        assert_eq!(big_endian.from_be(), register);
     }
 }
