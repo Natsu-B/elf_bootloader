@@ -61,8 +61,6 @@ use core::fmt;
 use core::hint::spin_loop;
 use core::task::Context;
 use core::task::Poll;
-use core::task::RawWaker;
-use core::task::RawWakerVTable;
 use core::task::Waker;
 use io_api::stream::PollByteStream;
 
@@ -129,32 +127,6 @@ pub enum ProcessResult {
 type TargetErr<T> = TargetError<<T as Target>::RecoverableError, <T as Target>::UnrecoverableError>;
 type GdbServerError<T> =
     GdbError<<T as Target>::RecoverableError, <T as Target>::UnrecoverableError>;
-
-// SAFETY: This callback never dereferences the pointer and returns the same
-// static no-op waker representation.
-unsafe fn noop_waker_clone(_ptr: *const ()) -> RawWaker {
-    RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
-}
-
-// SAFETY: No-op wake callback; pointer is intentionally unused.
-unsafe fn noop_waker_wake(_ptr: *const ()) {}
-// SAFETY: No-op wake-by-ref callback; pointer is intentionally unused.
-unsafe fn noop_waker_wake_by_ref(_ptr: *const ()) {}
-// SAFETY: No-op drop callback; pointer is intentionally unused.
-unsafe fn noop_waker_drop(_ptr: *const ()) {}
-
-static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    noop_waker_clone,
-    noop_waker_wake,
-    noop_waker_wake_by_ref,
-    noop_waker_drop,
-);
-
-/// Creates a no-op waker for polling.
-fn noop_waker() -> Waker {
-    // SAFETY: vtable functions are no-ops and the data pointer is never dereferenced.
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) }
-}
 
 /// IRQ-facing transport-agnostic interface for the RSP engine.
 pub trait RspIrqEndpoint<T: Target> {
@@ -900,8 +872,14 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         stream: &mut S,
         target: &mut T,
     ) -> Result<(), GdbServerError<T>> {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        // This server drives the stream synchronously instead of through an executor.
+        // Receive and transmit are polled on every loop iteration.
+        // `Poll::Pending` retries after `spin_loop`, so no task needs rescheduling.
+        // The no-op waker therefore never needs to schedule this loop.
+        // It remains borrowed only for the lifetime of this polling context.
+        // Transports used here must make progress when polled repeatedly.
+        // `Waker::noop` expresses that contract without a custom raw vtable.
+        let mut cx = Context::from_waker(Waker::noop());
         let mut rx_buf = [0u8; 64];
         let mut tx_buf = [0u8; 128];
         let mut tx_pos = 0usize;
