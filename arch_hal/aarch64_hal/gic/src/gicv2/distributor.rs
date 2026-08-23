@@ -57,26 +57,14 @@ impl Gicv2 {
             return Err(GicError::UnsupportedIntId);
         }
 
+        // Keep INTID validation before route conversion so its error takes precedence.
         let cpu_targets = match route {
             SpiRoute::Specific(affinity) => self.cpu_targets_mask_from_affinity(affinity)?,
             SpiRoute::AnyParticipating => return Err(GicError::UnsupportedFeature),
         };
-
-        let spi = (intid - 32) as usize;
-        let reg = spi / 4;
-        let byte = spi % 4;
-        let target = self
-            .gicd
-            .itargetsr
-            .get(reg)
-            .and_then(|entry| entry.get(byte))
-            .ok_or(GicError::UnsupportedIntId)?;
-
-        // SAFETY: The Distributor MMIO frame is validated and mapped by `Gicv2::new`, `intid`
-        // has been checked as an SPI in-range for this GIC instance, and this byte write targets
-        // only the ITARGETSR slot for the selected SPI without modifying other interrupt state.
-        target.write(cpu_targets);
-        Ok(())
+        // The byte helper performs the bounds-checked, slot-local ITARGETSR write without
+        // modifying other interrupt state.
+        self.set_spi_route_byte_inner(intid, cpu_targets)
     }
 
     fn set_spi_route_byte_inner(&self, intid: u32, cpu_targets: u8) -> Result<(), GicError> {
