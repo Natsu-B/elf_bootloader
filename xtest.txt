@@ -17,11 +17,14 @@ std intrusive_linked_list
 std mutex
 std net
 std pci
+std print
 std soc
 std typestate
 std typestate_macro
 std xtask
+# Select host GDB integrations explicitly; the remaining integrations target UEFI.
 unit gdb_remote
+std gdb_remote --test rsp_binary_decode --test rsp_frame_assembler
 
 uefi block-device virtio_blk_modern file/block-device/scripts/run_qemu.sh
 uefi file fat32_virtio file/scripts/run_fat32_virtio_test.sh
