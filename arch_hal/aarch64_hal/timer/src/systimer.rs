@@ -7,14 +7,9 @@ use core::time::Duration;
 use cpu::isb;
 
 /// Simple polling timer that spins on CNTPCT_EL0.
+#[derive(Default)]
 pub struct SystemTimer {
     counter_frequency: Option<NonZeroU64>,
-}
-
-impl Default for SystemTimer {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl SystemTimer {
