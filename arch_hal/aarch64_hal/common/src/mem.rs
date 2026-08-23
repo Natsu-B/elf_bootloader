@@ -1,30 +1,22 @@
 pub const PAGE_SIZE_4K: usize = 1usize << 12;
 pub const PAGE_SIZE_4K_U64: u64 = PAGE_SIZE_4K as u64;
 
-const fn is_pow2_nonzero_usize(value: usize) -> bool {
-    value != 0 && (value & (value - 1)) == 0
-}
-
-const fn is_pow2_nonzero_u64(value: u64) -> bool {
-    value != 0 && (value & (value - 1)) == 0
-}
-
 pub const fn is_aligned_usize(value: usize, align: usize) -> bool {
-    if !is_pow2_nonzero_usize(align) {
+    if !align.is_power_of_two() {
         return false;
     }
     (value & (align - 1)) == 0
 }
 
 pub const fn align_down_usize(value: usize, align: usize) -> usize {
-    if !is_pow2_nonzero_usize(align) {
+    if !align.is_power_of_two() {
         return value;
     }
     value & !(align - 1)
 }
 
 pub const fn align_up_usize(value: usize, align: usize) -> Option<usize> {
-    if !is_pow2_nonzero_usize(align) {
+    if !align.is_power_of_two() {
         return None;
     }
     match value.checked_add(align - 1) {
@@ -34,21 +26,21 @@ pub const fn align_up_usize(value: usize, align: usize) -> Option<usize> {
 }
 
 pub const fn is_aligned_u64(value: u64, align: u64) -> bool {
-    if !is_pow2_nonzero_u64(align) {
+    if !align.is_power_of_two() {
         return false;
     }
     (value & (align - 1)) == 0
 }
 
 pub const fn align_down_u64(value: u64, align: u64) -> u64 {
-    if !is_pow2_nonzero_u64(align) {
+    if !align.is_power_of_two() {
         return value;
     }
     value & !(align - 1)
 }
 
 pub const fn align_up_u64(value: u64, align: u64) -> Option<u64> {
-    if !is_pow2_nonzero_u64(align) {
+    if !align.is_power_of_two() {
         return None;
     }
     match value.checked_add(align - 1) {
