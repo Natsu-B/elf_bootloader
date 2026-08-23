@@ -23,11 +23,11 @@ use typestate::Writable;
 fn mirror_word_and_bit(
     scope: GicMirrorScope,
     intid: u32,
-    max_intid: u32,
+    max_intid: impl FnOnce() -> u32,
 ) -> Result<(usize, u32), GicError> {
     let word = match scope {
         GicMirrorScope::Local(_) if (16..32).contains(&intid) => 0,
-        GicMirrorScope::Global if (32..max_intid).contains(&intid) => (intid / 32) as usize,
+        GicMirrorScope::Global if (32..max_intid()).contains(&intid) => (intid / 32) as usize,
         _ => return Err(GicError::UnsupportedIntId),
     };
     Ok((word, 1u32 << (intid % 32)))
@@ -110,7 +110,7 @@ impl Gicv2 {
         group: IrqGroup,
     ) -> Result<(), GicError> {
         let security_ext = self.is_security_extension_implemented();
-        let (word, bit) = mirror_word_and_bit(scope, intid, self.max_intid())?;
+        let (word, bit) = mirror_word_and_bit(scope, intid, || self.max_intid())?;
         if security_ext && group == IrqGroup::Group0 {
             return Err(GicError::UnsupportedFeature);
         }
@@ -132,7 +132,7 @@ impl Gicv2 {
         intid: u32,
         priority: u8,
     ) -> Result<(), GicError> {
-        mirror_word_and_bit(scope, intid, self.max_intid())?;
+        mirror_word_and_bit(scope, intid, || self.max_intid())?;
         self.gicd.ipriorityr[intid as usize / 4][intid as usize % 4].write(priority);
         Ok(())
     }
@@ -143,7 +143,7 @@ impl Gicv2 {
         intid: u32,
         trigger: TriggerMode,
     ) -> Result<(), GicError> {
-        mirror_word_and_bit(scope, intid, self.max_intid())?;
+        mirror_word_and_bit(scope, intid, || self.max_intid())?;
         let reg = intid as usize / 16;
         let shift = (intid as usize % 16) * 2;
         self.gicd.icfgr[reg].clear_bits(0b11 << shift);
@@ -162,7 +162,7 @@ impl Gicv2 {
         intid: u32,
         enable: bool,
     ) -> Result<(), GicError> {
-        let (word, bit) = mirror_word_and_bit(scope, intid, self.max_intid())?;
+        let (word, bit) = mirror_word_and_bit(scope, intid, || self.max_intid())?;
         if enable {
             self.gicd.isenabler[word].write(bit);
         } else {
@@ -177,7 +177,7 @@ impl Gicv2 {
         intid: u32,
         pending: bool,
     ) -> Result<(), GicError> {
-        let (word, bit) = mirror_word_and_bit(scope, intid, self.max_intid())?;
+        let (word, bit) = mirror_word_and_bit(scope, intid, || self.max_intid())?;
         if pending {
             self.gicd.ispendr[word].write(bit);
         } else {
@@ -192,7 +192,7 @@ impl Gicv2 {
         intid: u32,
         active: bool,
     ) -> Result<(), GicError> {
-        let (word, bit) = mirror_word_and_bit(scope, intid, self.max_intid())?;
+        let (word, bit) = mirror_word_and_bit(scope, intid, || self.max_intid())?;
         if active {
             self.gicd.isactiver[word].write(bit);
         } else {
@@ -272,7 +272,11 @@ mod tests {
             (GicMirrorScope::Global, 64, Err(GicError::UnsupportedIntId)),
         ];
         for (scope, intid, expected) in cases {
-            assert_eq!(mirror_word_and_bit(scope, intid, 64), expected);
+            let max_intid = || {
+                assert!(matches!(scope, GicMirrorScope::Global));
+                64
+            };
+            assert_eq!(mirror_word_and_bit(scope, intid, max_intid), expected);
         }
     }
 }
