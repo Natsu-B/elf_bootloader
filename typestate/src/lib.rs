@@ -20,9 +20,8 @@
 //! - [`Unaligned<T>`]: unaligned access helper that performs byte-wise I/O via access wrappers.
 //!
 //! # Bitfield Helpers
-//! - [`bitregs!`]: declarative macro for defining MMIO register layouts with
-//!   compile-time coverage and overlap checks, available via
-//!   [`crate::bitregs!`](crate::bitregs!) or the alias [`crate::bitflags!`](crate::bitflags!).
+//! - [`bitregs!`]: macro for defining MMIO register layouts with compile-time
+//!   coverage and overlap checks.
 //!
 //! # Safety
 //! These wrappers do not validate that the underlying address actually maps to
@@ -49,6 +48,9 @@ pub use read_write::Readable;
 pub use read_write::Writable;
 pub use read_write::WriteOnly;
 pub use unaligned::Unaligned;
+
+#[doc(hidden)]
+pub use typestate_macro::bitregs_impl as __bitregs_impl;
 
 /// # Safety
 /// Implementors must ensure:

@@ -1,8 +1,11 @@
 //! Procedural macros for the typestate crate.
 //!
-//! Provides derive macros for `BytePod`, `RawReg`, and atomic width traits (`U8`, `U16`, `U32`, `U64`).
+//! Provides register-layout and derive macros for the `typestate` crate.
+
+mod bitregs;
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::format_ident;
 use quote::quote;
 use syn::DeriveInput;
@@ -10,7 +13,14 @@ use syn::Error;
 use syn::Result;
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
-use syn::{self};
+
+/// Implements the register-layout DSL exported as `typestate::bitregs!`.
+#[proc_macro]
+pub fn bitregs_impl(input: TokenStream) -> TokenStream {
+    bitregs::expand(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Ensures the input is a `#[repr(transparent)]` single-field tuple struct.
 /// Returns the inner field type on success; on failure returns `syn::Error`
@@ -357,18 +367,13 @@ pub fn derive_bytepod(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Derives [`typestate::RawReg`] for transparent tuple structs.
-#[proc_macro_derive(RawReg)]
-pub fn derive_rawreg(input: TokenStream) -> TokenStream {
-    let ast = parse_macro_input!(input as DeriveInput);
-    let ident = &ast.ident;
-
-    let raw_ty = match check_transparent_single_tuple_struct(&ast, "RawReg") {
-        Ok(ty) => ty,
-        Err(e) => return e.to_compile_error().into(),
-    };
-
-    let expanded = quote! {
+/// Generates the common `RawReg` implementation against a hygienic typestate path.
+pub(crate) fn expand_rawreg_impl(
+    ident: &syn::Ident,
+    raw_ty: &TokenStream2,
+    typestate_path: &TokenStream2,
+) -> TokenStream2 {
+    quote! {
         // Size/align equality with inner raw type
         const _: [(); ::core::mem::size_of::<#ident>()] =
             [(); ::core::mem::size_of::<#raw_ty>()];
@@ -376,20 +381,20 @@ pub fn derive_rawreg(input: TokenStream) -> TokenStream {
             [(); ::core::mem::align_of::<#raw_ty>()];
 
         // POD marker for the wrapper itself
-        unsafe impl ::typestate::BytePod for #ident {}
+        unsafe impl #typestate_path::BytePod for #ident {}
 
         // RawReg implementation, delegating to inner raw type
-        unsafe impl ::typestate::RawReg for #ident
+        unsafe impl #typestate_path::RawReg for #ident
         where
-            #raw_ty: Copy + ::typestate::RawReg,
+            #raw_ty: Copy + #typestate_path::RawReg,
         {
             type Raw = #raw_ty;
             #[inline] fn to_raw(self) -> Self::Raw { self.0 }
             #[inline] fn from_raw(raw: Self::Raw) -> Self { Self(raw) }
-            #[inline] fn to_le(self) -> Self { Self(::typestate::RawReg::to_le(self.0)) }
-            #[inline] fn from_le(self) -> Self { Self(::typestate::RawReg::from_le(self.0)) }
-            #[inline] fn to_be(self) -> Self { Self(::typestate::RawReg::to_be(self.0)) }
-            #[inline] fn from_be(self) -> Self { Self(::typestate::RawReg::from_be(self.0)) }
+            #[inline] fn to_le(self) -> Self { Self(#typestate_path::RawReg::to_le(self.0)) }
+            #[inline] fn from_le(self) -> Self { Self(#typestate_path::RawReg::from_le(self.0)) }
+            #[inline] fn to_be(self) -> Self { Self(#typestate_path::RawReg::to_be(self.0)) }
+            #[inline] fn from_be(self) -> Self { Self(#typestate_path::RawReg::from_be(self.0)) }
         }
 
         // Bitwise ops
@@ -474,8 +479,20 @@ pub fn derive_rawreg(input: TokenStream) -> TokenStream {
         where #raw_ty: ::core::ops::RemAssign + Copy {
             #[inline] fn rem_assign(&mut self, rhs: Self) { self.0 %= rhs.0; }
         }
+    }
+}
+
+/// Derives [`typestate::RawReg`] for transparent tuple structs.
+#[proc_macro_derive(RawReg)]
+pub fn derive_rawreg(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+    let ident = &ast.ident;
+
+    let raw_ty = match check_transparent_single_tuple_struct(&ast, "RawReg") {
+        Ok(ty) => ty,
+        Err(e) => return e.to_compile_error().into(),
     };
-    expanded.into()
+    expand_rawreg_impl(ident, &quote!(#raw_ty), &quote!(::typestate)).into()
 }
 
 /// Derives [`typestate::U8`] for 8-bit atomic-compatible types.
