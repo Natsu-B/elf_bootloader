@@ -71,8 +71,8 @@ fn print_xtask_usage() {
 fn build(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("rpi5") => build_rpi5(&args[1..]),
-        Some("rpi4") => build_rpi4(&args[1..]),
-        Some("rpi4_net") => build_rpi4_net(&args[1..]),
+        Some("rpi4") => build_bootloader_with_feature(&args[1..], "rpi4"),
+        Some("rpi4_net") => build_bootloader_with_feature(&args[1..], "rpi4_net"),
         Some("example") => build_examples(&args[1..]),
         _ => build_bootloader(args),
     }
@@ -349,26 +349,8 @@ fn build_bootloader(args: &[String]) -> Result<String, String> {
     copy_artifact_to_bin("elf-hypervisor", "elf-hypervisor.elf", &profile)
 }
 
-fn build_rpi4(args: &[String]) -> Result<String, String> {
-    let mut combined_args = Vec::with_capacity(args.len() + 2);
-    combined_args.push("--features".to_string());
-    combined_args.push("rpi4".to_string());
-    combined_args.extend_from_slice(args);
-    build_bootloader(&combined_args)
-}
-
-fn build_rpi4_net(args: &[String]) -> Result<String, String> {
-    let mut combined_args = Vec::with_capacity(args.len() + 2);
-    combined_args.push("--features".to_string());
-    combined_args.push("rpi4_net".to_string());
-    combined_args.extend_from_slice(args);
-    build_bootloader(&combined_args)
-}
-
-fn build_virtio_net(args: &[String]) -> Result<String, String> {
-    let mut combined_args = Vec::with_capacity(args.len() + 2);
-    combined_args.push("--features".to_string());
-    combined_args.push("virtio_net".to_string());
+fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<String, String> {
+    let mut combined_args = vec!["--features".to_string(), feature.to_string()];
     combined_args.extend_from_slice(args);
     build_bootloader(&combined_args)
 }
@@ -434,7 +416,7 @@ fn run_default(args: &[String]) -> ! {
 }
 
 fn run_rpi4(args: &[String]) -> ! {
-    let binary_path = build_rpi4(args).unwrap_or_else(|err| {
+    let binary_path = build_bootloader_with_feature(args, "rpi4").unwrap_or_else(|err| {
         panic!("Failed to build rpi4 bootloader: {}", err);
     });
 
@@ -548,7 +530,7 @@ fn run_single_gdb_bridge(
 }
 
 fn run_net(args: &[String]) -> Result<(), String> {
-    let binary_path = build_virtio_net(args)?;
+    let binary_path = build_bootloader_with_feature(args, "virtio_net")?;
     let stop = Arc::new(AtomicBool::new(false));
 
     let udp_gdb = UdpSocket::bind(PROXY_GDB_UDP_SRC_BIND).map_err(|e| {
