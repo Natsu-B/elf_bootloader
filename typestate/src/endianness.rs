@@ -63,7 +63,7 @@ macro_rules! impl_endian {
 
             #[doc = concat!("Creates a new ", $order, " wrapper from a host-endian value.")]
             pub fn new(t: T) -> Self {
-                Self(t.$from())
+                Self(t.$to())
             }
         }
 
@@ -116,8 +116,40 @@ impl_endian! {
 #[cfg(test)]
 mod tests {
     use core::cell::UnsafeCell;
+    use core::num::Wrapping;
 
     use super::*;
+
+    /// Uses distinct inverse conversions so tests can observe their direction.
+    /// The primitive implementations use byte swaps, where both directions coincide.
+    /// `to_le` and `to_be` add distinct offsets; their matching `from_*`
+    /// operations subtract those offsets.
+    /// Each pair round-trips, while applying either direction twice does not.
+    /// This keeps the test independent of the target's native byte order.
+    ///
+    /// # Safety
+    /// Raw conversion is lossless and each endian conversion pair is mutually inverse.
+    unsafe impl RawReg for Wrapping<u8> {
+        type Raw = u8;
+        fn to_raw(self) -> Self::Raw {
+            self.0
+        }
+        fn from_raw(raw: Self::Raw) -> Self {
+            Self(raw)
+        }
+        fn to_le(self) -> Self {
+            Self(self.0.wrapping_add(1))
+        }
+        fn from_le(self) -> Self {
+            Self(self.0.wrapping_sub(1))
+        }
+        fn to_be(self) -> Self {
+            Self(self.0.wrapping_add(2))
+        }
+        fn from_be(self) -> Self {
+            Self(self.0.wrapping_sub(2))
+        }
+    }
 
     /// Verifies one wrapper's pointer and endian-conversion contracts.
     /// `encoded` is the byte-order-specific representation expected in MMIO
@@ -156,5 +188,19 @@ mod tests {
             VALUE,
             VALUE.to_be(),
         );
+    }
+
+    /// Constructors encode host values before the read path decodes them.
+    #[test]
+    fn endian_constructors_use_write_direction() {
+        let value = Wrapping(7);
+        let little = Le::new(value);
+        let big = Be::new(value);
+        // Inspect the stored representations before the read path decodes them.
+        assert_eq!(little.0, Wrapping(8));
+        assert_eq!(big.0, Wrapping(9));
+        // Reading must apply the inverse conversion and recover the host value.
+        assert_eq!(little.read(), value);
+        assert_eq!(big.read(), value);
     }
 }
