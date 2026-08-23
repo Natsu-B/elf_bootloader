@@ -1,6 +1,5 @@
 //! Hypervisor bootloader binary entrypoint and platform bring-up flow.
 
-#![feature(once_cell_get_mut)]
 #![feature(sync_unsafe_cell)]
 #![feature(generic_const_exprs)]
 #![cfg_attr(all(test, target_arch = "aarch64"), feature(custom_test_frameworks))]
