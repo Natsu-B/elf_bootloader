@@ -238,11 +238,12 @@ mod tests {
     #[repr(transparent)]
     struct MaskedU32(u32);
 
-    /// Small-width wrappers keep each derive entry point exercised.
+    /// Byte-width wrapper covering generated raw storage and marker traits.
     #[derive(Clone, Copy, typestate_macro::U8)]
     #[repr(transparent)]
     struct TestU8(u8);
 
+    /// Halfword-width wrapper covering generated raw storage and marker traits.
     #[derive(Clone, Copy, typestate_macro::U16)]
     #[repr(transparent)]
     struct TestU16(u16);
@@ -262,6 +263,8 @@ mod tests {
         byte == a_off || (b_off..(b_off + core::mem::size_of::<u32>())).contains(&byte)
     }
 
+    /// Exercises both small-width entry points through opposite conversions.
+    /// Packing and construction must preserve their exact primitive widths.
     #[test]
     fn derive_small_widths_round_trip_raw_values() {
         assert_eq!(<TestU8 as AtomicPod>::to_raw(TestU8(0x5a)), 0x5a);
