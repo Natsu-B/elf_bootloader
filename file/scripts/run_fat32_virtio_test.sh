@@ -64,11 +64,10 @@ if [ $RETCODE -eq 0 ]; then
         sudo umount $DISK_MOUNT_DIR
         exit 1
     fi
-    echo "Host check: PASS"
-    sudo rm -rf "$DISK_MOUNT_DIR/testdir"
     sudo umount $DISK_MOUNT_DIR
+    echo "Host check: PASS"
     exit 0
-elif [ $RETCODE -eq 1 ]; then
+else
     printf "\nFailed\n"
-    exit 1
+    exit "$RETCODE"
 fi
