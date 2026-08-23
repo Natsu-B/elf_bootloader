@@ -108,7 +108,7 @@ impl<'dtb> DeviceTree<'dtb, Owned> {
 
         adjust_overlay_phandles(&mut working_overlay, delta)?;
         apply_local_fixups(&mut working_overlay, delta)?;
-        apply_external_fixups(self, &mut working_overlay, opt.strict)?;
+        apply_external_fixups(self, &mut working_overlay)?;
         let fragments = collect_fragments(&working_overlay)?;
 
         let mut report = OverlayApplyReport::default();
@@ -387,7 +387,6 @@ fn apply_local_fixups_recursive(
 fn apply_external_fixups(
     base: &DeviceTree<'_>,
     overlay: &mut DeviceTree<'_>,
-    strict: bool,
 ) -> Result<(), OverlayError> {
     let fixups_root = match overlay.find_node_by_path("/__fixups__") {
         Some(id) => id,
@@ -419,10 +418,7 @@ fn apply_external_fixups(
 
     for prop in fixup_properties {
         let label = prop.name.as_str();
-        let target_path = match symbol_map.get(label) {
-            Some(p) => p,
-            None => return Err(OverlayError::SymbolNotFound),
-        };
+        let target_path = symbol_map.get(label).ok_or(OverlayError::SymbolNotFound)?;
         let base_target = base
             .find_node_by_path(target_path)
             .ok_or(OverlayError::TargetNotFound)?;
