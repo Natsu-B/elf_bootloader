@@ -71,15 +71,8 @@ impl Gicv2DistIdRegs {
         let typer = gicd.typer.read().bits();
         let iidr = gicd.iidr.read();
 
-        let mut pidr = [0u32; 8];
-        for (i, v) in pidr.iter_mut().enumerate() {
-            *v = gicd.pidr[i].read();
-        }
-
-        let mut cidr = [0u32; 4];
-        for (i, v) in cidr.iter_mut().enumerate() {
-            *v = gicd.cidr[i].read();
-        }
+        let pidr = core::array::from_fn(|i| gicd.pidr[i].read());
+        let cidr = core::array::from_fn(|i| gicd.cidr[i].read());
 
         Self {
             typer,
