@@ -137,9 +137,6 @@ impl MemoryBlock {
         x: usize, // insertion_point
         region: &MemoryRegions,
     ) -> Result<(), &'static str> {
-        let mut pre_region_overlaps = false;
-        let mut next_region_overlaps = false;
-
         let pre_region_end = if x > 0 {
             Some(regions_slice[x - 1].end_checked()?)
         } else {
@@ -150,23 +147,11 @@ impl MemoryBlock {
         } else {
             None
         };
+        let region_end = region.end_checked()?;
 
-        // Check for overlap with pre_region
-        if x > 0 {
-            if let Some(pre_end) = pre_region_end
-                && region.address <= pre_end
-            {
-                pre_region_overlaps = true;
-            }
-        }
-
-        // Check for overlap with next_region
-        if x < *size_ref as usize {
-            let next_region = &regions_slice[x];
-            if region.end_checked()? >= next_region.address {
-                next_region_overlaps = true;
-            }
-        }
+        // Adjacency also joins regions, keeping both ordered neighbors in one range.
+        let pre_region_overlaps = pre_region_end.is_some_and(|pre_end| region.address <= pre_end);
+        let next_region_overlaps = x < *size_ref as usize && region_end >= regions_slice[x].address;
 
         match (pre_region_overlaps, next_region_overlaps) {
             (false, false) => {
@@ -176,11 +161,10 @@ impl MemoryBlock {
             (true, false) => {
                 // Overlap with pre_region only
                 let pre_region = &mut regions_slice[x - 1];
-                let new_end = region.end_checked()?;
                 let pre_region_end = pre_region_end.ok_or("region end overflow")?;
 
-                if new_end > pre_region_end {
-                    pre_region.size = new_end
+                if region_end > pre_region_end {
+                    pre_region.size = region_end
                         .checked_sub(pre_region.address)
                         .ok_or("region size underflow")?;
                 }
@@ -189,23 +173,20 @@ impl MemoryBlock {
                 // Overlap with next_region only
                 let next_region = &mut regions_slice[x];
                 let old_end = next_region_end.ok_or("region end overflow")?;
-                let new_end = region.end_checked()?;
 
                 next_region.address = region.address;
                 next_region.size = old_end
-                    .max(new_end)
+                    .max(region_end)
                     .checked_sub(region.address)
                     .ok_or("region end overflow")?;
             }
             (true, true) => {
                 // Overlap with both pre_region and next_region
-                let next_region = regions_slice[x];
                 let pre_region = &mut regions_slice[x - 1];
-
-                let new_end = pre_region
-                    .end_checked()?
-                    .max(region.end_checked()?)
-                    .max(next_region.end_checked()?);
+                let new_end = pre_region_end
+                    .ok_or("region end overflow")?
+                    .max(region_end)
+                    .max(next_region_end.ok_or("region end overflow")?);
 
                 pre_region.size = new_end
                     .checked_sub(pre_region.address)
