@@ -234,6 +234,10 @@ unsafe impl U64 for u64 {}
 mod tests {
     use super::AtomicPod;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, typestate_macro::RawReg)]
+    #[repr(transparent)]
+    struct TestReg(u32);
+
     #[cfg(target_has_atomic = "64")]
     #[derive(Copy, Clone, typestate_macro::U64)]
     #[repr(C)]
@@ -319,5 +323,31 @@ mod tests {
                 assert_eq!(*byte, 0);
             }
         }
+    }
+
+    #[test]
+    fn derive_rawreg_delegates_all_operators() {
+        let lhs = TestReg(12);
+        let rhs = TestReg(5);
+        assert_eq!(lhs | rhs, TestReg(13));
+        assert_eq!(lhs & rhs, TestReg(4));
+        assert_eq!(lhs ^ rhs, TestReg(9));
+        assert_eq!(lhs + rhs, TestReg(17));
+        assert_eq!(lhs - rhs, TestReg(7));
+        assert_eq!(lhs * rhs, TestReg(60));
+        assert_eq!(lhs / rhs, TestReg(2));
+        assert_eq!(lhs % rhs, TestReg(2));
+        assert_eq!(!lhs, TestReg(!12));
+
+        let mut value = lhs;
+        value |= rhs;
+        value &= TestReg(7);
+        value ^= TestReg(3);
+        value += TestReg(4);
+        value -= TestReg(2);
+        value *= TestReg(3);
+        value /= TestReg(4);
+        value %= TestReg(4);
+        assert_eq!(value, TestReg(2));
     }
 }

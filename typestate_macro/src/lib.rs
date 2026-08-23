@@ -373,6 +373,42 @@ pub(crate) fn expand_rawreg_impl(
     raw_ty: &TokenStream2,
     typestate_path: &TokenStream2,
 ) -> TokenStream2 {
+    // Binary and assignment operators differ only in their trait, method, and token.
+    macro_rules! binary_ops {
+        ($($trait:ident::$method:ident $op:tt),+ $(,)?) => {
+            quote! { $(
+                impl ::core::ops::$trait for #ident
+                where #raw_ty: ::core::ops::$trait<Output = #raw_ty> + Copy {
+                    type Output = Self;
+                    #[inline] fn $method(self, rhs: Self) -> Self { Self(self.0 $op rhs.0) }
+                }
+            )+ }
+        };
+    }
+    macro_rules! assign_ops {
+        ($($trait:ident::$method:ident $op:tt),+ $(,)?) => {
+            quote! { $(
+                impl ::core::ops::$trait for #ident
+                where #raw_ty: ::core::ops::$trait + Copy {
+                    #[inline] fn $method(&mut self, rhs: Self) { self.0 $op rhs.0; }
+                }
+            )+ }
+        };
+    }
+
+    let binary_ops = binary_ops!(
+        BitOr::bitor |, BitAnd::bitand &,
+        BitXor::bitxor ^, Add::add +,
+        Sub::sub -, Mul::mul *,
+        Div::div /, Rem::rem %,
+    );
+    let assign_ops = assign_ops!(
+        BitOrAssign::bitor_assign |=, BitAndAssign::bitand_assign &=,
+        BitXorAssign::bitxor_assign ^=, AddAssign::add_assign +=,
+        SubAssign::sub_assign -=, MulAssign::mul_assign *=,
+        DivAssign::div_assign /=, RemAssign::rem_assign %=,
+    );
+
     quote! {
         // Size/align equality with inner raw type
         const _: [(); ::core::mem::size_of::<#ident>()] =
@@ -397,88 +433,16 @@ pub(crate) fn expand_rawreg_impl(
             #[inline] fn from_be(self) -> Self { Self(#typestate_path::RawReg::from_be(self.0)) }
         }
 
-        // Bitwise ops
-        impl ::core::ops::BitOr for #ident
-        where #raw_ty: ::core::ops::BitOr<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
-        }
-        impl ::core::ops::BitAnd for #ident
-        where #raw_ty: ::core::ops::BitAnd<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) }
-        }
-        impl ::core::ops::BitXor for #ident
-        where #raw_ty: ::core::ops::BitXor<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) }
-        }
+        #binary_ops
+
+        // Unary operators keep their distinct signature explicit.
         impl ::core::ops::Not for #ident
         where #raw_ty: ::core::ops::Not<Output = #raw_ty> + Copy {
             type Output = Self;
             #[inline] fn not(self) -> Self { Self(!self.0) }
         }
 
-        // Arithmetic ops
-        impl ::core::ops::Add for #ident
-        where #raw_ty: ::core::ops::Add<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
-        }
-        impl ::core::ops::Sub for #ident
-        where #raw_ty: ::core::ops::Sub<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
-        }
-        impl ::core::ops::Mul for #ident
-        where #raw_ty: ::core::ops::Mul<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn mul(self, rhs: Self) -> Self { Self(self.0 * rhs.0) }
-        }
-        impl ::core::ops::Div for #ident
-        where #raw_ty: ::core::ops::Div<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn div(self, rhs: Self) -> Self { Self(self.0 / rhs.0) }
-        }
-        impl ::core::ops::Rem for #ident
-        where #raw_ty: ::core::ops::Rem<Output = #raw_ty> + Copy {
-            type Output = Self;
-            #[inline] fn rem(self, rhs: Self) -> Self { Self(self.0 % rhs.0) }
-        }
-
-        // Assign variants
-        impl ::core::ops::BitOrAssign for #ident
-        where #raw_ty: ::core::ops::BitOrAssign + Copy {
-            #[inline] fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
-        }
-        impl ::core::ops::BitAndAssign for #ident
-        where #raw_ty: ::core::ops::BitAndAssign + Copy {
-            #[inline] fn bitand_assign(&mut self, rhs: Self) { self.0 &= rhs.0; }
-        }
-        impl ::core::ops::BitXorAssign for #ident
-        where #raw_ty: ::core::ops::BitXorAssign + Copy {
-            #[inline] fn bitxor_assign(&mut self, rhs: Self) { self.0 ^= rhs.0; }
-        }
-        impl ::core::ops::AddAssign for #ident
-        where #raw_ty: ::core::ops::AddAssign + Copy {
-            #[inline] fn add_assign(&mut self, rhs: Self) { self.0 += rhs.0; }
-        }
-        impl ::core::ops::SubAssign for #ident
-        where #raw_ty: ::core::ops::SubAssign + Copy {
-            #[inline] fn sub_assign(&mut self, rhs: Self) { self.0 -= rhs.0; }
-        }
-        impl ::core::ops::MulAssign for #ident
-        where #raw_ty: ::core::ops::MulAssign + Copy {
-            #[inline] fn mul_assign(&mut self, rhs: Self) { self.0 *= rhs.0; }
-        }
-        impl ::core::ops::DivAssign for #ident
-        where #raw_ty: ::core::ops::DivAssign + Copy {
-            #[inline] fn div_assign(&mut self, rhs: Self) { self.0 /= rhs.0; }
-        }
-        impl ::core::ops::RemAssign for #ident
-        where #raw_ty: ::core::ops::RemAssign + Copy {
-            #[inline] fn rem_assign(&mut self, rhs: Self) { self.0 %= rhs.0; }
-        }
+        #assign_ops
     }
 }
 
