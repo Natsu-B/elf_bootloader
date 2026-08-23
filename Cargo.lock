@@ -129,7 +129,6 @@ dependencies = [
  "allocator",
  "arch_hal",
  "dtb",
- "elf",
  "file",
  "gdb_remote",
  "io-api",
@@ -172,7 +171,6 @@ version = "0.1.0"
 dependencies = [
  "allocator",
  "block-device-api",
- "mutex",
  "typestate",
  "typestate_macro",
 ]
@@ -269,7 +267,6 @@ name = "psci"
 version = "0.1.0"
 dependencies = [
  "cpu",
- "print",
 ]
 
 [[package]]
@@ -291,7 +288,6 @@ dependencies = [
  "arch_hal",
  "block-device-api",
  "dtb",
- "elf",
  "file",
  "mutex",
  "typestate",
@@ -364,7 +360,6 @@ checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 name = "virtio"
 version = "0.1.0"
 dependencies = [
- "allocator",
  "cpu",
  "intrusive_linked_list",
  "mutex",

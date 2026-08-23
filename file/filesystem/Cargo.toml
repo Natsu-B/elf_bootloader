@@ -7,5 +7,4 @@ edition = "2024"
 block-device-api = { path = "../block-device-api" }
 typestate = { path = "../../typestate" }
 typestate_macro = { path = "../../typestate_macro" }
-mutex = { path = "../../mutex" }
 allocator = { path = "../../allocator", features = ["no-allocator"] }

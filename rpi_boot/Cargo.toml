@@ -9,7 +9,6 @@ allocator = { path = "../allocator" }
 typestate = { path = "../typestate" }
 file = { path = "../file" }
 block-device-api = { path = "../file/block-device-api" }
-elf = { path = "../elf" }
 arch_hal = { path = "../arch_hal" }
 mutex = { path = "../mutex" }
 
