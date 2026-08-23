@@ -1291,6 +1291,31 @@ fn run_uboot_test_with_timeout(cmd: Command, label: &str, timeout_secs: u64) -> 
     run_guest_test_with_timeout(cmd, label, timeout_secs, "U-Boot test")
 }
 
+/// Owns a fresh per-test Cargo target directory and removes it on scope exit.
+struct UbootTargetDir(PathBuf);
+
+impl UbootTargetDir {
+    fn new(label: &str) -> Self {
+        let label = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let path = std::env::temp_dir()
+            .join("aarch64_hv_uboot_tests")
+            .join(format!("{}_{}", label, std::process::id()));
+        // Discard artifacts left by an interrupted run before Cargo sees the path.
+        let _ = fs::remove_dir_all(&path);
+        Self(path)
+    }
+}
+
+impl Drop for UbootTargetDir {
+    fn drop(&mut self) {
+        // Cleanup must not replace the test result with a filesystem error.
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn parse_xtest_cli_args(
     args: &[String],
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>, bool), String> {
@@ -1887,14 +1912,7 @@ fn test(args: &[String]) {
 
         // Give each U-Boot test its own fresh target dir to avoid mixing build-std
         // artifacts (duplicate core lang items).
-        let sanitized_label = label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect::<String>();
-        let target_dir = std::env::temp_dir()
-            .join("aarch64_hv_uboot_tests")
-            .join(format!("{}_{}", sanitized_label, std::process::id()));
-        let _ = fs::remove_dir_all(&target_dir);
+        let target_dir = UbootTargetDir::new(&label);
 
         let rustflags = {
             let mut parts = Vec::new();
@@ -1927,7 +1945,7 @@ fn test(args: &[String]) {
             .env("CARGO_PROFILE_TEST_PANIC", "abort")
             .env("CARGO_PROFILE_DEV_PANIC", "abort")
             .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", &target_dir)
+            .env("CARGO_TARGET_DIR", &target_dir.0)
             .env("CARGO_TERM_COLOR", "always")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1963,14 +1981,7 @@ fn test(args: &[String]) {
 
         let mut cmd = Command::new("cargo");
 
-        let sanitized_label = label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect::<String>();
-        let target_dir = std::env::temp_dir()
-            .join("aarch64_hv_uboot_tests")
-            .join(format!("{}_{}", sanitized_label, std::process::id()));
-        let _ = fs::remove_dir_all(&target_dir);
+        let target_dir = UbootTargetDir::new(&label);
 
         let rustflags = {
             let mut parts = Vec::new();
@@ -2010,7 +2021,7 @@ fn test(args: &[String]) {
             .env("CARGO_PROFILE_TEST_PANIC", "abort")
             .env("CARGO_PROFILE_DEV_PANIC", "abort")
             .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", &target_dir)
+            .env("CARGO_TARGET_DIR", &target_dir.0)
             .env("CARGO_TERM_COLOR", "always")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2052,8 +2063,11 @@ fn test(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::AnsiQueryFilter;
+    use super::UbootTargetDir;
     use super::apply_testname_filters;
     use super::parse_xtest_cli_args;
+    use std::fs;
+    use std::io;
 
     fn filter_chunks(chunks: &[&[u8]]) -> Vec<u8> {
         let mut filter = AnsiQueryFilter::new();
@@ -2067,6 +2081,31 @@ mod tests {
 
     fn to_args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn uboot_target_dir_starts_fresh_and_cleans_up_on_error() {
+        let label = format!("cleanup_test_{}", std::process::id());
+        let initial = UbootTargetDir::new(&label);
+        let path = initial.0.clone();
+        fs::create_dir_all(&path).expect("target dir should be created");
+        fs::write(path.join("complete"), b"complete").expect("artifact should be created");
+        drop(initial);
+        assert!(!path.exists());
+
+        fs::create_dir_all(&path).expect("stale target dir should be created");
+        fs::write(path.join("stale"), b"stale").expect("stale artifact should be created");
+
+        let result: io::Result<()> = (|| {
+            let target_dir = UbootTargetDir::new(&label);
+            assert!(!target_dir.0.join("stale").exists());
+            fs::create_dir_all(&target_dir.0)?;
+            fs::write(target_dir.0.join("current"), b"current")?;
+            Err(io::Error::other("test error"))
+        })();
+
+        assert!(result.is_err());
+        assert!(!path.exists());
     }
 
     #[test]
