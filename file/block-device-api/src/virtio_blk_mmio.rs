@@ -682,6 +682,8 @@ where
             validate_config_access(offset, size)?;
         }
 
+        // Only queue zero is implemented; other queue selections expose zeroed state.
+        let queue_value = |value| if self.queue_sel == 0 { value } else { 0 };
         let value = match offset {
             REG_MAGIC_VALUE => VIRTIO_MMIO_MAGIC_VALUE as u64,
             REG_VERSION => VIRTIO_MMIO_VERSION_MODERN as u64,
@@ -699,71 +701,17 @@ where
             }
             REG_DRIVER_FEATURES_SEL => self.driver_features_sel as u64,
             REG_QUEUE_SEL => self.queue_sel as u64,
-            REG_QUEUE_NUM_MAX => {
-                if self.queue_sel == 0 {
-                    QUEUE_MAX as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_NUM => {
-                if self.queue_sel == 0 {
-                    self.queue.size as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_READY => {
-                if self.queue_sel == 0 && self.queue.ready {
-                    1
-                } else {
-                    0
-                }
-            }
+            REG_QUEUE_NUM_MAX => queue_value(QUEUE_MAX as u64),
+            REG_QUEUE_NUM => queue_value(self.queue.size as u64),
+            REG_QUEUE_READY => queue_value(u64::from(self.queue.ready)),
             REG_INTERRUPT_STATUS => self.interrupt_status as u64,
             REG_STATUS => self.status as u64,
-            REG_QUEUE_DESC_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.desc_addr as u32 as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_DESC_HIGH => {
-                if self.queue_sel == 0 {
-                    (self.queue.desc_addr >> 32) as u32 as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_DRIVER_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.avail_addr as u32 as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_DRIVER_HIGH => {
-                if self.queue_sel == 0 {
-                    (self.queue.avail_addr >> 32) as u32 as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_DEVICE_LOW => {
-                if self.queue_sel == 0 {
-                    self.queue.used_addr as u32 as u64
-                } else {
-                    0
-                }
-            }
-            REG_QUEUE_DEVICE_HIGH => {
-                if self.queue_sel == 0 {
-                    (self.queue.used_addr >> 32) as u32 as u64
-                } else {
-                    0
-                }
-            }
+            REG_QUEUE_DESC_LOW => queue_value(self.queue.desc_addr as u32 as u64),
+            REG_QUEUE_DESC_HIGH => queue_value((self.queue.desc_addr >> 32) as u32 as u64),
+            REG_QUEUE_DRIVER_LOW => queue_value(self.queue.avail_addr as u32 as u64),
+            REG_QUEUE_DRIVER_HIGH => queue_value((self.queue.avail_addr >> 32) as u32 as u64),
+            REG_QUEUE_DEVICE_LOW => queue_value(self.queue.used_addr as u32 as u64),
+            REG_QUEUE_DEVICE_HIGH => queue_value((self.queue.used_addr >> 32) as u32 as u64),
             REG_CONFIG_GENERATION => self.config_generation as u64,
             _ if offset >= REG_CONFIG_SPACE => self.read_config(offset, size)?,
             _ => 0,
@@ -2224,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_setup_transitions_to_ready() {
+    fn queue_registers_follow_selected_queue() {
         let backend = FakeBlockDevice::new(vec![0u8; SECTOR_SIZE * 2], false);
         let memory = FakeGuestMemory::new(0x8000);
         let irq = FakeInterrupt::default();
@@ -2234,6 +2182,21 @@ mod tests {
 
         assert_eq!(device.mmio_read(REG_QUEUE_NUM, 4).unwrap(), 8);
         assert_eq!(device.mmio_read(REG_QUEUE_READY, 4).unwrap(), 1);
+
+        device.mmio_write(REG_QUEUE_SEL, 4, 1).unwrap();
+        for offset in [
+            REG_QUEUE_NUM_MAX,
+            REG_QUEUE_NUM,
+            REG_QUEUE_READY,
+            REG_QUEUE_DESC_LOW,
+            REG_QUEUE_DESC_HIGH,
+            REG_QUEUE_DRIVER_LOW,
+            REG_QUEUE_DRIVER_HIGH,
+            REG_QUEUE_DEVICE_LOW,
+            REG_QUEUE_DEVICE_HIGH,
+        ] {
+            assert_eq!(device.mmio_read(offset, 4).unwrap(), 0);
+        }
     }
 
     #[test]
