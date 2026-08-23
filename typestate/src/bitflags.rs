@@ -10,12 +10,6 @@ pub trait FieldSpec<Reg> {
     const SZ: u32;
 }
 
-/// Marker trait for fields that can be read.
-pub trait FieldReadable<Reg>: FieldSpec<Reg> {}
-
-/// Marker trait for fields that can be written.
-pub trait FieldWritable<Reg>: FieldSpec<Reg> {}
-
 /// A compile-time field descriptor with offset and size as const generics.
 pub struct Field<Reg, const OFF: u32, const SZ: u32>(pub PhantomData<Reg>);
 
@@ -169,11 +163,8 @@ mod tests {
 
     #[test]
     fn reserved_policy_and_enum_round_trip() {
-        let timer = Timer::new()
-            .set(Timer::period, 0xaa)
-            .set(Timer::enable, 1)
-            .with_bits(0xff01_00aa);
-        assert_eq!(timer.bits(), 0xff01_00aa);
+        let timer = Timer::from_bits(0x00fe_ffaa);
+        assert_eq!(timer.bits(), 0xfffe_00aa);
 
         let status = Status::new()
             .set_enum(Status::state, State::Done)
