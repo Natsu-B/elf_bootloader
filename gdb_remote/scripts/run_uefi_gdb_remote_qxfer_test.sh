@@ -1,6 +1,7 @@
 #!/bin/sh
+set -eu
 
-PATH_TO_ELF="$1"
+PATH_TO_ELF="${1:-}"
 
 if [ -z "$PATH_TO_ELF" ]; then
     echo "usage: $0 <path-to-uefi-test-elf>"
@@ -27,5 +28,3 @@ QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64}
   -no-reboot -no-shutdown \
   -drive file=fat:rw:"$SCRIPT_DIR/../bin",format=raw,if=none,media=disk,id=disk \
   -device virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0
-
-exit $?
