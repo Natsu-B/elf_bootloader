@@ -1389,7 +1389,7 @@ mod tests {
         assert_eq!(recorded_mirror_count(), 1);
         assert_eq!(
             recorded_mirror_op(0),
-            RecordedMirrorOp::SetGroup {
+            GicMirrorOp::SetGroup {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 group: IrqGroup::Group1,
@@ -1950,49 +1950,11 @@ mod tests {
         assert!(vm_size >= common_size + v2_size);
     }
 
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    enum RecordedMirrorOp {
-        SetGroup {
-            scope: GicMirrorScope,
-            intid: u32,
-            group: IrqGroup,
-        },
-        SetPriority {
-            scope: GicMirrorScope,
-            intid: u32,
-            priority: u8,
-        },
-        SetTrigger {
-            scope: GicMirrorScope,
-            intid: u32,
-            trigger: TriggerMode,
-        },
-        SetEnable {
-            scope: GicMirrorScope,
-            intid: u32,
-            enable: bool,
-        },
-        SetPending {
-            scope: GicMirrorScope,
-            intid: u32,
-            pending: bool,
-        },
-        SetActive {
-            scope: GicMirrorScope,
-            intid: u32,
-            active: bool,
-        },
-        SetRoute {
-            intid: u32,
-            route: GicMirrorRoute,
-        },
-    }
-
     const MAX_RECORDED_MIRROR_OPS: usize = 32;
 
     struct MirrorLog {
         count: usize,
-        ops: [Option<RecordedMirrorOp>; MAX_RECORDED_MIRROR_OPS],
+        ops: [Option<GicMirrorOp>; MAX_RECORDED_MIRROR_OPS],
     }
 
     impl MirrorLog {
@@ -2031,7 +1993,7 @@ mod tests {
         log.count
     }
 
-    fn recorded_mirror_op(index: usize) -> RecordedMirrorOp {
+    fn recorded_mirror_op(index: usize) -> GicMirrorOp {
         let log = MIRROR_LOG.lock_irqsave();
         log.ops[index].expect("missing recorded mirror op")
     }
@@ -2060,72 +2022,12 @@ mod tests {
                 return Err(GicError::UnsupportedFeature);
             }
 
-            let recorded = match op {
-                GicMirrorOp::SetGroup {
-                    scope,
-                    intid,
-                    group,
-                } => RecordedMirrorOp::SetGroup {
-                    scope,
-                    intid,
-                    group,
-                },
-                GicMirrorOp::SetPriority {
-                    scope,
-                    intid,
-                    priority,
-                } => RecordedMirrorOp::SetPriority {
-                    scope,
-                    intid,
-                    priority,
-                },
-                GicMirrorOp::SetTrigger {
-                    scope,
-                    intid,
-                    trigger,
-                } => RecordedMirrorOp::SetTrigger {
-                    scope,
-                    intid,
-                    trigger,
-                },
-                GicMirrorOp::SetEnable {
-                    scope,
-                    intid,
-                    enable,
-                } => RecordedMirrorOp::SetEnable {
-                    scope,
-                    intid,
-                    enable,
-                },
-                GicMirrorOp::SetPending {
-                    scope,
-                    intid,
-                    pending,
-                } => RecordedMirrorOp::SetPending {
-                    scope,
-                    intid,
-                    pending,
-                },
-                GicMirrorOp::SetActive {
-                    scope,
-                    intid,
-                    active,
-                } => RecordedMirrorOp::SetActive {
-                    scope,
-                    intid,
-                    active,
-                },
-                GicMirrorOp::SetRoute { intid, route } => {
-                    RecordedMirrorOp::SetRoute { intid, route }
-                }
-            };
-
             let mut log = MIRROR_LOG.lock_irqsave();
             if log.count >= log.ops.len() {
                 return Err(GicError::OutOfResources);
             }
             let index = log.count;
-            log.ops[index] = Some(recorded);
+            log.ops[index] = Some(op);
             log.count = index + 1;
             Ok(())
         }
@@ -2283,7 +2185,7 @@ mod tests {
         assert_eq!(recorded_mirror_count(), 3);
         assert_eq!(
             recorded_mirror_op(0),
-            RecordedMirrorOp::SetGroup {
+            GicMirrorOp::SetGroup {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 group: IrqGroup::Group1,
@@ -2291,7 +2193,7 @@ mod tests {
         );
         assert_eq!(
             recorded_mirror_op(1),
-            RecordedMirrorOp::SetPriority {
+            GicMirrorOp::SetPriority {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 priority: 0x68,
@@ -2299,7 +2201,7 @@ mod tests {
         );
         assert_eq!(
             recorded_mirror_op(2),
-            RecordedMirrorOp::SetTrigger {
+            GicMirrorOp::SetTrigger {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 trigger: TriggerMode::Edge,
@@ -2311,7 +2213,7 @@ mod tests {
         assert_eq!(recorded_mirror_count(), 4);
         assert_eq!(
             recorded_mirror_op(3),
-            RecordedMirrorOp::SetEnable {
+            GicMirrorOp::SetEnable {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 enable: true,
@@ -2334,7 +2236,7 @@ mod tests {
         assert_eq!(recorded_mirror_count(), 1);
         assert_eq!(
             recorded_mirror_op(0),
-            RecordedMirrorOp::SetGroup {
+            GicMirrorOp::SetGroup {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 group: IrqGroup::Group1,
@@ -2357,7 +2259,7 @@ mod tests {
         assert_eq!(recorded_mirror_count(), 1);
         assert_eq!(
             recorded_mirror_op(0),
-            RecordedMirrorOp::SetPriority {
+            GicMirrorOp::SetPriority {
                 scope: GicMirrorScope::Local(target),
                 intid: 27,
                 priority: 0x60,
@@ -2457,7 +2359,7 @@ mod tests {
         assert_eq!(recorded_mirror_count(), 1);
         assert_eq!(
             recorded_mirror_op(0),
-            RecordedMirrorOp::SetRoute {
+            GicMirrorOp::SetRoute {
                 intid: 48,
                 route: GicMirrorRoute::Gicv2TargetMask(0b0000_1011),
             }
