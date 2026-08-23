@@ -95,6 +95,11 @@ where
     local_v2p: [[Option<PIntId>; LOCAL_INTID_COUNT]; VCPUS],
 }
 
+fn checked_index(raw: impl Into<u64>, len: usize, error: GicError) -> Result<usize, GicError> {
+    let index = raw.into() as usize;
+    (index < len).then_some(index).ok_or(error)
+}
+
 impl<const VCPUS: usize> PirqTable<VCPUS>
 where
     [(); crate::max_intids_for_vcpus(VCPUS)]:,
@@ -109,43 +114,27 @@ where
     }
 
     fn index(&self, pintid: PIntId) -> Result<usize, GicError> {
-        let idx = pintid.0 as usize;
-        if idx >= self.global_entries.len() {
-            return Err(GicError::UnsupportedIntId);
-        }
-        Ok(idx)
+        checked_index(
+            pintid.0,
+            self.global_entries.len(),
+            GicError::UnsupportedIntId,
+        )
     }
 
     fn vindex(&self, vintid: VIntId) -> Result<usize, GicError> {
-        let idx = vintid.0 as usize;
-        if idx >= self.global_v2p.len() {
-            return Err(GicError::UnsupportedIntId);
-        }
-        Ok(idx)
+        checked_index(vintid.0, self.global_v2p.len(), GicError::UnsupportedIntId)
     }
 
     fn local_pindex(&self, pintid: PIntId) -> Result<usize, GicError> {
-        let idx = pintid.0 as usize;
-        if idx >= LOCAL_INTID_COUNT {
-            return Err(GicError::UnsupportedIntId);
-        }
-        Ok(idx)
+        checked_index(pintid.0, LOCAL_INTID_COUNT, GicError::UnsupportedIntId)
     }
 
     fn local_vindex(&self, vintid: VIntId) -> Result<usize, GicError> {
-        let idx = vintid.0 as usize;
-        if idx >= LOCAL_INTID_COUNT {
-            return Err(GicError::UnsupportedIntId);
-        }
-        Ok(idx)
+        checked_index(vintid.0, LOCAL_INTID_COUNT, GicError::UnsupportedIntId)
     }
 
     fn tindex(&self, target: VcpuId) -> Result<usize, GicError> {
-        let idx = target.0 as usize;
-        if idx >= VCPUS {
-            return Err(GicError::InvalidVcpuId);
-        }
-        Ok(idx)
+        checked_index(target.0, VCPUS, GicError::InvalidVcpuId)
     }
 
     pub(crate) fn get(&self, pintid: PIntId) -> Result<Option<PirqEntry>, GicError> {
