@@ -1531,7 +1531,7 @@ fn init_gicv2(
     Ok((gic, gdb_intid))
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Range {
     start: usize,
     end: usize,
@@ -1543,6 +1543,26 @@ fn align_down(value: usize, align: usize) -> usize {
 
 fn align_up(value: usize, align: usize) -> usize {
     value.checked_add(align - 1).unwrap_or(usize::MAX) & !(align - 1)
+}
+
+/// Sorts nonempty ranges and merges overlapping or adjacent spans in place.
+/// Returns the length of the normalized prefix.
+fn normalize_ranges(ranges: &mut [Range]) -> usize {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut count = 0;
+    for index in 0..ranges.len() {
+        let range = ranges[index];
+        if range.end <= range.start {
+            continue;
+        }
+        if count != 0 && range.start <= ranges[count - 1].end {
+            ranges[count - 1].end = ranges[count - 1].end.max(range.end);
+        } else {
+            ranges[count] = range;
+            count += 1;
+        }
+    }
+    count
 }
 
 fn sort_stage2_settings(settings: &mut [Stage2PagingSetting], count: usize) {
@@ -1725,7 +1745,7 @@ fn build_stage1_el2_map() -> Vec<EL2Stage1PagingSetting> {
 fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>) {
     const MAX_RESERVED_REGIONS: usize = 32;
 
-    let mut mem_raw = [Range { start: 0, end: 0 }; MAX_MEM_REGIONS];
+    let mut mem_ranges = [Range { start: 0, end: 0 }; MAX_MEM_REGIONS];
     let mut mem_count = 0usize;
     // SAFETY: early boot records memory regions before secondary cores or interrupts are enabled.
     unsafe {
@@ -1741,42 +1761,17 @@ fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>
             if end <= start {
                 continue;
             }
-            mem_raw[mem_count] = Range { start, end };
+            mem_ranges[mem_count] = Range { start, end };
             mem_count += 1;
         }
     }
+    let mem_ranges_count = normalize_ranges(&mut mem_ranges[..mem_count]);
 
-    for i in 0..mem_count {
-        for j in i + 1..mem_count {
-            if mem_raw[i].start > mem_raw[j].start {
-                mem_raw.swap(i, j);
-            }
-        }
-    }
-
-    let mut mem_ranges = [Range { start: 0, end: 0 }; MAX_MEM_REGIONS];
-    let mut mem_ranges_count = 0usize;
-    for idx in 0..mem_count {
-        let r = mem_raw[idx];
-        if mem_ranges_count == 0 {
-            mem_ranges[0] = r;
-            mem_ranges_count = 1;
-            continue;
-        }
-        let last = &mut mem_ranges[mem_ranges_count - 1];
-        if r.start <= last.end {
-            last.end = last.end.max(r.end);
-        } else {
-            mem_ranges[mem_ranges_count] = r;
-            mem_ranges_count += 1;
-        }
-    }
-
-    let mut reserved_raw = [Range { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
+    let mut reserved = [Range { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
     let mut reserved_count = 0usize;
     GLOBAL_ALLOCATOR
         .for_each_reserved_region(|base, size| {
-            if size == 0 || reserved_count >= reserved_raw.len() {
+            if size == 0 || reserved_count >= reserved.len() {
                 return;
             }
             let start = align_down(base, PAGE_SIZE);
@@ -1784,36 +1779,11 @@ fn build_stage2_guest_map() -> (Vec<Stage2PagingSetting>, Option<(usize, usize)>
             if end <= start {
                 return;
             }
-            reserved_raw[reserved_count] = Range { start, end };
+            reserved[reserved_count] = Range { start, end };
             reserved_count += 1;
         })
         .unwrap();
-
-    for i in 0..reserved_count {
-        for j in i + 1..reserved_count {
-            if reserved_raw[i].start > reserved_raw[j].start {
-                reserved_raw.swap(i, j);
-            }
-        }
-    }
-
-    let mut reserved = [Range { start: 0, end: 0 }; MAX_RESERVED_REGIONS];
-    let mut reserved_merged_count = 0usize;
-    for idx in 0..reserved_count {
-        let r = reserved_raw[idx];
-        if reserved_merged_count == 0 {
-            reserved[0] = r;
-            reserved_merged_count = 1;
-            continue;
-        }
-        let last = &mut reserved[reserved_merged_count - 1];
-        if r.start <= last.end {
-            last.end = last.end.max(r.end);
-        } else {
-            reserved[reserved_merged_count] = r;
-            reserved_merged_count += 1;
-        }
-    }
+    let reserved_merged_count = normalize_ranges(&mut reserved[..reserved_count]);
 
     let mut best: Option<Range> = None;
     for idx in 0..mem_ranges_count {
@@ -2557,5 +2527,23 @@ mod tests {
         };
         let text = str::from_utf8(&out[..len]).unwrap();
         assert!(text.starts_with("no"));
+    }
+
+    #[test_case]
+    fn range_normalization_sorts_merges_and_discards_empty() {
+        let mut ranges = [
+            Range { start: 8, end: 12 },
+            Range { start: 0, end: 4 },
+            Range { start: 5, end: 6 },
+            Range { start: 3, end: 10 },
+            Range { start: 12, end: 16 },
+            Range { start: 20, end: 20 },
+            Range { start: 24, end: 28 },
+        ];
+        let count = normalize_ranges(&mut ranges);
+        assert_eq!(
+            &ranges[..count],
+            &[Range { start: 0, end: 16 }, Range { start: 24, end: 28 }]
+        );
     }
 }
