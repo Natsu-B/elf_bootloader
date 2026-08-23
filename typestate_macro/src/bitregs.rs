@@ -302,10 +302,7 @@ impl Item {
     fn span(&self) -> proc_macro2::Span {
         match self {
             Self::Field(field) => field.name.span(),
-            Self::Reserved(item) => item
-                .policy
-                .as_ref()
-                .map_or_else(|| item.range.msb.span(), Ident::span),
+            Self::Reserved(item) => item.range.msb.span(),
             Self::Union(union) => union.name.span(),
         }
     }
@@ -412,10 +409,17 @@ struct EnumVariant {
     value: LitInt,
 }
 
-/// A range with an optional encoding policy.
+/// A reserved range and its encoding policy.
 struct Reserved {
     range: BitRange,
-    policy: Option<Ident>,
+    policy: ReservedPolicy,
+}
+
+/// Encoding policy for one reserved range.
+enum ReservedPolicy {
+    Preserve,
+    Zero,
+    One,
 }
 
 /// A range with multiple complete interpretations.
@@ -555,13 +559,23 @@ fn parse_reserved(input: ParseStream<'_>, _attrs: Vec<Attribute>) -> Result<Rese
     let policy = if input.peek(syn::token::Bracket) {
         let policy_body;
         bracketed!(policy_body in input);
-        let policy = policy_body.parse()?;
+        let policy: Ident = policy_body.parse()?;
         if !policy_body.is_empty() {
             return Err(policy_body.error("bitregs: reserved policy must be one identifier"));
         }
-        Some(policy)
+        match policy.to_string().as_str() {
+            "res0" => ReservedPolicy::Zero,
+            "res1" => ReservedPolicy::One,
+            "ignore" => ReservedPolicy::Preserve,
+            _ => {
+                return Err(Error::new(
+                    policy.span(),
+                    "bitregs: reserved policy must be res0, res1, or ignore",
+                ));
+            }
+        }
     } else {
-        None
+        ReservedPolicy::Preserve
     };
     Ok(Reserved { range, policy })
 }
@@ -641,7 +655,7 @@ impl Validator {
             covered |= mask;
             match item {
                 Item::Field(field) => self.field(field)?,
-                Item::Reserved(item) => Self::reserved(item)?,
+                Item::Reserved(_) => {}
                 Item::Union(union) => self.union(union, mask)?,
             }
         }
@@ -709,20 +723,6 @@ impl Validator {
         Ok(())
     }
 
-    /// Validates a reserved-bit policy.
-    fn reserved(item: &Reserved) -> Result<()> {
-        let Some(policy) = &item.policy else {
-            return Ok(());
-        };
-        match policy.to_string().as_str() {
-            "res0" | "res1" | "ignore" => Ok(()),
-            _ => Err(Error::new(
-                policy.span(),
-                "bitregs: reserved policy must be res0, res1, or ignore",
-            )),
-        }
-    }
-
     /// Validates all complete views of a union, including nested unions.
     fn union(&mut self, union: &Union, mask: u128) -> Result<()> {
         if !self.unions.insert(union.name.to_string()) {
@@ -769,16 +769,10 @@ fn reserved_masks(items: &[Item]) -> Result<(u128, u128)> {
             continue;
         };
         let mask = item.range.mask(128, u128::MAX)?;
-        match item.policy.as_ref().map(ToString::to_string).as_deref() {
-            Some("res0") => res0 |= mask,
-            Some("res1") => res1 |= mask,
-            Some("ignore") | None => {}
-            _ => {
-                return Err(Error::new(
-                    item.range.msb.span(),
-                    "bitregs: reserved policy must be res0, res1, or ignore",
-                ));
-            }
+        match &item.policy {
+            ReservedPolicy::Zero => res0 |= mask,
+            ReservedPolicy::One => res1 |= mask,
+            ReservedPolicy::Preserve => {}
         }
     }
     Ok((res0, res1))
