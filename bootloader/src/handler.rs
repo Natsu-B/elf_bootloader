@@ -4,6 +4,7 @@ use crate::gdb_uart;
 use crate::guest_mmio_allowlist_contains_range;
 use crate::irq_monitor;
 use crate::monitor;
+use crate::monitor::MemfaultAccess;
 use crate::softirq;
 use crate::vgic;
 use arch_hal::aarch64_gdb;
@@ -241,6 +242,15 @@ fn decoded_mmio_is_allowlisted(decoded: &MmioDecoded) -> bool {
     }
 }
 
+fn classify_data_abort_access(
+    write_access: WriteNotRead,
+) -> (WatchpointKind, MemfaultAccess, &'static str) {
+    match write_access {
+        WriteNotRead::ReadingMemoryAbort => (WatchpointKind::Read, MemfaultAccess::Read, "read"),
+        WriteNotRead::WritingMemoryAbort => (WatchpointKind::Write, MemfaultAccess::Write, "write"),
+    }
+}
+
 fn data_abort_handler(
     regs: &mut cpu::Registers,
     info: &DataAbortInfo,
@@ -273,14 +283,7 @@ fn data_abort_handler(
     let access_width: SyndromeAccessSize = access.access_width;
     let write_access: WriteNotRead = access.write_access;
     let reg_num = access.reg_num;
-    let kind = if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-        WatchpointKind::Write
-    } else if matches!(write_access, WriteNotRead::ReadingMemoryAbort) {
-        WatchpointKind::Read
-    } else {
-        WatchpointKind::Access
-    };
-    let stop_kind = kind;
+    let (kind, memfault_access, access_name) = classify_data_abort_access(write_access);
     let reg_opt = u8::try_from(reg_num).ok();
 
     let access_bytes = access_width_bytes(access_width);
@@ -373,33 +376,12 @@ fn data_abort_handler(
             if let Some(ipa) = fault_addr.ipa {
                 println!(
                     "warning: mmio abort class=allowlisted {} addr=0x{:X} ipa=0x{:X} far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                    if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                        "write"
-                    } else {
-                        "read"
-                    },
-                    addr_u64,
-                    ipa,
-                    fault_addr.far,
-                    access_bytes,
-                    reg_bits,
-                    esr,
-                    elr
+                    access_name, addr_u64, ipa, fault_addr.far, access_bytes, reg_bits, esr, elr
                 );
             } else {
                 println!(
                     "warning: mmio abort class=allowlisted {} addr=0x{:X} ipa=none far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                    if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                        "write"
-                    } else {
-                        "read"
-                    },
-                    addr_u64,
-                    fault_addr.far,
-                    access_bytes,
-                    reg_bits,
-                    esr,
-                    elr
+                    access_name, addr_u64, fault_addr.far, access_bytes, reg_bits, esr, elr
                 );
             }
         }
@@ -457,11 +439,7 @@ fn data_abort_handler(
         pc: elr,
         kind,
         ipa: fault_addr.ipa,
-        access: if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-            monitor::MemfaultAccess::Write
-        } else {
-            monitor::MemfaultAccess::Read
-        },
+        access: memfault_access,
         size: access_bytes as u8,
         esr,
         far: fault_addr.far,
@@ -489,7 +467,7 @@ fn data_abort_handler(
             }
         } else {
             // Breakpoint: trap decision reached (SIGINT stop expected here).
-            did_trap = debug::enter_debug_from_memfault(regs, stop_kind, addr_u64);
+            did_trap = debug::enter_debug_from_memfault(regs, kind, addr_u64);
             if did_trap {
                 return;
             }
@@ -504,11 +482,7 @@ fn data_abort_handler(
                         attach_reason,
                         debug_active_now,
                         session_active_now,
-                        if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                            "write"
-                        } else {
-                            "read"
-                        },
+                        access_name,
                         addr_u64,
                         ipa,
                         fault_addr.far,
@@ -524,11 +498,7 @@ fn data_abort_handler(
                         attach_reason,
                         debug_active_now,
                         session_active_now,
-                        if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                            "write"
-                        } else {
-                            "read"
-                        },
+                        access_name,
                         addr_u64,
                         fault_addr.far,
                         access_bytes,
@@ -560,33 +530,12 @@ fn data_abort_handler(
         if let Some(ipa) = fault_addr.ipa {
             println!(
                 "warning: abort class=invalid {} addr=0x{:X} ipa=0x{:X} far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                    "write"
-                } else {
-                    "read"
-                },
-                addr_u64,
-                ipa,
-                fault_addr.far,
-                access_bytes,
-                reg_bits,
-                esr,
-                elr
+                access_name, addr_u64, ipa, fault_addr.far, access_bytes, reg_bits, esr, elr
             );
         } else {
             println!(
                 "warning: abort class=invalid {} addr=0x{:X} ipa=none far=0x{:X} size={} reg={} esr=0x{:X} elr=0x{:X}",
-                if matches!(write_access, WriteNotRead::WritingMemoryAbort) {
-                    "write"
-                } else {
-                    "read"
-                },
-                addr_u64,
-                fault_addr.far,
-                access_bytes,
-                reg_bits,
-                esr,
-                elr
+                access_name, addr_u64, fault_addr.far, access_bytes, reg_bits, esr, elr
             );
         }
     }
@@ -753,4 +702,21 @@ fn trapped_wf_handler(regs: &mut cpu::Registers, info: &TrappedWfInfo) {
 
 fn deny_cpu_on_handler(regs: &mut cpu::Registers) {
     regs.x0 = PsciReturnCode::Denied.to_x0();
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn data_abort_access_classification_matches_direction() {
+        assert_eq!(
+            classify_data_abort_access(WriteNotRead::ReadingMemoryAbort),
+            (WatchpointKind::Read, MemfaultAccess::Read, "read")
+        );
+        assert_eq!(
+            classify_data_abort_access(WriteNotRead::WritingMemoryAbort),
+            (WatchpointKind::Write, MemfaultAccess::Write, "write")
+        );
+    }
 }
