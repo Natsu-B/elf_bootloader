@@ -500,6 +500,22 @@ impl FAT32FileSystem {
         Ok((dir_cluster, dir_meta))
     }
 
+    fn resolve_parent<'a>(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        path: &'a str,
+    ) -> Result<(u32, Option<DirMeta>, &'a str), FileSystemErr> {
+        let components = Self::split_path_components(path)?;
+        let (parent_components, name) = components.split_at(components.len() - 1);
+        let name = name[0];
+        // Reserved final components are rejected before accessing the parent directory.
+        if name == "." || name == ".." {
+            return Err(FileSystemErr::InvalidInput);
+        }
+        let (cluster, meta) = self.resolve_directory(block_device, parent_components)?;
+        Ok((cluster, meta, name))
+    }
+
     fn ensure_directory_writable(
         &self,
         block_device: &Arc<dyn BlockDevice>,
@@ -1261,14 +1277,7 @@ impl FAT32FileSystem {
         block_device: &Arc<dyn BlockDevice>,
         path: &str,
     ) -> Result<(), FileSystemErr> {
-        let components = Self::split_path_components(path)?;
-        let (parent_components, name) = components.split_at(components.len() - 1);
-        let dir_name = name[0];
-        if dir_name == "." || dir_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (parent_cluster, parent_meta) =
-            self.resolve_directory(block_device, parent_components)?;
+        let (parent_cluster, parent_meta, dir_name) = self.resolve_parent(block_device, path)?;
         self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
         if self
             .search_file_name_with_cluster_dir(block_device, parent_cluster, dir_name)?
@@ -1290,14 +1299,7 @@ impl FAT32FileSystem {
         block_device: &Arc<dyn BlockDevice>,
         path: &str,
     ) -> Result<(), FileSystemErr> {
-        let components = Self::split_path_components(path)?;
-        let (parent_components, name) = components.split_at(components.len() - 1);
-        let dir_name = name[0];
-        if dir_name == "." || dir_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (parent_cluster, parent_meta) =
-            self.resolve_directory(block_device, parent_components)?;
+        let (parent_cluster, parent_meta, dir_name) = self.resolve_parent(block_device, path)?;
         self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
         let Some(meta) =
             self.search_file_name_with_cluster_dir(block_device, parent_cluster, dir_name)?
@@ -1379,14 +1381,7 @@ impl FileSystemTrait for FAT32FileSystem {
         file_system: &Arc<dyn FileSystemTrait>,
         path: &str,
     ) -> Result<FileHandle, FileSystemErr> {
-        let components = Self::split_path_components(path)?;
-        let (parent_components, name) = components.split_at(components.len() - 1);
-        let file_name = name[0];
-        if file_name == "." || file_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (parent_cluster, parent_meta) =
-            self.resolve_directory(block_device, parent_components)?;
+        let (parent_cluster, parent_meta, file_name) = self.resolve_parent(block_device, path)?;
         self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
         if self
             .search_file_name_with_cluster_dir(block_device, parent_cluster, file_name)?
@@ -1421,14 +1416,7 @@ impl FileSystemTrait for FAT32FileSystem {
         block_device: &Arc<dyn BlockDevice>,
         path: &str,
     ) -> Result<(), FileSystemErr> {
-        let components = Self::split_path_components(path)?;
-        let (parent_components, name) = components.split_at(components.len() - 1);
-        let file_name = name[0];
-        if file_name == "." || file_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (parent_cluster, parent_meta) =
-            self.resolve_directory(block_device, parent_components)?;
+        let (parent_cluster, parent_meta, file_name) = self.resolve_parent(block_device, path)?;
         self.ensure_directory_writable(block_device, parent_meta.as_ref())?;
         let Some(meta) =
             self.search_file_name_with_cluster_dir(block_device, parent_cluster, file_name)?
@@ -1451,14 +1439,7 @@ impl FileSystemTrait for FAT32FileSystem {
         from: &str,
         to: &str,
     ) -> Result<(), FileSystemErr> {
-        let src_components = Self::split_path_components(from)?;
-        let (src_parent_components, src_name) = src_components.split_at(src_components.len() - 1);
-        let src_file_name = src_name[0];
-        if src_file_name == "." || src_file_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (src_parent_cluster, _) =
-            self.resolve_directory(block_device, src_parent_components)?;
+        let (src_parent_cluster, _, src_file_name) = self.resolve_parent(block_device, from)?;
         let Some(src_meta) = self.search_file_name_with_cluster_dir(
             block_device,
             src_parent_cluster,
@@ -1471,14 +1452,8 @@ impl FileSystemTrait for FAT32FileSystem {
             return Err(FileSystemErr::IsDir);
         }
 
-        let dst_components = Self::split_path_components(to)?;
-        let (dst_parent_components, dst_name) = dst_components.split_at(dst_components.len() - 1);
-        let dst_file_name = dst_name[0];
-        if dst_file_name == "." || dst_file_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (dst_parent_cluster, dst_parent_meta) =
-            self.resolve_directory(block_device, dst_parent_components)?;
+        let (dst_parent_cluster, dst_parent_meta, dst_file_name) =
+            self.resolve_parent(block_device, to)?;
         self.ensure_directory_writable(block_device, dst_parent_meta.as_ref())?;
         if self
             .search_file_name_with_cluster_dir(block_device, dst_parent_cluster, dst_file_name)?
@@ -1535,14 +1510,8 @@ impl FileSystemTrait for FAT32FileSystem {
         if from == to {
             return Ok(());
         }
-        let src_components = Self::split_path_components(from)?;
-        let (src_parent_components, src_name) = src_components.split_at(src_components.len() - 1);
-        let src_file_name = src_name[0];
-        if src_file_name == "." || src_file_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (src_parent_cluster, src_parent_meta) =
-            self.resolve_directory(block_device, src_parent_components)?;
+        let (src_parent_cluster, src_parent_meta, src_file_name) =
+            self.resolve_parent(block_device, from)?;
         self.ensure_directory_writable(block_device, src_parent_meta.as_ref())?;
         let Some(src_meta) = self.search_file_name_with_cluster_dir(
             block_device,
@@ -1556,14 +1525,8 @@ impl FileSystemTrait for FAT32FileSystem {
             return Err(FileSystemErr::ReadOnly);
         }
 
-        let dst_components = Self::split_path_components(to)?;
-        let (dst_parent_components, dst_name) = dst_components.split_at(dst_components.len() - 1);
-        let dst_file_name = dst_name[0];
-        if dst_file_name == "." || dst_file_name == ".." {
-            return Err(FileSystemErr::InvalidInput);
-        }
-        let (dst_parent_cluster, dst_parent_meta) =
-            self.resolve_directory(block_device, dst_parent_components)?;
+        let (dst_parent_cluster, dst_parent_meta, dst_file_name) =
+            self.resolve_parent(block_device, to)?;
         self.ensure_directory_writable(block_device, dst_parent_meta.as_ref())?;
 
         if src_meta.is_dir {
