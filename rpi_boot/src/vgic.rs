@@ -234,15 +234,7 @@ pub fn init(gic: &Gicv2, info: &Gicv2Info, uart_irq: Option<UartIrq>) -> Result<
         if intid >= MIP_SPI_OFFSET + 32 {
             continue;
         }
-        let pintid = PIntId(intid);
-        match VGIC.bind_spi_pirq_passthrough(gic, pintid, VIntId(intid)) {
-            Ok(()) => {}
-            Err(GicError::InvalidState) => continue,
-            Err(x) => {
-                println!("vgic: map pirq failed: {:?}", x);
-                return Err("vgic: map pirq");
-            }
-        }
+        bind_spi_passthrough(gic, intid).map_err(|_| "vgic: map pirq")?;
     }
 
     for spi in EXPLICIT_SPI_PASSTHROUGH_SPIS {
