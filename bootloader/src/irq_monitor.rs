@@ -286,7 +286,7 @@ pub fn record_pirq_deactivate(pintid: u32) {
 fn poll_timeouts_at(now: u64) {
     let mut warns = [TimeoutWarn::empty(); MAX_TIMEOUT_WARNINGS_PER_POLL];
     let mut warn_len = 0usize;
-    let mut freq_hz = 0u64;
+    let freq_hz;
     {
         let mut guard = IRQ_MONITOR.lock_irqsave();
         freq_hz = guard.counter_freq_hz;
