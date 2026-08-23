@@ -2,6 +2,7 @@
 name = "gic"
 version = "0.1.0"
 edition = "2024"
+autotests = false
 
 [dependencies]
 typestate = { path = "../../../typestate" }
