@@ -185,13 +185,8 @@ impl Drop for StopLoopGuard {
 }
 
 pub fn handle_irq() {
-    if !GDB_UART_READY.load(Ordering::Acquire) {
-        return;
-    }
-    let mut guard = GDB_UART_STATE.lock_irqsave();
-    // SAFETY: READY is published after full initialization with Release ordering.
-    let state = unsafe { (&mut *guard).assume_init_mut() };
-    drain_uart_locked(state);
+    // Polling owns RX draining; IRQ delivery is one trigger for the same path.
+    poll_rx();
 }
 
 pub fn poll_rx() {
