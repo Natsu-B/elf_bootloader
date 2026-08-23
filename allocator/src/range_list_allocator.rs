@@ -1553,14 +1553,11 @@ mod tests {
         assert_eq!(allocator.region_size, 121);
 
         let capacity = allocator.region_capacity;
-        allocator.trim_for_boot(0x10).unwrap();
+        let reserved = allocator.trim_for_boot(0x10).unwrap();
+        assert_eq!(reserved.len(), 121);
         assert_eq!(allocator.region_capacity, capacity);
         assert_eq!(allocator.region_size, 1);
-        assert!(
-            allocator.regions[1..]
-                .iter()
-                .all(|region| *region == EMPTY_REGION)
-        );
+        assert!(allocator.regions[1..].iter().all(|&r| r == EMPTY_REGION));
     }
 
     #[test]
