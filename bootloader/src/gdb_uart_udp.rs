@@ -323,16 +323,7 @@ pub fn prefetch_first_rsp_frame(
                     return fail_prefetch(PrefetchResult::Overflow);
                 }
             }
-            RspFrameEvent::CtrlC => {
-                if !push_prefetch_byte_state(&mut len, byte) {
-                    return fail_prefetch(PrefetchResult::Overflow);
-                }
-                if !store_prefetch(len) {
-                    return PrefetchResult::Unavailable;
-                }
-                return PrefetchResult::Success;
-            }
-            RspFrameEvent::FrameComplete => {
+            RspFrameEvent::CtrlC | RspFrameEvent::FrameComplete => {
                 if !push_prefetch_byte_state(&mut len, byte) {
                     return fail_prefetch(PrefetchResult::Overflow);
                 }
