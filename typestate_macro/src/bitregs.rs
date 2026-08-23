@@ -673,21 +673,11 @@ impl Validator {
 
     /// Validates a field name and its optional inline enum.
     fn field(&mut self, field: &FieldDef) -> Result<()> {
-        if !self.fields.insert(field.name.to_string()) {
-            return Err(Error::new(
-                field.name.span(),
-                format!("bitregs: duplicate field name `{}`", field.name),
-            ));
-        }
+        ensure_unique_name(&mut self.fields, &field.name, "field name")?;
         let Some(values) = &field.values else {
             return Ok(());
         };
-        if !self.enums.insert(values.name.to_string()) {
-            return Err(Error::new(
-                values.name.span(),
-                format!("bitregs: duplicate enum name `{}`", values.name),
-            ));
-        }
+        ensure_unique_name(&mut self.enums, &values.name, "enum name")?;
         if values.variants.is_empty() {
             return Err(Error::new(
                 values.name.span(),
@@ -700,12 +690,7 @@ impl Validator {
         let mut names = HashSet::new();
         let mut raw_values = HashSet::new();
         for variant in &values.variants {
-            if !names.insert(variant.name.to_string()) {
-                return Err(Error::new(
-                    variant.name.span(),
-                    format!("bitregs: duplicate enum variant `{}`", variant.name),
-                ));
-            }
+            ensure_unique_name(&mut names, &variant.name, "enum variant")?;
             let value = variant.value.base10_parse::<u128>()?;
             if value > maximum {
                 return Err(Error::new(
@@ -725,12 +710,7 @@ impl Validator {
 
     /// Validates all complete views of a union, including nested unions.
     fn union(&mut self, union: &Union, mask: u128) -> Result<()> {
-        if !self.unions.insert(union.name.to_string()) {
-            return Err(Error::new(
-                union.name.span(),
-                format!("bitregs: duplicate union name `{}`", union.name),
-            ));
-        }
+        ensure_unique_name(&mut self.unions, &union.name, "union name")?;
         if union.views.is_empty() {
             return Err(Error::new(
                 union.name.span(),
@@ -739,16 +719,19 @@ impl Validator {
         }
         let mut names = HashSet::new();
         for view in &union.views {
-            if !names.insert(view.name.to_string()) {
-                return Err(Error::new(
-                    view.name.span(),
-                    format!("bitregs: duplicate view name `{}`", view.name),
-                ));
-            }
+            ensure_unique_name(&mut names, &view.name, "view name")?;
             self.partition(&view.items, mask, view.name.span(), "union view")?;
         }
         Ok(())
     }
+}
+
+/// Records a name or returns the matching duplicate-name diagnostic.
+fn ensure_unique_name(names: &mut HashSet<String>, name: &Ident, kind: &str) -> Result<()> {
+    names
+        .insert(name.to_string())
+        .then_some(())
+        .ok_or_else(|| Error::new(name.span(), format!("bitregs: duplicate {kind} `{name}`")))
 }
 
 /// Returns an all-ones mask of the requested width.
@@ -826,6 +809,10 @@ mod tests {
             (
                 quote!([::typestate] struct R: u16 { pub a@[8:0], pub b@[15:8], }),
                 "overlaps",
+            ),
+            (
+                quote!([::typestate] struct R: u16 { pub a@[7:0], pub a@[15:8], }),
+                "duplicate field name",
             ),
             (
                 quote!([::typestate] struct R: u16 { reserved@[14:0] [ignore], }),
