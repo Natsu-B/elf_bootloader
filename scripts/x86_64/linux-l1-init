@@ -24,6 +24,7 @@ else
 fi
 if [ -c /dev/kvm ]; then
     echo 'thin-hv: linux L1 /dev/kvm=1'
+    /bin/kvm-probe || true
 else
     echo 'thin-hv: linux L1 /dev/kvm=0'
 fi

@@ -49,6 +49,7 @@ cpio=$(first_command "${CPIO:-}" cpio) || die 'cpio not found; set CPIO'
 gzip=$(first_command "${GZIP:-}" gzip) || die 'gzip not found; set GZIP'
 modprobe=$(first_command "${MODPROBE:-}" modprobe) || die 'modprobe not found; set MODPROBE'
 depmod=$(first_command "${DEPMOD:-}" depmod) || die 'depmod not found; set DEPMOD'
+cc=$(first_command "${CC:-}" cc gcc clang) || die 'C compiler not found; set CC'
 
 valid_busybox() {
     local candidate=$1 applet applets description
@@ -93,6 +94,8 @@ stub=$(first_file "$stub_override" /run/current-system/sw/lib/systemd/boot/efi/l
 busybox=$(find_busybox) || die 'full static x86-64 BusyBox not found; pass arg 3 or set BUSYBOX_STATIC'
 init_source=$(first_file "${LINUX_L1_INIT:-}" "$repo_root/scripts/x86_64/linux-l1-init") \
     || die 'init source not found; set LINUX_L1_INIT'
+kvm_probe_source=$(first_file "${LINUX_L1_KVM_PROBE:-}" "$repo_root/scripts/x86_64/linux-l1-kvm-probe.c") \
+    || die 'KVM probe source not found; set LINUX_L1_KVM_PROBE'
 kernel_release=${LINUX_KERNEL_RELEASE:-$(uname -r)}
 modules_prefix=${LINUX_MODULES_PREFIX:-/run/current-system/kernel-modules}
 modules_root=$modules_prefix/lib/modules/$kernel_release
@@ -101,7 +104,7 @@ modules_root=$modules_prefix/lib/modules/$kernel_release
 [[ "$($file_cmd -Lb -- "$stub")" == *'PE32+ executable (EFI application) x86-64'* ]] || die "not an x86-64 EFI stub: $stub"
 [[ -n "$cmdline" && "$cmdline" != *$'\n'* ]] || die 'LINUX_L1_CMDLINE must be one non-empty line'
 [[ -r "$modules_root/modules.dep" ]] || die "kernel modules not found: $modules_root"
-for input in "$kernel" "$stub" "$busybox" "$init_source"; do
+for input in "$kernel" "$stub" "$busybox" "$init_source" "$kvm_probe_source"; do
     [[ ! -e "$output" || ! "$output" -ef "$input" ]] || die "output would overwrite input: $input"
 done
 
@@ -114,6 +117,11 @@ for applet in sh mount grep modprobe setsid cttyhack; do
     ln -s busybox "$root/bin/$applet"
 done
 install -m 0755 -- "$init_source" "$root/init"
+"$cc" -Os -Wall -Wextra -Werror -ffreestanding -fno-pie -fno-stack-protector \
+    -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdlib -static -no-pie -s \
+    -Wl,--build-id=none,-e,_start "$kvm_probe_source" -o "$root/bin/kvm-probe"
+[[ "$($file_cmd -Lb -- "$root/bin/kvm-probe")" == *x86-64*static* ]] \
+    || die 'KVM probe is not a static x86-64 executable'
 
 while read -r action module_path _; do
     [[ "$action" == insmod ]] || continue
