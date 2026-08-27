@@ -1,27 +1,28 @@
 # x86_64 thin monitor: architecture and validation status
 
 This document records only implementation and measurements that exist on
-`feat/x86-thin-monitor` as of 2026-08-28. It deliberately does not infer Linux KVM,
-Windows Hyper-V, or WSL2 success from the smaller UEFI VMX smoke test.
+`feat/x86-thin-monitor` as of 2026-08-28. Linux KVM results below come from an actual L2 run;
+Windows Hyper-V and WSL2 remain untested.
 
 ## Status summary
 
 | Area | Current evidence | Not yet demonstrated |
 | --- | --- | --- |
 | x86-64 UEFI entry | Builds as `x86_64-unknown-uefi`; boots under QEMU/KVM + OVMF | Physical-machine boot |
-| First VMX launch | One vCPU reaches VMX non-root from a runtime EFI driver; the small payload returns by VMCALL and Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, interrupt reflection, SMP, and bare-metal lifetime validation |
-| Linux UKI | Reproducible UKI build; this L0 reaches the initramfs shell with `vmx=1`, `kvm_intel=1`, and `/dev/kvm=1` | QEMU/KVM L2, SMP, or a normal distribution userspace |
-| Trusted nested VMX | Conservative capability masking plus live CR4.VMXE and VMXON interception are sufficient for `kvm_intel nested=0` initialization | VMCLEAR/VMPTRLD/VMREAD/VMWRITE/VMLAUNCH and the remaining nested-exit path; an L2 guest |
-| Direct EPT | QEMU-only 4 GiB identity EPT; direct-L1-EPT policy is encoded | Platform-derived RAM/MMIO memory typing and a live L1 EPT |
+| First VMX launch | One vCPU reaches VMX non-root from a runtime EFI driver; Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, SMP, and bare-metal lifetime validation |
+| Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO` | SMP, a normal distribution userspace, and a faulting or long-mode L2 |
+| Trusted nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, VMLAUNCH, and VMRESUME through a direct hardware VMCS; external-interrupt, EPT-violation, and I/O exits were reflected to KVM | Non-empty MSR lists, CR2/XSAVE switching, optional VMX controls, and SMP |
+| Direct EPT | QEMU-only 4 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and a non-test workload |
 | UEFI variables | ABI-independent profile overlay for the four variable operations, with tests | Runtime-services table integration and OVMF/OS isolation test |
 | Windows | None | Windows boot, Hyper-V, WSL2, Sandbox, VBS/HVCI |
 
 Relevant commits include `af35d3b` (x86 HAL/VMX foundation), `d02d384` (four-operation
 variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UKI builder),
-`1f9b344` (CPUID dispatch and VMRESUME), `4549597` (Linux L1 shell), `ced873a` (long-mode
-walk and VMX operand decode), `8d4cfc2` (conservative nested capability mask), `c8bd855`
-(runtime-resident monitor, private `HOST_CR3`, and VMXON interception), and `d04f31b`
-(`kvm_intel nested=0` initialization probe).
+`1f9b344` (CPUID dispatch and outer VMRESUME), `4549597` (Linux L1 shell), `ced873a`
+(long-mode walk and VMX operand decode), `8d4cfc2` (conservative nested capability mask),
+`c8bd855` (runtime-resident monitor, private `HOST_CR3`, and VMXON interception), `39019e8`
+(deterministic KVM L2 probe), `6a1547a` through `6a40b2b` (nested VMCS instructions and
+INVEPT), and `8c83a42` (direct nested entry and exit reflection).
 
 ## Architecture and late launch
 
@@ -34,7 +35,7 @@ crates:
   current VM-exit target.
 * `x86_guest_uefi_test`: the smallest firmware payload used to prove `StartImage` in VMX
   non-root.
-* `nested_vmx`: safe, heap-free policy/state for the intended trusted direct-VMCS path.
+* `nested_vmx`: safe, heap-free policy/state for the trusted direct-VMCS path.
 * `uefi_variable_overlay`: safe, heap-free profile-selection policy independent of VMX and the
   firmware ABI.
 
@@ -56,7 +57,11 @@ OVMF / physical UEFI
   -> guest_entry (VMX non-root L1)
        7. firmware StartImage(preloaded guest)
        8. small payload: VMCALL after StartImage returns
-          Linux UKI: ExitBootServices and continue running
+          Linux UKI: ExitBootServices, load KVM, and continue running
+       9. kvm_intel programs its VMCS and enters the real-mode L2
+  -> L2 (the KVM probe)
+      10. direct L1 EPT and VMCS run in hardware
+      11. L0 reflects requested exits into KVM; userspace observes KVM_EXIT_IO
 ```
 
 The runtime data block is 83 pages: one VMXON page, one VMCS page, six EPT pages, one zeroed MSR
@@ -91,7 +96,7 @@ There are two distinct EPT uses:
    with 2 MiB read/write/execute leaves. `[0, 1 GiB)` is marked write-back for the test RAM;
    `[1 GiB, 4 GiB)` is uncacheable for the QEMU APIC, PCI MMIO, and firmware windows. The loader
    rejects its reserved block, entry/exit code, or CR3 if an address is at or above 4 GiB.
-2. The trusted nested model intends to put L1's EPTP directly into the hardware VMCS for L2.
+2. The trusted nested path puts L1's EPTP directly into the hardware VMCS for L2.
    Because L1 physical addresses are treated as machine physical addresses, there is no EPT12 x
    EPT01 composition, shadow EPT, or EPT02 cache.
 
@@ -102,14 +107,14 @@ physical address width and derive suitable RAM/MMIO cache types from platform st
 code therefore cannot be used for arbitrary bare-metal MMIO or for firmware allocations above
 the limit.
 
-The direct-L1-EPT path is a tested policy, not an integrated execution path. `INVEPT` wrappers
-exist, and the conservative capability mask retains four-level EPT, write-back EPTP, and
-single/global invalidation when hardware provides the required subset. No L1 has yet supplied an
-EPTP to the running monitor.
+The Linux 7.1.5 KVM probe supplied an EPTP that the monitor used directly. L1 issued global and
+single-context INVEPT before the direct entry; L0 forwarded both to hardware. The conservative
+capability mask retains only four-level EPT, write-back EPTP, and the supported invalidation
+types. The accepted threat model permits L1's EPT to map L0 memory.
 
 ## Trusted direct-VMCS nesting model
 
-The intended path follows BitVisor's unsafe/trusted nesting idea: L1's VMCS page is also the
+The path follows BitVisor's unsafe/trusted nesting idea: L1's VMCS page is also the
 hardware VMCS instead of copying a software VMCS12 into a separately synthesized VMCS02. The CPU
 remains the authority for VMCS field and VM-entry validation. `nested_vmx` currently implements
 the state and policy pieces:
@@ -122,36 +127,28 @@ the state and policy pieces:
 * a 30-field direct-VMCS patch manifest: 26 host-state fields plus both address/count pairs for
   the VM-exit MSR store and load lists.
 
-The running one-vCPU monitor now applies the conservative `IA32_VMX_*` masks, keeps hardware
-CR4.VMXE set while exposing L1's requested value through the VMCS read shadow, and handles VMXON.
-The VMXON path checks virtual CR4.VMXE, CPL, VMX fixed bits, operand encoding, L1 long-mode page
-translation, physical width/alignment, and the hardware revision ID. It records the accepted
-region and returns architectural VMsucceed/VMfail flags without issuing a second hardware VMXON.
-This is the exact path exercised by the measured `kvm_intel nested=0` load. The current
-single-vCPU state is deliberately one atomic VMXON-region value; it must become per-pCPU state
-before SMP.
+The running one-vCPU monitor applies the conservative `IA32_VMX_*` masks, keeps hardware
+CR4.VMXE set while exposing L1's requested value through the VMCS read shadow, and handles VMXON,
+VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE, INVEPT, VMLAUNCH, and VMRESUME. The VMXON path
+checks virtual CR4.VMXE, CPL, VMX fixed bits, operand encoding, L1 long-mode page translation,
+physical width/alignment, and the hardware revision ID. Nested instructions return architectural
+VMsucceed/VMfail flags, and hardware validates direct VMCS operations.
 
-Before an L2 entry, L0 must save L1's VMCS host state and replace it with L0's CRs, segment bases,
-descriptor-table bases, SYSENTER state, PAT/EFER, RSP/RIP, and applicable CET state. Hardware then
-lands at L0 on an L2 exit. For an exit requested by L1, L0 applies the saved L1 host state as the
-new L1 guest state and reflects the nested exit; an exit forced only by L0 is handled locally and
-L2 resumes.
+Before an L2 entry, L0 saves the direct VMCS host fields and replaces them with VMCS01's L0 CRs,
+segment bases, descriptor-table bases, SYSENTER state, PAT/EFER, RSP/RIP, and supported optional
+state. Hardware then lands at L0 on an L2 exit. L0 restores the direct fields, reloads VMCS01,
+applies the saved L1 host state as its guest state, and resumes Linux KVM at L1's host RIP/RSP.
+The measured run reflected external-interrupt exits, an EPT violation, and the final I/O exit;
+KVM resolved the EPT violation and userspace received `KVM_EXIT_IO`.
 
-### VM-exit MSR store/load mirror
+### VM-exit MSR list ceiling
 
-Passing L1's two VM-exit MSR lists through unchanged would make L0 enter with L1-selected host
-MSRs and would expose stores caused by L0-only exits. The encoded model therefore does this:
-
-| Direct VMCS field | Entry-time replacement | Reflected L2 exit | L0-only exit |
-| --- | --- | --- | --- |
-| `VM_EXIT_MSR_STORE_ADDR/COUNT` | Save L1 metadata; point at an L0-owned mirror | Copy captured values to L1's original store list | Discard mirror values |
-| `VM_EXIT_MSR_LOAD_ADDR/COUNT` | Save L1 metadata; point at an L0 list that restores L0-safe MSRs | Apply L1-requested host MSRs before returning to L1 | Keep/restore L0 state and resume L2 |
-
-The policy caps each mirrored list at 512 entries. The mirror buffers, list copying, complete
-guest-memory fault synthesis, VMCLEAR/VMPTRLD/VMREAD/VMWRITE/VMLAUNCH handlers, hardware VMCS
-patch/restore loop, and nested-exit synthesizer are not implemented in the running monitor yet.
-VMCS shadowing, VPID, APICv, posted interrupts, VMFUNC, PML, TSC scaling, and eVMCS are
-deliberately not advertised by the policy.
+Passing L1's VM-exit MSR lists through unchanged could load L1 host MSRs before L0 runs. The
+current measured KVM VMCS uses zero entry-load, exit-store, and exit-load counts. L0 verifies that
+condition and patches the two exit address/count pairs to zero while L2 runs. It stops instead of
+entering an L2 with non-empty lists or unsupported optional host-state controls. Bounded L0 MSR
+mirrors are deferred until a measured workload requires them. VMCS shadowing, VPID, APICv,
+posted interrupts, VMFUNC, PML, TSC scaling, and eVMCS remain unadvertised.
 
 ## UEFI variable profile model
 
@@ -299,7 +296,7 @@ thin-hv: linux L1 shell
 
 This separates UKI construction and the Linux image itself from failures in this monitor.
 
-## Monitor persistence fixes and Linux KVM initialization
+## Monitor persistence, Linux KVM, and L2 execution
 
 Loading `kvm_intel` forced the first late VM exit after Linux had reclaimed Boot Services memory
 and exposed two L0 lifetime bugs. First, an ordinary EFI application's code pages were reclaimed,
@@ -315,45 +312,49 @@ its physical identity map. The VM-exit path now writes fixed byte strings and he
 directly to COM1. Pre-launch firmware diagnostics may still use `core::fmt`; the persistent
 VM-exit path does not.
 
-The measured default-path test can be reproduced exactly from a clean build with:
+After `cargo xbuild x86` and `scripts/x86_64/build-linux-uki.sh`, the measured L2 run is reproduced
+with this command from the Nix development shell:
 
 ```sh
-nix develop --accept-flake-config --command bash -c '
-set -eu
-cargo xbuild x86
-scripts/x86_64/build-linux-uki.sh
 env X86_RETURN_MARKER= \
-  X86_GUEST_MARKER="thin-hv: linux L1 kvm_intel=1" \
+  X86_GUEST_MARKER='thin-hv: linux L1 L2 KVM PASS' \
   X86_UEFI_TIMEOUT_SECONDS=25 \
   X86_UEFI_MEMORY=768M \
   scripts/x86_64/run-uefi-smoke.sh \
-    bin/x86_64/x86-uefi-loader.efi \
-    bin/x86_64/linux-l1.efi
-'
+  bin/x86_64/x86-uefi-loader.efi \
+  bin/x86_64/linux-l1.efi
 ```
 
-The initramfs loads the generic KVM module first and then runs `modprobe kvm_intel nested=0`.
-The captured log contains:
+The initramfs loads the generic KVM module, runs `modprobe kvm_intel nested=0`, and executes the
+freestanding `/bin/kvm-probe`. That probe creates a VM and one vCPU through `/dev/kvm`, maps one
+page, enters a real-mode L2 that loads DX with `0xe9`, performs `outl %eax, %dx`, and requires
+userspace to receive the matching `KVM_EXIT_IO`. The ignored capture
+`bin/x86_64/l2-kvm-pass.log` records Linux 7.1.5 and the following direct-entry sequence:
 
 ```text
-thin-hv: loading runtime monitor
-thin-hv: runtime monitor active
 thin-hv: linux L1 /proc/cpuinfo vmx=1
-thin-hv: linux L1 modprobe kvm begin
-thin-hv: linux L1 modprobe kvm end rc=0
-thin-hv: linux L1 modprobe kvm_intel begin
-thin-hv: L1 VMXON entry=0x000000000000001b
-thin-hv: L1 VMXON operand_linear=0xffffcf2c400c7dc8
-thin-hv: L1 VMXON region=0x0000000002096000
 thin-hv: linux L1 kvm_intel=1
 thin-hv: linux L1 /dev/kvm=1
+thin-hv: L1 VMCLEAR region=0x000000002e4dc000
+thin-hv: L1 VMPTRLD region=0x000000002e4dc000
+thin-hv: L1 INVEPT kind=0x0000000000000002
+thin-hv: L1 INVEPT kind=0x0000000000000001
+thin-hv: L1 VMLAUNCH direct=0x000000002e4dc000
+thin-hv: L1 L2 EXIT reason=0x0000000000000001
+thin-hv: L1 VMRESUME direct=0x000000002e4dc000
+thin-hv: L1 L2 EXIT reason=0x0000000000000030
+thin-hv: L1 L2 EXIT qualification=0x0000000000000184
+thin-hv: L1 VMRESUME direct=0x000000002e4dc000
+thin-hv: L1 L2 EXIT reason=0x000000000000001e
+thin-hv: L1 L2 EXIT qualification=0x0000000000e90003
+thin-hv: linux L1 L2 KVM PASS
 thin-hv: linux L1 shell
 ```
 
-This proves `OVMF -> this L0 -> Linux L1`, VMXON emulation, successful `kvm_intel`
-initialization, and `/dev/kvm` creation on the measured host. `nested=0` avoids asking L1 KVM to
-offer VMX to its own guests; it does not prevent an ordinary L2. No KVM ioctl or L2 guest has been
-run through this monitor yet.
+Exit reason `0x1` is an external interrupt, `0x30` is an EPT violation resolved by KVM, and
+`0x1e` is the expected I/O exit. This proves the measured chain `host KVM -> this L0 -> Linux
+7.1.5/kvm_intel -> real-mode L2`, including direct L1 EPT, nested VMRESUME, and delivery of
+`KVM_EXIT_IO` to L1 userspace. `nested=0` only prevents L1 KVM from advertising VMX to L2.
 
 ## Windows, Hyper-V, and WSL2 status
 
@@ -370,8 +371,9 @@ view, but Windows and Hyper-V do not yet.
 ## Known limitations and bare-metal boundary
 
 * Intel VMX only; AMD SVM is out of scope.
-* One vCPU only. There is no AP startup, physical interrupt routing, x2APIC policy, APICv, or posted
-  interrupt handling.
+* One vCPU only. Nested state and the active direct run use global storage; there is no AP startup,
+  x2APIC policy, APICv, or posted-interrupt support. Move both state objects to per-pCPU storage
+  before SMP.
 * The smoke EPT covers only the first 4 GiB and uses a QEMU-specific low-WB/upper-UC split. It is
   not safe for a general bare-metal RAM/MMIO layout.
 * The runtime PE sections and 83-page data block survive Linux `ExitBootServices`, and the VMCS
@@ -384,20 +386,24 @@ view, but Windows and Hyper-V do not yet.
 * The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle. A production
   Windows chain needs an explicit monitor/guest device-path handoff instead of assuming the test
   ESP and fallback boot path.
-* The VM-exit path currently handles only CPUID, trusted XSETBV, one unsupported-RDMSR `#GP`
-  path, CR4 writes, VMX capability reads, VMXON, and the VMCALL test. Invalid XSETBV operands are
-  not converted to guest `#GP`; general exception/interrupt, I/O, MSR, EPT, and remaining
-  nested-VMX exit routing is absent.
-* Linux loads `kvm_intel nested=0` and creates `/dev/kvm` under L0, but no KVM VM-creation ioctl or
-  L2 Linux has run. All nested VMX instructions after VMXON remain to be implemented.
+* The measured nested path handles VMXON, VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE, INVEPT,
+  VMLAUNCH, and VMRESUME. Memory-form VMREAD/VMWRITE, VMXOFF, INVVPID, optional VMX controls, and
+  VMX in L2 are not supported.
+* Direct entry currently requires zero VM-entry MSR-load, VM-exit MSR-store, and VM-exit MSR-load
+  counts. Add bounded L0-owned mirrors before accepting non-empty lists.
+* The real-mode L2 probe is deliberately fault-free and does not exercise extended register
+  state. L0 does not save/switch CR2 or XSAVE state around a direct run; add both before a faulting,
+  SIMD-using, SMP, or Windows/Hyper-V workload.
+* Linux KVM has run one VM/vCPU to `KVM_EXIT_IO`; an L2 Linux kernel, KVM SMP, and sustained or
+  device-heavy workloads have not run.
 * The profile variable adapter has no firmware ABI hook, persistent backend wiring, or real OVMF
   profile test. Each QEMU smoke starts from a copied OVMF variable template.
 * No physical PCI/NVMe/GPU/USB/NIC handoff has been tested. There is no IOMMU setup.
 * Serial diagnostics have no compile-time release trace switch and are not yet removed from the
   VM-exit hot path in release builds.
-* Development under host KVM creates another nesting level. A future
-  `host KVM -> this L0 -> Linux KVM/Hyper-V -> L2` failure must be separated from this monitor's
-  behavior; no such three-level execution has been attempted yet.
+* Development under host KVM creates another nesting level. The tiny
+  `host KVM -> this L0 -> Linux KVM -> L2` chain passed, but failures from features beyond this
+  probe must still be separated between the monitor and outer KVM's nested-nested support.
 * The bootstrap, runtime monitor, and guests are unsigned. Secure Boot was disabled for the QEMU
   measurements; signing and verification policy must be added before a Secure Boot test.
 * `cargo xbuild x86` produces bare-metal-stagable bootstrap and runtime EFI images under ignored
