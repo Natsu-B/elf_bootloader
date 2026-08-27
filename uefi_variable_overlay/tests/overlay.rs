@@ -5,7 +5,12 @@ use uefi_variable_overlay::EFI_GLOBAL_VARIABLE_GUID;
 use uefi_variable_overlay::Guid;
 use uefi_variable_overlay::MONITOR_VENDOR_GUID;
 use uefi_variable_overlay::ProfileId;
+use uefi_variable_overlay::RuntimeVariableOverlay;
+use uefi_variable_overlay::StoredVariable;
+use uefi_variable_overlay::VariableBackend;
+use uefi_variable_overlay::VariableInfo;
 use uefi_variable_overlay::VariableScope;
+use uefi_variable_overlay::VariableStatus;
 use uefi_variable_overlay::classify;
 use uefi_variable_overlay::map_private_variable;
 use uefi_variable_overlay::unmap_private_variable;
@@ -147,4 +152,190 @@ fn enumeration_filters_and_translates_backend_keys() {
             .get_next(EFI_GLOBAL_VARIABLE_GUID, &utf16("missing"))
             .is_none()
     );
+}
+
+struct Record {
+    guid: Guid,
+    name: Vec<u16>,
+    attributes: u32,
+    data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct MemoryBackend {
+    records: Vec<Record>,
+    queried_attributes: core::cell::Cell<u32>,
+}
+
+impl VariableBackend for MemoryBackend {
+    fn get_variable(&self, guid: Guid, name: &[u16]) -> Result<StoredVariable<'_>, VariableStatus> {
+        self.records
+            .iter()
+            .find(|record| record.guid == guid && record.name == name)
+            .map(|record| StoredVariable {
+                attributes: record.attributes,
+                data: &record.data,
+            })
+            .ok_or(VariableStatus::NotFound)
+    }
+
+    fn set_variable(
+        &mut self,
+        guid: Guid,
+        name: &[u16],
+        attributes: u32,
+        data: &[u8],
+    ) -> VariableStatus {
+        let existing = self
+            .records
+            .iter()
+            .position(|record| record.guid == guid && record.name == name);
+        if data.is_empty() {
+            return existing.map_or(VariableStatus::NotFound, |index| {
+                self.records.remove(index);
+                VariableStatus::Success
+            });
+        }
+        if let Some(index) = existing {
+            self.records[index].attributes = attributes;
+            self.records[index].data = data.to_vec();
+        } else {
+            self.records.push(Record {
+                guid,
+                name: name.to_vec(),
+                attributes,
+                data: data.to_vec(),
+            });
+        }
+        VariableStatus::Success
+    }
+
+    fn visit_keys(&self, visitor: &mut dyn FnMut(Guid, &[u16]) -> bool) -> VariableStatus {
+        for record in &self.records {
+            if !visitor(record.guid, &record.name) {
+                break;
+            }
+        }
+        VariableStatus::Success
+    }
+
+    fn query_variable_info(&self, attributes: u32) -> Result<VariableInfo, VariableStatus> {
+        self.queried_attributes.set(attributes);
+        Ok(VariableInfo {
+            maximum_storage_size: 4096,
+            remaining_storage_size: 3072,
+            maximum_variable_size: 1024,
+        })
+    }
+}
+
+#[test]
+fn runtime_adapter_dispatches_four_operations_and_isolates_profiles() {
+    let windows = ProfileId(1);
+    let linux = ProfileId(2);
+    let guid = EFI_GLOBAL_VARIABLE_GUID;
+    let boot_order = utf16("BootOrder");
+    let lang = utf16("Lang");
+    let attributes = 7;
+    let mut backend = MemoryBackend::default();
+
+    {
+        let mut overlay = RuntimeVariableOverlay::<_, 8, 32>::new(windows, &mut backend);
+        assert_eq!(
+            overlay.set_variable(guid, &boot_order, attributes, &[1, 0]),
+            VariableStatus::Success
+        );
+        assert_eq!(
+            overlay.set_variable(guid, &lang, attributes, b"en-US"),
+            VariableStatus::Success
+        );
+
+        let mut too_small = [0xaa];
+        let result = overlay.get_variable(guid, &boot_order, &mut too_small);
+        assert_eq!(result.status, VariableStatus::BufferTooSmall);
+        assert_eq!(result.data_size, 2);
+        assert_eq!(result.attributes, None);
+        assert_eq!(too_small, [0xaa]);
+    }
+
+    {
+        let mut overlay = RuntimeVariableOverlay::<_, 8, 32>::new(linux, &mut backend);
+        assert_eq!(
+            overlay.get_variable(guid, &boot_order, &mut []).status,
+            VariableStatus::NotFound
+        );
+        assert_eq!(
+            overlay.set_variable(guid, &boot_order, attributes, &[2, 0]),
+            VariableStatus::Success
+        );
+
+        let mut shared = [0; 5];
+        let result = overlay.get_variable(guid, &lang, &mut shared);
+        assert_eq!(result.status, VariableStatus::Success);
+        assert_eq!(result.attributes, Some(attributes));
+        assert_eq!(&shared, b"en-US");
+    }
+
+    {
+        let overlay = RuntimeVariableOverlay::<_, 8, 32>::new(windows, &mut backend);
+        let mut data = [0; 2];
+        let result = overlay.get_variable(guid, &boot_order, &mut data);
+        assert_eq!(result.status, VariableStatus::Success);
+        assert_eq!(data, [1, 0]);
+
+        let mut short_name = [0xaaaa; 2];
+        let result =
+            overlay.get_next_variable_name(Guid::new(0, 0, 0, [0; 8]), &[], &mut short_name);
+        assert_eq!(result.status, VariableStatus::BufferTooSmall);
+        assert_eq!(result.name_size, (boot_order.len() + 1) * 2);
+        assert_eq!(short_name, [0xaaaa; 2]);
+
+        let mut name = [0; 16];
+        let first = overlay.get_next_variable_name(Guid::new(0, 0, 0, [0; 8]), &[], &mut name);
+        assert_eq!(first.status, VariableStatus::Success);
+        assert_eq!(first.guid, Some(EFI_GLOBAL_VARIABLE_GUID));
+        assert_eq!(&name[..boot_order.len()], &boot_order);
+        assert_eq!(name[boot_order.len()], 0);
+
+        let second = overlay.get_next_variable_name(first.guid.unwrap(), &boot_order, &mut name);
+        assert_eq!(second.status, VariableStatus::Success);
+        assert_eq!(&name[..lang.len()], &lang);
+        assert_eq!(name[lang.len()], 0);
+        assert_eq!(
+            overlay
+                .get_next_variable_name(second.guid.unwrap(), &lang, &mut name)
+                .status,
+            VariableStatus::NotFound
+        );
+
+        assert_eq!(
+            overlay.query_variable_info(attributes).unwrap(),
+            VariableInfo {
+                maximum_storage_size: 4096,
+                remaining_storage_size: 3072,
+                maximum_variable_size: 1024,
+            }
+        );
+    }
+    assert_eq!(backend.queried_attributes.get(), attributes);
+
+    {
+        let mut overlay = RuntimeVariableOverlay::<_, 8, 32>::new(linux, &mut backend);
+        assert_eq!(
+            overlay.set_variable(guid, &boot_order, attributes, &[]),
+            VariableStatus::Success
+        );
+        assert_eq!(
+            overlay.get_variable(guid, &boot_order, &mut []).status,
+            VariableStatus::NotFound
+        );
+    }
+
+    let overlay = RuntimeVariableOverlay::<_, 8, 32>::new(windows, &mut backend);
+    let mut data = [0; 2];
+    assert_eq!(
+        overlay.get_variable(guid, &boot_order, &mut data).status,
+        VariableStatus::Success
+    );
+    assert_eq!(data, [1, 0]);
 }

@@ -311,6 +311,272 @@ impl<const ENTRY_CAPACITY: usize, const NAME_CAPACITY: usize> Default
     }
 }
 
+/// Status returned by the ABI-independent runtime-variable adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VariableStatus {
+    /// The operation completed successfully.
+    Success,
+    /// The requested variable or enumeration successor does not exist.
+    NotFound,
+    /// The caller-provided output buffer is too small.
+    BufferTooSmall,
+    /// An input parameter is invalid.
+    InvalidParameter,
+    /// The variable store or adapter snapshot has insufficient capacity.
+    OutOfResources,
+    /// The variable store rejected a write.
+    WriteProtected,
+    /// The requested operation or attribute combination is unsupported.
+    Unsupported,
+    /// The variable store rejected a write for security-policy reasons.
+    SecurityViolation,
+    /// The variable store reported an implementation-specific failure.
+    DeviceError,
+}
+
+/// One variable borrowed from the physical backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredVariable<'a> {
+    /// UEFI variable attributes.
+    pub attributes: u32,
+    /// Variable payload bytes.
+    pub data: &'a [u8],
+}
+
+/// Capacity information returned by `QueryVariableInfo`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VariableInfo {
+    /// Maximum storage available for variables with the requested attributes.
+    pub maximum_storage_size: u64,
+    /// Remaining storage available for variables with the requested attributes.
+    pub remaining_storage_size: u64,
+    /// Maximum size of one variable payload.
+    pub maximum_variable_size: u64,
+}
+
+/// Minimal persistent-variable store used by [`RuntimeVariableOverlay`].
+///
+/// Names do not include a terminating NUL. Returning `false` from the
+/// `visit_keys` callback stops enumeration successfully. `set_variable` must
+/// interpret an empty `data` slice as deletion, matching UEFI `DataSize == 0`.
+pub trait VariableBackend {
+    /// Reads one physical backend variable without copying its payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's UEFI-equivalent failure status.
+    fn get_variable(&self, guid: Guid, name: &[u16]) -> Result<StoredVariable<'_>, VariableStatus>;
+
+    /// Creates, updates, or deletes one physical backend variable.
+    fn set_variable(
+        &mut self,
+        guid: Guid,
+        name: &[u16],
+        attributes: u32,
+        data: &[u8],
+    ) -> VariableStatus;
+
+    /// Visits physical keys in the backend's stable enumeration order.
+    fn visit_keys(&self, visitor: &mut dyn FnMut(Guid, &[u16]) -> bool) -> VariableStatus;
+
+    /// Reports physical-store capacity for one UEFI attribute combination.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's UEFI-equivalent failure status.
+    fn query_variable_info(&self, attributes: u32) -> Result<VariableInfo, VariableStatus>;
+}
+
+/// Result of an ABI-independent `GetVariable` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GetVariableResult {
+    /// Completion status.
+    pub status: VariableStatus,
+    /// Payload size in bytes, including the required size on buffer failure.
+    pub data_size: usize,
+    /// Attributes on success; error paths leave the ABI output untouched.
+    pub attributes: Option<u32>,
+}
+
+/// Result of an ABI-independent `GetNextVariableName` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GetNextVariableNameResult {
+    /// Completion status.
+    pub status: VariableStatus,
+    /// Required UTF-16 name size in bytes, including the terminating NUL.
+    pub name_size: usize,
+    /// Logical vendor GUID on success.
+    pub guid: Option<Guid>,
+}
+
+/// Profile-selecting adapter for the four UEFI variable runtime operations.
+///
+/// `ENTRY_CAPACITY` and `NAME_CAPACITY` bound the stack snapshot rebuilt for
+/// each enumeration call. Reads and writes do not allocate or retain state.
+pub struct RuntimeVariableOverlay<
+    'a,
+    B: VariableBackend + ?Sized,
+    const ENTRY_CAPACITY: usize,
+    const NAME_CAPACITY: usize = 64,
+> {
+    /// Selected OS profile.
+    profile: ProfileId,
+    /// Physical variable store.
+    backend: &'a mut B,
+}
+
+impl<'a, B: VariableBackend + ?Sized, const ENTRY_CAPACITY: usize, const NAME_CAPACITY: usize>
+    RuntimeVariableOverlay<'a, B, ENTRY_CAPACITY, NAME_CAPACITY>
+{
+    /// Wraps `backend` with the selected profile policy.
+    #[must_use]
+    pub const fn new(profile: ProfileId, backend: &'a mut B) -> Self {
+        Self { profile, backend }
+    }
+
+    /// Dispatches UEFI `GetVariable` and applies EFI buffer-size semantics.
+    pub fn get_variable(&self, guid: Guid, name: &[u16], data: &mut [u8]) -> GetVariableResult {
+        if name.is_empty() {
+            return get_error(VariableStatus::InvalidParameter);
+        }
+
+        with_backend_key(self.profile, guid, name, |backend_guid, backend_name| {
+            let stored = match self.backend.get_variable(backend_guid, backend_name) {
+                Ok(stored) => stored,
+                Err(status) => return get_error(status),
+            };
+            if data.len() < stored.data.len() {
+                return GetVariableResult {
+                    status: VariableStatus::BufferTooSmall,
+                    data_size: stored.data.len(),
+                    attributes: None,
+                };
+            }
+
+            data[..stored.data.len()].copy_from_slice(stored.data);
+            GetVariableResult {
+                status: VariableStatus::Success,
+                data_size: stored.data.len(),
+                attributes: Some(stored.attributes),
+            }
+        })
+    }
+
+    /// Dispatches UEFI `SetVariable`; an empty payload deletes the variable.
+    pub fn set_variable(
+        &mut self,
+        guid: Guid,
+        name: &[u16],
+        attributes: u32,
+        data: &[u8],
+    ) -> VariableStatus {
+        if name.is_empty() {
+            return VariableStatus::InvalidParameter;
+        }
+
+        with_backend_key(self.profile, guid, name, |backend_guid, backend_name| {
+            self.backend
+                .set_variable(backend_guid, backend_name, attributes, data)
+        })
+    }
+
+    /// Dispatches filtered UEFI `GetNextVariableName`.
+    ///
+    /// `previous_name` and `name` omit/include the terminating NUL
+    /// respectively: the input cursor omits it, while a successful output
+    /// writes it into `name` and counts it in `name_size`.
+    pub fn get_next_variable_name(
+        &self,
+        previous_guid: Guid,
+        previous_name: &[u16],
+        name: &mut [u16],
+    ) -> GetNextVariableNameResult {
+        // ponytail: rebuild a bounded snapshot per call; persist an index only
+        // if measured variable counts or firmware latency make this too slow.
+        let mut catalog = Catalog::<ENTRY_CAPACITY, NAME_CAPACITY>::new();
+        let mut catalog_failed = false;
+        let status = self.backend.visit_keys(&mut |guid, backend_name| {
+            if catalog
+                .push_backend(self.profile, guid, backend_name)
+                .is_err()
+            {
+                catalog_failed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if status != VariableStatus::Success {
+            return next_error(status);
+        }
+        if catalog_failed {
+            return next_error(VariableStatus::OutOfResources);
+        }
+
+        let Some(next) = catalog.get_next(previous_guid, previous_name) else {
+            return next_error(VariableStatus::NotFound);
+        };
+        let required_units = next.name().len() + 1;
+        let required_bytes = required_units * core::mem::size_of::<u16>();
+        if name.len() < required_units {
+            return GetNextVariableNameResult {
+                status: VariableStatus::BufferTooSmall,
+                name_size: required_bytes,
+                guid: None,
+            };
+        }
+
+        name[..next.name().len()].copy_from_slice(next.name());
+        name[next.name().len()] = 0;
+        GetNextVariableNameResult {
+            status: VariableStatus::Success,
+            name_size: required_bytes,
+            guid: Some(next.guid()),
+        }
+    }
+
+    /// Dispatches UEFI `QueryVariableInfo` to the shared physical store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the physical backend's failure status unchanged.
+    pub fn query_variable_info(&self, attributes: u32) -> Result<VariableInfo, VariableStatus> {
+        self.backend.query_variable_info(attributes)
+    }
+}
+
+/// Calls `operation` with the physical key selected by the profile policy.
+fn with_backend_key<R>(
+    profile: ProfileId,
+    guid: Guid,
+    name: &[u16],
+    operation: impl FnOnce(Guid, &[u16]) -> R,
+) -> R {
+    if let Some(mapped) = map_private_variable(profile, guid, name) {
+        operation(mapped.guid(), mapped.name())
+    } else {
+        operation(guid, name)
+    }
+}
+
+/// Constructs a `GetVariable` error result without touching ABI outputs.
+const fn get_error(status: VariableStatus) -> GetVariableResult {
+    GetVariableResult {
+        status,
+        data_size: 0,
+        attributes: None,
+    }
+}
+
+/// Constructs a `GetNextVariableName` error result without touching outputs.
+const fn next_error(status: VariableStatus) -> GetNextVariableNameResult {
+    GetNextVariableNameResult {
+        status,
+        name_size: 0,
+        guid: None,
+    }
+}
+
 /// Owned entry in an enumeration snapshot.
 #[derive(Clone, Copy)]
 struct CatalogEntry<const NAME_CAPACITY: usize> {
