@@ -271,7 +271,7 @@ pub unsafe fn invept(kind: u64, descriptor: &InveptDescriptor) -> VmxStatus {
             descriptor = in(reg) descriptor,
             carry = lateout(reg_byte) carry,
             zero = lateout(reg_byte) zero,
-            options(nostack, readonly)
+            options(nostack)
         );
     }
     VmxStatus::from_flags(carry, zero)
@@ -296,7 +296,7 @@ pub unsafe fn invvpid(kind: u64, descriptor: &InvvpidDescriptor) -> VmxStatus {
             descriptor = in(reg) descriptor,
             carry = lateout(reg_byte) carry,
             zero = lateout(reg_byte) zero,
-            options(nostack, readonly)
+            options(nostack)
         );
     }
     VmxStatus::from_flags(carry, zero)
