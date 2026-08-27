@@ -157,6 +157,19 @@ const MONITOR_IMAGE_PATH: [efi::Char16; 25] = [
     b'I' as u16,
     0,
 ];
+/// Windows boot manager on a profile-owned EFI System Partition.
+const WINDOWS_BOOT_IMAGE_PATH: [efi::Char16; 33] =
+    ascii_uefi_path(b"\\EFI\\Microsoft\\Boot\\bootmgfw.efi\0");
+
+const fn ascii_uefi_path<const N: usize>(ascii: &[u8; N]) -> [efi::Char16; N] {
+    let mut path = [0; N];
+    let mut index = 0;
+    while index < N {
+        path[index] = ascii[index] as efi::Char16;
+        index += 1;
+    }
+    path
+}
 
 static GUEST_RAN: AtomicU64 = AtomicU64::new(0);
 static GUEST_STATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -228,6 +241,15 @@ pub(crate) enum Error {
     OutsideIdentityMap(u64),
     /// A UEFI service used to load the nested payload failed.
     Firmware(&'static str, usize),
+}
+
+impl Error {
+    fn is_missing_image(self) -> bool {
+        matches!(
+            self,
+            Self::Firmware("LoadImage", value) if value == efi::Status::NOT_FOUND.as_usize()
+        )
+    }
 }
 
 impl fmt::Display for Error {
@@ -433,7 +455,13 @@ fn start_runtime_monitor(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
 ) -> Result<(), Error> {
-    let guest = load_image(parent_image, system_table, GUEST_IMAGE_PATH)?;
+    let guest = match load_image(parent_image, system_table, GUEST_IMAGE_PATH) {
+        Ok(image) => image,
+        Err(error) if error.is_missing_image() => {
+            load_image_from_other_filesystem(parent_image, system_table, WINDOWS_BOOT_IMAGE_PATH)?
+        }
+        Err(error) => return Err(error),
+    };
     let monitor = match load_image(parent_image, system_table, MONITOR_IMAGE_PATH) {
         Ok(image) => image,
         Err(error) => {
@@ -489,14 +517,85 @@ fn load_image<const PATH_SIZE: usize>(
     system_table: *mut efi::SystemTable,
     image_path: [efi::Char16; PATH_SIZE],
 ) -> Result<efi::Handle, Error> {
-    let boot_services = unsafe { (*system_table).boot_services };
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
+    let device_handle = unsafe { (*loaded_image).device_handle };
+    load_image_on_device(parent_image, system_table, device_handle, image_path)
+}
+
+/// Loads one image from a filesystem other than the monitor's own ESP.
+fn load_image_from_other_filesystem<const PATH_SIZE: usize>(
+    parent_image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    image_path: [efi::Char16; PATH_SIZE],
+) -> Result<efi::Handle, Error> {
+    let boot_services = unsafe { (*system_table).boot_services };
+    let parent_loaded = loaded_image_protocol(parent_image, system_table)?;
+    let parent_device = unsafe { (*parent_loaded).device_handle };
+    let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
+    let mut handle_count = 0;
+    let mut handles = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).locate_handle_buffer)(
+            efi::BY_PROTOCOL,
+            &mut filesystem_guid,
+            ptr::null_mut(),
+            &mut handle_count,
+            &mut handles,
+        )
+    };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "LocateHandleBuffer(SimpleFileSystem)",
+            status.as_usize(),
+        ));
+    }
+    if handles.is_null() {
+        return Err(Error::Firmware(
+            "LocateHandleBuffer(SimpleFileSystem)",
+            efi::Status::INVALID_PARAMETER.as_usize(),
+        ));
+    }
+
+    let mut result = Err(Error::Firmware(
+        "LoadImage(other filesystem)",
+        efi::Status::NOT_FOUND.as_usize(),
+    ));
+    // ponytail: firmware order selects the first non-parent Windows ESP;
+    // select by profile partition GUID when multiple Windows installs matter.
+    for index in 0..handle_count {
+        let device_handle = unsafe { *handles.add(index) };
+        if device_handle != parent_device {
+            match load_image_on_device(parent_image, system_table, device_handle, image_path) {
+                Ok(image) => {
+                    result = Ok(image);
+                    break;
+                }
+                Err(error) if error.is_missing_image() => {}
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+    }
+    free_pool(boot_services, handles.cast());
+    result
+}
+
+/// Loads one image using a complete path rooted at `device_handle`.
+fn load_image_on_device<const PATH_SIZE: usize>(
+    parent_image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    device_handle: efi::Handle,
+    image_path: [efi::Char16; PATH_SIZE],
+) -> Result<efi::Handle, Error> {
+    let boot_services = unsafe { (*system_table).boot_services };
 
     let mut device_path_guid = efi::protocols::device_path::PROTOCOL_GUID;
     let mut parent_device_path = ptr::null_mut();
     let status = unsafe {
         ((*boot_services).handle_protocol)(
-            (*loaded_image).device_handle,
+            device_handle,
             &mut device_path_guid,
             &mut parent_device_path,
         )
@@ -583,6 +682,9 @@ fn load_image<const PATH_SIZE: usize>(
     };
     free_pool(boot_services, complete_path.cast());
     if status.is_error() {
+        if status == efi::Status::SECURITY_VIOLATION && !guest_image.is_null() {
+            let _ = unsafe { ((*boot_services).unload_image)(guest_image) };
+        }
         return Err(Error::Firmware("LoadImage", status.as_usize()));
     }
     Ok(guest_image)
