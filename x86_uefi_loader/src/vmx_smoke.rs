@@ -228,8 +228,6 @@ pub(crate) enum Error {
     OutsideIdentityMap(u64),
     /// A UEFI service used to load the nested payload failed.
     Firmware(&'static str, usize),
-    /// The staged payload has an invalid or unrepresentable file size.
-    GuestImageSize(u64),
 }
 
 impl fmt::Display for Error {
@@ -251,7 +249,6 @@ impl fmt::Display for Error {
             Self::Firmware(service, status) => {
                 write!(formatter, "{service} status={status:#x}")
             }
-            Self::GuestImageSize(size) => write!(formatter, "invalid guest payload size {size}"),
         }
     }
 }
@@ -486,108 +483,105 @@ fn runtime_guest_image(
     (!image.is_null()).then_some(image)
 }
 
-/// Reads one staged image through firmware and asks firmware to relocate it.
+/// Loads one staged image through its complete filesystem device path.
 fn load_image<const PATH_SIZE: usize>(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
-    mut image_path: [efi::Char16; PATH_SIZE],
+    image_path: [efi::Char16; PATH_SIZE],
 ) -> Result<efi::Handle, Error> {
     let boot_services = unsafe { (*system_table).boot_services };
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
 
-    let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
-    let mut filesystem_interface = ptr::null_mut();
+    let mut device_path_guid = efi::protocols::device_path::PROTOCOL_GUID;
+    let mut parent_device_path = ptr::null_mut();
     let status = unsafe {
         ((*boot_services).handle_protocol)(
             (*loaded_image).device_handle,
-            &mut filesystem_guid,
-            &mut filesystem_interface,
+            &mut device_path_guid,
+            &mut parent_device_path,
         )
     };
     if status.is_error() {
         return Err(Error::Firmware(
-            "HandleProtocol(SimpleFileSystem)",
+            "HandleProtocol(DevicePath)",
             status.as_usize(),
         ));
     }
-    let filesystem = filesystem_interface.cast::<efi::protocols::simple_file_system::Protocol>();
 
-    let mut root = ptr::null_mut();
-    let status = unsafe { ((*filesystem).open_volume)(filesystem, &mut root) };
-    if status.is_error() {
-        return Err(Error::Firmware("OpenVolume", status.as_usize()));
-    }
-
-    let mut file = ptr::null_mut();
+    let mut utilities_guid = efi::protocols::device_path_utilities::PROTOCOL_GUID;
+    let mut utilities_interface = ptr::null_mut();
     let status = unsafe {
-        ((*root).open)(
-            root,
-            &mut file,
-            image_path.as_mut_ptr(),
-            efi::protocols::file::MODE_READ,
-            0,
+        ((*boot_services).locate_protocol)(
+            &mut utilities_guid,
+            ptr::null_mut(),
+            &mut utilities_interface,
         )
     };
     if status.is_error() {
-        // SAFETY: `root` was returned by OpenVolume and is still open.
-        let _ = unsafe { ((*root).close)(root) };
-        return Err(Error::Firmware("Open staged image", status.as_usize()));
-    }
-
-    let payload_size = match guest_file_size(boot_services, file) {
-        Ok(size) => size,
-        Err(error) => {
-            close_guest_file(root, file);
-            return Err(error);
-        }
-    };
-    let mut buffer = ptr::null_mut();
-    let status =
-        unsafe { ((*boot_services).allocate_pool)(efi::LOADER_DATA, payload_size, &mut buffer) };
-    if status.is_error() {
-        close_guest_file(root, file);
         return Err(Error::Firmware(
-            "AllocatePool(guest payload)",
+            "LocateProtocol(DevicePathUtilities)",
             status.as_usize(),
         ));
     }
+    let utilities = utilities_interface.cast::<efi::protocols::device_path_utilities::Protocol>();
 
-    let mut offset = 0;
-    while offset < payload_size {
-        let mut chunk_size = payload_size - offset;
-        let status = unsafe {
-            ((*file).read)(
-                file,
-                &mut chunk_size,
-                buffer.cast::<u8>().add(offset).cast(),
-            )
-        };
-        if status.is_error() {
-            free_guest_buffer(boot_services, buffer);
-            close_guest_file(root, file);
-            return Err(Error::Firmware("Read staged image", status.as_usize()));
-        }
-        if chunk_size == 0 {
-            free_guest_buffer(boot_services, buffer);
-            close_guest_file(root, file);
-            return Err(Error::GuestImageSize(offset as u64));
-        }
-        offset += chunk_size;
+    let node_size = PATH_SIZE
+        .checked_mul(core::mem::size_of::<efi::Char16>())
+        .and_then(|path_size| {
+            core::mem::size_of::<efi::protocols::device_path::Protocol>().checked_add(path_size)
+        })
+        .and_then(|size| u16::try_from(size).ok())
+        .ok_or(Error::Firmware(
+            "CreateDeviceNode(FilePath)",
+            efi::Status::INVALID_PARAMETER.as_usize(),
+        ))?;
+    let file_path_node = unsafe {
+        ((*utilities).create_device_node)(
+            efi::protocols::device_path::TYPE_MEDIA,
+            efi::protocols::device_path::Media::SUBTYPE_FILE_PATH,
+            node_size,
+        )
+    };
+    if file_path_node.is_null() {
+        return Err(Error::Firmware(
+            "CreateDeviceNode(FilePath)",
+            efi::Status::OUT_OF_RESOURCES.as_usize(),
+        ));
     }
-    close_guest_file(root, file);
+    unsafe {
+        ptr::copy_nonoverlapping(
+            image_path.as_ptr(),
+            file_path_node
+                .cast::<u8>()
+                .add(core::mem::size_of::<efi::protocols::device_path::Protocol>())
+                .cast::<efi::Char16>(),
+            PATH_SIZE,
+        );
+    }
+
+    let complete_path = unsafe {
+        ((*utilities).append_device_node)(parent_device_path.cast(), file_path_node.cast())
+    };
+    free_pool(boot_services, file_path_node.cast());
+    if complete_path.is_null() {
+        return Err(Error::Firmware(
+            "AppendDeviceNode(FilePath)",
+            efi::Status::OUT_OF_RESOURCES.as_usize(),
+        ));
+    }
 
     let mut guest_image = ptr::null_mut();
     let status = unsafe {
         ((*boot_services).load_image)(
             efi::Boolean::FALSE,
             parent_image,
+            complete_path,
             ptr::null_mut(),
-            buffer,
-            payload_size,
+            0,
             &mut guest_image,
         )
     };
-    free_guest_buffer(boot_services, buffer);
+    free_pool(boot_services, complete_path.cast());
     if status.is_error() {
         return Err(Error::Firmware("LoadImage", status.as_usize()));
     }
@@ -614,56 +608,8 @@ fn loaded_image_protocol(
     }
 }
 
-fn guest_file_size(
-    boot_services: *mut efi::BootServices,
-    file: *mut efi::protocols::file::Protocol,
-) -> Result<usize, Error> {
-    let mut info_guid = efi::protocols::file::INFO_ID;
-    let mut info_size = 0_usize;
-    let status =
-        unsafe { ((*file).get_info)(file, &mut info_guid, &mut info_size, ptr::null_mut()) };
-    if status != efi::Status::BUFFER_TOO_SMALL
-        || info_size < core::mem::size_of::<efi::protocols::file::Info>()
-    {
-        return Err(Error::Firmware("GetInfo(size)", status.as_usize()));
-    }
-
-    let mut info_buffer = ptr::null_mut();
-    let status =
-        unsafe { ((*boot_services).allocate_pool)(efi::LOADER_DATA, info_size, &mut info_buffer) };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "AllocatePool(file info)",
-            status.as_usize(),
-        ));
-    }
-
-    let status = unsafe { ((*file).get_info)(file, &mut info_guid, &mut info_size, info_buffer) };
-    if status.is_error() {
-        free_guest_buffer(boot_services, info_buffer);
-        return Err(Error::Firmware("GetInfo", status.as_usize()));
-    }
-    let size = unsafe { (*info_buffer.cast::<efi::protocols::file::Info>()).file_size };
-    free_guest_buffer(boot_services, info_buffer);
-    if size == 0 || size > usize::MAX as u64 {
-        return Err(Error::GuestImageSize(size));
-    }
-    Ok(size as usize)
-}
-
-fn close_guest_file(
-    root: *mut efi::protocols::file::Protocol,
-    file: *mut efi::protocols::file::Protocol,
-) {
-    // SAFETY: both handles were returned by their corresponding open calls.
-    unsafe {
-        let _ = ((*file).close)(file);
-        let _ = ((*root).close)(root);
-    }
-}
-
-fn free_guest_buffer(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
-    // SAFETY: `buffer` was returned by this table's AllocatePool call.
+fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
+    // SAFETY: `buffer` was allocated by this firmware's device-path utilities.
     let _ = unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
