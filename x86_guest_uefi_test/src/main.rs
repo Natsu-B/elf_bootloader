@@ -45,7 +45,32 @@ pub extern "efiapi" fn efi_main(
     for byte in b"thin-hv: guest uefi payload\r\n" {
         write_byte(*byte);
     }
-    efi::Status::SUCCESS
+    let leaf_one = cpu::cpuid(1, 0);
+    let vmx = u8::from(leaf_one.ecx & (1 << 5) != 0);
+    let hypervisor = u8::from(leaf_one.ecx & (1 << 31) != 0);
+    for byte in b"thin-hv: guest cpuid vmx=" {
+        write_byte(*byte);
+    }
+    write_byte(b'0' + vmx);
+    for byte in b" hypervisor=" {
+        write_byte(*byte);
+    }
+    write_byte(b'0' + hypervisor);
+    write_byte(b'\r');
+    write_byte(b'\n');
+
+    let hypervisor_leaf = cpu::cpuid(0x4000_0000, 0);
+    if vmx == 1
+        && hypervisor == 0
+        && hypervisor_leaf.eax == 0
+        && hypervisor_leaf.ebx == 0
+        && hypervisor_leaf.ecx == 0
+        && hypervisor_leaf.edx == 0
+    {
+        efi::Status::SUCCESS
+    } else {
+        efi::Status::DEVICE_ERROR
+    }
 }
 
 /// Stops the payload if an unexpected panic occurs.

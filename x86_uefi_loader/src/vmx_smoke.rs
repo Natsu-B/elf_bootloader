@@ -29,6 +29,8 @@ const GUEST_STACK_PAGE: u64 = 9;
 const PAGE_SIZE: u64 = 4096;
 /// VMCALL basic exit reason.
 const EXIT_REASON_VMCALL: u64 = 18;
+/// CPUID basic exit reason.
+const EXIT_REASON_CPUID: u64 = 10;
 /// Marker written in non-root mode before VMCALL.
 const GUEST_MARKER: u64 = 0x7468_696e_6876_4d58;
 /// Payload staged by `run-uefi-smoke.sh`.
@@ -64,6 +66,29 @@ static GUEST_IMAGE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static SYSTEM_TABLE: AtomicPtr<efi::SystemTable> = AtomicPtr::new(ptr::null_mut());
 static ORIGINAL_CR0: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
+static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Guest GPRs that are not stored in the VMCS on VM exit.
+#[repr(C)]
+struct GuestRegisters {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<GuestRegisters>() == 15 * 8);
 
 /// Failure from the bounded VMX smoke launch.
 #[derive(Clone, Copy, Debug)]
@@ -496,6 +521,7 @@ fn configure_and_launch(
 
     GUEST_RAN.store(0, Ordering::Release);
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
+    CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
         "VMLAUNCH",
@@ -781,25 +807,159 @@ extern "C" fn guest_entry() -> ! {
 }
 
 /// Hardware VM-exit target for the smoke VMCS.
-extern "C" fn vmexit_entry() -> ! {
+#[unsafe(naked)]
+extern "sysv64" fn vmexit_entry() -> ! {
+    core::arch::naked_asm!(
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rbp",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "call {dispatch}",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rbp",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "vmresume",
+        "pushfq",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rbp",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "sub rsp, 8",
+        "lea rdi, [rsp + 8]",
+        "mov rsi, [rsp + 128]",
+        "call {resume_failed}",
+        "ud2",
+        dispatch = sym vmexit_dispatch,
+        resume_failed = sym vmresume_failed,
+    );
+}
+
+/// Handles one VM exit and returns only when the guest can be resumed.
+unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
+    // SAFETY: `vmexit_entry` passes its live, uniquely owned stack frame.
+    let registers = unsafe { &mut *registers };
     let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
     let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
     let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_CPUID {
+        CPUID_EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
+        let leaf = registers.rax as u32;
+        let subleaf = registers.rcx as u32;
+        let mut result = if (0x4000_0000..=0x4fff_ffff).contains(&leaf) {
+            cpu::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            }
+        } else {
+            cpu::cpuid(leaf, subleaf)
+        };
+        if leaf == 1 {
+            result.ecx |= 1 << 5;
+            result.ecx &= !(1 << 31);
+        }
+        registers.rax = u64::from(result.eax);
+        registers.rbx = u64::from(result.ebx);
+        registers.rcx = u64::from(result.ecx);
+        registers.rdx = u64::from(result.edx);
+
+        let Some(next_rip) = guest_rip.checked_add(instruction_len) else {
+            stop_unexpected_exit(
+                "guest RIP overflow",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        let status = unsafe { vmx::vmwrite(vmcs::GUEST_RIP, next_rip) };
+        if status != VmxStatus::Success {
+            stop_unexpected_exit(
+                "VMWRITE(GUEST_RIP) failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        return;
+    }
+
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
+        log_vmexit(reason, qualification, guest_rip, instruction_len);
+        finish_vmcall(reason);
+    }
+
+    stop_unexpected_exit(
+        "unhandled VM exit",
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Logs the common architectural VM-exit state.
+fn log_vmexit(reason: u64, qualification: u64, guest_rip: u64, instruction_len: u64) {
     let cpu_id = (cpu::cpuid(1, 0).ebx >> 24) & 0xff;
-    let marker = GUEST_RAN.load(Ordering::Acquire);
-    let guest_status = GUEST_STATUS.load(Ordering::Acquire);
+    let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
     let mut serial = SerialPort;
     serial.init();
     let _ = writeln!(
         serial,
-        "thin-hv: VMEXIT cpu={cpu_id} level=1 reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len}"
+        "thin-hv: VMEXIT cpu={cpu_id} level=1 reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} cpuid_exits={cpuid_exits}"
     );
+}
 
-    let vmxoff = unsafe { vmx::vmxoff() };
-    restore_control_registers();
+/// Completes the bounded smoke test after the guest's VMCALL.
+fn finish_vmcall(reason: u64) -> ! {
+    let marker = GUEST_RAN.load(Ordering::Acquire);
+    let guest_status = GUEST_STATUS.load(Ordering::Acquire);
+    let vmxoff = leave_vmx();
+    let mut serial = SerialPort;
+    serial.init();
     if reason & 0xffff == EXIT_REASON_VMCALL
-        && reason & (1 << 31) == 0
         && marker == GUEST_MARKER
         && guest_status == efi::Status::SUCCESS.as_usize()
         && vmxoff == VmxStatus::Success
@@ -817,4 +977,73 @@ extern "C" fn vmexit_entry() -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Reports an exit that this smoke monitor cannot reflect or handle.
+fn stop_unexpected_exit(
+    message: &str,
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) -> ! {
+    let vm_error = vm_instruction_error();
+    let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
+    let mut serial = SerialPort;
+    serial.init();
+    let _ = writeln!(
+        serial,
+        "thin-hv: vmx guest FAIL: {message} reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} vm_instruction_error={vm_error:#x} cpuid_exits={cpuid_exits} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
+        registers.rax, registers.rbx, registers.rcx, registers.rdx,
+    );
+    let vmxoff = leave_vmx();
+    let _ = writeln!(serial, "thin-hv: VMXOFF status={vmxoff:?}");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Reports a VMRESUME architectural failure reached from the assembly stub.
+unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rflags: u64) -> ! {
+    // SAFETY: `vmexit_entry` passes its still-live saved-register frame.
+    let registers = unsafe { &*registers };
+    let status = if rflags & 1 != 0 {
+        VmxStatus::FailInvalid
+    } else if rflags & (1 << 6) != 0 {
+        VmxStatus::FailValid
+    } else {
+        VmxStatus::Success
+    };
+    let vm_error = if status == VmxStatus::FailValid {
+        vm_instruction_error()
+    } else {
+        u64::MAX
+    };
+    let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+    let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
+    let mut serial = SerialPort;
+    serial.init();
+    let _ = writeln!(
+        serial,
+        "thin-hv: VMRESUME FAIL status={status:?} rflags={rflags:#x} vm_instruction_error={vm_error:#x} reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} cpuid_exits={cpuid_exits} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
+        registers.rax, registers.rbx, registers.rcx, registers.rdx,
+    );
+    let vmxoff = leave_vmx();
+    let _ = writeln!(serial, "thin-hv: VMXOFF status={vmxoff:?}");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Leaves VMX operation and restores the pre-smoke control registers on success.
+fn leave_vmx() -> VmxStatus {
+    let status = unsafe { vmx::vmxoff() };
+    if status == VmxStatus::Success {
+        restore_control_registers();
+    }
+    status
 }
