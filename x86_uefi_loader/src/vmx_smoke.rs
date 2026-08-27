@@ -10,12 +10,16 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use mutex::SpinLock;
+use nested_vmx::DIRECT_VMCS_PATCH_MANIFEST;
+use nested_vmx::PatchKind;
 use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMCLEAR_VMXON_POINTER;
 use nested_vmx::VMXERR_VMPTRLD_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMPTRLD_VMXON_POINTER;
 use nested_vmx::VcpuState;
+use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
+use nested_vmx::VmcsField;
 use nested_vmx::VmcsLaunchState;
 use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
@@ -65,6 +69,10 @@ const EXIT_REASON_CR_ACCESS: u64 = 28;
 const EXIT_REASON_VMXON: u64 = 27;
 /// VMCLEAR basic exit reason.
 const EXIT_REASON_VMCLEAR: u64 = 19;
+/// VMLAUNCH basic exit reason.
+const EXIT_REASON_VMLAUNCH: u64 = 20;
+/// VMRESUME basic exit reason.
+const EXIT_REASON_VMRESUME: u64 = 24;
 /// VMPTRLD basic exit reason.
 const EXIT_REASON_VMPTRLD: u64 = 21;
 /// VMREAD basic exit reason.
@@ -73,6 +81,12 @@ const EXIT_REASON_VMREAD: u64 = 23;
 const EXIT_REASON_VMWRITE: u64 = 25;
 /// INVEPT basic exit reason.
 const EXIT_REASON_INVEPT: u64 = 50;
+/// Continue the current carrier VMCS after dispatch.
+const VMEXIT_ACTION_RESUME: u64 = 0;
+/// Restore the saved GPR frame and enter L1's direct VMCS.
+const VMEXIT_ACTION_VMLAUNCH: u64 = 1;
+/// Restore the saved GPR frame and resume L1's direct VMCS.
+const VMEXIT_ACTION_VMRESUME: u64 = 2;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
 /// VM-entry interruption information for #UD without an error code.
@@ -156,6 +170,10 @@ static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Nested VMX state for the current single-vCPU smoke run.
 // ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
 static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
+/// State abandoned on the L0 stack while a direct L2 is running.
+// ponytail: one global direct run is sufficient for the current one-pCPU
+// probe; move this into per-pCPU storage before enabling SMP.
+static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 4 == MONITOR_PAGES as u64);
 
@@ -180,6 +198,20 @@ struct GuestRegisters {
 }
 
 const _: () = assert!(core::mem::size_of::<GuestRegisters>() == 15 * 8);
+
+/// Saved state needed to turn one direct hardware exit back into an L1 exit.
+#[derive(Clone, Copy)]
+struct NestedRun {
+    carrier: VmcsPhys,
+    direct: VmcsPhys,
+    saved_direct: [u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    l1_interruptibility: u64,
+    outer_reason: u64,
+    outer_qualification: u64,
+    outer_rip: u64,
+    outer_instruction_len: u64,
+    instruction: VmEntryInstruction,
+}
 
 /// Failure from the bounded VMX smoke launch.
 #[derive(Clone, Copy, Debug)]
@@ -770,6 +802,7 @@ fn configure_and_launch(
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
     CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
     *L1_VCPU_STATE.lock() = VcpuState::new();
+    *NESTED_RUN.lock() = None;
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
         "VMLAUNCH",
@@ -1078,6 +1111,10 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "push rax",
         "mov rdi, rsp",
         "call {dispatch}",
+        "cmp rax, {vmlaunch_action}",
+        "je 2f",
+        "cmp rax, {vmresume_action}",
+        "je 4f",
         "pop rax",
         "pop rbx",
         "pop rcx",
@@ -1093,6 +1130,7 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "pop r13",
         "pop r14",
         "pop r15",
+        "3:",
         "vmresume",
         "pushfq",
         "push r15",
@@ -1115,19 +1153,101 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "mov rsi, [rsp + 128]",
         "call {resume_failed}",
         "ud2",
+        "2:",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rbp",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "vmlaunch",
+        "jmp 5f",
+        "4:",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rbp",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "vmresume",
+        "5:",
+        "pushfq",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rbp",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "sub rsp, 8",
+        "lea rdi, [rsp + 8]",
+        "mov rsi, [rsp + 128]",
+        "call {entry_failed}",
+        "add rsp, 8",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rbp",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "add rsp, 8",
+        "jmp 3b",
         dispatch = sym vmexit_dispatch,
+        entry_failed = sym nested_vmentry_failed,
         resume_failed = sym vmresume_failed,
+        vmlaunch_action = const VMEXIT_ACTION_VMLAUNCH,
+        vmresume_action = const VMEXIT_ACTION_VMRESUME,
     );
 }
 
 /// Handles one VM exit and returns only when the guest can be resumed.
-unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
+unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64 {
     // SAFETY: `vmexit_entry` passes its live, uniquely owned stack frame.
     let registers = unsafe { &mut *registers };
     let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
     let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
     let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+
+    if NESTED_RUN.lock().is_some() {
+        reflect_l2_vmexit(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
 
     // VM-entry event fields persist in the VMCS after delivery.
     let clear_event = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
@@ -1166,7 +1286,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         registers.rdx = u64::from(result.edx);
 
         advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_XSETBV {
@@ -1183,7 +1303,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         // ponytail: this one-vCPU smoke shares extended register state with
         // L0; add per-vCPU XSAVE switching before SMP or L2 workloads.
         advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_RDMSR {
@@ -1198,16 +1318,16 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
                     instruction_len,
                     registers,
                 );
-                return;
+                return VMEXIT_ACTION_RESUME;
             };
             registers.rax = value & u64::from(u32::MAX);
             registers.rdx = value >> 32;
             advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
-            return;
+            return VMEXIT_ACTION_RESUME;
         }
         if AMD_MSR_RANGE.contains(&msr) {
             inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
-            return;
+            return VMEXIT_ACTION_RESUME;
         }
     }
 
@@ -1243,22 +1363,40 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
             }
         }
         advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMXON {
         handle_l1_vmxon(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCLEAR {
         handle_l1_vmclear(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMPTRLD {
         handle_l1_vmptrld(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
+    }
+
+    if reason & (1 << 31) == 0
+        && matches!(reason & 0xffff, EXIT_REASON_VMLAUNCH | EXIT_REASON_VMRESUME)
+    {
+        let instruction = if reason & 0xffff == EXIT_REASON_VMLAUNCH {
+            VmEntryInstruction::Vmlaunch
+        } else {
+            VmEntryInstruction::Vmresume
+        };
+        return handle_l1_vmentry(
+            instruction,
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
     }
 
     if reason & (1 << 31) == 0
@@ -1272,12 +1410,12 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
             instruction_len,
             registers,
         );
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_INVEPT {
         handle_l1_invept(reason, qualification, guest_rip, instruction_len, registers);
-        return;
+        return VMEXIT_ACTION_RESUME;
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
@@ -1619,6 +1757,442 @@ fn handle_l1_vmptrld(
         qualification,
         guest_rip,
         instruction_len,
+        registers,
+    );
+}
+
+/// Prepares L1's current VMCS for one direct hardware VM entry.
+fn handle_l1_vmentry(
+    instruction: VmEntryInstruction,
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) -> u64 {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+    let entry_result = state.entry_result(instruction);
+    if entry_result != VmInstructionResult::Vmsucceed {
+        complete_vmx_instruction(
+            entry_result,
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return VMEXIT_ACTION_RESUME;
+    }
+    let Some(current) = state.current_vmcs() else {
+        complete_vmx_instruction(
+            VmInstructionResult::VmfailInvalid,
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return VMEXIT_ACTION_RESUME;
+    };
+
+    let mut carrier_address = u64::MAX;
+    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"saving VMLAUNCH carrier failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+        stop_unexpected_exit(
+            b"invalid VMLAUNCH carrier",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    if carrier == current.address() {
+        stop_unexpected_exit(
+            b"VMLAUNCH targets VMCS01",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let Some(carrier_values) = read_direct_patch_fields() else {
+        stop_unexpected_exit(
+            b"saving carrier host state failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let l1_interruptibility =
+        unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
+
+    if unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"selecting L1 VMCS for VMLAUNCH failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let Some(saved_direct) = read_direct_patch_fields() else {
+        stop_unexpected_exit(
+            b"saving direct VMCS patch fields failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let exit_store_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrStoreCount);
+    let exit_load_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrLoadCount);
+    let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
+    let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.unwrap_or(u64::MAX);
+    let entry_controls = unsafe { vmx::vmread(vmcs::VM_ENTRY_CONTROLS) }.unwrap_or(u64::MAX);
+    if exit_store_count != Some(0)
+        || exit_load_count != Some(0)
+        || entry_load_count != Some(0)
+        || exit_controls & (1 << 12) != 0
+        || exit_controls >> 18 != 0
+        || entry_controls >> 13 != 0
+    {
+        // ponytail: the measured KVM probe has empty MSR lists and no optional
+        // host-state loads. Add bounded L0 MSR mirrors when a real workload
+        // first supplies a non-empty list.
+        stop_unexpected_exit(
+            b"unsupported nested VM-entry state",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    if !patch_direct_vmcs(&carrier_values) {
+        stop_unexpected_exit(
+            b"patching direct VMCS failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    let mut active = NESTED_RUN.lock();
+    if active.is_some() {
+        stop_unexpected_exit(
+            b"nested VMLAUNCH already active",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    *active = Some(NestedRun {
+        carrier,
+        direct: current.address(),
+        saved_direct,
+        l1_interruptibility,
+        outer_reason: reason,
+        outer_qualification: qualification,
+        outer_rip: guest_rip,
+        outer_instruction_len: instruction_len,
+        instruction,
+    });
+    drop(active);
+    let (name, action) = match instruction {
+        VmEntryInstruction::Vmlaunch => (b"VMLAUNCH".as_slice(), VMEXIT_ACTION_VMLAUNCH),
+        VmEntryInstruction::Vmresume => (b"VMRESUME".as_slice(), VMEXIT_ACTION_VMRESUME),
+    };
+    log_l1_vmx(name, b"direct", current.address().get());
+    action
+}
+
+/// Reads every field whose direct-VMCS value must survive L0 patching.
+fn read_direct_patch_fields() -> Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]> {
+    let mut values = [0; DIRECT_VMCS_PATCH_MANIFEST.len()];
+    for (value, patch) in values.iter_mut().zip(DIRECT_VMCS_PATCH_MANIFEST) {
+        *value = unsafe { vmx::vmread(patch.field as u32) }.ok()?;
+    }
+    Some(values)
+}
+
+/// Returns one saved field by its architectural encoding.
+fn direct_patch_value(
+    values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    field: VmcsField,
+) -> Option<u64> {
+    DIRECT_VMCS_PATCH_MANIFEST
+        .iter()
+        .position(|patch| patch.field == field)
+        .map(|index| values[index])
+}
+
+/// Replaces L1 host state with VMCS01 host state and disables exit MSR lists.
+fn patch_direct_vmcs(carrier_values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
+    for (index, patch) in DIRECT_VMCS_PATCH_MANIFEST.iter().enumerate() {
+        let value = match patch.kind {
+            PatchKind::HostState => carrier_values[index],
+            PatchKind::ExitMsrStore | PatchKind::ExitMsrLoad => 0,
+        };
+        if unsafe { vmx::vmwrite(patch.field as u32, value) } != VmxStatus::Success {
+            return false;
+        }
+    }
+    true
+}
+
+/// Restores all direct-VMCS fields hidden while L0 handled an L2 exit.
+fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
+    for (value, patch) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST) {
+        if unsafe { vmx::vmwrite(patch.field as u32, *value) } != VmxStatus::Success {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reflects a hardware L2 exit through VMCS01 into Linux KVM's host RIP.
+fn reflect_l2_vmexit(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let Some(run) = NESTED_RUN.lock().take() else {
+        stop_unexpected_exit(
+            b"missing nested run state",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let mut current = u64::MAX;
+    if unsafe { vmx::vmptrst(&mut current) } != VmxStatus::Success || current != run.direct.get() {
+        stop_unexpected_exit(
+            b"unexpected direct VMCS on L2 exit",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    if !restore_direct_vmcs(&run.saved_direct) {
+        stop_unexpected_exit(
+            b"restoring direct VMCS after L2 exit failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"restoring carrier after L2 exit failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    if reason & (1 << 31) == 0 && !L1_VCPU_STATE.lock().record_entry_success(run.instruction) {
+        stop_unexpected_exit(
+            b"recording nested VMLAUNCH success failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    if write_reflected_l1_state(&run).is_none() {
+        stop_unexpected_exit(
+            b"reflecting L1 host state failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    // ponytail: the fault-free real-mode probe leaves CR2 untouched. Save it
+    // in the entry stub before allowing an L2 that can fault.
+    log_l1_vmx(b"L2 EXIT", b"reason", reason);
+    log_l1_vmx(b"L2 EXIT", b"qualification", qualification);
+}
+
+/// Writes the architectural 64-bit VM-exit host state as VMCS01 guest state.
+fn write_reflected_l1_state(run: &NestedRun) -> Option<()> {
+    let host = |field| direct_patch_value(&run.saved_direct, field);
+    let es = host(VmcsField::HostEsSelector)?;
+    let cs = host(VmcsField::HostCsSelector)?;
+    let ss = host(VmcsField::HostSsSelector)?;
+    let ds = host(VmcsField::HostDsSelector)?;
+    let fs = host(VmcsField::HostFsSelector)?;
+    let gs = host(VmcsField::HostGsSelector)?;
+
+    for (field, value) in [
+        (vmcs::GUEST_ES_SELECTOR, es),
+        (vmcs::GUEST_CS_SELECTOR, cs),
+        (vmcs::GUEST_SS_SELECTOR, ss),
+        (vmcs::GUEST_DS_SELECTOR, ds),
+        (vmcs::GUEST_FS_SELECTOR, fs),
+        (vmcs::GUEST_GS_SELECTOR, gs),
+        (vmcs::GUEST_TR_SELECTOR, host(VmcsField::HostTrSelector)?),
+        (vmcs::GUEST_LDTR_SELECTOR, 0),
+        (vmcs::GUEST_ES_LIMIT, u64::from(u32::MAX)),
+        (vmcs::GUEST_CS_LIMIT, u64::from(u32::MAX)),
+        (vmcs::GUEST_SS_LIMIT, u64::from(u32::MAX)),
+        (vmcs::GUEST_DS_LIMIT, u64::from(u32::MAX)),
+        (vmcs::GUEST_FS_LIMIT, u64::from(u32::MAX)),
+        (vmcs::GUEST_GS_LIMIT, u64::from(u32::MAX)),
+        (vmcs::GUEST_TR_LIMIT, 0x67),
+        (vmcs::GUEST_LDTR_LIMIT, 0),
+        (vmcs::GUEST_GDTR_LIMIT, 0xffff),
+        (vmcs::GUEST_IDTR_LIMIT, 0xffff),
+        (vmcs::GUEST_ES_AR_BYTES, 0xc093),
+        (vmcs::GUEST_CS_AR_BYTES, 0xa09b),
+        (vmcs::GUEST_SS_AR_BYTES, 0xc093),
+        (vmcs::GUEST_DS_AR_BYTES, 0xc093),
+        (vmcs::GUEST_FS_AR_BYTES, 0xc093),
+        (vmcs::GUEST_GS_AR_BYTES, 0xc093),
+        (vmcs::GUEST_TR_AR_BYTES, 0x008b),
+        (
+            vmcs::GUEST_LDTR_AR_BYTES,
+            u64::from(vmcs::GUEST_SEGMENT_UNUSABLE),
+        ),
+        (vmcs::GUEST_CR0, host(VmcsField::HostCr0)?),
+        (vmcs::GUEST_CR3, host(VmcsField::HostCr3)?),
+        (vmcs::GUEST_CR4, host(VmcsField::HostCr4)?),
+        (vmcs::CR4_READ_SHADOW, host(VmcsField::HostCr4)?),
+        (vmcs::GUEST_ES_BASE, 0),
+        (vmcs::GUEST_CS_BASE, 0),
+        (vmcs::GUEST_SS_BASE, 0),
+        (vmcs::GUEST_DS_BASE, 0),
+        (vmcs::GUEST_FS_BASE, host(VmcsField::HostFsBase)?),
+        (vmcs::GUEST_GS_BASE, host(VmcsField::HostGsBase)?),
+        (vmcs::GUEST_LDTR_BASE, 0),
+        (vmcs::GUEST_TR_BASE, host(VmcsField::HostTrBase)?),
+        (vmcs::GUEST_GDTR_BASE, host(VmcsField::HostGdtrBase)?),
+        (vmcs::GUEST_IDTR_BASE, host(VmcsField::HostIdtrBase)?),
+        (vmcs::GUEST_DR7, 0x400),
+        (vmcs::GUEST_RSP, host(VmcsField::HostRsp)?),
+        (vmcs::GUEST_RIP, host(VmcsField::HostRip)?),
+        (vmcs::GUEST_RFLAGS, 2),
+        (vmcs::GUEST_PENDING_DBG_EXCEPTIONS, 0),
+        // VM exit clears STI/MOV-SS blocking and retains L1's
+        // blocking-by-NMI state, matching KVM's host-state load.
+        (vmcs::GUEST_INTERRUPTIBILITY_INFO, run.l1_interruptibility),
+        (vmcs::GUEST_ACTIVITY_STATE, 0),
+        (vmcs::GUEST_IA32_DEBUGCTL, 0),
+        (
+            vmcs::GUEST_SYSENTER_CS,
+            host(VmcsField::HostIa32SysenterCs)?,
+        ),
+        (
+            vmcs::GUEST_SYSENTER_ESP,
+            host(VmcsField::HostIa32SysenterEsp)?,
+        ),
+        (
+            vmcs::GUEST_SYSENTER_EIP,
+            host(VmcsField::HostIa32SysenterEip)?,
+        ),
+        (vmcs::VM_ENTRY_INTR_INFO_FIELD, 0),
+    ] {
+        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Completes an immediate direct VM-entry failure and resumes VMCS01.
+unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters, rflags: u64) {
+    // SAFETY: `vmexit_entry` passes its live, uniquely owned saved-GPR frame.
+    let registers = unsafe { &*registers };
+    let Some(run) = NESTED_RUN.lock().take() else {
+        stop_unexpected_exit(b"missing failed VMLAUNCH state", 20, 0, 0, 0, registers);
+    };
+    let result = if rflags & 1 != 0 {
+        VmInstructionResult::VmfailInvalid
+    } else if rflags & (1 << 6) != 0 {
+        let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            stop_unexpected_exit(
+                b"reading failed VMLAUNCH error failed",
+                run.outer_reason,
+                run.outer_qualification,
+                run.outer_rip,
+                run.outer_instruction_len,
+                registers,
+            );
+        };
+        VmInstructionResult::VmfailValid(error)
+    } else {
+        stop_unexpected_exit(
+            b"VMLAUNCH returned without failure flags",
+            run.outer_reason,
+            run.outer_qualification,
+            run.outer_rip,
+            run.outer_instruction_len,
+            registers,
+        );
+    };
+    if !restore_direct_vmcs(&run.saved_direct)
+        || unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success
+    {
+        stop_unexpected_exit(
+            b"restoring carrier after VMLAUNCH failure failed",
+            run.outer_reason,
+            run.outer_qualification,
+            run.outer_rip,
+            run.outer_instruction_len,
+            registers,
+        );
+    }
+    complete_vmx_instruction(
+        result,
+        run.outer_reason,
+        run.outer_qualification,
+        run.outer_rip,
+        run.outer_instruction_len,
         registers,
     );
 }
