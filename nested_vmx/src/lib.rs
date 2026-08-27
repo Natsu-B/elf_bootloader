@@ -36,6 +36,10 @@ pub const VMXERR_VMCLEAR_VMXON_POINTER: u32 = 3;
 pub const VMXERR_VMLAUNCH_NONCLEAR_VMCS: u32 = 4;
 /// `VM_INSTRUCTION_ERROR` for VMRESUME with a clear current VMCS.
 pub const VMXERR_VMRESUME_NONLAUNCHED_VMCS: u32 = 5;
+/// `VM_INSTRUCTION_ERROR` for VMPTRLD with an invalid physical address.
+pub const VMXERR_VMPTRLD_INVALID_ADDRESS: u32 = 9;
+/// `VM_INSTRUCTION_ERROR` for VMPTRLD targeting the active VMXON region.
+pub const VMXERR_VMPTRLD_VMXON_POINTER: u32 = 10;
 
 /// Architectural completion status of an emulated VMX instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

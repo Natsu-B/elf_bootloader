@@ -12,8 +12,11 @@ use core::sync::atomic::Ordering;
 use mutex::SpinLock;
 use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMCLEAR_VMXON_POINTER;
+use nested_vmx::VMXERR_VMPTRLD_INVALID_ADDRESS;
+use nested_vmx::VMXERR_VMPTRLD_VMXON_POINTER;
 use nested_vmx::VcpuState;
 use nested_vmx::VmInstructionResult;
+use nested_vmx::VmcsLaunchState;
 use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
 use x86_64_hal::addr::EptPhys;
@@ -62,6 +65,8 @@ const EXIT_REASON_CR_ACCESS: u64 = 28;
 const EXIT_REASON_VMXON: u64 = 27;
 /// VMCLEAR basic exit reason.
 const EXIT_REASON_VMCLEAR: u64 = 19;
+/// VMPTRLD basic exit reason.
+const EXIT_REASON_VMPTRLD: u64 = 21;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
 /// VM-entry interruption information for #UD without an error code.
@@ -1245,6 +1250,11 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         return;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMPTRLD {
+        handle_l1_vmptrld(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
@@ -1426,6 +1436,148 @@ fn handle_l1_vmclear(
             else {
                 stop_unexpected_exit(
                     b"reading VMCLEAR error failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            l1_vmx_failure(&state, error)
+        }
+    };
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Selects L1's direct VMCS while retaining VMCS01 as the hardware carrier.
+fn handle_l1_vmptrld(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let mut carrier_address = u64::MAX;
+    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"saving VMPTRLD carrier failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+        stop_unexpected_exit(
+            b"invalid VMPTRLD carrier",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    let address = read_l1_vmx_pointer(
+        b"VMPTRLD",
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+    log_l1_vmx(b"VMPTRLD", b"region", address);
+    let Some(region) = validate_l1_vmcs_address(address) else {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_VMPTRLD_INVALID_ADDRESS),
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    };
+    if state
+        .vmxon_region()
+        .is_some_and(|vmxon| vmxon.get() == region.get())
+    {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_VMPTRLD_VMXON_POINTER),
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    }
+    if carrier == region {
+        // ponytail: L1 memory and the reserved runtime block are disjoint;
+        // virtualize a colliding carrier only if that trusted layout changes.
+        stop_unexpected_exit(
+            b"VMPTRLD targets VMCS01",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    let status = unsafe { vmx::vmptrld(region) };
+    let hardware_error = if status == VmxStatus::FailValid {
+        (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+    } else {
+        None
+    };
+    if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"restoring VMPTRLD carrier failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    let result = match status {
+        VmxStatus::Success => {
+            // ponytail: the single-vCPU probe selects the VMCS it just cleared;
+            // track launch state per page before allowing multiple L1 VMCSes.
+            L1_VCPU_STATE
+                .lock()
+                .record_vmptrld_success(region, VmcsLaunchState::Clear);
+            VmInstructionResult::Vmsucceed
+        }
+        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
+        VmxStatus::FailValid => {
+            let Some(error) = hardware_error else {
+                stop_unexpected_exit(
+                    b"reading VMPTRLD error failed",
                     reason,
                     qualification,
                     guest_rip,
