@@ -9,9 +9,10 @@ esp="$stage/esp"
 serial_log="$stage/serial.log"
 vars="$stage/OVMF_VARS.fd"
 marker='thin-hv: uefi entry'
-vmx_marker='thin-hv: vmx guest PASS'
-payload_marker='thin-hv: guest uefi payload'
+return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
+payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
+memory=${X86_UEFI_MEMORY:-256M}
 
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
@@ -32,6 +33,7 @@ first_file() {
 [[ -f "$loader" ]] || die "loader not found: $loader"
 [[ -f "$guest" ]] || die "guest payload not found: $guest"
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
+[[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
 command -v timeout >/dev/null || die "GNU timeout is required"
 
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
@@ -74,7 +76,7 @@ timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     -machine q35,accel=kvm \
     -cpu host,+vmx,-hypervisor \
     -smp 1 \
-    -m 256M \
+    -m "$memory" \
     -nodefaults \
     -display none \
     -monitor none \
@@ -90,7 +92,9 @@ set -e
 
 cat -- "$serial_log"
 grep -Fq -- "$marker" "$serial_log" || die "marker '$marker' missing from $serial_log (QEMU status $qemu_status)"
-grep -Fq -- "$vmx_marker" "$serial_log" || die "marker '$vmx_marker' missing from $serial_log (QEMU status $qemu_status)"
+if [[ -n "$return_marker" ]]; then
+    grep -Fq -- "$return_marker" "$serial_log" || die "marker '$return_marker' missing from $serial_log (QEMU status $qemu_status)"
+fi
 grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
 
 case $qemu_status in
