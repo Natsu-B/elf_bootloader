@@ -1,8 +1,8 @@
 # x86_64 thin monitor: architecture and validation status
 
 This document records only implementation and measurements that exist on
-`feat/x86-thin-monitor` as of 2026-08-28. Linux KVM results below come from an actual L2 run;
-Windows Hyper-V and WSL2 remain untested.
+`feat/x86-thin-monitor` as of 2026-08-28. Linux KVM and Windows boot results below come from
+actual runs; Windows Hyper-V and WSL2 remain untested.
 
 ## Status summary
 
@@ -12,9 +12,9 @@ Windows Hyper-V and WSL2 remain untested.
 | First VMX launch | One vCPU reaches VMX non-root from a runtime EFI driver; Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, SMP, and bare-metal lifetime validation |
 | Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO` | SMP, a normal distribution userspace, and a faulting or long-mode L2 |
 | Trusted nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, VMLAUNCH, and VMRESUME through a direct hardware VMCS; external-interrupt, EPT-violation, and I/O exits were reflected to KVM | Non-empty MSR lists, CR2/XSAVE switching, optional VMX controls, and SMP |
-| Direct EPT | QEMU-only 4 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and a non-test workload |
+| Direct EPT | QEMU-only 8 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and bare-metal use |
 | UEFI variables | ABI-independent profile overlay for the four variable operations, with tests | Runtime-services table integration and OVMF/OS isolation test |
-| Windows | None | Windows boot, Hyper-V, WSL2, Sandbox, VBS/HVCI |
+| Windows | Windows 11 Enterprise Evaluation 25H2 boots directly and reaches the desktop through the one-vCPU monitor | Hyper-V, WSL2, Sandbox, VBS/HVCI, and SMP |
 
 Relevant commits include `af35d3b` (x86 HAL/VMX foundation), `d02d384` (four-operation
 variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UKI builder),
@@ -22,7 +22,8 @@ variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UK
 (long-mode walk and VMX operand decode), `8d4cfc2` (conservative nested capability mask),
 `c8bd855` (runtime-resident monitor, private `HOST_CR3`, and VMXON interception), `39019e8`
 (deterministic KVM L2 probe), `6a1547a` through `6a40b2b` (nested VMCS instructions and
-INVEPT), and `8c83a42` (direct nested entry and exit reflection).
+INVEPT), `8c83a42` (direct nested entry and exit reflection), `f16b53a` (chainload Windows from
+its installed ESP), and `c9c73f3` (reproducible Windows monitor test).
 
 ## Architecture and late launch
 
@@ -47,29 +48,31 @@ preserves its pages across `ExitBootServices`:
 ```text
 OVMF / physical UEFI
   -> BOOTX64.EFI (ordinary EFI application)
-       1. LoadImage(GUESTX64.EFI)
+       1. LoadImage(GUESTX64.EFI), or locate installed bootmgfw.efi on another filesystem
        2. LoadImage(MONITORX64.EFI), pass the guest handle in LoadOptions
        3. StartImage(runtime monitor)
   -> MONITORX64.EFI (EFI runtime driver, VMX root)
-       4. allocate one 83-page EfiRuntimeServicesData block below 4 GiB
+       4. allocate one 91-page EfiRuntimeServicesData block below 8 GiB
        5. build identity EPT and an L0-owned identity HOST_CR3
        6. VMXON, VMCLEAR, VMPTRLD, VMLAUNCH
   -> guest_entry (VMX non-root L1)
-       7. firmware StartImage(preloaded guest)
+       7. firmware StartImage(preloaded payload, Linux UKI, or Windows boot manager)
        8. small payload: VMCALL after StartImage returns
           Linux UKI: ExitBootServices, load KVM, and continue running
-       9. kvm_intel programs its VMCS and enters the real-mode L2
+          Windows: boot from its installed ESP and continue to the desktop
+       9. Linux only: kvm_intel programs its VMCS and enters the real-mode L2
   -> L2 (the KVM probe)
       10. direct L1 EPT and VMCS run in hardware
       11. L0 reflects requested exits into KVM; userspace observes KVM_EXIT_IO
 ```
 
-The runtime data block is 83 pages: one VMXON page, one VMCS page, six EPT pages, one zeroed MSR
-bitmap, four host-stack pages, 64 guest-stack pages (256 KiB), and six L0 page-table pages (PML4,
-PDPT, and four page directories). Linux reports the runtime image and data as `device reserved`.
+The runtime data block is 91 pages: one VMXON page, one VMCS page, ten EPT pages, one zeroed MSR
+bitmap, four host-stack pages, 64 guest-stack pages (256 KiB), and ten L0 page-table pages (PML4,
+PDPT, and eight page directories). Linux reports the runtime image and data as `device reserved`.
 The VMCS uses the private identity table as `HOST_CR3`, rather than firmware's Boot Services page
-tables. This is enough for the measured one-vCPU QEMU/Linux path, but the monitor still reuses
-firmware GDT/IDT/TSS state and is not ready for a bare-metal fault or interrupt.
+tables. This is enough for the measured one-vCPU QEMU/Linux and QEMU/Windows paths, but the
+monitor still reuses firmware GDT/IDT/TSS state and is not ready for a bare-metal fault or
+interrupt.
 
 ## Threat model and TCB boundary
 
@@ -92,10 +95,11 @@ to remain shared. PK, KEK, db, and dbx are also shared by policy.
 
 There are two distinct EPT uses:
 
-1. The current QEMU smoke builds six EPT paging pages and maps physical `[0, 4 GiB)` identically
-   with 2 MiB read/write/execute leaves. `[0, 1 GiB)` is marked write-back for the test RAM;
-   `[1 GiB, 4 GiB)` is uncacheable for the QEMU APIC, PCI MMIO, and firmware windows. The loader
-   rejects its reserved block, entry/exit code, or CR3 if an address is at or above 4 GiB.
+1. The current QEMU smoke builds ten EPT paging pages and maps physical `[0, 8 GiB)` identically
+   with 2 MiB read/write/execute leaves. `[0, 2 GiB)` and `[4 GiB, 6 GiB)` are write-back buckets
+   for the 4 GiB test RAM; `[2 GiB, 4 GiB)` and `[6 GiB, 8 GiB)` are uncacheable buckets for PCI
+   MMIO and firmware windows. The loader rejects its reserved block, entry/exit code, or CR3 if
+   an address is at or above 8 GiB.
 2. The trusted nested path puts L1's EPTP directly into the hardware VMCS for L2.
    Because L1 physical addresses are treated as machine physical addresses, there is no EPT12 x
    EPT01 composition, shadow EPT, or EPT02 cache.
@@ -105,7 +109,9 @@ The first map is only a bounded QEMU layout, not a general firmware/OS memory ma
 UKI to enter the kernel and reach its initramfs shell. A real launch must cover the required
 physical address width and derive suitable RAM/MMIO cache types from platform state. The current
 code therefore cannot be used for arbitrary bare-metal MMIO or for firmware allocations above
-the limit.
+the limit. The Windows QEMU harness constrains q35's 64-bit PCI hole to 1 GiB and tells OVMF to
+use the same aperture, keeping its high MMIO inside the existing uncacheable EPT buckets. Those
+knobs describe only this QEMU layout; they do not make the fixed map suitable for bare metal.
 
 The Linux 7.1.5 KVM probe supplied an EPTP that the monitor used directly. L1 issued global and
 single-context INVEPT before the direct entry; L0 forwarded both to hardware. The conservative
@@ -190,9 +196,9 @@ Enter the pinned development environment for every command:
 nix develop --accept-flake-config
 ```
 
-The shell supplies nightly Rust with the AArch64 and x86 UEFI targets, QEMU, OVMF, binutils,
-`cpio`, `file`, `gzip`, a static BusyBox, and the systemd x86 EFI stub. It exports `OVMF_CODE`,
-`OVMF_VARS`, `BUSYBOX_STATIC`, and `LINUX_EFI_STUB`.
+The shell supplies nightly Rust with the AArch64 and x86 UEFI targets, QEMU, OVMF, swtpm,
+binutils, `cpio`, `file`, `gzip`, a static BusyBox, and the systemd x86 EFI stub. It exports
+`OVMF_CODE`, `OVMF_VARS`, `BUSYBOX_STATIC`, and `LINUX_EFI_STUB`.
 
 Build the bootstrap application, its runtime-driver copy, and the test payload under ignored
 `bin/x86_64/`:
@@ -216,9 +222,10 @@ cargo test -p uefi_variable_overlay
 cargo fmt --all -- --check
 ```
 
-After the Linux L1 changes, `nix develop --accept-flake-config --command cargo xtest -t std`
-passed all 15 selected host-test packages. A fresh full AArch64 firmware/QEMU regression is still
-required.
+On the current branch, AArch64 `cargo xbuild`, all 15 `cargo xtest -t std` entries, the unit-test
+plan, the UEFI/QEMU `virtio_blk_modern` test, and the U-Boot/QEMU `stage1_translation` test pass.
+A full `cargo xtest` stopped before executing tests because its `sudo -v` preflight could not
+authenticate in the non-interactive session.
 
 ## QEMU/KVM + OVMF UEFI smoke
 
@@ -302,8 +309,8 @@ Loading `kvm_intel` forced the first late VM exit after Linux had reclaimed Boot
 and exposed two L0 lifetime bugs. First, an ordinary EFI application's code pages were reclaimed,
 so its saved `HOST_RIP` no longer contained monitor code. Loading the monitor a second time as an
 EFI runtime driver keeps its PE sections reserved. Second, the VMCS still used firmware's
-`HOST_CR3`; Linux reclaimed the page-table pages behind it. The six additional pages in the
-83-page runtime allocation now provide an L0-owned four-level identity map and are installed as
+`HOST_CR3`; Linux reclaimed the page-table pages behind it. The ten L0 page-table pages in the
+91-page runtime allocation provide an L0-owned four-level identity map and are installed as
 `HOST_CR3` before launch.
 
 Linux also performs the EFI runtime virtual-address transition. Post-transition VM-exit logging
@@ -358,15 +365,49 @@ Exit reason `0x1` is an external interrupt, `0x30` is an EPT violation resolved 
 
 ## Windows, Hyper-V, and WSL2 status
 
-No Windows ISO or disk image has been downloaded or installed for this branch. Windows has not
-booted directly or through the monitor. Hyper-V features have not been enabled, no Hyper-V VM has
-been started, and WSL2 has not run. Windows Sandbox and VBS/HVCI are also untested.
+The Microsoft-hosted Windows 11 Enterprise Evaluation 25H2 English ISO was downloaded as ignored
+`bin/x86_64/windows/win11-enterprise-eval-25h2-en-us.iso`, verified as SHA-256
+`a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9`, and installed to an
+ignored 80 GiB sparse raw `bin/x86_64/windows/windows.raw`. Both the unattended install and a
+subsequent direct OVMF boot reached the Windows desktop. The measured monitor boot is reproduced
+after `cargo xbuild x86` with:
+
+```sh
+scripts/x86_64/windows/windows-test.sh monitor
+```
+
+Monitor mode stages only `BOOTX64.EFI` and `MONITORX64.EFI` on its loader ESP. If staged
+`GUESTX64.EFI` is absent, the loader enumerates non-parent `SimpleFileSystem` handles and uses a
+complete device path to load `\EFI\Microsoft\Boot\bootmgfw.efi` from the first matching installed
+ESP. This preserves the Windows boot manager's actual device handle and file path. The current
+first-match rule is sufficient for one Windows installation; profile partition-GUID selection is
+needed if multiple Windows ESPs matter.
+
+The monitor test creates fresh `monitor-vars.fd` from the OVMF template so firmware boot entries
+cannot bypass the loader, then runs q35 with `pci-hole64-size=1G` and OVMF
+`X-PciMmio64Mb=1024`. This fresh variable store is a test-harness boot control, not the profile
+variable overlay described above; no Runtime Services hook is installed.
+
+The ignored evidence captures are:
+
+* `bin/x86_64/windows/direct-install-pass.log` and
+  `bin/x86_64/windows/direct-boot-pass.log`: `thin-hv: windows desktop`;
+* `bin/x86_64/windows/monitor-l0-windows-pass.log`: `thin-hv: runtime monitor active` and reads of
+  VMX capability MSRs `0x482` and `0x48b`;
+* `bin/x86_64/windows/monitor-desktop-pass.log`: `thinhvwindowsdesktop`, emitted to COM2 by the
+  harness's desktop-ready Run-dialog probe;
+* `bin/x86_64/linux-l2-regression-pass.log`: `thin-hv: linux L1 L2 KVM PASS` after the Windows
+  loader changes.
+
+These results prove `host KVM -> this L0 -> Windows desktop` with one vCPU. The observed Windows
+VMX capability reads do not prove that Hyper-V started. Hyper-V features have not been enabled,
+no Hyper-V VM has been started, and WSL2 has not run. Windows Sandbox and VBS/HVCI are also
+untested.
 
 The repository contains only the conservative standard-VMX policy needed to begin those tests.
 It does not implement or advertise Hyper-V CPUID leaves, SynIC, VP Assist Page, enlightened VMCS,
 or enlightened VM-entry. The design goal remains to expose bare-metal-style VMX (`VMX=1`,
-`hypervisor-present=0`) to trusted Windows. The small payload and Linux KVM probe measure that
-view, but Windows and Hyper-V do not yet.
+`hypervisor-present=0`) to trusted Windows; testing Hyper-V itself is still required.
 
 ## Known limitations and bare-metal boundary
 
@@ -374,18 +415,19 @@ view, but Windows and Hyper-V do not yet.
 * One vCPU only. Nested state and the active direct run use global storage; there is no AP startup,
   x2APIC policy, APICv, or posted-interrupt support. Move both state objects to per-pCPU storage
   before SMP.
-* The smoke EPT covers only the first 4 GiB and uses a QEMU-specific low-WB/upper-UC split. It is
-  not safe for a general bare-metal RAM/MMIO layout.
-* The runtime PE sections and 83-page data block survive Linux `ExitBootServices`, and the VMCS
+* The smoke EPT covers only the first 8 GiB and uses QEMU-specific fixed WB/UC buckets. It is not
+  safe for a general bare-metal RAM/MMIO layout. The q35/OVMF 1 GiB PCI-hole settings are also
+  QEMU-only.
+* The runtime PE sections and 91-page data block survive Linux `ExitBootServices`, and the VMCS
   uses an L0-owned `HOST_CR3`. L0 still reuses firmware GDT/IDT/TSS state; private descriptor
   tables and fault handlers are required before bare-metal use.
 * `MONITORX64.EFI` is currently the application PE copied with its subsystem changed to EFI
   runtime driver. It has no runtime virtual-address-change handler or self-relocated resident
-  core. Raw VM-exit logging works across the measured Linux relocation, but this is not a general
-  Windows or firmware runtime-PE solution.
-* The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle. A production
-  Windows chain needs an explicit monitor/guest device-path handoff instead of assuming the test
-  ESP and fallback boot path.
+  core. Raw VM-exit logging works across the measured Linux relocation and Windows boot, but this
+  is not a general bare-metal firmware runtime-PE solution.
+* The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle and chainloads
+  Windows from the first other filesystem containing `bootmgfw.efi`. Multiple Windows installs
+  need profile-owned ESP selection instead of firmware enumeration order.
 * The measured nested path handles VMXON, VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE, INVEPT,
   VMLAUNCH, and VMRESUME. Memory-form VMREAD/VMWRITE, VMXOFF, INVVPID, optional VMX controls, and
   VMX in L2 are not supported.
@@ -393,11 +435,12 @@ view, but Windows and Hyper-V do not yet.
   counts. Add bounded L0-owned mirrors before accepting non-empty lists.
 * The real-mode L2 probe is deliberately fault-free and does not exercise extended register
   state. L0 does not save/switch CR2 or XSAVE state around a direct run; add both before a faulting,
-  SIMD-using, SMP, or Windows/Hyper-V workload.
+  SIMD-using, SMP, or Hyper-V L2 workload.
 * Linux KVM has run one VM/vCPU to `KVM_EXIT_IO`; an L2 Linux kernel, KVM SMP, and sustained or
   device-heavy workloads have not run.
 * The profile variable adapter has no firmware ABI hook, persistent backend wiring, or real OVMF
-  profile test. Each QEMU smoke starts from a copied OVMF variable template.
+  profile test. Monitor-mode Windows deliberately starts from a fresh OVMF variable template;
+  that prevents boot-entry bypass but does not test profile isolation.
 * No physical PCI/NVMe/GPU/USB/NIC handoff has been tested. There is no IOMMU setup.
 * Serial diagnostics have no compile-time release trace switch and are not yet removed from the
   VM-exit hot path in release builds.
@@ -410,8 +453,8 @@ view, but Windows and Hyper-V do not yet.
   `bin/x86_64/`, but neither has booted on physical hardware. The QEMU-specific map, descriptor
   tables, runtime relocation, and device-path assumptions must be resolved first.
 
-All generated EFI files, ESP directories, OVMF variable stores, serial logs, UKIs, future ISO or
-qcow2 files, and other large artifacts belong under `bin/` (or another ignored build directory).
+All generated EFI files, ESP directories, OVMF variable stores, serial logs, UKIs, ISO or qcow2
+files, and other large artifacts belong under `bin/` (or another ignored build directory).
 The repository's `.gitignore` excludes `/bin`; none of these generated artifacts should be
 committed.
 
