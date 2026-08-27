@@ -231,7 +231,7 @@ probe_wsl_enable() {
 
 run_windows() {
     local mode=$1
-    local timeout_seconds memory smp disk_size ovmf_code ovmf_vars active_vars
+    local timeout_seconds memory smp cpu disk_size ovmf_code ovmf_vars active_vars
     local disk_image=$disk disk_format=raw disk_snapshot=off
     local tpm_dir=$base_tpm_dir tpm_instance=base
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
@@ -245,6 +245,8 @@ run_windows() {
     qemu=$(command -v qemu-system-x86_64)
     swtpm=$(command -v swtpm)
     memory=${WINDOWS_MEMORY:-4G}
+    cpu=${WINDOWS_CPU:-host,+vmx,-hypervisor}
+    [[ -n "$cpu" ]] || die 'WINDOWS_CPU must not be empty'
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
         smp=1
@@ -428,7 +430,7 @@ run_windows() {
     "$qemu" \
         -machine q35,accel=kvm,smm=on \
         -global q35-pcihost.pci-hole64-size=1G \
-        -cpu host,+vmx,-hypervisor \
+        -cpu "$cpu" \
         -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024 \
         -smp "$smp" \
         -m "$memory" \
