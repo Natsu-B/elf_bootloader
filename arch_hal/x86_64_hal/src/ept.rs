@@ -75,10 +75,51 @@ pub fn build_identity_1g(
     pml4_phys.get() | 6 | (3 << 3)
 }
 
+/// Builds a 4 GiB identity map with low RAM as WB and the upper 3 GiB as UC.
+///
+/// This is the QEMU smoke layout: RAM is constrained below 1 GiB, while the
+/// local APIC, PCI MMIO windows, and firmware mappings above it must not be WB.
+/// Returns the EPT pointer to write into the VMCS.
+pub fn build_identity_4g(
+    pml4: &mut EptPage,
+    pml4_phys: EptPhys,
+    pdpt: &mut EptPage,
+    pdpt_phys: EptPhys,
+    page_directories: &mut [EptPage; 4],
+    page_directory_phys: [EptPhys; 4],
+) -> u64 {
+    const READ_WRITE_EXECUTE: u64 = 0b111;
+    const WRITE_BACK: u64 = 6 << 3;
+    const LARGE_PAGE: u64 = 1 << 7;
+    const TWO_MIB: u64 = 2 * 1024 * 1024;
+
+    pml4.entries.fill(0);
+    pdpt.entries.fill(0);
+    pml4.entries[0] = pdpt_phys.get() | READ_WRITE_EXECUTE;
+    for (directory_index, (directory, physical)) in page_directories
+        .iter_mut()
+        .zip(page_directory_phys)
+        .enumerate()
+    {
+        directory.entries.fill(0);
+        pdpt.entries[directory_index] = physical.get() | READ_WRITE_EXECUTE;
+        let memory_type = if directory_index == 0 { WRITE_BACK } else { 0 };
+        for (entry_index, entry) in directory.entries.iter_mut().enumerate() {
+            let leaf_index = directory_index * 512 + entry_index;
+            *entry = leaf_index as u64 * TWO_MIB | READ_WRITE_EXECUTE | memory_type | LARGE_PAGE;
+        }
+    }
+
+    // ponytail: the QEMU test fixes RAM below 1 GiB; derive WB/UC ranges from
+    // the UEFI memory map before using this map on arbitrary bare metal.
+    pml4_phys.get() | 6 | (3 << 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::EptPage;
     use super::build_identity_1g;
+    use super::build_identity_4g;
     use crate::addr::EptPhys;
 
     #[test]
@@ -100,5 +141,32 @@ mod tests {
         assert_eq!(pdpt.entries()[0], 0x3007);
         assert_eq!(page_directory.entries()[0], 0xb7);
         assert_eq!(page_directory.entries()[511], 0x3fe0_00b7);
+    }
+
+    #[test]
+    fn qemu_map_covers_apic_and_firmware_as_uncacheable() {
+        let mut pml4 = EptPage::new();
+        let mut pdpt = EptPage::new();
+        let mut page_directories = core::array::from_fn(|_| EptPage::new());
+        let eptp = build_identity_4g(
+            &mut pml4,
+            EptPhys::new(0x1000).unwrap(),
+            &mut pdpt,
+            EptPhys::new(0x2000).unwrap(),
+            &mut page_directories,
+            [
+                EptPhys::new(0x3000).unwrap(),
+                EptPhys::new(0x4000).unwrap(),
+                EptPhys::new(0x5000).unwrap(),
+                EptPhys::new(0x6000).unwrap(),
+            ],
+        );
+
+        assert_eq!(eptp, 0x101e);
+        assert_eq!(pdpt.entries()[3], 0x6007);
+        assert_eq!(page_directories[0].entries()[0], 0xb7);
+        assert_eq!(page_directories[1].entries()[0], 0x4000_0087);
+        assert_eq!(page_directories[3].entries()[503], 0xfee0_0087);
+        assert_eq!(page_directories[3].entries()[511], 0xffe0_0087);
     }
 }

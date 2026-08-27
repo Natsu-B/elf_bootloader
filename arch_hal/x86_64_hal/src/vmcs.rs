@@ -57,6 +57,7 @@ vmcs_fields! {
     HOST_GS_SELECTOR = 0x0c0a => (WIDTH_16, HOST_STATE, 5);
     HOST_TR_SELECTOR = 0x0c0c => (WIDTH_16, HOST_STATE, 6);
 
+    MSR_BITMAP = 0x2004 => (WIDTH_64, CONTROL, 2);
     EPT_POINTER = 0x201a => (WIDTH_64, CONTROL, 13);
     GUEST_PHYSICAL_ADDRESS = 0x2400 => (WIDTH_64, EXIT_INFORMATION, 0);
     VMCS_LINK_POINTER = 0x2800 => (WIDTH_64, GUEST_STATE, 0);
@@ -159,8 +160,18 @@ vmcs_fields! {
 
 /// Primary processor control that activates secondary controls.
 pub const PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
+/// Primary processor control that selects the four-kibibyte MSR bitmap.
+pub const PRIMARY_EXEC_USE_MSR_BITMAPS: u32 = 1 << 28;
 /// Secondary processor control that enables EPT.
 pub const SECONDARY_EXEC_ENABLE_EPT: u32 = 1 << 1;
+/// Secondary processor control that lets the guest execute `RDTSCP`.
+pub const SECONDARY_EXEC_ENABLE_RDTSCP: u32 = 1 << 3;
+/// Secondary processor control that lets the guest execute `INVPCID`.
+pub const SECONDARY_EXEC_ENABLE_INVPCID: u32 = 1 << 12;
+/// Secondary processor control that lets the guest execute `XSAVES` and `XRSTORS`.
+pub const SECONDARY_EXEC_ENABLE_XSAVES: u32 = 1 << 20;
+/// Secondary processor control that lets the guest execute `UMWAIT` and `TPAUSE`.
+pub const SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE: u32 = 1 << 26;
 /// Secondary processor control that enables unrestricted guests.
 pub const SECONDARY_EXEC_UNRESTRICTED_GUEST: u32 = 1 << 7;
 
@@ -192,6 +203,7 @@ mod tests {
     #[test]
     fn representative_encodings_cover_every_width_and_class() {
         assert_eq!(GUEST_ES_SELECTOR, 0x0800);
+        assert_eq!(MSR_BITMAP, 0x2004);
         assert_eq!(EPT_POINTER, 0x201a);
         assert_eq!(VM_EXIT_REASON, 0x4402);
         assert_eq!(GUEST_CS_AR_BYTES, 0x4816);

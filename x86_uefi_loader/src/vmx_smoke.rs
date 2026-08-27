@@ -20,17 +20,35 @@ use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 13;
+const MONITOR_PAGES: usize = 77;
+/// First of four page directories mapping the low four gibibytes.
+const EPT_PD_FIRST_PAGE: u64 = 4;
+/// Zeroed bitmap that lets covered L1 MSR accesses execute directly.
+const MSR_BITMAP_PAGE: u64 = 8;
 /// First page used as the host stack.
-const HOST_STACK_PAGE: u64 = 5;
+const HOST_STACK_PAGE: u64 = 9;
 /// First page used as the guest stack.
-const GUEST_STACK_PAGE: u64 = 9;
+const GUEST_STACK_PAGE: u64 = 13;
+/// Linux's EFI path uses more than the 128 KiB stack needed by small payloads.
+const GUEST_STACK_PAGES: u64 = 64;
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
 /// VMCALL basic exit reason.
 const EXIT_REASON_VMCALL: u64 = 18;
 /// CPUID basic exit reason.
 const EXIT_REASON_CPUID: u64 = 10;
+/// XSETBV basic exit reason.
+const EXIT_REASON_XSETBV: u64 = 55;
+/// RDMSR basic exit reason.
+const EXIT_REASON_RDMSR: u64 = 31;
+/// VM-entry interruption information for #GP with an error code.
+const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
+/// AMD64_DE_CFG, which raises #GP when Linux probes it on this Intel target.
+const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
+/// CR4.VMXE, required by the hardware VMCS but initially hidden from L1.
+const CR4_VMX_ENABLE: u64 = 1 << 13;
+/// CR4.OSXSAVE, required while L0 handles an unconditional XSETBV exit.
+const CR4_OSXSAVE: u64 = 1 << 18;
 /// Marker written in non-root mode before VMCALL.
 const GUEST_MARKER: u64 = 0x7468_696e_6876_4d58;
 /// Payload staged by `run-uefi-smoke.sh`.
@@ -66,6 +84,8 @@ static GUEST_IMAGE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static SYSTEM_TABLE: AtomicPtr<efi::SystemTable> = AtomicPtr::new(ptr::null_mut());
 static ORIGINAL_CR0: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
+/// XCR0 restored when the bounded smoke leaves VMX operation.
+static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
 static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Guest GPRs that are not stored in the VMCS on VM exit.
@@ -101,7 +121,7 @@ pub(crate) enum Error {
     Instruction(&'static str, VmxStatus, u64),
     /// One VMCS field could not be written.
     Vmwrite(u32, VmxStatus, u64),
-    /// The smoke-only 1 GiB EPT cannot cover the allocated block or code.
+    /// The smoke-only 4 GiB EPT cannot cover the allocated block or code.
     OutsideIdentityMap(u64),
     /// A UEFI service used to load the nested payload failed.
     Firmware(&'static str, usize),
@@ -190,7 +210,7 @@ pub(crate) fn run(
         vmexit_entry as usize as u64,
         cpu::read_cr3(),
     ] {
-        if address >= 1 << 30 {
+        if address >= 1 << 32 {
             return Err(Error::OutsideIdentityMap(address));
         }
     }
@@ -205,15 +225,21 @@ pub(crate) fn run(
 
     let pml4_phys = EptPhys::new(block + 2 * PAGE_SIZE).unwrap();
     let pdpt_phys = EptPhys::new(block + 3 * PAGE_SIZE).unwrap();
-    let pd_phys = EptPhys::new(block + 4 * PAGE_SIZE).unwrap();
-    // SAFETY: these three exclusive pages are aligned, zeroed, and exactly EptPage-sized.
+    let pd_phys = [
+        EptPhys::new(block + EPT_PD_FIRST_PAGE * PAGE_SIZE).unwrap(),
+        EptPhys::new(block + (EPT_PD_FIRST_PAGE + 1) * PAGE_SIZE).unwrap(),
+        EptPhys::new(block + (EPT_PD_FIRST_PAGE + 2) * PAGE_SIZE).unwrap(),
+        EptPhys::new(block + (EPT_PD_FIRST_PAGE + 3) * PAGE_SIZE).unwrap(),
+    ];
+    // SAFETY: these six exclusive pages are aligned, zeroed, and the final
+    // four are one contiguous `[EptPage; 4]` allocation.
     let ept_pointer = unsafe {
-        ept::build_identity_1g(
+        ept::build_identity_4g(
             &mut *((block + 2 * PAGE_SIZE) as *mut ept::EptPage),
             pml4_phys,
             &mut *((block + 3 * PAGE_SIZE) as *mut ept::EptPage),
             pdpt_phys,
-            &mut *((block + 4 * PAGE_SIZE) as *mut ept::EptPage),
+            &mut *((block + EPT_PD_FIRST_PAGE * PAGE_SIZE) as *mut [ept::EptPage; 4]),
             pd_phys,
         )
     };
@@ -224,13 +250,20 @@ pub(crate) fn run(
         & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1) };
     let fixed_cr4 = (original_cr4 | (1 << 13) | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
         & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
+    if cpu::cpuid(1, 0).ecx & (1 << 26) == 0 {
+        return Err(Error::Capability("XSAVE", 0));
+    }
+    let host_cr4 = fixed_cr4 | CR4_OSXSAVE;
     ORIGINAL_CR0.store(original_cr0, Ordering::Relaxed);
     ORIGINAL_CR4.store(original_cr4, Ordering::Relaxed);
     // SAFETY: values were normalized with the CPU's VMX fixed-bit MSRs.
     unsafe {
         cpu::write_cr0(fixed_cr0);
-        cpu::write_cr4(fixed_cr4);
+        cpu::write_cr4(host_cr4);
     }
+    // SAFETY: CPUID advertised XSAVE and host CR4.OSXSAVE is now set. XCR0 is
+    // restored before the original CR4 is restored.
+    ORIGINAL_XCR0.store(unsafe { cpu::xgetbv(0) }, Ordering::Relaxed);
 
     let vmxon = VmxonPhys::new(block).unwrap();
     let vmcs = VmcsPhys::new(block + PAGE_SIZE).unwrap();
@@ -243,11 +276,13 @@ pub(crate) fn run(
     let result = configure_and_launch(
         vmcs,
         ept_pointer,
+        block + MSR_BITMAP_PAGE * PAGE_SIZE,
         fixed_cr0,
         fixed_cr4,
-        fixed_cr4,
+        original_cr4,
+        host_cr4,
         block + (HOST_STACK_PAGE + 4) * PAGE_SIZE - 8,
-        block + (GUEST_STACK_PAGE + 4) * PAGE_SIZE - 8,
+        block + (GUEST_STACK_PAGE + GUEST_STACK_PAGES) * PAGE_SIZE - 8,
         basic.true_controls,
     );
 
@@ -440,8 +475,10 @@ fn free_guest_buffer(boot_services: *mut efi::BootServices, buffer: *mut c_void)
 fn configure_and_launch(
     vmcs_page: VmcsPhys,
     ept_pointer: u64,
+    msr_bitmap: u64,
     host_cr0: u64,
-    guest_cr4: u64,
+    guest_cr4_hardware: u64,
+    guest_cr4_shadow: u64,
     host_cr4: u64,
     host_rsp: u64,
     guest_rsp: u64,
@@ -471,18 +508,29 @@ fn configure_and_launch(
         vmx::IA32_VMX_ENTRY_CTLS
     };
     let pin = vmx::adjust_controls(0, unsafe { cpu::rdmsr(pin_msr) });
-    let primary = vmx::adjust_controls(vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS, unsafe {
-        cpu::rdmsr(primary_msr)
-    });
-    let secondary = vmx::adjust_controls(vmcs::SECONDARY_EXEC_ENABLE_EPT, unsafe {
-        cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2)
-    });
+    let primary = vmx::adjust_controls(
+        vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS | vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS,
+        unsafe { cpu::rdmsr(primary_msr) },
+    );
+    let secondary = vmx::adjust_controls(
+        vmcs::SECONDARY_EXEC_ENABLE_EPT
+            | vmcs::SECONDARY_EXEC_ENABLE_RDTSCP
+            | vmcs::SECONDARY_EXEC_ENABLE_INVPCID
+            | vmcs::SECONDARY_EXEC_ENABLE_XSAVES
+            | vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE,
+        unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) },
+    );
     let exit = vmx::adjust_controls(vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE, unsafe {
         cpu::rdmsr(exit_msr)
     });
     let entry = vmx::adjust_controls(vmcs::VM_ENTRY_IA32E_MODE, unsafe { cpu::rdmsr(entry_msr) });
     if primary & vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS == 0
+        || primary & vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_EPT == 0
+        || secondary & vmcs::SECONDARY_EXEC_ENABLE_RDTSCP == 0
+        || secondary & vmcs::SECONDARY_EXEC_ENABLE_INVPCID == 0
+        || secondary & vmcs::SECONDARY_EXEC_ENABLE_XSAVES == 0
+        || secondary & vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE == 0
         || exit & vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0
         || entry & vmcs::VM_ENTRY_IA32E_MODE == 0
     {
@@ -507,15 +555,16 @@ fn configure_and_launch(
         (vmcs::VM_ENTRY_MSR_LOAD_COUNT, 0),
         (vmcs::VM_ENTRY_INTR_INFO_FIELD, 0),
         (vmcs::CR0_GUEST_HOST_MASK, 0),
-        (vmcs::CR4_GUEST_HOST_MASK, 0),
+        (vmcs::CR4_GUEST_HOST_MASK, CR4_VMX_ENABLE),
         (vmcs::CR0_READ_SHADOW, host_cr0),
-        (vmcs::CR4_READ_SHADOW, guest_cr4),
+        (vmcs::CR4_READ_SHADOW, guest_cr4_shadow),
+        (vmcs::MSR_BITMAP, msr_bitmap),
         (vmcs::EPT_POINTER, ept_pointer),
     ] {
         write_vmcs(field, value)?;
     }
 
-    write_guest_state(host_cr0, guest_cr4, guest_rsp)?;
+    write_guest_state(host_cr0, guest_cr4_hardware, guest_rsp)?;
     write_host_state(host_cr0, host_cr4, host_rsp)?;
     log_guest_state();
 
@@ -777,6 +826,7 @@ fn log_guest_state() {
 fn restore_control_registers() {
     // SAFETY: these are the exact values captured before enabling VMX.
     unsafe {
+        cpu::xsetbv(0, ORIGINAL_XCR0.load(Ordering::Relaxed));
         cpu::write_cr4(ORIGINAL_CR4.load(Ordering::Relaxed));
         cpu::write_cr0(ORIGINAL_CR0.load(Ordering::Relaxed));
     }
@@ -878,6 +928,19 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
     let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
 
+    // VM-entry event fields persist in the VMCS after delivery.
+    let clear_event = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
+    if clear_event != VmxStatus::Success {
+        stop_unexpected_exit(
+            "clearing VM-entry event failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_CPUID {
         CPUID_EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
         let leaf = registers.rax as u32;
@@ -901,27 +964,32 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         registers.rcx = u64::from(result.ecx);
         registers.rdx = u64::from(result.edx);
 
-        let Some(next_rip) = guest_rip.checked_add(instruction_len) else {
-            stop_unexpected_exit(
-                "guest RIP overflow",
-                reason,
-                qualification,
-                guest_rip,
-                instruction_len,
-                registers,
-            );
-        };
-        let status = unsafe { vmx::vmwrite(vmcs::GUEST_RIP, next_rip) };
-        if status != VmxStatus::Success {
-            stop_unexpected_exit(
-                "VMWRITE(GUEST_RIP) failed",
-                reason,
-                qualification,
-                guest_rip,
-                instruction_len,
-                registers,
+        advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_XSETBV {
+        // SAFETY: L1 is trusted and supplied the architectural ECX/EDX:EAX
+        // operands. Invalid values are not yet converted into a guest #GP.
+        // ponytail: validate XCR0 dependencies and inject #GP before accepting
+        // untrusted L1 input; the current Linux L1 is part of the TCB.
+        unsafe {
+            cpu::xsetbv(
+                registers.rcx as u32,
+                (registers.rdx << 32) | (registers.rax & u64::from(u32::MAX)),
             );
         }
+        // ponytail: this one-vCPU smoke shares extended register state with
+        // L0; add per-vCPU XSAVE switching before SMP or L2 workloads.
+        advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    if reason & (1 << 31) == 0
+        && reason & 0xffff == EXIT_REASON_RDMSR
+        && registers.rcx as u32 == MSR_AMD64_DE_CFG
+    {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
 
@@ -938,6 +1006,63 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         instruction_len,
         registers,
     );
+}
+
+/// Injects the fault an unsupported bitmap-outside MSR would raise on Intel.
+fn inject_general_protection(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    for (field, value) in [
+        (vmcs::VM_ENTRY_EXCEPTION_ERROR_CODE, 0),
+        (vmcs::VM_ENTRY_INTR_INFO_FIELD, INJECT_GENERAL_PROTECTION),
+    ] {
+        let status = unsafe { vmx::vmwrite(field, value) };
+        if status != VmxStatus::Success {
+            stop_unexpected_exit(
+                "injecting guest #GP failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    }
+}
+
+/// Advances past one instruction handled entirely by L0.
+fn advance_guest_rip(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let Some(next_rip) = guest_rip.checked_add(instruction_len) else {
+        stop_unexpected_exit(
+            "guest RIP overflow",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let status = unsafe { vmx::vmwrite(vmcs::GUEST_RIP, next_rip) };
+    if status != VmxStatus::Success {
+        stop_unexpected_exit(
+            "VMWRITE(GUEST_RIP) failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
 }
 
 /// Logs the common architectural VM-exit state.

@@ -320,6 +320,47 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// Reads one extended control register.
+///
+/// # Safety
+///
+/// `xcr` must be readable on this CPU and CR4.OSXSAVE must be set.
+#[must_use]
+pub unsafe fn xgetbv(xcr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: upheld by the caller.
+    unsafe {
+        asm!(
+            "xgetbv",
+            in("ecx") xcr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Writes one extended control register.
+///
+/// # Safety
+///
+/// `xcr` and `value` must form an architecturally valid combination and
+/// CR4.OSXSAVE must be set.
+pub unsafe fn xsetbv(xcr: u32, value: u64) {
+    // SAFETY: upheld by the caller.
+    unsafe {
+        asm!(
+            "xsetbv",
+            in("ecx") xcr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 /// Reads CR0.
 #[must_use]
 pub fn read_cr0() -> u64 {
