@@ -166,6 +166,22 @@ pub fn memory_operand_address_64(
     }))
 }
 
+/// Returns the two GPR indices encoded by a register-form VMX instruction.
+///
+/// Intel calls bits 6:3 "register 1" and bits 31:28 "register 2". Their
+/// meaning depends on the instruction; VMREAD uses register 1 as its
+/// destination, while VMWRITE uses it as the value source.
+#[must_use]
+pub const fn register_operand_indices(instruction_info: u32) -> Option<(u8, u8)> {
+    if instruction_info & (1 << 10) == 0 {
+        return None;
+    }
+    Some((
+        ((instruction_info >> 3) & 0xf) as u8,
+        ((instruction_info >> 28) & 0xf) as u8,
+    ))
+}
+
 /// Executes VMXON on a page containing the hardware revision identifier.
 ///
 /// # Safety
@@ -477,6 +493,7 @@ mod tests {
     use super::VmxBasic;
     use super::adjust_controls;
     use super::memory_operand_address_64;
+    use super::register_operand_indices;
     use super::restrict_controls;
 
     #[test]
@@ -517,5 +534,11 @@ mod tests {
             ),
             Some(rsp)
         );
+    }
+
+    #[test]
+    fn linux_vmwrite_register_operands_are_decoded() {
+        assert_eq!(register_operand_indices(0x0361_cd34), Some((6, 0)));
+        assert_eq!(register_operand_indices(0x0361_c934), None);
     }
 }

@@ -67,6 +67,10 @@ const EXIT_REASON_VMXON: u64 = 27;
 const EXIT_REASON_VMCLEAR: u64 = 19;
 /// VMPTRLD basic exit reason.
 const EXIT_REASON_VMPTRLD: u64 = 21;
+/// VMREAD basic exit reason.
+const EXIT_REASON_VMREAD: u64 = 23;
+/// VMWRITE basic exit reason.
+const EXIT_REASON_VMWRITE: u64 = 25;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
 /// VM-entry interruption information for #UD without an error code.
@@ -1255,6 +1259,20 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         return;
     }
 
+    if reason & (1 << 31) == 0
+        && matches!(reason & 0xffff, EXIT_REASON_VMREAD | EXIT_REASON_VMWRITE)
+    {
+        handle_l1_vmcs_access(
+            reason & 0xffff == EXIT_REASON_VMWRITE,
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
@@ -1598,6 +1616,180 @@ fn handle_l1_vmptrld(
     );
 }
 
+/// Executes one register-form L1 VMREAD or VMWRITE on its direct VMCS.
+fn handle_l1_vmcs_access(
+    write: bool,
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &mut GuestRegisters,
+) {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let Some(current) = state.current_vmcs() else {
+        complete_vmx_instruction(
+            VmInstructionResult::VmfailInvalid,
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    };
+
+    let operands = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
+        .and_then(vmx::register_operand_indices);
+    let Some((register1, field_register)) = operands else {
+        // ponytail: Linux's observed VMCS accesses are register-form; add
+        // translated guest-memory access only when an L1 uses memory-form.
+        stop_unexpected_exit(
+            b"unsupported memory-form VMCS access",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let field_value = guest_gpr(registers, field_register);
+    let write_value = if write {
+        guest_gpr(registers, register1)
+    } else {
+        None
+    };
+    let Some(field) = field_value.and_then(|value| u32::try_from(value).ok()) else {
+        stop_unexpected_exit(
+            b"invalid VMCS field operand",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    if write && write_value.is_none() {
+        stop_unexpected_exit(
+            b"invalid VMWRITE value register",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    let mut carrier_address = u64::MAX;
+    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"saving VMCS-access carrier failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+        stop_unexpected_exit(
+            b"invalid VMCS-access carrier",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    if carrier == current.address()
+        || unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success
+    {
+        stop_unexpected_exit(
+            b"selecting L1 VMCS for access failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    let (status, read_value) = if write {
+        (unsafe { vmx::vmwrite(field, write_value.unwrap()) }, None)
+    } else {
+        match unsafe { vmx::vmread(field) } {
+            Ok(value) => (VmxStatus::Success, Some(value)),
+            Err(status) => (status, None),
+        }
+    };
+    let hardware_error = if status == VmxStatus::FailValid {
+        (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+            .ok()
+            .and_then(|value| u32::try_from(value).ok())
+    } else {
+        None
+    };
+    if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"restoring VMCS-access carrier failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+
+    let result = match status {
+        VmxStatus::Success => VmInstructionResult::Vmsucceed,
+        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
+        VmxStatus::FailValid => {
+            let Some(error) = hardware_error else {
+                stop_unexpected_exit(
+                    b"reading VMCS-access error failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            VmInstructionResult::VmfailValid(error)
+        }
+    };
+    if let Some(value) = read_value {
+        if !set_guest_gpr(registers, register1, value) {
+            stop_unexpected_exit(
+                b"writing VMREAD destination failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    }
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
 /// Converts a VMfail error according to whether L1 has a current VMCS.
 fn l1_vmx_failure(state: &VcpuState, error: u32) -> VmInstructionResult {
     if state.current_vmcs().is_some() {
@@ -1813,6 +2005,30 @@ fn guest_gpr(registers: &GuestRegisters, index: u8) -> Option<u64> {
         15 => registers.r15,
         _ => return None,
     })
+}
+
+/// Writes a GPR saved by the VM-exit entry, including VMCS-backed RSP.
+fn set_guest_gpr(registers: &mut GuestRegisters, index: u8, value: u64) -> bool {
+    match index {
+        0 => registers.rax = value,
+        1 => registers.rcx = value,
+        2 => registers.rdx = value,
+        3 => registers.rbx = value,
+        4 => return unsafe { vmx::vmwrite(vmcs::GUEST_RSP, value) } == VmxStatus::Success,
+        5 => registers.rbp = value,
+        6 => registers.rsi = value,
+        7 => registers.rdi = value,
+        8 => registers.r8 = value,
+        9 => registers.r9 = value,
+        10 => registers.r10 = value,
+        11 => registers.r11 = value,
+        12 => registers.r12 = value,
+        13 => registers.r13 = value,
+        14 => registers.r14 = value,
+        15 => registers.r15 = value,
+        _ => return false,
+    }
+    true
 }
 
 /// Injects the fault an unsupported bitmap-outside MSR would raise on Intel.
