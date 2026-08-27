@@ -34,27 +34,27 @@ use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 83;
-/// First of four page directories mapping the low four gibibytes.
+const MONITOR_PAGES: usize = 91;
+/// First of eight page directories mapping the low eight gibibytes.
 const EPT_PD_FIRST_PAGE: u64 = 4;
 /// L1 MSR bitmap, including conservative VMX capability interception.
-const MSR_BITMAP_PAGE: u64 = 8;
+const MSR_BITMAP_PAGE: u64 = 12;
 /// First page used as the host stack.
-const HOST_STACK_PAGE: u64 = 9;
+const HOST_STACK_PAGE: u64 = 13;
 /// First page used as the guest stack.
-const GUEST_STACK_PAGE: u64 = 13;
+const GUEST_STACK_PAGE: u64 = 17;
 /// Linux's EFI path uses more than the 128 KiB stack needed by small payloads.
 const GUEST_STACK_PAGES: u64 = 64;
-/// PML4 page for the L0-owned four-gibibyte identity map.
-const HOST_PML4_PAGE: u64 = 77;
-/// PDPT page for the L0-owned four-gibibyte identity map.
-const HOST_PDPT_PAGE: u64 = 78;
-/// First of four L0-owned page directories.
-const HOST_PD_FIRST_PAGE: u64 = 79;
+/// PML4 page for the L0-owned eight-gibibyte identity map.
+const HOST_PML4_PAGE: u64 = 81;
+/// PDPT page for the L0-owned eight-gibibyte identity map.
+const HOST_PDPT_PAGE: u64 = 82;
+/// First of eight L0-owned page directories.
+const HOST_PD_FIRST_PAGE: u64 = 83;
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
 /// Upper bound of the smoke monitor's identity-mapped physical space.
-const IDENTITY_MAP_LIMIT: u64 = 1 << 32;
+const IDENTITY_MAP_LIMIT: u64 = 1 << 33;
 /// VMCALL basic exit reason.
 const EXIT_REASON_VMCALL: u64 = 18;
 /// CPUID basic exit reason.
@@ -175,7 +175,7 @@ static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
 // probe; move this into per-pCPU storage before enabling SMP.
 static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
-const _: () = assert!(HOST_PD_FIRST_PAGE + 4 == MONITOR_PAGES as u64);
+const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
 
 /// Guest GPRs that are not stored in the VMCS on VM exit.
 #[repr(C)]
@@ -224,7 +224,7 @@ pub(crate) enum Error {
     Instruction(&'static str, VmxStatus, u64),
     /// One VMCS field could not be written.
     Vmwrite(u32, VmxStatus, u64),
-    /// The smoke-only 4 GiB EPT cannot cover the allocated block or code.
+    /// The smoke-only 8 GiB EPT cannot cover the allocated block or code.
     OutsideIdentityMap(u64),
     /// A UEFI service used to load the nested payload failed.
     Firmware(&'static str, usize),
@@ -330,17 +330,25 @@ pub(crate) fn run(
     if status.is_error() {
         return Err(Error::Allocate(status.as_usize()));
     }
-    let block_end = block + MONITOR_PAGES as u64 * PAGE_SIZE;
+    let block_end = block
+        .checked_add(MONITOR_PAGES as u64 * PAGE_SIZE)
+        .ok_or(Error::OutsideIdentityMap(block))?;
+    if block_end > IDENTITY_MAP_LIMIT {
+        return Err(Error::OutsideIdentityMap(block_end));
+    }
     for address in [
-        block_end,
         guest_entry as usize as u64,
         vmexit_entry as usize as u64,
         cpu::read_cr3(),
     ] {
-        if address >= 1 << 32 {
+        if address >= IDENTITY_MAP_LIMIT {
             return Err(Error::OutsideIdentityMap(address));
         }
     }
+    let _ = writeln!(
+        serial,
+        "thin-hv: monitor block={block:#018x} end={block_end:#018x}"
+    );
 
     // SAFETY: AllocatePages returned an exclusive, aligned block of this exact size.
     unsafe { ptr::write_bytes(block as *mut u8, 0, MONITOR_PAGES * PAGE_SIZE as usize) };
@@ -353,26 +361,23 @@ pub(crate) fn run(
 
     let pml4_phys = EptPhys::new(block + 2 * PAGE_SIZE).unwrap();
     let pdpt_phys = EptPhys::new(block + 3 * PAGE_SIZE).unwrap();
-    let pd_phys = [
-        EptPhys::new(block + EPT_PD_FIRST_PAGE * PAGE_SIZE).unwrap(),
-        EptPhys::new(block + (EPT_PD_FIRST_PAGE + 1) * PAGE_SIZE).unwrap(),
-        EptPhys::new(block + (EPT_PD_FIRST_PAGE + 2) * PAGE_SIZE).unwrap(),
-        EptPhys::new(block + (EPT_PD_FIRST_PAGE + 3) * PAGE_SIZE).unwrap(),
-    ];
-    // SAFETY: these six exclusive pages are aligned, zeroed, and the final
-    // four are one contiguous `[EptPage; 4]` allocation.
+    let pd_phys: [EptPhys; 8] = core::array::from_fn(|index| {
+        EptPhys::new(block + (EPT_PD_FIRST_PAGE + index as u64) * PAGE_SIZE).unwrap()
+    });
+    // SAFETY: these ten exclusive pages are aligned and zeroed, and the final
+    // eight are one contiguous `[EptPage; 8]` allocation.
     let ept_pointer = unsafe {
-        ept::build_identity_4g(
+        ept::build_identity_8g(
             &mut *((block + 2 * PAGE_SIZE) as *mut ept::EptPage),
             pml4_phys,
             &mut *((block + 3 * PAGE_SIZE) as *mut ept::EptPage),
             pdpt_phys,
-            &mut *((block + EPT_PD_FIRST_PAGE * PAGE_SIZE) as *mut [ept::EptPage; 4]),
+            &mut *((block + EPT_PD_FIRST_PAGE * PAGE_SIZE) as *mut [ept::EptPage; 8]),
             pd_phys,
         )
     };
-    // SAFETY: the final six pages are exclusive, aligned, and zeroed.
-    let host_cr3 = unsafe { build_host_identity_4g(block) };
+    // SAFETY: the final ten pages are exclusive, aligned, and zeroed.
+    let host_cr3 = unsafe { build_host_identity_8g(block) };
 
     let original_cr0 = cpu::read_cr0();
     let original_cr4 = cpu::read_cr4();
@@ -667,15 +672,15 @@ fn free_guest_buffer(boot_services: *mut efi::BootServices, buffer: *mut c_void)
 /// # Safety
 ///
 /// `block` must point to the exclusive, zeroed `MONITOR_PAGES` allocation.
-unsafe fn build_host_identity_4g(block: u64) -> u64 {
+unsafe fn build_host_identity_8g(block: u64) -> u64 {
     const PRESENT_WRITE: u64 = 0b11;
     const LARGE_PAGE: u64 = 1 << 7;
 
     let pml4 = block + HOST_PML4_PAGE * PAGE_SIZE;
     let pdpt = block + HOST_PDPT_PAGE * PAGE_SIZE;
-    // SAFETY: the caller provides the exclusive six-page table area.
+    // SAFETY: the caller provides the exclusive ten-page table area.
     unsafe { ptr::write_volatile(pml4 as *mut u64, pdpt | PRESENT_WRITE) };
-    for directory in 0_u64..4 {
+    for directory in 0_u64..8 {
         let pd = block + (HOST_PD_FIRST_PAGE + directory) * PAGE_SIZE;
         // SAFETY: each index is within its exclusive 512-entry page.
         unsafe {
@@ -686,7 +691,7 @@ unsafe fn build_host_identity_4g(block: u64) -> u64 {
         }
         for entry in 0_u64..512 {
             let physical = (directory * 512 + entry) << 21;
-            // ponytail: 2 MiB RWX leaves cover the trusted 4 GiB smoke map;
+            // ponytail: 2 MiB RWX leaves cover the trusted 8 GiB smoke map;
             // split and protect only when enforcing an untrusted-L1 boundary.
             unsafe {
                 ptr::write_volatile(
@@ -2589,7 +2594,7 @@ fn read_l1_linear_u64(linear: u64) -> Option<u64> {
             return None;
         }
         // SAFETY: the trusted L1 page walk resolved this byte inside the
-        // identity-mapped four-gibibyte smoke address space.
+        // identity-mapped eight-gibibyte smoke address space.
         *byte = unsafe { ptr::read_volatile(physical as *const u8) };
     }
     Some(u64::from_le_bytes(bytes))
