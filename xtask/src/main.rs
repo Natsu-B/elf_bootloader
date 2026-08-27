@@ -397,6 +397,10 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("bin")
         .join("x86_64")
         .join("x86-uefi-loader.efi");
+    let monitor_destination = workspace
+        .join("bin")
+        .join("x86_64")
+        .join("x86-uefi-monitor.efi");
     let guest_artifact = workspace
         .join("target")
         .join("x86_64-unknown-uefi")
@@ -416,6 +420,26 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             e
         )
     })?;
+    fs::copy(&artifact, &monitor_destination).map_err(|e| {
+        format!(
+            "Failed to copy {} to {}: {}",
+            artifact.display(),
+            monitor_destination.display(),
+            e
+        )
+    })?;
+    let status = Command::new("objcopy")
+        .arg("--subsystem=efi-rtd")
+        .arg(&monitor_destination)
+        .status()
+        .map_err(|e| format!("Failed to run objcopy for runtime monitor: {}", e))?;
+    if !status.success() {
+        return Err(format!(
+            "objcopy failed for {} with status: {}",
+            monitor_destination.display(),
+            status
+        ));
+    }
     fs::copy(&guest_artifact, &guest_destination).map_err(|e| {
         format!(
             "Failed to copy {} to {}: {}",

@@ -9,6 +9,7 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+use nested_vmx::VmInstructionResult;
 use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
 use x86_64_hal::addr::EptPhys;
@@ -16,12 +17,13 @@ use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
 use x86_64_hal::cpu;
 use x86_64_hal::ept;
+use x86_64_hal::paging;
 use x86_64_hal::vmcs;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 77;
+const MONITOR_PAGES: usize = 83;
 /// First of four page directories mapping the low four gibibytes.
 const EPT_PD_FIRST_PAGE: u64 = 4;
 /// L1 MSR bitmap, including conservative VMX capability interception.
@@ -32,8 +34,16 @@ const HOST_STACK_PAGE: u64 = 9;
 const GUEST_STACK_PAGE: u64 = 13;
 /// Linux's EFI path uses more than the 128 KiB stack needed by small payloads.
 const GUEST_STACK_PAGES: u64 = 64;
+/// PML4 page for the L0-owned four-gibibyte identity map.
+const HOST_PML4_PAGE: u64 = 77;
+/// PDPT page for the L0-owned four-gibibyte identity map.
+const HOST_PDPT_PAGE: u64 = 78;
+/// First of four L0-owned page directories.
+const HOST_PD_FIRST_PAGE: u64 = 79;
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
+/// Upper bound of the smoke monitor's identity-mapped physical space.
+const IDENTITY_MAP_LIMIT: u64 = 1 << 32;
 /// VMCALL basic exit reason.
 const EXIT_REASON_VMCALL: u64 = 18;
 /// CPUID basic exit reason.
@@ -44,14 +54,20 @@ const EXIT_REASON_XSETBV: u64 = 55;
 const EXIT_REASON_RDMSR: u64 = 31;
 /// Control-register-access basic exit reason.
 const EXIT_REASON_CR_ACCESS: u64 = 28;
+/// VMXON basic exit reason.
+const EXIT_REASON_VMXON: u64 = 27;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
+/// VM-entry interruption information for #UD without an error code.
+const INJECT_INVALID_OPCODE: u64 = (1 << 31) | (3 << 8) | 6;
 /// AMD-specific MSR range, which raises #GP when probed on this Intel target.
 const AMD_MSR_RANGE: core::ops::RangeInclusive<u32> = 0xc001_0000..=0xc001_ffff;
 /// VMX capability MSRs exposed through the conservative nested policy.
 const VMX_CAPABILITY_MSR_RANGE: core::ops::RangeInclusive<u32> = 0x480..=0x492;
 /// CR4.VMXE, required by the hardware VMCS but initially hidden from L1.
 const CR4_VMX_ENABLE: u64 = 1 << 13;
+/// CR4.LA57, unsupported by the current four-level L0 page table.
+const CR4_LA57: u64 = 1 << 12;
 /// CR4.OSXSAVE, required while L0 handles an unconditional XSETBV exit.
 const CR4_OSXSAVE: u64 = 1 << 18;
 /// Marker written in non-root mode before VMCALL.
@@ -82,6 +98,34 @@ const GUEST_IMAGE_PATH: [efi::Char16; 23] = [
     b'I' as u16,
     0,
 ];
+/// Runtime-driver copy of this monitor staged by `run-uefi-smoke.sh`.
+const MONITOR_IMAGE_PATH: [efi::Char16; 25] = [
+    b'\\' as u16,
+    b'E' as u16,
+    b'F' as u16,
+    b'I' as u16,
+    b'\\' as u16,
+    b'B' as u16,
+    b'O' as u16,
+    b'O' as u16,
+    b'T' as u16,
+    b'\\' as u16,
+    b'M' as u16,
+    b'O' as u16,
+    b'N' as u16,
+    b'I' as u16,
+    b'T' as u16,
+    b'O' as u16,
+    b'R' as u16,
+    b'X' as u16,
+    b'6' as u16,
+    b'4' as u16,
+    b'.' as u16,
+    b'E' as u16,
+    b'F' as u16,
+    b'I' as u16,
+    0,
+];
 
 static GUEST_RAN: AtomicU64 = AtomicU64::new(0);
 static GUEST_STATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -92,6 +136,11 @@ static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
 /// XCR0 restored when the bounded smoke leaves VMX operation.
 static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
 static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// L1's VMXON page for the current single-vCPU smoke run.
+// ponytail: replace this atomic with per-pCPU `VcpuState` before SMP.
+static L1_VMXON_REGION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+const _: () = assert!(HOST_PD_FIRST_PAGE + 4 == MONITOR_PAGES as u64);
 
 /// Guest GPRs that are not stored in the VMCS on VM exit.
 #[repr(C)]
@@ -163,6 +212,19 @@ pub(crate) fn run(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
 ) -> Result<(), Error> {
+    let loaded_image = loaded_image_protocol(parent_image, system_table)?;
+    if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
+        let mut serial = SerialPort;
+        serial.init();
+        let _ = writeln!(serial, "thin-hv: loading runtime monitor");
+        return start_runtime_monitor(parent_image, system_table);
+    }
+    let mut serial = SerialPort;
+    serial.init();
+    let _ = writeln!(serial, "thin-hv: runtime monitor active");
+    // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
+    // path; use a self-relocated resident core before Windows or bare metal.
+
     let vmx_basic_raw = unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) };
     let basic = vmx::VmxBasic::from_msr(vmx_basic_raw);
     if basic.region_size == 0 || usize::from(basic.region_size) > PAGE_SIZE as usize {
@@ -183,9 +245,20 @@ pub(crate) fn run(
         return Err(Error::Capability("EPT", ept_capability));
     }
 
-    let guest_image = load_guest_image(parent_image, system_table)?;
+    let guest_image = runtime_guest_image(loaded_image).ok_or(Error::Firmware(
+        "runtime guest-image handoff",
+        efi::Status::INVALID_PARAMETER.as_usize(),
+    ))?;
     GUEST_IMAGE.store(guest_image, Ordering::Release);
     SYSTEM_TABLE.store(system_table, Ordering::Release);
+
+    let image_base = unsafe { (*loaded_image).image_base } as usize as u64;
+    let image_end = image_base
+        .checked_add(unsafe { (*loaded_image).image_size })
+        .ok_or(Error::OutsideIdentityMap(image_base))?;
+    if image_base >= IDENTITY_MAP_LIMIT || image_end > IDENTITY_MAP_LIMIT {
+        return Err(Error::OutsideIdentityMap(image_end));
+    }
 
     let feature_control = unsafe { cpu::rdmsr(cpu::IA32_FEATURE_CONTROL) };
     if feature_control & 1 == 0 {
@@ -195,12 +268,12 @@ pub(crate) fn run(
         return Err(Error::Capability("VMX outside SMX", feature_control));
     }
 
-    let mut block = 0_u64;
+    let mut block = IDENTITY_MAP_LIMIT - 1;
     // SAFETY: the firmware owns `system_table`; its boot-services table remains live here.
     let status = unsafe {
         ((*(*system_table).boot_services).allocate_pages)(
-            efi::ALLOCATE_ANY_PAGES,
-            efi::RESERVED_MEMORY_TYPE,
+            efi::ALLOCATE_MAX_ADDRESS,
+            efi::RUNTIME_SERVICES_DATA,
             MONITOR_PAGES,
             &mut block,
         )
@@ -249,9 +322,14 @@ pub(crate) fn run(
             pd_phys,
         )
     };
+    // SAFETY: the final six pages are exclusive, aligned, and zeroed.
+    let host_cr3 = unsafe { build_host_identity_4g(block) };
 
     let original_cr0 = cpu::read_cr0();
     let original_cr4 = cpu::read_cr4();
+    if original_cr4 & CR4_LA57 != 0 {
+        return Err(Error::Capability("CR4.LA57", original_cr4));
+    }
     let fixed_cr0 = (original_cr0 | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0) })
         & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1) };
     let fixed_cr4 = (original_cr4 | (1 << 13) | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
@@ -287,6 +365,7 @@ pub(crate) fn run(
         fixed_cr4,
         original_cr4,
         host_cr4,
+        host_cr3,
         block + (HOST_STACK_PAGE + 4) * PAGE_SIZE - 8,
         block + (GUEST_STACK_PAGE + GUEST_STACK_PAGES) * PAGE_SIZE - 8,
         basic.true_controls,
@@ -295,33 +374,72 @@ pub(crate) fn run(
     // This is reached only when VM entry failed.
     let _ = unsafe { vmx::vmxoff() };
     restore_control_registers();
-    // SAFETY: `guest_image` was returned by LoadImage and was never started on this path.
-    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest_image) };
     result
 }
 
-/// Reads the staged payload through firmware and asks firmware to relocate it.
-fn load_guest_image(
+/// Starts a runtime-driver copy whose code survives guest ExitBootServices.
+fn start_runtime_monitor(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
+) -> Result<(), Error> {
+    let guest = load_image(parent_image, system_table, GUEST_IMAGE_PATH)?;
+    let monitor = match load_image(parent_image, system_table, MONITOR_IMAGE_PATH) {
+        Ok(image) => image,
+        Err(error) => {
+            let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
+            return Err(error);
+        }
+    };
+    let monitor_loaded = match loaded_image_protocol(monitor, system_table) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let _ = unsafe { ((*(*system_table).boot_services).unload_image)(monitor) };
+            let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
+            return Err(error);
+        }
+    };
+    let mut guest_handoff = guest;
+    unsafe {
+        (*monitor_loaded).load_options_size = core::mem::size_of::<efi::Handle>() as u32;
+        (*monitor_loaded).load_options = ptr::addr_of_mut!(guest_handoff).cast();
+    }
+    let mut exit_data_size = 0;
+    let mut exit_data = ptr::null_mut();
+    let status = unsafe {
+        ((*(*system_table).boot_services).start_image)(monitor, &mut exit_data_size, &mut exit_data)
+    };
+    // A working monitor VM-launches and never returns to this loader copy.
+    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(monitor) };
+    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
+    Err(Error::Firmware(
+        "StartImage(runtime monitor)",
+        status.as_usize(),
+    ))
+}
+
+/// Reads the one-handle load option supplied by the boot application copy.
+fn runtime_guest_image(
+    loaded_image: *mut efi::protocols::loaded_image::Protocol,
+) -> Option<efi::Handle> {
+    if unsafe { (*loaded_image).load_options_size } as usize != core::mem::size_of::<efi::Handle>()
+        || unsafe { (*loaded_image).load_options }.is_null()
+    {
+        return None;
+    }
+    // SAFETY: the application copy keeps this one-handle option live for the
+    // complete nested StartImage call.
+    let image = unsafe { ptr::read_unaligned((*loaded_image).load_options.cast::<efi::Handle>()) };
+    (!image.is_null()).then_some(image)
+}
+
+/// Reads one staged image through firmware and asks firmware to relocate it.
+fn load_image<const PATH_SIZE: usize>(
+    parent_image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    mut image_path: [efi::Char16; PATH_SIZE],
 ) -> Result<efi::Handle, Error> {
     let boot_services = unsafe { (*system_table).boot_services };
-    let mut loaded_image_guid = efi::protocols::loaded_image::PROTOCOL_GUID;
-    let mut loaded_image_interface = ptr::null_mut();
-    let status = unsafe {
-        ((*boot_services).handle_protocol)(
-            parent_image,
-            &mut loaded_image_guid,
-            &mut loaded_image_interface,
-        )
-    };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "HandleProtocol(LoadedImage)",
-            status.as_usize(),
-        ));
-    }
-    let loaded_image = loaded_image_interface.cast::<efi::protocols::loaded_image::Protocol>();
+    let loaded_image = loaded_image_protocol(parent_image, system_table)?;
 
     let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
     let mut filesystem_interface = ptr::null_mut();
@@ -346,13 +464,12 @@ fn load_guest_image(
         return Err(Error::Firmware("OpenVolume", status.as_usize()));
     }
 
-    let mut guest_path = GUEST_IMAGE_PATH;
     let mut file = ptr::null_mut();
     let status = unsafe {
         ((*root).open)(
             root,
             &mut file,
-            guest_path.as_mut_ptr(),
+            image_path.as_mut_ptr(),
             efi::protocols::file::MODE_READ,
             0,
         )
@@ -360,7 +477,7 @@ fn load_guest_image(
     if status.is_error() {
         // SAFETY: `root` was returned by OpenVolume and is still open.
         let _ = unsafe { ((*root).close)(root) };
-        return Err(Error::Firmware("Open guest payload", status.as_usize()));
+        return Err(Error::Firmware("Open staged image", status.as_usize()));
     }
 
     let payload_size = match guest_file_size(boot_services, file) {
@@ -394,7 +511,7 @@ fn load_guest_image(
         if status.is_error() {
             free_guest_buffer(boot_services, buffer);
             close_guest_file(root, file);
-            return Err(Error::Firmware("Read guest payload", status.as_usize()));
+            return Err(Error::Firmware("Read staged image", status.as_usize()));
         }
         if chunk_size == 0 {
             free_guest_buffer(boot_services, buffer);
@@ -421,6 +538,26 @@ fn load_guest_image(
         return Err(Error::Firmware("LoadImage", status.as_usize()));
     }
     Ok(guest_image)
+}
+
+/// Returns the firmware's metadata for one loaded image handle.
+fn loaded_image_protocol(
+    image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+) -> Result<*mut efi::protocols::loaded_image::Protocol, Error> {
+    let mut guid = efi::protocols::loaded_image::PROTOCOL_GUID;
+    let mut interface = ptr::null_mut();
+    let status = unsafe {
+        ((*(*system_table).boot_services).handle_protocol)(image, &mut guid, &mut interface)
+    };
+    if status.is_error() {
+        Err(Error::Firmware(
+            "HandleProtocol(LoadedImage)",
+            status.as_usize(),
+        ))
+    } else {
+        Ok(interface.cast())
+    }
 }
 
 fn guest_file_size(
@@ -476,6 +613,43 @@ fn free_guest_buffer(boot_services: *mut efi::BootServices, buffer: *mut c_void)
     let _ = unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
+/// Builds the L0-owned page tables used after firmware memory is reclaimed.
+///
+/// # Safety
+///
+/// `block` must point to the exclusive, zeroed `MONITOR_PAGES` allocation.
+unsafe fn build_host_identity_4g(block: u64) -> u64 {
+    const PRESENT_WRITE: u64 = 0b11;
+    const LARGE_PAGE: u64 = 1 << 7;
+
+    let pml4 = block + HOST_PML4_PAGE * PAGE_SIZE;
+    let pdpt = block + HOST_PDPT_PAGE * PAGE_SIZE;
+    // SAFETY: the caller provides the exclusive six-page table area.
+    unsafe { ptr::write_volatile(pml4 as *mut u64, pdpt | PRESENT_WRITE) };
+    for directory in 0_u64..4 {
+        let pd = block + (HOST_PD_FIRST_PAGE + directory) * PAGE_SIZE;
+        // SAFETY: each index is within its exclusive 512-entry page.
+        unsafe {
+            ptr::write_volatile(
+                (pdpt as *mut u64).add(directory as usize),
+                pd | PRESENT_WRITE,
+            );
+        }
+        for entry in 0_u64..512 {
+            let physical = (directory * 512 + entry) << 21;
+            // ponytail: 2 MiB RWX leaves cover the trusted 4 GiB smoke map;
+            // split and protect only when enforcing an untrusted-L1 boundary.
+            unsafe {
+                ptr::write_volatile(
+                    (pd as *mut u64).add(entry as usize),
+                    physical | PRESENT_WRITE | LARGE_PAGE,
+                );
+            }
+        }
+    }
+    pml4
+}
+
 /// Configures the current VMCS and launches the non-root marker.
 #[allow(clippy::too_many_arguments)]
 fn configure_and_launch(
@@ -486,6 +660,7 @@ fn configure_and_launch(
     guest_cr4_hardware: u64,
     guest_cr4_shadow: u64,
     host_cr4: u64,
+    host_cr3: u64,
     host_rsp: u64,
     guest_rsp: u64,
     true_controls: bool,
@@ -571,12 +746,13 @@ fn configure_and_launch(
     }
 
     write_guest_state(host_cr0, guest_cr4_hardware, guest_rsp)?;
-    write_host_state(host_cr0, host_cr4, host_rsp)?;
+    write_host_state(host_cr0, host_cr3, host_cr4, host_rsp)?;
     log_guest_state();
 
     GUEST_RAN.store(0, Ordering::Release);
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
     CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
+    L1_VMXON_REGION.store(u64::MAX, Ordering::Relaxed);
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
         "VMLAUNCH",
@@ -667,7 +843,9 @@ fn write_guest_state(cr0: u64, cr4: u64, stack: u64) -> Result<(), Error> {
 }
 
 /// Writes the host state used for the first VM exit.
-fn write_host_state(cr0: u64, cr4: u64, stack: u64) -> Result<(), Error> {
+fn write_host_state(cr0: u64, cr3: u64, cr4: u64, stack: u64) -> Result<(), Error> {
+    // ponytail: reuse firmware descriptor tables on this fault-free one-vCPU
+    // path; install private GDT/IDT/TSS before untrusted input or bare metal.
     let gdtr = cpu::sgdt();
     let idtr = cpu::sidt();
     let current_tr = cpu::read_tr();
@@ -687,7 +865,7 @@ fn write_host_state(cr0: u64, cr4: u64, stack: u64) -> Result<(), Error> {
         (vmcs::HOST_GS_SELECTOR, u64::from(cpu::read_gs() & !7)),
         (vmcs::HOST_TR_SELECTOR, u64::from(tr_selector)),
         (vmcs::HOST_CR0, cr0),
-        (vmcs::HOST_CR3, cpu::read_cr3()),
+        (vmcs::HOST_CR3, cr3),
         (vmcs::HOST_CR4, cr4),
         (vmcs::HOST_FS_BASE, unsafe { cpu::rdmsr(cpu::IA32_FS_BASE) }),
         (vmcs::HOST_GS_BASE, unsafe { cpu::rdmsr(cpu::IA32_GS_BASE) }),
@@ -938,7 +1116,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
     let clear_event = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
     if clear_event != VmxStatus::Success {
         stop_unexpected_exit(
-            "clearing VM-entry event failed",
+            b"clearing VM-entry event failed",
             reason,
             qualification,
             guest_rip,
@@ -994,6 +1172,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_RDMSR {
         let msr = registers.rcx as u32;
         if VMX_CAPABILITY_MSR_RANGE.contains(&msr) {
+            log_l1_vmxon(b"capability_msr", u64::from(msr));
             let Some(value) = l1_vmx_capability(msr) else {
                 inject_general_protection(
                     reason,
@@ -1022,7 +1201,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         let register = ((qualification >> 8) & 0xf) as u8;
         let Some(value) = guest_gpr(registers, register) else {
             stop_unexpected_exit(
-                "invalid CR4 source register",
+                b"invalid CR4 source register",
                 reason,
                 qualification,
                 guest_rip,
@@ -1032,11 +1211,12 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         };
         let fixed = (value | CR4_VMX_ENABLE | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
             & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
+        log_l1_vmxon(b"cr4_write", value);
         for (field, field_value) in [(vmcs::GUEST_CR4, fixed), (vmcs::CR4_READ_SHADOW, value)] {
             let status = unsafe { vmx::vmwrite(field, field_value) };
             if status != VmxStatus::Success {
                 stop_unexpected_exit(
-                    "virtualizing CR4 write failed",
+                    b"virtualizing CR4 write failed",
                     reason,
                     qualification,
                     guest_rip,
@@ -1049,13 +1229,18 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         return;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMXON {
+        handle_l1_vmxon(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
     }
 
     stop_unexpected_exit(
-        "unhandled VM exit",
+        b"unhandled VM exit",
         reason,
         qualification,
         guest_rip,
@@ -1083,6 +1268,215 @@ fn l1_vmx_capability(msr: u32) -> Option<u64> {
         _ => unsafe { cpu::rdmsr(msr) },
     };
     restrict_vmx_capability(msr, hardware)
+}
+
+/// Emulates L1's transition into VMX operation while L0 remains VMX root.
+fn handle_l1_vmxon(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    log_l1_vmxon(b"entry", reason);
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    if L1_VMXON_REGION.load(Ordering::Relaxed) != u64::MAX {
+        complete_vmx_instruction(
+            VmInstructionResult::VmfailInvalid,
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    }
+    let cr0 = unsafe { vmx::vmread(vmcs::GUEST_CR0) }.unwrap_or(0);
+    if !vmx_control_registers_valid(cr0, cr4_shadow) {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+        .ok()
+        .and_then(|value| u32::try_from(value).ok());
+    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+    let linear = instruction_info.and_then(|information| {
+        vmx::memory_operand_address_64(
+            information,
+            qualification,
+            |register| guest_gpr(registers, register),
+            fs_base,
+            gs_base,
+        )
+    });
+    let Some(linear) = linear else {
+        stop_unexpected_exit(
+            b"decoding VMXON operand failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    log_l1_vmxon(b"operand_linear", linear);
+    let Some(region_address) = read_l1_linear_u64(linear) else {
+        // ponytail: trusted long-mode L1 uses a valid operand. Add precise
+        // #PF/#GP/#SS synthesis before accepting untrusted or 32-bit L1s.
+        stop_unexpected_exit(
+            b"reading VMXON operand failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    log_l1_vmxon(b"region", region_address);
+
+    let result = validate_l1_vmxon_region(region_address).map_or(
+        VmInstructionResult::VmfailInvalid,
+        |region| {
+            L1_VMXON_REGION.store(region.get(), Ordering::Relaxed);
+            VmInstructionResult::Vmsucceed
+        },
+    );
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Logs one cold-path VMXON decode value.
+fn log_l1_vmxon(name: &[u8], value: u64) {
+    let mut serial = SerialPort;
+    serial.init();
+    serial.write_bytes(b"thin-hv: L1 VMXON ");
+    serial.write_bytes(name);
+    serial.write_byte(b'=');
+    serial.write_hex(value);
+    serial.write_byte(b'\r');
+    serial.write_byte(b'\n');
+}
+
+/// Checks the fixed-bit contract used by VMXON.
+fn vmx_control_registers_valid(cr0: u64, cr4: u64) -> bool {
+    let cr0_fixed0 = unsafe { cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0) };
+    let cr0_fixed1 = unsafe { cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1) };
+    let cr4_fixed0 = unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) };
+    let cr4_fixed1 = unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
+    cr0 & cr0_fixed0 == cr0_fixed0
+        && cr0 & !cr0_fixed1 == 0
+        && cr4 & cr4_fixed0 == cr4_fixed0
+        && cr4 & !cr4_fixed1 == 0
+}
+
+/// Reads an m64 operand through L1's current long-mode page tables.
+fn read_l1_linear_u64(linear: u64) -> Option<u64> {
+    let cr3 = unsafe { vmx::vmread(vmcs::GUEST_CR3) }.ok()?;
+    let cr4 = unsafe { vmx::vmread(vmcs::GUEST_CR4) }.ok()?;
+    let max_physical_bits = max_physical_address_bits()?;
+    let mut bytes = [0_u8; 8];
+    // ponytail: eight walks make a cold VMX operand cross-page safe; cache
+    // translated pages only if instruction emulation becomes measurable.
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let address = linear.checked_add(index as u64)?;
+        let physical =
+            paging::translate_long_mode(address, cr3, cr4, max_physical_bits, |entry| {
+                read_l1_physical_u64(entry)
+            })?;
+        if physical >= IDENTITY_MAP_LIMIT {
+            return None;
+        }
+        // SAFETY: the trusted L1 page walk resolved this byte inside the
+        // identity-mapped four-gibibyte smoke address space.
+        *byte = unsafe { ptr::read_volatile(physical as *const u8) };
+    }
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// Reads one aligned paging entry from identity-mapped L1 physical memory.
+fn read_l1_physical_u64(physical: u64) -> Option<u64> {
+    if physical.checked_add(7)? >= IDENTITY_MAP_LIMIT || !physical.is_multiple_of(8) {
+        return None;
+    }
+    // SAFETY: trusted L1 supplies paging structures in identity-mapped RAM.
+    Some(unsafe { ptr::read_volatile(physical as *const u64) })
+}
+
+/// Returns the physical-address width exposed unchanged to L1 by CPUID.
+fn max_physical_address_bits() -> Option<u8> {
+    if cpu::cpuid(0x8000_0000, 0).eax < 0x8000_0008 {
+        return Some(36);
+    }
+    let bits = u8::try_from(cpu::cpuid(0x8000_0008, 0).eax & 0xff).ok()?;
+    (12..=52).contains(&bits).then_some(bits)
+}
+
+/// Validates the VMXON GPA and its direct-hardware revision identifier.
+fn validate_l1_vmxon_region(address: u64) -> Option<VmxonPhys> {
+    let bits = max_physical_address_bits()?;
+    let physical_limit = 1_u64 << bits;
+    if address.checked_add(PAGE_SIZE)? > physical_limit
+        || address.checked_add(PAGE_SIZE)? > IDENTITY_MAP_LIMIT
+    {
+        return None;
+    }
+    let region = VmxonPhys::new(address)?;
+    // SAFETY: the checks above cover the four-byte header in the trusted
+    // identity-mapped VMXON page.
+    let revision = unsafe { ptr::read_volatile(address as *const u32) };
+    let expected = vmx::VmxBasic::from_msr(unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) }).revision_id;
+    (revision == expected).then_some(region)
+}
+
+/// Applies VMX status flags and advances past an emulated VMX instruction.
+fn complete_vmx_instruction(
+    result: VmInstructionResult,
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let Some(rflags) = (unsafe { vmx::vmread(vmcs::GUEST_RFLAGS) }).ok() else {
+        stop_unexpected_exit(
+            b"VMREAD(GUEST_RFLAGS) failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    if unsafe { vmx::vmwrite(vmcs::GUEST_RFLAGS, result.apply_to_rflags(rflags)) }
+        != VmxStatus::Success
+    {
+        stop_unexpected_exit(
+            b"VMWRITE(GUEST_RFLAGS) failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
 }
 
 /// Reads the GPR encoding used by control-register exit qualification.
@@ -1123,7 +1517,7 @@ fn inject_general_protection(
         let status = unsafe { vmx::vmwrite(field, value) };
         if status != VmxStatus::Success {
             stop_unexpected_exit(
-                "injecting guest #GP failed",
+                b"injecting guest #GP failed",
                 reason,
                 qualification,
                 guest_rip,
@@ -1131,6 +1525,27 @@ fn inject_general_protection(
                 registers,
             );
         }
+    }
+}
+
+/// Injects the #UD that VMXON raises when virtual CR4.VMXE is clear.
+fn inject_invalid_opcode(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let status = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, INJECT_INVALID_OPCODE) };
+    if status != VmxStatus::Success {
+        stop_unexpected_exit(
+            b"injecting guest #UD failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
     }
 }
 
@@ -1144,7 +1559,7 @@ fn advance_guest_rip(
 ) {
     let Some(next_rip) = guest_rip.checked_add(instruction_len) else {
         stop_unexpected_exit(
-            "guest RIP overflow",
+            b"guest RIP overflow",
             reason,
             qualification,
             guest_rip,
@@ -1155,7 +1570,7 @@ fn advance_guest_rip(
     let status = unsafe { vmx::vmwrite(vmcs::GUEST_RIP, next_rip) };
     if status != VmxStatus::Success {
         stop_unexpected_exit(
-            "VMWRITE(GUEST_RIP) failed",
+            b"VMWRITE(GUEST_RIP) failed",
             reason,
             qualification,
             guest_rip,
@@ -1171,10 +1586,15 @@ fn log_vmexit(reason: u64, qualification: u64, guest_rip: u64, instruction_len: 
     let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
     let mut serial = SerialPort;
     serial.init();
-    let _ = writeln!(
-        serial,
-        "thin-hv: VMEXIT cpu={cpu_id} level=1 reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} cpuid_exits={cpuid_exits}"
-    );
+    serial.write_bytes(b"thin-hv: VMEXIT");
+    write_raw_field(&mut serial, b"cpu", u64::from(cpu_id));
+    write_raw_field(&mut serial, b"level", 1);
+    write_raw_field(&mut serial, b"reason", reason);
+    write_raw_field(&mut serial, b"qualification", qualification);
+    write_raw_field(&mut serial, b"guest_rip", guest_rip);
+    write_raw_field(&mut serial, b"instruction_len", instruction_len);
+    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits as u64);
+    write_raw_newline(&mut serial);
 }
 
 /// Completes the bounded smoke test after the guest's VMCALL.
@@ -1189,16 +1609,16 @@ fn finish_vmcall(reason: u64) -> ! {
         && guest_status == efi::Status::SUCCESS.as_usize()
         && vmxoff == VmxStatus::Success
     {
-        let _ = writeln!(
-            serial,
-            "thin-hv: vmx guest PASS start_image_status={guest_status:#x}"
-        );
+        serial.write_bytes(b"thin-hv: vmx guest PASS");
+        write_raw_field(&mut serial, b"start_image_status", guest_status as u64);
     } else {
-        let _ = writeln!(
-            serial,
-            "thin-hv: vmx guest FAIL marker={marker:#x} start_image_status={guest_status:#x} vmxoff={vmxoff:?}"
-        );
+        serial.write_bytes(b"thin-hv: vmx guest FAIL");
+        write_raw_field(&mut serial, b"marker", marker);
+        write_raw_field(&mut serial, b"start_image_status", guest_status as u64);
+        serial.write_bytes(b" vmxoff=");
+        write_raw_vmx_status(&mut serial, vmxoff);
     }
+    write_raw_newline(&mut serial);
     loop {
         core::hint::spin_loop();
     }
@@ -1206,7 +1626,7 @@ fn finish_vmcall(reason: u64) -> ! {
 
 /// Reports an exit that this smoke monitor cannot reflect or handle.
 fn stop_unexpected_exit(
-    message: &str,
+    message: &[u8],
     reason: u64,
     qualification: u64,
     guest_rip: u64,
@@ -1218,13 +1638,24 @@ fn stop_unexpected_exit(
     let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
     let mut serial = SerialPort;
     serial.init();
-    let _ = writeln!(
-        serial,
-        "thin-hv: vmx guest FAIL: {message} reason={reason:#x} qualification={qualification:#x} instruction_info={instruction_info:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} vm_instruction_error={vm_error:#x} cpuid_exits={cpuid_exits} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
-        registers.rax, registers.rbx, registers.rcx, registers.rdx,
-    );
+    serial.write_bytes(b"thin-hv: vmx guest FAIL: ");
+    serial.write_bytes(message);
+    write_raw_field(&mut serial, b"reason", reason);
+    write_raw_field(&mut serial, b"qualification", qualification);
+    write_raw_field(&mut serial, b"instruction_info", instruction_info);
+    write_raw_field(&mut serial, b"guest_rip", guest_rip);
+    write_raw_field(&mut serial, b"instruction_len", instruction_len);
+    write_raw_field(&mut serial, b"vm_instruction_error", vm_error);
+    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits as u64);
+    write_raw_field(&mut serial, b"rax", registers.rax);
+    write_raw_field(&mut serial, b"rbx", registers.rbx);
+    write_raw_field(&mut serial, b"rcx", registers.rcx);
+    write_raw_field(&mut serial, b"rdx", registers.rdx);
+    write_raw_newline(&mut serial);
     let vmxoff = leave_vmx();
-    let _ = writeln!(serial, "thin-hv: VMXOFF status={vmxoff:?}");
+    serial.write_bytes(b"thin-hv: VMXOFF status=");
+    write_raw_vmx_status(&mut serial, vmxoff);
+    write_raw_newline(&mut serial);
     loop {
         core::hint::spin_loop();
     }
@@ -1253,16 +1684,50 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
     let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
     let mut serial = SerialPort;
     serial.init();
-    let _ = writeln!(
-        serial,
-        "thin-hv: VMRESUME FAIL status={status:?} rflags={rflags:#x} vm_instruction_error={vm_error:#x} reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} cpuid_exits={cpuid_exits} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
-        registers.rax, registers.rbx, registers.rcx, registers.rdx,
-    );
+    serial.write_bytes(b"thin-hv: VMRESUME FAIL status=");
+    write_raw_vmx_status(&mut serial, status);
+    write_raw_field(&mut serial, b"rflags", rflags);
+    write_raw_field(&mut serial, b"vm_instruction_error", vm_error);
+    write_raw_field(&mut serial, b"reason", reason);
+    write_raw_field(&mut serial, b"qualification", qualification);
+    write_raw_field(&mut serial, b"guest_rip", guest_rip);
+    write_raw_field(&mut serial, b"instruction_len", instruction_len);
+    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits as u64);
+    write_raw_field(&mut serial, b"rax", registers.rax);
+    write_raw_field(&mut serial, b"rbx", registers.rbx);
+    write_raw_field(&mut serial, b"rcx", registers.rcx);
+    write_raw_field(&mut serial, b"rdx", registers.rdx);
+    write_raw_newline(&mut serial);
     let vmxoff = leave_vmx();
-    let _ = writeln!(serial, "thin-hv: VMXOFF status={vmxoff:?}");
+    serial.write_bytes(b"thin-hv: VMXOFF status=");
+    write_raw_vmx_status(&mut serial, vmxoff);
+    write_raw_newline(&mut serial);
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Writes one name/value pair without EFI-relocated formatting metadata.
+fn write_raw_field(serial: &mut SerialPort, name: &[u8], value: u64) {
+    serial.write_byte(b' ');
+    serial.write_bytes(name);
+    serial.write_byte(b'=');
+    serial.write_hex(value);
+}
+
+/// Writes one VMX instruction status without `core::fmt`.
+fn write_raw_vmx_status(serial: &mut SerialPort, status: VmxStatus) {
+    serial.write_bytes(match status {
+        VmxStatus::Success => b"Success",
+        VmxStatus::FailInvalid => b"FailInvalid",
+        VmxStatus::FailValid => b"FailValid",
+    });
+}
+
+/// Ends one raw serial record.
+fn write_raw_newline(serial: &mut SerialPort) {
+    serial.write_byte(b'\r');
+    serial.write_byte(b'\n');
 }
 
 /// Leaves VMX operation and restores the pre-smoke control registers on success.

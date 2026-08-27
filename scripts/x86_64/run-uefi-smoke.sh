@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
+monitor=${X86_MONITOR_IMAGE:-"$(dirname -- "$loader")/x86-uefi-monitor.efi"}
 stage="$repo_root/bin/x86_64"
 esp="$stage/esp"
 serial_log="$stage/serial.log"
@@ -31,6 +32,7 @@ first_file() {
 }
 
 [[ -f "$loader" ]] || die "loader not found: $loader"
+[[ -f "$monitor" ]] || die "runtime monitor not found: $monitor"
 [[ -f "$guest" ]] || die "guest payload not found: $guest"
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
 [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
@@ -66,6 +68,7 @@ ovmf_vars=$(first_file \
 
 mkdir -p -- "$esp/EFI/BOOT"
 install -m 0644 -- "$loader" "$esp/EFI/BOOT/BOOTX64.EFI"
+install -m 0644 -- "$monitor" "$esp/EFI/BOOT/MONITORX64.EFI"
 install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
 install -m 0600 -- "$ovmf_vars" "$vars"
 : >"$serial_log"

@@ -34,7 +34,7 @@ impl SerialPort {
     }
 
     /// Waits for the transmitter and writes one byte.
-    fn write_byte(&mut self, byte: u8) {
+    pub(crate) fn write_byte(&mut self, byte: u8) {
         // SAFETY: UEFI applications run at CPL0 and this loader exclusively uses COM1.
         unsafe {
             while cpu::inb(COM1 + 5) & 0x20 == 0 {
@@ -43,16 +43,34 @@ impl SerialPort {
             cpu::outb(COM1, byte);
         }
     }
-}
 
-impl fmt::Write for SerialPort {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        for byte in text.bytes() {
+    /// Writes bytes without constructing formatting state.
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
             if byte == b'\n' {
                 self.write_byte(b'\r');
             }
             self.write_byte(byte);
         }
+    }
+
+    /// Writes one fixed-width hexadecimal value without `core::fmt`.
+    pub(crate) fn write_hex(&mut self, value: u64) {
+        self.write_bytes(b"0x");
+        for digit in (0..16).rev() {
+            let nibble = ((value >> (digit * 4)) & 0xf) as u8;
+            self.write_byte(if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            });
+        }
+    }
+}
+
+impl fmt::Write for SerialPort {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.write_bytes(text.as_bytes());
         Ok(())
     }
 }
@@ -110,7 +128,7 @@ pub extern "efiapi" fn efi_main(
 fn panic(_info: &PanicInfo<'_>) -> ! {
     let mut serial = SerialPort;
     serial.init();
-    let _ = serial.write_str("thin-hv: panic\n");
+    serial.write_bytes(b"thin-hv: panic\n");
     loop {
         core::hint::spin_loop();
     }
