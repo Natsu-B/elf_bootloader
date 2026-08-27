@@ -36,11 +36,17 @@
             })
             pkgs.qemu
             pkgs.OVMF.fd
+            pkgs.binutils
+            pkgs.cpio
             pkgs.dtc
+            pkgs.file
+            pkgs.gzip
             pkgs.cargo-binutils
             pkgs.gdb
           ];
 
+          BUSYBOX_STATIC = "${pkgs.pkgsStatic.busybox}/bin/busybox";
+          LINUX_EFI_STUB = "${pkgs.systemd}/lib/systemd/boot/efi/linuxx64.efi.stub";
           OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";
           OVMF_VARS = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
         };
