@@ -232,7 +232,8 @@ probe_wsl_enable() {
 run_windows() {
     local mode=$1
     local timeout_seconds memory smp disk_size ovmf_code ovmf_vars active_vars
-    local disk_image=$disk disk_format=raw tpm_dir=$base_tpm_dir tpm_instance=base
+    local disk_image=$disk disk_format=raw disk_snapshot=off
+    local tpm_dir=$base_tpm_dir tpm_instance=base
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
     local expected_marker marker_log wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
@@ -259,7 +260,8 @@ run_windows() {
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
     mkdir -p -- "$work"
-    if [[ -f "$hyperv_disk" && "$mode" != hyperv && "$mode" != monitor-hyperv && "$mode" != wsl ]]; then
+    if [[ -f "$hyperv_disk" && "$mode" != monitor && "$mode" != hyperv && \
+        "$mode" != monitor-hyperv && "$mode" != wsl ]]; then
         # ponytail: keep the raw backing immutable instead of duplicating its
         # allocated blocks; remove all Hyper-V state before changing the base.
         die "Hyper-V overlay exists; remove its disk, vars, TPM, and ready marker together before changing the base"
@@ -290,6 +292,9 @@ run_windows() {
     elif [[ "$mode" == monitor ]]; then
         [[ -f "$disk" ]] || die "Windows disk not found: $disk"
         prepare_monitor_media
+        # ponytail: QEMU's temporary overlay keeps the raw backing immutable
+        # while the persistent Hyper-V qcow2 exists.
+        disk_snapshot=on
         install -m 0600 -- "$ovmf_vars" "$monitor_vars"
         timeout_seconds=${WINDOWS_BOOT_TIMEOUT_SECONDS:-900}
         active_vars=$monitor_vars
@@ -444,7 +449,7 @@ run_windows() {
         -device qemu-xhci,id=xhci \
         -device usb-kbd,bus=xhci.0 \
         -device usb-tablet,bus=xhci.0 \
-        -drive "if=none,id=windisk,format=$disk_format,file=$disk_image,cache=writeback,discard=unmap,detect-zeroes=unmap" \
+        -drive "if=none,id=windisk,format=$disk_format,file=$disk_image,snapshot=$disk_snapshot,cache=writeback,discard=unmap,detect-zeroes=unmap" \
         -device ide-hd,bus=ide.0,drive=windisk,bootindex=2 \
         -netdev user,id=net0 \
         -device e1000e,netdev=net0 \
