@@ -31,8 +31,6 @@ const PAGE_SIZE: u64 = 4096;
 const EXIT_REASON_VMCALL: u64 = 18;
 /// Marker written in non-root mode before VMCALL.
 const GUEST_MARKER: u64 = 0x7468_696e_6876_4d58;
-/// Largest payload accepted by the smoke-only firmware file reader.
-const GUEST_IMAGE_CAPACITY: usize = 256 * 1024;
 /// Payload staged by `run-uefi-smoke.sh`.
 const GUEST_IMAGE_PATH: [efi::Char16; 23] = [
     b'\\' as u16,
@@ -82,8 +80,8 @@ pub(crate) enum Error {
     OutsideIdentityMap(u64),
     /// A UEFI service used to load the nested payload failed.
     Firmware(&'static str, usize),
-    /// The fixed smoke buffer cannot hold the staged payload.
-    GuestImageTooLarge,
+    /// The staged payload has an invalid or unrepresentable file size.
+    GuestImageSize(u64),
 }
 
 impl fmt::Display for Error {
@@ -105,10 +103,7 @@ impl fmt::Display for Error {
             Self::Firmware(service, status) => {
                 write!(formatter, "{service} status={status:#x}")
             }
-            Self::GuestImageTooLarge => write!(
-                formatter,
-                "guest payload exceeds {GUEST_IMAGE_CAPACITY} byte smoke limit"
-            ),
+            Self::GuestImageSize(size) => write!(formatter, "invalid guest payload size {size}"),
         }
     }
 }
@@ -302,12 +297,16 @@ fn load_guest_image(
         return Err(Error::Firmware("Open guest payload", status.as_usize()));
     }
 
-    // ponytail: fixed 256 KiB buffer is sufficient for the smoke payload; use
-    // EFI_FILE_INFO sizing when this path loads a production OS boot image.
-    let mut buffer = ptr::null_mut();
-    let status = unsafe {
-        ((*boot_services).allocate_pool)(efi::LOADER_DATA, GUEST_IMAGE_CAPACITY, &mut buffer)
+    let payload_size = match guest_file_size(boot_services, file) {
+        Ok(size) => size,
+        Err(error) => {
+            close_guest_file(root, file);
+            return Err(error);
+        }
     };
+    let mut buffer = ptr::null_mut();
+    let status =
+        unsafe { ((*boot_services).allocate_pool)(efi::LOADER_DATA, payload_size, &mut buffer) };
     if status.is_error() {
         close_guest_file(root, file);
         return Err(Error::Firmware(
@@ -316,29 +315,29 @@ fn load_guest_image(
         ));
     }
 
-    let mut payload_size = GUEST_IMAGE_CAPACITY;
-    let status = unsafe { ((*file).read)(file, &mut payload_size, buffer) };
-    if status.is_error() {
-        free_guest_buffer(boot_services, buffer);
-        close_guest_file(root, file);
-        return Err(Error::Firmware("Read guest payload", status.as_usize()));
+    let mut offset = 0;
+    while offset < payload_size {
+        let mut chunk_size = payload_size - offset;
+        let status = unsafe {
+            ((*file).read)(
+                file,
+                &mut chunk_size,
+                buffer.cast::<u8>().add(offset).cast(),
+            )
+        };
+        if status.is_error() {
+            free_guest_buffer(boot_services, buffer);
+            close_guest_file(root, file);
+            return Err(Error::Firmware("Read guest payload", status.as_usize()));
+        }
+        if chunk_size == 0 {
+            free_guest_buffer(boot_services, buffer);
+            close_guest_file(root, file);
+            return Err(Error::GuestImageSize(offset as u64));
+        }
+        offset += chunk_size;
     }
-    let mut trailing = 0_u8;
-    let mut trailing_size = 1_usize;
-    let status =
-        unsafe { ((*file).read)(file, &mut trailing_size, ptr::addr_of_mut!(trailing).cast()) };
     close_guest_file(root, file);
-    if status.is_error() {
-        free_guest_buffer(boot_services, buffer);
-        return Err(Error::Firmware(
-            "Check guest payload EOF",
-            status.as_usize(),
-        ));
-    }
-    if trailing_size != 0 {
-        free_guest_buffer(boot_services, buffer);
-        return Err(Error::GuestImageTooLarge);
-    }
 
     let mut guest_image = ptr::null_mut();
     let status = unsafe {
@@ -356,6 +355,43 @@ fn load_guest_image(
         return Err(Error::Firmware("LoadImage", status.as_usize()));
     }
     Ok(guest_image)
+}
+
+fn guest_file_size(
+    boot_services: *mut efi::BootServices,
+    file: *mut efi::protocols::file::Protocol,
+) -> Result<usize, Error> {
+    let mut info_guid = efi::protocols::file::INFO_ID;
+    let mut info_size = 0_usize;
+    let status =
+        unsafe { ((*file).get_info)(file, &mut info_guid, &mut info_size, ptr::null_mut()) };
+    if status != efi::Status::BUFFER_TOO_SMALL
+        || info_size < core::mem::size_of::<efi::protocols::file::Info>()
+    {
+        return Err(Error::Firmware("GetInfo(size)", status.as_usize()));
+    }
+
+    let mut info_buffer = ptr::null_mut();
+    let status =
+        unsafe { ((*boot_services).allocate_pool)(efi::LOADER_DATA, info_size, &mut info_buffer) };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "AllocatePool(file info)",
+            status.as_usize(),
+        ));
+    }
+
+    let status = unsafe { ((*file).get_info)(file, &mut info_guid, &mut info_size, info_buffer) };
+    if status.is_error() {
+        free_guest_buffer(boot_services, info_buffer);
+        return Err(Error::Firmware("GetInfo", status.as_usize()));
+    }
+    let size = unsafe { (*info_buffer.cast::<efi::protocols::file::Info>()).file_size };
+    free_guest_buffer(boot_services, info_buffer);
+    if size == 0 || size > usize::MAX as u64 {
+        return Err(Error::GuestImageSize(size));
+    }
+    Ok(size as usize)
 }
 
 fn close_guest_file(
