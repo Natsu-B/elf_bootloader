@@ -1,0 +1,10 @@
+[package]
+name = "nested_vmx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+x86_64_hal = { path = "../arch_hal/x86_64_hal" }
+
+[lints]
+workspace = true

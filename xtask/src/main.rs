@@ -60,8 +60,8 @@ fn print_xtask_usage() {
     println!("Usage: cargo xtask <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build [rpi5|rpi4|rpi4_net|example] [args...]");
-    println!("  run [rpi4|rpi5|net] [args...]");
+    println!("  build [x86|rpi5|rpi4|rpi4_net|example] [args...]");
+    println!("  run [x86|rpi4|rpi5|net] [args...]");
     println!("  test [xtest args...]");
     println!();
     println!("Options:");
@@ -70,6 +70,7 @@ fn print_xtask_usage() {
 
 fn build(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
+        Some("x86") => build_x86_uefi(&args[1..]),
         Some("rpi5") => build_rpi5(&args[1..]),
         Some("rpi4") => build_bootloader_with_feature(&args[1..], "rpi4"),
         Some("rpi4_net") => build_bootloader_with_feature(&args[1..], "rpi4_net"),
@@ -355,6 +356,58 @@ fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<Strin
     build_bootloader(&combined_args)
 }
 
+fn build_x86_uefi(args: &[String]) -> Result<String, String> {
+    let pkg = "x86_uefi_loader";
+    eprintln!("\n--- Building x86 UEFI package: {} ---", pkg);
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("-p")
+        .arg(pkg)
+        .arg("--target")
+        .arg("x86_64-unknown-uefi")
+        .args(args)
+        .env("XTASK_BUILD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    eprintln!("Running: {:?}", cmd);
+    let status = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn cargo build for {}: {}", pkg, e))?
+        .wait()
+        .map_err(|e| format!("Failed to wait for cargo build for {}: {}", pkg, e))?;
+    if !status.success() {
+        return Err(format!(
+            "cargo build failed for package '{}' with status: {}",
+            pkg, status
+        ));
+    }
+
+    let workspace = workspace_root()?;
+    let artifact = workspace
+        .join("target")
+        .join("x86_64-unknown-uefi")
+        .join(resolve_profile(args))
+        .join("x86-uefi-loader.efi");
+    let destination = workspace
+        .join("bin")
+        .join("x86_64")
+        .join("x86-uefi-loader.efi");
+    fs::create_dir_all(destination.parent().expect("destination has a parent"))
+        .map_err(|e| format!("Failed to create x86 staging directory: {}", e))?;
+    fs::copy(&artifact, &destination).map_err(|e| {
+        format!(
+            "Failed to copy {} to {}: {}",
+            artifact.display(),
+            destination.display(),
+            e
+        )
+    })?;
+
+    Ok(destination.to_string_lossy().into_owned())
+}
+
 fn build_rpi5(args: &[String]) -> Result<String, String> {
     let pkg = "rpi_boot";
     eprintln!("\n--- Building rpi5 package: {} ---", pkg);
@@ -395,12 +448,31 @@ fn build_rpi5(args: &[String]) -> Result<String, String> {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
+        Some("x86") => run_x86_uefi(&args[1..]),
         Some("rpi5") => run_rpi5(&args[1..]),
         Some("rpi4") => run_rpi4(&args[1..]),
         Some("net") => run_net(&args[1..]),
         _ => {
             run_default(args);
         }
+    }
+}
+
+fn run_x86_uefi(args: &[String]) -> Result<(), String> {
+    let binary_path = build_x86_uefi(args)?;
+    eprintln!("\n--- Running x86 UEFI smoke test ---");
+    let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+        .arg(binary_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Failed to run x86 UEFI smoke test: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("x86 UEFI smoke test exited with status {}", status))
     }
 }
 

@@ -27,14 +27,22 @@
         devShells.default = pkgs.mkShell {
           packages = [
             (pkgs.rust-bin.nightly.latest.default.override {
-              targets = [ "aarch64-unknown-none-softfloat" "aarch64-unknown-uefi" ];
+              targets = [
+                "aarch64-unknown-none-softfloat"
+                "aarch64-unknown-uefi"
+                "x86_64-unknown-uefi"
+              ];
               extensions = [ "rust-src" "llvm-tools-preview" ];
             })
             pkgs.qemu
+            pkgs.OVMF.fd
             pkgs.dtc
             pkgs.cargo-binutils
             pkgs.gdb
           ];
+
+          OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";
+          OVMF_VARS = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
         };
       }
     );

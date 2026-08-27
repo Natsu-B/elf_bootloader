@@ -72,6 +72,7 @@ name = "arch_hal"
 version = "0.1.0"
 dependencies = [
  "aarch64_hal",
+ "x86_64_hal",
 ]
 
 [[package]]
@@ -221,6 +222,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nested_vmx"
+version = "0.1.0"
+dependencies = [
+ "x86_64_hal",
+]
+
+[[package]]
 name = "net"
 version = "0.1.0"
 dependencies = [
@@ -282,6 +290,12 @@ checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rpi_boot"
@@ -356,6 +370,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "uefi_variable_overlay"
+version = "0.1.0"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -370,6 +388,18 @@ dependencies = [
  "mutex",
  "typestate",
  "typestate_macro",
+]
+
+[[package]]
+name = "x86_64_hal"
+version = "0.1.0"
+
+[[package]]
+name = "x86_uefi_loader"
+version = "0.1.0"
+dependencies = [
+ "r-efi",
+ "x86_64_hal",
 ]
 
 [[package]]

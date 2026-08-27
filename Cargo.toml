@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "allocator",
     "arch_hal",
+    "arch_hal/x86_64_hal",
     "bootloader",
     "dtb",
     "elf",
@@ -11,12 +12,15 @@ members = [
     "io_api",
     "intrusive_linked_list",
     "mutex",
+    "nested_vmx",
     "net",
     "pci",
     "rpi_boot",
     "typestate",
     "typestate_macro",
+    "uefi_variable_overlay",
     "virtio",
+    "x86_uefi_loader",
     "xtask",
 ]
 
