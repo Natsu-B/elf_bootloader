@@ -9,6 +9,7 @@
 
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
+use x86_64_hal::vmx;
 use x86_64_hal::vmx::restrict_controls;
 
 /// Carry flag in RFLAGS.
@@ -364,6 +365,65 @@ pub const TRUSTED_EPT_VPID_CAPABILITIES: u64 =
     KVM_REQUIRED_EPT_CAPABILITIES | EPT_INVEPT_SINGLE_CONTEXT;
 /// VMFUNC functions exposed to trusted L1; VMFUNC is deliberately hidden.
 pub const TRUSTED_VMFUNC_CAPABILITIES: u64 = 0;
+/// `IA32_VMX_BASIC` fields safe for direct hardware VMCS use.
+const TRUSTED_BASIC_MASK: u64 = 0x00bc_1fff_7fff_ffff;
+/// `IA32_VMX_MISC` features implemented by the direct trusted path.
+const TRUSTED_MISC_MASK: u64 = 0x160;
+
+/// Restricts one VMX capability MSR to the trusted direct-VMCS contract.
+///
+/// The caller supplies the hardware value. `IA32_VMX_VMFUNC` and tertiary
+/// controls deliberately return zero without depending on that value.
+#[must_use]
+pub const fn restrict_vmx_capability(msr: u32, hardware: u64) -> Option<u64> {
+    match msr {
+        vmx::IA32_VMX_BASIC => {
+            let basic = vmx::VmxBasic::from_msr(hardware);
+            if basic.region_size == 0
+                || basic.region_size > 4096
+                || basic.memory_type != 6
+                || basic.physical_address_width_32
+                || !basic.true_controls
+            {
+                None
+            } else {
+                Some(hardware & TRUSTED_BASIC_MASK)
+            }
+        }
+        vmx::IA32_VMX_PINBASED_CTLS | vmx::IA32_VMX_TRUE_PINBASED_CTLS => {
+            restrict_control_capability(hardware, TRUSTED_PIN_CONTROLS, KVM_REQUIRED_PIN_CONTROLS)
+        }
+        vmx::IA32_VMX_PROCBASED_CTLS | vmx::IA32_VMX_TRUE_PROCBASED_CTLS => {
+            restrict_control_capability(
+                hardware,
+                TRUSTED_PRIMARY_CONTROLS,
+                KVM_REQUIRED_PRIMARY_CONTROLS,
+            )
+        }
+        vmx::IA32_VMX_EXIT_CTLS | vmx::IA32_VMX_TRUE_EXIT_CTLS => {
+            restrict_control_capability(hardware, TRUSTED_EXIT_CONTROLS, KVM_REQUIRED_EXIT_CONTROLS)
+        }
+        vmx::IA32_VMX_ENTRY_CTLS | vmx::IA32_VMX_TRUE_ENTRY_CTLS => restrict_control_capability(
+            hardware,
+            TRUSTED_ENTRY_CONTROLS,
+            KVM_REQUIRED_ENTRY_CONTROLS,
+        ),
+        vmx::IA32_VMX_PROCBASED_CTLS2 => restrict_control_capability(
+            hardware,
+            TRUSTED_SECONDARY_CONTROLS,
+            TRUSTED_SECONDARY_CONTROLS,
+        ),
+        vmx::IA32_VMX_EPT_VPID_CAP => restrict_ept_vpid_capability(hardware),
+        vmx::IA32_VMX_MISC => Some(hardware & TRUSTED_MISC_MASK),
+        vmx::IA32_VMX_CR0_FIXED0
+        | vmx::IA32_VMX_CR0_FIXED1
+        | vmx::IA32_VMX_CR4_FIXED0
+        | vmx::IA32_VMX_CR4_FIXED1
+        | vmx::IA32_VMX_VMCS_ENUM => Some(hardware),
+        vmx::IA32_VMX_VMFUNC | vmx::IA32_VMX_PROCBASED_CTLS3 => Some(0),
+        _ => None,
+    }
+}
 
 /// Restricts one hardware VMX control MSR to this crate's allowed-one policy.
 ///
@@ -752,6 +812,11 @@ mod tests {
         assert_eq!(TRUSTED_SECONDARY_CONTROLS & hidden_secondary, 0);
         assert_eq!(TRUSTED_EPT_VPID_CAPABILITIES >> 32, 0);
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
+        assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
+        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb399_8e8c);
+        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_0082);
+        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0000_8204);
+        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_0204);
 
         assert_eq!(
             TRUSTED_PIN_CONTROLS & KVM_REQUIRED_PIN_CONTROLS,
@@ -772,6 +837,24 @@ mod tests {
         assert_eq!(
             TRUSTED_EPT_VPID_CAPABILITIES & KVM_REQUIRED_EPT_CAPABILITIES,
             KVM_REQUIRED_EPT_CAPABILITIES
+        );
+
+        let all_controls = u64::from(u32::MAX) << 32;
+        assert_eq!(
+            restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS, all_controls).unwrap() >> 32,
+            u64::from(TRUSTED_PRIMARY_CONTROLS)
+        );
+        assert_eq!(
+            restrict_vmx_capability(vmx::IA32_VMX_VMFUNC, u64::MAX),
+            Some(0)
+        );
+        assert_eq!(
+            restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS3, u64::MAX),
+            Some(0)
+        );
+        assert_eq!(
+            restrict_vmx_capability(vmx::IA32_VMX_BASIC, 0x01d8_1000_11e5_7ed0),
+            Some(0x0098_1000_11e5_7ed0)
         );
     }
 

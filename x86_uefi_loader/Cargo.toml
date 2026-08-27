@@ -8,6 +8,7 @@ name = "x86-uefi-loader"
 path = "src/main.rs"
 
 [dependencies]
+nested_vmx = { path = "../nested_vmx" }
 r-efi = "=6.0.0"
 x86_64_hal = { path = "../arch_hal/x86_64_hal" }
 

@@ -9,6 +9,7 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
 use x86_64_hal::addr::EptPhys;
 use x86_64_hal::addr::VmcsPhys;
@@ -23,7 +24,7 @@ use x86_64_hal::vmx::VmxStatus;
 const MONITOR_PAGES: usize = 77;
 /// First of four page directories mapping the low four gibibytes.
 const EPT_PD_FIRST_PAGE: u64 = 4;
-/// Zeroed bitmap that lets covered L1 MSR accesses execute directly.
+/// L1 MSR bitmap, including conservative VMX capability interception.
 const MSR_BITMAP_PAGE: u64 = 8;
 /// First page used as the host stack.
 const HOST_STACK_PAGE: u64 = 9;
@@ -41,10 +42,14 @@ const EXIT_REASON_CPUID: u64 = 10;
 const EXIT_REASON_XSETBV: u64 = 55;
 /// RDMSR basic exit reason.
 const EXIT_REASON_RDMSR: u64 = 31;
+/// Control-register-access basic exit reason.
+const EXIT_REASON_CR_ACCESS: u64 = 28;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
-/// AMD64_DE_CFG, which raises #GP when Linux probes it on this Intel target.
-const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
+/// AMD-specific MSR range, which raises #GP when probed on this Intel target.
+const AMD_MSR_RANGE: core::ops::RangeInclusive<u32> = 0xc001_0000..=0xc001_ffff;
+/// VMX capability MSRs exposed through the conservative nested policy.
+const VMX_CAPABILITY_MSR_RANGE: core::ops::RangeInclusive<u32> = 0x480..=0x492;
 /// CR4.VMXE, required by the hardware VMCS but initially hidden from L1.
 const CR4_VMX_ENABLE: u64 = 1 << 13;
 /// CR4.OSXSAVE, required while L0 handles an unconditional XSETBV exit.
@@ -221,6 +226,7 @@ pub(crate) fn run(
     unsafe {
         ptr::write_volatile(block as *mut u32, basic.revision_id);
         ptr::write_volatile((block + PAGE_SIZE) as *mut u32, basic.revision_id);
+        initialize_l1_msr_bitmap(block + MSR_BITMAP_PAGE * PAGE_SIZE);
     }
 
     let pml4_phys = EptPhys::new(block + 2 * PAGE_SIZE).unwrap();
@@ -985,11 +991,61 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         return;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_RDMSR {
+        let msr = registers.rcx as u32;
+        if VMX_CAPABILITY_MSR_RANGE.contains(&msr) {
+            let Some(value) = l1_vmx_capability(msr) else {
+                inject_general_protection(
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+                return;
+            };
+            registers.rax = value & u64::from(u32::MAX);
+            registers.rdx = value >> 32;
+            advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
+            return;
+        }
+        if AMD_MSR_RANGE.contains(&msr) {
+            inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+            return;
+        }
+    }
+
     if reason & (1 << 31) == 0
-        && reason & 0xffff == EXIT_REASON_RDMSR
-        && registers.rcx as u32 == MSR_AMD64_DE_CFG
+        && reason & 0xffff == EXIT_REASON_CR_ACCESS
+        && qualification & 0x3f == 4
     {
-        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        let register = ((qualification >> 8) & 0xf) as u8;
+        let Some(value) = guest_gpr(registers, register) else {
+            stop_unexpected_exit(
+                "invalid CR4 source register",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        let fixed = (value | CR4_VMX_ENABLE | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
+            & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
+        for (field, field_value) in [(vmcs::GUEST_CR4, fixed), (vmcs::CR4_READ_SHADOW, value)] {
+            let status = unsafe { vmx::vmwrite(field, field_value) };
+            if status != VmxStatus::Success {
+                stop_unexpected_exit(
+                    "virtualizing CR4 write failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+        }
+        advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
 
@@ -1006,6 +1062,50 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         instruction_len,
         registers,
     );
+}
+
+/// Enables read exits for the complete VMX capability range.
+///
+/// # Safety
+///
+/// `bitmap` must name an exclusive, zeroed architectural MSR-bitmap page.
+unsafe fn initialize_l1_msr_bitmap(bitmap: u64) {
+    for (offset, value) in [(0x90, 0xff), (0x91, 0xff), (0x92, 0x07)] {
+        // SAFETY: the three offsets are within the caller-owned 4 KiB page.
+        unsafe { ptr::write_volatile((bitmap as *mut u8).add(offset), value) };
+    }
+}
+
+/// Returns one masked VMX capability without touching absent optional MSRs.
+fn l1_vmx_capability(msr: u32) -> Option<u64> {
+    let hardware = match msr {
+        vmx::IA32_VMX_VMFUNC | vmx::IA32_VMX_PROCBASED_CTLS3 => 0,
+        _ => unsafe { cpu::rdmsr(msr) },
+    };
+    restrict_vmx_capability(msr, hardware)
+}
+
+/// Reads the GPR encoding used by control-register exit qualification.
+fn guest_gpr(registers: &GuestRegisters, index: u8) -> Option<u64> {
+    Some(match index {
+        0 => registers.rax,
+        1 => registers.rcx,
+        2 => registers.rdx,
+        3 => registers.rbx,
+        4 => unsafe { vmx::vmread(vmcs::GUEST_RSP) }.ok()?,
+        5 => registers.rbp,
+        6 => registers.rsi,
+        7 => registers.rdi,
+        8 => registers.r8,
+        9 => registers.r9,
+        10 => registers.r10,
+        11 => registers.r11,
+        12 => registers.r12,
+        13 => registers.r13,
+        14 => registers.r14,
+        15 => registers.r15,
+        _ => return None,
+    })
 }
 
 /// Injects the fault an unsupported bitmap-outside MSR would raise on Intel.
@@ -1114,12 +1214,13 @@ fn stop_unexpected_exit(
     registers: &GuestRegisters,
 ) -> ! {
     let vm_error = vm_instruction_error();
+    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }.unwrap_or(u64::MAX);
     let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
     let mut serial = SerialPort;
     serial.init();
     let _ = writeln!(
         serial,
-        "thin-hv: vmx guest FAIL: {message} reason={reason:#x} qualification={qualification:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} vm_instruction_error={vm_error:#x} cpuid_exits={cpuid_exits} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
+        "thin-hv: vmx guest FAIL: {message} reason={reason:#x} qualification={qualification:#x} instruction_info={instruction_info:#x} guest_rip={guest_rip:#x} instruction_len={instruction_len} vm_instruction_error={vm_error:#x} cpuid_exits={cpuid_exits} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
         registers.rax, registers.rbx, registers.rcx, registers.rdx,
     );
     let vmxoff = leave_vmx();

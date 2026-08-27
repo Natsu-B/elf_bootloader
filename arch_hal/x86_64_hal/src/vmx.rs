@@ -26,6 +26,8 @@ pub const IA32_VMX_CR0_FIXED1: u32 = 0x0487;
 pub const IA32_VMX_CR4_FIXED0: u32 = 0x0488;
 /// IA32_VMX_CR4_FIXED1.
 pub const IA32_VMX_CR4_FIXED1: u32 = 0x0489;
+/// IA32_VMX_VMCS_ENUM.
+pub const IA32_VMX_VMCS_ENUM: u32 = 0x048a;
 /// IA32_VMX_PROCBASED_CTLS2.
 pub const IA32_VMX_PROCBASED_CTLS2: u32 = 0x048b;
 /// IA32_VMX_EPT_VPID_CAP.
@@ -38,6 +40,10 @@ pub const IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x048e;
 pub const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x048f;
 /// IA32_VMX_TRUE_ENTRY_CTLS.
 pub const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x0490;
+/// IA32_VMX_VMFUNC.
+pub const IA32_VMX_VMFUNC: u32 = 0x0491;
+/// IA32_VMX_PROCBASED_CTLS3.
+pub const IA32_VMX_PROCBASED_CTLS3: u32 = 0x0492;
 
 /// Outcome reported through RFLAGS.CF and RFLAGS.ZF by a VMX instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
