@@ -1,10 +1,13 @@
 //! One-vCPU VMXON/VMLAUNCH/VMCALL validation.
 
 use crate::SerialPort;
+use core::ffi::c_void;
 use core::fmt;
 use core::fmt::Write;
 use core::ptr;
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU64;
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use r_efi::efi;
 use x86_64_hal::addr::EptPhys;
@@ -28,8 +31,39 @@ const PAGE_SIZE: u64 = 4096;
 const EXIT_REASON_VMCALL: u64 = 18;
 /// Marker written in non-root mode before VMCALL.
 const GUEST_MARKER: u64 = 0x7468_696e_6876_4d58;
+/// Largest payload accepted by the smoke-only firmware file reader.
+const GUEST_IMAGE_CAPACITY: usize = 256 * 1024;
+/// Payload staged by `run-uefi-smoke.sh`.
+const GUEST_IMAGE_PATH: [efi::Char16; 23] = [
+    b'\\' as u16,
+    b'E' as u16,
+    b'F' as u16,
+    b'I' as u16,
+    b'\\' as u16,
+    b'B' as u16,
+    b'O' as u16,
+    b'O' as u16,
+    b'T' as u16,
+    b'\\' as u16,
+    b'G' as u16,
+    b'U' as u16,
+    b'E' as u16,
+    b'S' as u16,
+    b'T' as u16,
+    b'X' as u16,
+    b'6' as u16,
+    b'4' as u16,
+    b'.' as u16,
+    b'E' as u16,
+    b'F' as u16,
+    b'I' as u16,
+    0,
+];
 
 static GUEST_RAN: AtomicU64 = AtomicU64::new(0);
+static GUEST_STATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
+static GUEST_IMAGE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static SYSTEM_TABLE: AtomicPtr<efi::SystemTable> = AtomicPtr::new(ptr::null_mut());
 static ORIGINAL_CR0: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
 
@@ -46,6 +80,10 @@ pub(crate) enum Error {
     Vmwrite(u32, VmxStatus, u64),
     /// The smoke-only 1 GiB EPT cannot cover the allocated block or code.
     OutsideIdentityMap(u64),
+    /// A UEFI service used to load the nested payload failed.
+    Firmware(&'static str, usize),
+    /// The fixed smoke buffer cannot hold the staged payload.
+    GuestImageTooLarge,
 }
 
 impl fmt::Display for Error {
@@ -64,12 +102,22 @@ impl fmt::Display for Error {
             Self::OutsideIdentityMap(address) => {
                 write!(formatter, "smoke EPT does not cover {address:#x}")
             }
+            Self::Firmware(service, status) => {
+                write!(formatter, "{service} status={status:#x}")
+            }
+            Self::GuestImageTooLarge => write!(
+                formatter,
+                "guest payload exceeds {GUEST_IMAGE_CAPACITY} byte smoke limit"
+            ),
         }
     }
 }
 
 /// Runs the VMX smoke test. Success transfers to `vmexit_entry` and does not return.
-pub(crate) fn run(system_table: *mut efi::SystemTable) -> Result<(), Error> {
+pub(crate) fn run(
+    parent_image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+) -> Result<(), Error> {
     let vmx_basic_raw = unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) };
     let basic = vmx::VmxBasic::from_msr(vmx_basic_raw);
     if basic.region_size == 0 || usize::from(basic.region_size) > PAGE_SIZE as usize {
@@ -89,6 +137,10 @@ pub(crate) fn run(system_table: *mut efi::SystemTable) -> Result<(), Error> {
     if ept_capability & ept::REQUIRED_EPT_CAPS != ept::REQUIRED_EPT_CAPS {
         return Err(Error::Capability("EPT", ept_capability));
     }
+
+    let guest_image = load_guest_image(parent_image, system_table)?;
+    GUEST_IMAGE.store(guest_image, Ordering::Release);
+    SYSTEM_TABLE.store(system_table, Ordering::Release);
 
     let feature_control = unsafe { cpu::rdmsr(cpu::IA32_FEATURE_CONTROL) };
     if feature_control & 1 == 0 {
@@ -182,7 +234,144 @@ pub(crate) fn run(system_table: *mut efi::SystemTable) -> Result<(), Error> {
     // This is reached only when VM entry failed.
     let _ = unsafe { vmx::vmxoff() };
     restore_control_registers();
+    // SAFETY: `guest_image` was returned by LoadImage and was never started on this path.
+    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest_image) };
     result
+}
+
+/// Reads the staged payload through firmware and asks firmware to relocate it.
+fn load_guest_image(
+    parent_image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+) -> Result<efi::Handle, Error> {
+    let boot_services = unsafe { (*system_table).boot_services };
+    let mut loaded_image_guid = efi::protocols::loaded_image::PROTOCOL_GUID;
+    let mut loaded_image_interface = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).handle_protocol)(
+            parent_image,
+            &mut loaded_image_guid,
+            &mut loaded_image_interface,
+        )
+    };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "HandleProtocol(LoadedImage)",
+            status.as_usize(),
+        ));
+    }
+    let loaded_image = loaded_image_interface.cast::<efi::protocols::loaded_image::Protocol>();
+
+    let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
+    let mut filesystem_interface = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).handle_protocol)(
+            (*loaded_image).device_handle,
+            &mut filesystem_guid,
+            &mut filesystem_interface,
+        )
+    };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "HandleProtocol(SimpleFileSystem)",
+            status.as_usize(),
+        ));
+    }
+    let filesystem = filesystem_interface.cast::<efi::protocols::simple_file_system::Protocol>();
+
+    let mut root = ptr::null_mut();
+    let status = unsafe { ((*filesystem).open_volume)(filesystem, &mut root) };
+    if status.is_error() {
+        return Err(Error::Firmware("OpenVolume", status.as_usize()));
+    }
+
+    let mut guest_path = GUEST_IMAGE_PATH;
+    let mut file = ptr::null_mut();
+    let status = unsafe {
+        ((*root).open)(
+            root,
+            &mut file,
+            guest_path.as_mut_ptr(),
+            efi::protocols::file::MODE_READ,
+            0,
+        )
+    };
+    if status.is_error() {
+        // SAFETY: `root` was returned by OpenVolume and is still open.
+        let _ = unsafe { ((*root).close)(root) };
+        return Err(Error::Firmware("Open guest payload", status.as_usize()));
+    }
+
+    // ponytail: fixed 256 KiB buffer is sufficient for the smoke payload; use
+    // EFI_FILE_INFO sizing when this path loads a production OS boot image.
+    let mut buffer = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).allocate_pool)(efi::LOADER_DATA, GUEST_IMAGE_CAPACITY, &mut buffer)
+    };
+    if status.is_error() {
+        close_guest_file(root, file);
+        return Err(Error::Firmware(
+            "AllocatePool(guest payload)",
+            status.as_usize(),
+        ));
+    }
+
+    let mut payload_size = GUEST_IMAGE_CAPACITY;
+    let status = unsafe { ((*file).read)(file, &mut payload_size, buffer) };
+    if status.is_error() {
+        free_guest_buffer(boot_services, buffer);
+        close_guest_file(root, file);
+        return Err(Error::Firmware("Read guest payload", status.as_usize()));
+    }
+    let mut trailing = 0_u8;
+    let mut trailing_size = 1_usize;
+    let status =
+        unsafe { ((*file).read)(file, &mut trailing_size, ptr::addr_of_mut!(trailing).cast()) };
+    close_guest_file(root, file);
+    if status.is_error() {
+        free_guest_buffer(boot_services, buffer);
+        return Err(Error::Firmware(
+            "Check guest payload EOF",
+            status.as_usize(),
+        ));
+    }
+    if trailing_size != 0 {
+        free_guest_buffer(boot_services, buffer);
+        return Err(Error::GuestImageTooLarge);
+    }
+
+    let mut guest_image = ptr::null_mut();
+    let status = unsafe {
+        ((*boot_services).load_image)(
+            efi::Boolean::FALSE,
+            parent_image,
+            ptr::null_mut(),
+            buffer,
+            payload_size,
+            &mut guest_image,
+        )
+    };
+    free_guest_buffer(boot_services, buffer);
+    if status.is_error() {
+        return Err(Error::Firmware("LoadImage", status.as_usize()));
+    }
+    Ok(guest_image)
+}
+
+fn close_guest_file(
+    root: *mut efi::protocols::file::Protocol,
+    file: *mut efi::protocols::file::Protocol,
+) {
+    // SAFETY: both handles were returned by their corresponding open calls.
+    unsafe {
+        let _ = ((*file).close)(file);
+        let _ = ((*root).close)(root);
+    }
+}
+
+fn free_guest_buffer(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
+    // SAFETY: `buffer` was returned by this table's AllocatePool call.
+    let _ = unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
 /// Configures the current VMCS and launches the non-root marker.
@@ -270,6 +459,7 @@ fn configure_and_launch(
     log_guest_state();
 
     GUEST_RAN.store(0, Ordering::Release);
+    GUEST_STATUS.store(usize::MAX, Ordering::Release);
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
         "VMLAUNCH",
@@ -533,6 +723,20 @@ fn restore_control_registers() {
 /// First non-root instruction stream.
 extern "C" fn guest_entry() -> ! {
     GUEST_RAN.store(GUEST_MARKER, Ordering::Release);
+    let system_table = SYSTEM_TABLE.load(Ordering::Acquire);
+    let guest_image = GUEST_IMAGE.load(Ordering::Acquire);
+    let mut exit_data_size = 0_usize;
+    let mut exit_data = ptr::null_mut();
+    // SAFETY: both pointers were captured in root mode before VMLAUNCH, and
+    // UEFI Boot Services are still active for this late-launch smoke test.
+    let status = unsafe {
+        ((*(*system_table).boot_services).start_image)(
+            guest_image,
+            &mut exit_data_size,
+            &mut exit_data,
+        )
+    };
+    GUEST_STATUS.store(status.as_usize(), Ordering::Release);
     // SAFETY: this guest runs specifically under the VMCALL smoke handler.
     unsafe { vmx::vmcall() };
     loop {
@@ -548,6 +752,7 @@ extern "C" fn vmexit_entry() -> ! {
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
     let cpu_id = (cpu::cpuid(1, 0).ebx >> 24) & 0xff;
     let marker = GUEST_RAN.load(Ordering::Acquire);
+    let guest_status = GUEST_STATUS.load(Ordering::Acquire);
     let mut serial = SerialPort;
     serial.init();
     let _ = writeln!(
@@ -560,13 +765,17 @@ extern "C" fn vmexit_entry() -> ! {
     if reason & 0xffff == EXIT_REASON_VMCALL
         && reason & (1 << 31) == 0
         && marker == GUEST_MARKER
+        && guest_status == efi::Status::SUCCESS.as_usize()
         && vmxoff == VmxStatus::Success
     {
-        let _ = writeln!(serial, "thin-hv: vmx guest PASS");
+        let _ = writeln!(
+            serial,
+            "thin-hv: vmx guest PASS start_image_status={guest_status:#x}"
+        );
     } else {
         let _ = writeln!(
             serial,
-            "thin-hv: vmx guest FAIL marker={marker:#x} vmxoff={vmxoff:?}"
+            "thin-hv: vmx guest FAIL marker={marker:#x} start_image_status={guest_status:#x} vmxoff={vmxoff:?}"
         );
     }
     loop {

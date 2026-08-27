@@ -358,11 +358,14 @@ fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<Strin
 
 fn build_x86_uefi(args: &[String]) -> Result<String, String> {
     let pkg = "x86_uefi_loader";
+    let guest_pkg = "x86_guest_uefi_test";
     eprintln!("\n--- Building x86 UEFI package: {} ---", pkg);
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
         .arg("-p")
         .arg(pkg)
+        .arg("-p")
+        .arg(guest_pkg)
         .arg("--target")
         .arg("x86_64-unknown-uefi")
         .args(args)
@@ -394,6 +397,15 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("bin")
         .join("x86_64")
         .join("x86-uefi-loader.efi");
+    let guest_artifact = workspace
+        .join("target")
+        .join("x86_64-unknown-uefi")
+        .join(resolve_profile(args))
+        .join("x86_guest_uefi_test.efi");
+    let guest_destination = workspace
+        .join("bin")
+        .join("x86_64")
+        .join("x86_guest_uefi_test.efi");
     fs::create_dir_all(destination.parent().expect("destination has a parent"))
         .map_err(|e| format!("Failed to create x86 staging directory: {}", e))?;
     fs::copy(&artifact, &destination).map_err(|e| {
@@ -401,6 +413,14 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             "Failed to copy {} to {}: {}",
             artifact.display(),
             destination.display(),
+            e
+        )
+    })?;
+    fs::copy(&guest_artifact, &guest_destination).map_err(|e| {
+        format!(
+            "Failed to copy {} to {}: {}",
+            guest_artifact.display(),
+            guest_destination.display(),
             e
         )
     })?;

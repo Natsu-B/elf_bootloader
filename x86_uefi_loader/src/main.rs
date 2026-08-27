@@ -60,7 +60,7 @@ impl fmt::Write for SerialPort {
 /// UEFI image entry point.
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(
-    _image: efi::Handle,
+    image: efi::Handle,
     system_table: *mut efi::SystemTable,
 ) -> efi::Status {
     let mut serial = SerialPort;
@@ -97,7 +97,7 @@ pub extern "efiapi" fn efi_main(
         u8::from(vmx_basic.true_controls)
     );
 
-    if let Err(error) = vmx_smoke::run(system_table) {
+    if let Err(error) = vmx_smoke::run(image, system_table) {
         let _ = writeln!(serial, "thin-hv: vmx smoke FAIL: {error}");
         return efi::Status::DEVICE_ERROR;
     }

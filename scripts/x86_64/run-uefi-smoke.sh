@@ -3,12 +3,14 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
+guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 stage="$repo_root/bin/x86_64"
 esp="$stage/esp"
 serial_log="$stage/serial.log"
 vars="$stage/OVMF_VARS.fd"
 marker='thin-hv: uefi entry'
 vmx_marker='thin-hv: vmx guest PASS'
+payload_marker='thin-hv: guest uefi payload'
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 
 die() {
@@ -28,6 +30,7 @@ first_file() {
 }
 
 [[ -f "$loader" ]] || die "loader not found: $loader"
+[[ -f "$guest" ]] || die "guest payload not found: $guest"
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
 command -v timeout >/dev/null || die "GNU timeout is required"
 
@@ -61,6 +64,7 @@ ovmf_vars=$(first_file \
 
 mkdir -p -- "$esp/EFI/BOOT"
 install -m 0644 -- "$loader" "$esp/EFI/BOOT/BOOTX64.EFI"
+install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
 install -m 0600 -- "$ovmf_vars" "$vars"
 : >"$serial_log"
 
@@ -87,6 +91,7 @@ set -e
 cat -- "$serial_log"
 grep -Fq -- "$marker" "$serial_log" || die "marker '$marker' missing from $serial_log (QEMU status $qemu_status)"
 grep -Fq -- "$vmx_marker" "$serial_log" || die "marker '$vmx_marker' missing from $serial_log (QEMU status $qemu_status)"
+grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
 
 case $qemu_status in
     0 | 124) ;;
