@@ -43,7 +43,6 @@
             pkgs.file
             pkgs.gzip
             pkgs.kmod
-            pkgs.mtools
             pkgs.swtpm
             pkgs.util-linux
             pkgs.cargo-binutils

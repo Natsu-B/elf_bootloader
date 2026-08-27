@@ -6,11 +6,16 @@ work=${WINDOWS_TEST_DIR:-"$repo_root/bin/x86_64/windows"}
 iso="$work/win11-enterprise-eval-25h2-en-us.iso"
 disk="$work/windows.raw"
 vars="$work/windows-vars.fd"
+monitor_vars="$work/monitor-vars.fd"
 tpm_dir="$work/tpm"
 answer_dir="$work/answer"
+monitor_esp="$work/monitor-loader-esp"
+loader="$repo_root/bin/x86_64/x86-uefi-loader.efi"
+runtime_monitor="$repo_root/bin/x86_64/x86-uefi-monitor.efi"
 expected_hash=a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9
 download_url='https://go.microsoft.com/fwlink/?clcid=0x409&country=us&culture=en-us&linkid=2334167'
 marker='thin-hv: windows desktop'
+desktop_marker=thinhvwindowsdesktop
 
 die() {
     printf 'Windows x86 test: %s\n' "$*" >&2
@@ -33,6 +38,7 @@ first_file() {
 }
 
 verify_iso() {
+    need_command sha256sum
     [[ -f "$iso" ]] || die "ISO not found: $iso; run '$0 download'"
     printf '%s  %s\n' "$expected_hash" "$iso" | sha256sum -c -
 }
@@ -59,10 +65,20 @@ prepare_install_media() {
     install -m 0644 -- "$answer_source/first-logon.ps1" "$answer_dir/thin-hv-first-logon.ps1"
 }
 
+prepare_monitor_media() {
+    [[ -f "$loader" ]] || die "loader not found: $loader; run 'cargo xbuild x86'"
+    [[ -f "$runtime_monitor" ]] || die "runtime monitor not found: $runtime_monitor; run 'cargo xbuild x86'"
+
+    mkdir -p -- "$monitor_esp/EFI/BOOT"
+    rm -f -- "$monitor_esp/EFI/BOOT/GUESTX64.EFI"
+    install -m 0644 -- "$loader" "$monitor_esp/EFI/BOOT/BOOTX64.EFI"
+    install -m 0644 -- "$runtime_monitor" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
+}
+
 stop_pid_file() {
     local pid_file=$1 pid
     [[ -r "$pid_file" ]] || return 0
-    read -r pid <"$pid_file"
+    read -r pid <"$pid_file" || return 0
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
     [[ -r "/proc/$pid/comm" && "$(<"/proc/$pid/comm")" == swtpm ]] || return 0
     [[ -r "/proc/$pid/cmdline" ]] || return 0
@@ -70,31 +86,61 @@ stop_pid_file() {
     kill "$pid" 2>/dev/null || true
 }
 
+probe_windows_desktop() {
+    local command="cmd /c echo $desktop_marker>com2" index key
+
+    # ponytail: the Run dialog is the desktop-ready probe; use a guest agent
+    # only if later tests need general command execution inside Windows.
+    printf 'sendkey esc 20\n' >&9
+    sleep 0.1
+    printf 'sendkey esc 20\n' >&9
+    sleep 1
+    printf 'sendkey meta_l-r 20\n' >&9
+    sleep 3
+    for ((index = 0; index < ${#command}; index++)); do
+        key=${command:index:1}
+        case $key in
+            ' ') key=spc ;;
+            /) key=slash ;;
+            '>') key=shift-dot ;;
+        esac
+        printf 'sendkey %s 20\n' "$key" >&9
+        sleep 0.1
+    done
+    printf 'sendkey ret 20\n' >&9
+}
+
 run_windows() {
     local mode=$1
-    local timeout_seconds memory smp disk_size ovmf_code ovmf_vars
-    local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log qemu_log
-    local qemu_pid='' elapsed=0 monitor_fd_open=0
+    local timeout_seconds memory smp disk_size ovmf_code ovmf_vars active_vars
+    local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
+    local expected_marker marker_log
+    local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0
     local -a media_args
 
     need_command qemu-system-x86_64
-    need_command qemu-img
     need_command swtpm
-    need_command sha256sum
     qemu=$(command -v qemu-system-x86_64)
     swtpm=$(command -v swtpm)
     memory=${WINDOWS_MEMORY:-4G}
-    smp=${WINDOWS_SMP:-2}
-    disk_size=${WINDOWS_DISK_SIZE:-80G}
+    if [[ "$mode" == monitor ]]; then
+        [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
+        smp=1
+    else
+        smp=${WINDOWS_SMP:-2}
+    fi
     [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'WINDOWS_MEMORY must be a QEMU size such as 4G'
     [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'WINDOWS_SMP must be a positive integer'
-    [[ "$disk_size" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'WINDOWS_DISK_SIZE must be a QEMU size such as 80G'
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
     mkdir -p -- "$work" "$tpm_dir"
 
     if [[ "$mode" == install ]]; then
+        need_command qemu-img
+        disk_size=${WINDOWS_DISK_SIZE:-80G}
+        [[ "$disk_size" =~ ^[1-9][0-9]*[KMG]$ ]] || \
+            die 'WINDOWS_DISK_SIZE must be a QEMU size such as 80G'
         verify_iso
         prepare_install_media
         if [[ ! -f "$disk" ]]; then
@@ -111,11 +157,24 @@ run_windows() {
             -device "usb-storage,bus=xhci.0,drive=answer,removable=on"
             -boot "once=d,menu=off"
         )
+        active_vars=$vars
+    elif [[ "$mode" == monitor ]]; then
+        [[ -f "$disk" ]] || die "Windows disk not found: $disk"
+        prepare_monitor_media
+        install -m 0600 -- "$ovmf_vars" "$monitor_vars"
+        timeout_seconds=${WINDOWS_BOOT_TIMEOUT_SECONDS:-900}
+        active_vars=$monitor_vars
+        media_args=(
+            -drive "if=none,id=monitor-esp,format=raw,snapshot=on,file=fat:ro:$monitor_esp"
+            -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
+            -boot "menu=off,strict=on"
+        )
     else
         [[ -f "$disk" ]] || die "Windows disk not found: $disk"
         [[ -f "$vars" ]] || die "OVMF variables not found: $vars"
         timeout_seconds=${WINDOWS_BOOT_TIMEOUT_SECONDS:-900}
         media_args=(-boot menu=off)
+        active_vars=$vars
     fi
     [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'timeout must be a positive integer'
 
@@ -123,11 +182,20 @@ run_windows() {
     tpm_pid_file="$work/swtpm.pid"
     monitor_fifo="$work/qemu-monitor.in"
     serial_log="$work/$mode-serial.log"
+    desktop_serial_log="$work/$mode-desktop-serial.log"
     qemu_log="$work/$mode-qemu.log"
     stop_pid_file "$tpm_pid_file"
     rm -f -- "$tpm_socket" "$tpm_pid_file" "$monitor_fifo"
     : >"$serial_log"
+    : >"$desktop_serial_log"
     : >"$qemu_log"
+    if [[ "$mode" == monitor ]]; then
+        expected_marker=$desktop_marker
+        marker_log=$desktop_serial_log
+    else
+        expected_marker=$marker
+        marker_log=$serial_log
+    fi
 
     cleanup() {
         if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
@@ -157,9 +225,13 @@ run_windows() {
     exec 9<>"$monitor_fifo"
     monitor_fd_open=1
 
+    # ponytail: keep q35 PCI MMIO inside the current 8 GiB EPT; bare-metal
+    # launch must derive RAM/MMIO ranges from firmware resources.
     "$qemu" \
         -machine q35,accel=kvm,smm=on \
+        -global q35-pcihost.pci-hole64-size=1G \
         -cpu host,+vmx,-hypervisor \
+        -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024 \
         -smp "$smp" \
         -m "$memory" \
         -nodefaults \
@@ -167,10 +239,11 @@ run_windows() {
         -vnc "${WINDOWS_VNC:-127.0.0.1:1}" \
         -monitor stdio \
         -serial "file:$serial_log" \
+        -serial "file:$desktop_serial_log" \
         -rtc base=localtime,clock=host \
         -global driver=cfi.pflash01,property=secure,value=on \
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
-        -drive "if=pflash,format=raw,file=$vars" \
+        -drive "if=pflash,format=raw,file=$active_vars" \
         -chardev "socket,id=chrtpm,path=$tpm_socket" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
         -device tpm-crb,tpmdev=tpm0 \
@@ -196,23 +269,34 @@ run_windows() {
     fi
 
     while ((elapsed < timeout_seconds)); do
-        if grep -Fq -- "$marker" "$serial_log"; then
-            printf 'Windows x86 test: observed %s\n' "$marker"
+        if grep -Fq -- "$expected_marker" "$marker_log"; then
+            printf 'Windows x86 test: observed %s\n' "$expected_marker"
             break
         fi
         if ! kill -0 "$qemu_pid" 2>/dev/null; then
-            wait "$qemu_pid" || true
+            set +e
+            wait "$qemu_pid"
+            qemu_status=$?
+            set -e
             qemu_pid=
             tail -n 80 -- "$qemu_log" >&2
-            die "QEMU exited before marker; logs: $serial_log $qemu_log"
+            die "QEMU exited with status $qemu_status before marker; logs: $serial_log $marker_log $qemu_log"
         fi
         sleep 2
         elapsed=$((elapsed + 2))
+        if [[ "$mode" == monitor ]] && ((elapsed >= 150 && elapsed % 30 == 0)); then
+            probe_windows_desktop
+        fi
         if ((elapsed % 30 == 0)); then
             printf 'Windows x86 test: waiting for marker (%ss/%ss)\n' "$elapsed" "$timeout_seconds"
         fi
     done
-    grep -Fq -- "$marker" "$serial_log" || die "marker timeout; logs: $serial_log $qemu_log"
+    grep -Fq -- "$expected_marker" "$marker_log" || \
+        die "marker timeout; logs: $serial_log $marker_log $qemu_log"
+    if [[ "$mode" == monitor ]]; then
+        grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
+            die "monitor marker missing from $serial_log"
+    fi
 
     printf 'system_powerdown\n' >&9
     for _ in {1..120}; do
@@ -230,7 +314,7 @@ run_windows() {
 }
 
 usage() {
-    printf 'usage: %s download|verify|install|boot\n' "$0"
+    printf 'usage: %s download|verify|install|boot|monitor\n' "$0"
 }
 
 case ${1:-} in
@@ -238,6 +322,7 @@ case ${1:-} in
     verify) verify_iso ;;
     install) run_windows install ;;
     boot) run_windows boot ;;
+    monitor) run_windows monitor ;;
     -h | --help | help) usage ;;
     *) usage >&2; exit 2 ;;
 esac
