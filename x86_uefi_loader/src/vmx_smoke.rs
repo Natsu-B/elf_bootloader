@@ -1,6 +1,7 @@
 //! One-vCPU VMXON/VMLAUNCH/VMCALL validation.
 
 use crate::SerialPort;
+use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
 use core::fmt::Write;
@@ -23,6 +24,7 @@ use nested_vmx::VmcsField;
 use nested_vmx::VmcsLaunchState;
 use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
+use uefi_variable_overlay::ProfileId;
 use x86_64_hal::addr::EptPhys;
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
@@ -160,6 +162,10 @@ const MONITOR_IMAGE_PATH: [efi::Char16; 25] = [
 /// Windows boot manager on a profile-owned EFI System Partition.
 const WINDOWS_BOOT_IMAGE_PATH: [efi::Char16; 33] =
     ascii_uefi_path(b"\\EFI\\Microsoft\\Boot\\bootmgfw.efi\0");
+/// Stable profile selected when the staged Linux/test payload is present.
+const LINUX_PROFILE: ProfileId = ProfileId(2);
+/// Stable profile selected when chainloading the installed Windows ESP.
+const WINDOWS_PROFILE: ProfileId = ProfileId(1);
 
 const fn ascii_uefi_path<const N: usize>(ascii: &[u8; N]) -> [efi::Char16; N] {
     let mut path = [0; N];
@@ -189,6 +195,15 @@ static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
 static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
+
+/// Bootstrap-to-runtime handoff copied before entering VMX non-root mode.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RuntimeHandoff {
+    guest: efi::Handle,
+    profile: u32,
+    reserved: u32,
+}
 
 /// Guest GPRs that are not stored in the VMCS on VM exit.
 #[repr(C)]
@@ -313,7 +328,7 @@ pub(crate) fn run(
         return Err(Error::Capability("EPT", ept_capability));
     }
 
-    let guest_image = runtime_guest_image(loaded_image).ok_or(Error::Firmware(
+    let (guest_image, profile) = runtime_handoff(loaded_image).ok_or(Error::Firmware(
         "runtime guest-image handoff",
         efi::Status::INVALID_PARAMETER.as_usize(),
     ))?;
@@ -324,6 +339,10 @@ pub(crate) fn run(
     let image_end = image_base
         .checked_add(unsafe { (*loaded_image).image_size })
         .ok_or(Error::OutsideIdentityMap(image_base))?;
+    let _ = writeln!(
+        serial,
+        "thin-hv: runtime image base={image_base:#018x} end={image_end:#018x}"
+    );
     if image_base >= IDENTITY_MAP_LIMIT || image_end > IDENTITY_MAP_LIMIT {
         return Err(Error::OutsideIdentityMap(image_end));
     }
@@ -430,6 +449,27 @@ pub(crate) fn run(
         return Err(Error::Instruction("VMXON", vmxon_status, u64::MAX));
     }
 
+    let variable_overlay =
+        match runtime_variables::install(system_table, profile, image_base, unsafe {
+            (*loaded_image).image_size
+        }) {
+            Ok(overlay) => overlay,
+            Err(status) => {
+                let _ = unsafe { vmx::vmxoff() };
+                restore_control_registers();
+                return Err(Error::Firmware(
+                    "install variable overlay",
+                    status.as_usize(),
+                ));
+            }
+        };
+    let _ = writeln!(
+        serial,
+        "thin-hv: variable overlay profile={} mat_patches={}",
+        profile.0,
+        variable_overlay.memory_attribute_patch_count()
+    );
+
     let result = configure_and_launch(
         vmcs,
         ept_pointer,
@@ -445,9 +485,16 @@ pub(crate) fn run(
     );
 
     // This is reached only when VM entry failed.
+    let overlay_rollback = variable_overlay.rollback();
     let _ = unsafe { vmx::vmxoff() };
     restore_control_registers();
-    result
+    match overlay_rollback {
+        Ok(()) => result,
+        Err(status) => Err(Error::Firmware(
+            "restore variable overlay",
+            status.as_usize(),
+        )),
+    }
 }
 
 /// Starts a runtime-driver copy whose code survives guest ExitBootServices.
@@ -455,11 +502,12 @@ fn start_runtime_monitor(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
 ) -> Result<(), Error> {
-    let guest = match load_image(parent_image, system_table, GUEST_IMAGE_PATH) {
-        Ok(image) => image,
-        Err(error) if error.is_missing_image() => {
-            load_image_from_other_filesystem(parent_image, system_table, WINDOWS_BOOT_IMAGE_PATH)?
-        }
+    let (guest, profile) = match load_image(parent_image, system_table, GUEST_IMAGE_PATH) {
+        Ok(image) => (image, LINUX_PROFILE),
+        Err(error) if error.is_missing_image() => (
+            load_image_from_other_filesystem(parent_image, system_table, WINDOWS_BOOT_IMAGE_PATH)?,
+            WINDOWS_PROFILE,
+        ),
         Err(error) => return Err(error),
     };
     let monitor = match load_image(parent_image, system_table, MONITOR_IMAGE_PATH) {
@@ -477,9 +525,13 @@ fn start_runtime_monitor(
             return Err(error);
         }
     };
-    let mut guest_handoff = guest;
+    let mut guest_handoff = RuntimeHandoff {
+        guest,
+        profile: profile.0,
+        reserved: 0,
+    };
     unsafe {
-        (*monitor_loaded).load_options_size = core::mem::size_of::<efi::Handle>() as u32;
+        (*monitor_loaded).load_options_size = core::mem::size_of::<RuntimeHandoff>() as u32;
         (*monitor_loaded).load_options = ptr::addr_of_mut!(guest_handoff).cast();
     }
     let mut exit_data_size = 0;
@@ -496,19 +548,25 @@ fn start_runtime_monitor(
     ))
 }
 
-/// Reads the one-handle load option supplied by the boot application copy.
-fn runtime_guest_image(
+/// Reads the target handle and profile supplied by the boot application copy.
+fn runtime_handoff(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
-) -> Option<efi::Handle> {
-    if unsafe { (*loaded_image).load_options_size } as usize != core::mem::size_of::<efi::Handle>()
+) -> Option<(efi::Handle, ProfileId)> {
+    if unsafe { (*loaded_image).load_options_size } as usize
+        != core::mem::size_of::<RuntimeHandoff>()
         || unsafe { (*loaded_image).load_options }.is_null()
     {
         return None;
     }
-    // SAFETY: the application copy keeps this one-handle option live for the
+    // SAFETY: the application copy keeps this fixed handoff live for the
     // complete nested StartImage call.
-    let image = unsafe { ptr::read_unaligned((*loaded_image).load_options.cast::<efi::Handle>()) };
-    (!image.is_null()).then_some(image)
+    let handoff =
+        unsafe { ptr::read_unaligned((*loaded_image).load_options.cast::<RuntimeHandoff>()) };
+    let profile = ProfileId(handoff.profile);
+    (!handoff.guest.is_null()
+        && handoff.reserved == 0
+        && matches!(profile, WINDOWS_PROFILE | LINUX_PROFILE))
+    .then_some((handoff.guest, profile))
 }
 
 /// Loads one staged image through its complete filesystem device path.

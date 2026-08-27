@@ -409,6 +409,7 @@ dependencies = [
  "mutex",
  "nested_vmx",
  "r-efi",
+ "uefi_variable_overlay",
  "x86_64_hal",
 ]
 

@@ -10,6 +10,7 @@ use r_efi::efi;
 use x86_64_hal::cpu;
 use x86_64_hal::vmx;
 
+mod runtime_variables;
 mod vmx_smoke;
 
 /// Legacy COM1 base I/O port.
