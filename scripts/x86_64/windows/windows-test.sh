@@ -7,15 +7,21 @@ iso="$work/win11-enterprise-eval-25h2-en-us.iso"
 disk="$work/windows.raw"
 vars="$work/windows-vars.fd"
 monitor_vars="$work/monitor-vars.fd"
-tpm_dir="$work/tpm"
+hyperv_vars="$work/hyperv-vars.fd"
+hyperv_disk="$work/windows-hyperv.qcow2"
+hyperv_ready="$work/hyperv-ready"
+base_tpm_dir="$work/tpm"
+hyperv_tpm_dir="$work/hyperv-tpm"
 answer_dir="$work/answer"
 monitor_esp="$work/monitor-loader-esp"
+hyperv_media="$work/hyperv-media"
 loader="$repo_root/bin/x86_64/x86-uefi-loader.efi"
 runtime_monitor="$repo_root/bin/x86_64/x86-uefi-monitor.efi"
 expected_hash=a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9
 download_url='https://go.microsoft.com/fwlink/?clcid=0x409&country=us&culture=en-us&linkid=2334167'
 marker='thin-hv: windows desktop'
 desktop_marker=thinhvwindowsdesktop
+hyperv_marker='thin-hv: windows hyperv PASS'
 
 die() {
     printf 'Windows x86 test: %s\n' "$*" >&2
@@ -75,6 +81,28 @@ prepare_monitor_media() {
     install -m 0644 -- "$runtime_monitor" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
 }
 
+prepare_hyperv_media() {
+    local source="$repo_root/scripts/x86_64/windows"
+
+    [[ -f "$disk" ]] || die "Windows disk not found: $disk"
+    [[ -f "$vars" ]] || die "OVMF variables not found: $vars"
+    [[ -d "$base_tpm_dir" ]] || die "TPM state not found: $base_tpm_dir"
+    if [[ -f "$hyperv_disk" && -f "$hyperv_vars" && -d "$hyperv_tpm_dir" ]]; then
+        :
+    elif [[ ! -e "$hyperv_disk" && ! -e "$hyperv_vars" && ! -e "$hyperv_tpm_dir" ]]; then
+        qemu-img create -f qcow2 -F raw -b "$disk" "$hyperv_disk"
+        install -m 0600 -- "$vars" "$hyperv_vars"
+        mkdir -p -- "$hyperv_tpm_dir"
+        cp -a -- "$base_tpm_dir/." "$hyperv_tpm_dir/"
+        rm -f -- "$hyperv_ready"
+    else
+        die "partial Hyper-V state; remove together: $hyperv_disk $hyperv_vars $hyperv_tpm_dir $hyperv_ready"
+    fi
+    mkdir -p -- "$hyperv_media"
+    install -m 0644 -- "$source/hyperv-enable.ps1" "$hyperv_media/hyperv-enable.ps1"
+    install -m 0644 -- "$source/hyperv-verify.ps1" "$hyperv_media/hyperv-verify.ps1"
+}
+
 stop_pid_file() {
     local pid_file=$1 pid
     [[ -r "$pid_file" ]] || return 0
@@ -86,11 +114,9 @@ stop_pid_file() {
     kill "$pid" 2>/dev/null || true
 }
 
-probe_windows_desktop() {
-    local command="cmd /c echo $desktop_marker>com2" index key
+run_dialog_command() {
+    local command=$1 submit_key=${2:-ret} index key
 
-    # ponytail: the Run dialog is the desktop-ready probe; use a guest agent
-    # only if later tests need general command execution inside Windows.
     printf 'sendkey esc 20\n' >&9
     sleep 0.1
     printf 'sendkey esc 20\n' >&9
@@ -102,20 +128,37 @@ probe_windows_desktop() {
         case $key in
             ' ') key=spc ;;
             /) key=slash ;;
+            \\) key=backslash ;;
+            :) key=shift-semicolon ;;
+            .) key='dot' ;;
+            -) key=minus ;;
             '>') key=shift-dot ;;
         esac
         printf 'sendkey %s 20\n' "$key" >&9
         sleep 0.1
     done
-    printf 'sendkey ret 20\n' >&9
+    printf 'sendkey %s 20\n' "$submit_key" >&9
+}
+
+probe_windows_desktop() {
+    # ponytail: the Run dialog is the desktop-ready probe; use a guest agent
+    # only if later tests need general command execution inside Windows.
+    run_dialog_command "cmd /c echo $desktop_marker>com2"
+}
+
+probe_hyperv_enable() {
+    run_dialog_command 'powershell -nop -ep bypass -f d:\hyperv-enable.ps1' ctrl-shift-ret
+    sleep 5
+    printf 'sendkey alt-y 20\n' >&9
 }
 
 run_windows() {
     local mode=$1
     local timeout_seconds memory smp disk_size ovmf_code ovmf_vars active_vars
+    local disk_image=$disk disk_format=raw tpm_dir=$base_tpm_dir tpm_instance=base
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
     local expected_marker marker_log
-    local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0
+    local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 hyperv_probe_sent=0
     local -a media_args
 
     need_command qemu-system-x86_64
@@ -123,9 +166,12 @@ run_windows() {
     qemu=$(command -v qemu-system-x86_64)
     swtpm=$(command -v swtpm)
     memory=${WINDOWS_MEMORY:-4G}
-    if [[ "$mode" == monitor ]]; then
+    if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
         smp=1
+    elif [[ "$mode" == hyperv ]]; then
+        [[ "$memory" == 4G ]] || die 'Hyper-V control currently requires WINDOWS_MEMORY=4G'
+        smp=2
     else
         smp=${WINDOWS_SMP:-2}
     fi
@@ -134,7 +180,12 @@ run_windows() {
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
-    mkdir -p -- "$work" "$tpm_dir"
+    mkdir -p -- "$work"
+    if [[ -f "$hyperv_disk" && "$mode" != hyperv && "$mode" != monitor-hyperv ]]; then
+        # ponytail: keep the raw backing immutable instead of duplicating its
+        # allocated blocks; remove all Hyper-V state before changing the base.
+        die "Hyper-V overlay exists; remove its disk, vars, TPM, and ready marker together before changing the base"
+    fi
 
     if [[ "$mode" == install ]]; then
         need_command qemu-img
@@ -169,6 +220,37 @@ run_windows() {
             -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
             -boot "menu=off,strict=on"
         )
+    elif [[ "$mode" == hyperv ]]; then
+        need_command qemu-img
+        prepare_hyperv_media
+        timeout_seconds=${WINDOWS_HYPERV_TIMEOUT_SECONDS:-1200}
+        active_vars=$hyperv_vars
+        disk_image=$hyperv_disk
+        disk_format=qcow2
+        tpm_dir=$hyperv_tpm_dir
+        tpm_instance=hyperv
+        media_args=(
+            -drive "if=none,id=hyperv-media,format=raw,readonly=on,file=fat:$hyperv_media"
+            -device "usb-storage,bus=xhci.0,drive=hyperv-media,removable=on"
+            -boot "menu=off"
+        )
+    elif [[ "$mode" == monitor-hyperv ]]; then
+        need_command qemu-img
+        prepare_hyperv_media
+        [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
+        prepare_monitor_media
+        install -m 0600 -- "$ovmf_vars" "$monitor_vars"
+        timeout_seconds=${WINDOWS_HYPERV_TIMEOUT_SECONDS:-600}
+        active_vars=$monitor_vars
+        disk_image=$hyperv_disk
+        disk_format=qcow2
+        tpm_dir=$hyperv_tpm_dir
+        tpm_instance=hyperv
+        media_args=(
+            -drive "if=none,id=monitor-esp,format=raw,snapshot=on,file=fat:ro:$monitor_esp"
+            -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
+            -boot "menu=off,strict=on"
+        )
     else
         [[ -f "$disk" ]] || die "Windows disk not found: $disk"
         [[ -f "$vars" ]] || die "OVMF variables not found: $vars"
@@ -177,10 +259,11 @@ run_windows() {
         active_vars=$vars
     fi
     [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'timeout must be a positive integer'
+    mkdir -p -- "$tpm_dir"
 
-    tpm_socket="$work/swtpm.sock"
-    tpm_pid_file="$work/swtpm.pid"
-    monitor_fifo="$work/qemu-monitor.in"
+    tpm_socket="$work/swtpm-$tpm_instance.sock"
+    tpm_pid_file="$work/swtpm-$tpm_instance.pid"
+    monitor_fifo="$work/qemu-monitor-$mode.in"
     serial_log="$work/$mode-serial.log"
     desktop_serial_log="$work/$mode-desktop-serial.log"
     qemu_log="$work/$mode-qemu.log"
@@ -189,7 +272,10 @@ run_windows() {
     : >"$serial_log"
     : >"$desktop_serial_log"
     : >"$qemu_log"
-    if [[ "$mode" == monitor ]]; then
+    if [[ "$mode" == hyperv || "$mode" == monitor-hyperv ]]; then
+        expected_marker=$hyperv_marker
+        marker_log=$desktop_serial_log
+    elif [[ "$mode" == monitor ]]; then
         expected_marker=$desktop_marker
         marker_log=$desktop_serial_log
     else
@@ -251,7 +337,7 @@ run_windows() {
         -device qemu-xhci,id=xhci \
         -device usb-kbd,bus=xhci.0 \
         -device usb-tablet,bus=xhci.0 \
-        -drive "if=none,id=windisk,format=raw,file=$disk,cache=writeback,discard=unmap,detect-zeroes=unmap" \
+        -drive "if=none,id=windisk,format=$disk_format,file=$disk_image,cache=writeback,discard=unmap,detect-zeroes=unmap" \
         -device ide-hd,bus=ide.0,drive=windisk,bootindex=2 \
         -netdev user,id=net0 \
         -device e1000e,netdev=net0 \
@@ -287,13 +373,20 @@ run_windows() {
         if [[ "$mode" == monitor ]] && ((elapsed >= 150 && elapsed % 30 == 0)); then
             probe_windows_desktop
         fi
+        if [[ "$mode" == hyperv ]] && ((elapsed >= 150 && !hyperv_probe_sent)); then
+            probe_hyperv_enable
+            hyperv_probe_sent=1
+        fi
         if ((elapsed % 30 == 0)); then
             printf 'Windows x86 test: waiting for marker (%ss/%ss)\n' "$elapsed" "$timeout_seconds"
         fi
     done
     grep -Fq -- "$expected_marker" "$marker_log" || \
         die "marker timeout; logs: $serial_log $marker_log $qemu_log"
-    if [[ "$mode" == monitor ]]; then
+    if [[ "$mode" == hyperv ]]; then
+        : >"$hyperv_ready"
+    fi
+    if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
     fi
@@ -314,7 +407,7 @@ run_windows() {
 }
 
 usage() {
-    printf 'usage: %s download|verify|install|boot|monitor\n' "$0"
+    printf 'usage: %s download|verify|install|boot|monitor|hyperv|monitor-hyperv\n' "$0"
 }
 
 case ${1:-} in
@@ -323,6 +416,8 @@ case ${1:-} in
     install) run_windows install ;;
     boot) run_windows boot ;;
     monitor) run_windows monitor ;;
+    hyperv) run_windows hyperv ;;
+    monitor-hyperv) run_windows monitor-hyperv ;;
     -h | --help | help) usage ;;
     *) usage >&2; exit 2 ;;
 esac
