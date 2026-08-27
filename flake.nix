@@ -36,12 +36,16 @@
             })
             pkgs.qemu
             pkgs.OVMF.fd
+            pkgs.OVMFFull.fd
             pkgs.binutils
             pkgs.cpio
             pkgs.dtc
             pkgs.file
             pkgs.gzip
             pkgs.kmod
+            pkgs.mtools
+            pkgs.swtpm
+            pkgs.util-linux
             pkgs.cargo-binutils
             pkgs.gdb
           ];
@@ -50,6 +54,8 @@
           LINUX_EFI_STUB = "${pkgs.systemd}/lib/systemd/boot/efi/linuxx64.efi.stub";
           OVMF_CODE = "${pkgs.OVMF.fd}/FV/OVMF_CODE.fd";
           OVMF_VARS = "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd";
+          OVMF_FULL_CODE = "${pkgs.OVMFFull.fd}/FV/OVMF_CODE.fd";
+          OVMF_FULL_VARS = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.fd";
         };
       }
     );
