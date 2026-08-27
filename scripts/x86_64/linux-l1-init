@@ -10,7 +10,14 @@ if grep -qw vmx /proc/cpuinfo; then
 else
     echo 'thin-hv: linux L1 /proc/cpuinfo vmx=0'
 fi
-if modprobe kvm_intel && [ -d /sys/module/kvm_intel ]; then
+echo 'thin-hv: linux L1 modprobe kvm begin'
+if modprobe kvm; then
+    echo 'thin-hv: linux L1 modprobe kvm end rc=0'
+else
+    echo 'thin-hv: linux L1 modprobe kvm end rc=1'
+fi
+echo 'thin-hv: linux L1 modprobe kvm_intel begin'
+if modprobe kvm_intel nested=0 && [ -d /sys/module/kvm_intel ]; then
     echo 'thin-hv: linux L1 kvm_intel=1'
 else
     echo 'thin-hv: linux L1 kvm_intel=0'
