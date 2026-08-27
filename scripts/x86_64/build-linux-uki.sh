@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+output=${1:-${LINUX_UKI_OUTPUT:-"$repo_root/bin/x86_64/linux-l1.efi"}}
+kernel_override=${2:-${LINUX_KERNEL:-}}
+busybox_override=${3:-${BUSYBOX_STATIC:-}}
+stub_override=${4:-${LINUX_EFI_STUB:-}}
+cmdline=${LINUX_L1_CMDLINE:-'console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=1 panic=-1'}
+
+die() {
+    printf 'linux L1 UKI: %s\n' "$*" >&2
+    exit 1
+}
+
+if (( $# > 4 )); then
+    die "usage: $0 [output [kernel [static-busybox [linuxx64.efi.stub]]]]"
+fi
+
+first_file() {
+    local candidate
+    for candidate in "$@"; do
+        if [[ -n "$candidate" && -f "$candidate" && -r "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+first_command() {
+    local candidate resolved
+    for candidate in "$@"; do
+        [[ -n "$candidate" ]] || continue
+        if [[ "$candidate" == */* ]]; then
+            [[ -x "$candidate" ]] && printf '%s\n' "$candidate" && return 0
+        elif resolved=$(command -v -- "$candidate" 2>/dev/null); then
+            printf '%s\n' "$resolved"
+            return 0
+        fi
+    done
+    return 1
+}
+
+file_cmd=$(first_command "${FILE:-}" file) || die 'file not found; set FILE'
+objcopy=$(first_command "${OBJCOPY:-}" objcopy llvm-objcopy) || die 'objcopy not found; set OBJCOPY'
+objdump=$(first_command "${OBJDUMP:-}" objdump llvm-objdump) || die 'objdump not found; set OBJDUMP'
+cpio=$(first_command "${CPIO:-}" cpio) || die 'cpio not found; set CPIO'
+gzip=$(first_command "${GZIP:-}" gzip) || die 'gzip not found; set GZIP'
+
+valid_busybox() {
+    local candidate=$1 applet applets description
+    [[ -f "$candidate" && -x "$candidate" ]] || return 1
+    description=$($file_cmd -Lb -- "$candidate")
+    [[ "$description" == *x86-64* && "$description" == *'statically linked'* ]] || return 1
+    applets=$($candidate --list 2>/dev/null) || return 1
+    for applet in sh mount grep setsid cttyhack; do
+        grep -Fxq -- "$applet" <<<"$applets" || return 1
+    done
+}
+
+find_busybox() {
+    local candidate store
+    for candidate in "$busybox_override" "$(command -v busybox 2>/dev/null || true)"; do
+        if valid_busybox "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    while IFS= read -r candidate; do
+        if valid_busybox "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(find /nix/store -maxdepth 3 -type f -path '*/busybox-static-*/bin/busybox' -print 2>/dev/null | sort)
+    if command -v nix >/dev/null; then
+        store=$(nix build --no-link --print-out-paths nixpkgs#pkgsStatic.busybox | tail -n 1)
+        candidate=$store/bin/busybox
+        if valid_busybox "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+kernel=$(first_file "$kernel_override" /run/current-system/kernel) || die 'x86 bzImage not found; pass arg 2 or set LINUX_KERNEL'
+stub=$(first_file "$stub_override" /run/current-system/sw/lib/systemd/boot/efi/linuxx64.efi.stub \
+    "$(find /nix/store -maxdepth 6 -type f -path '*/lib/systemd/boot/efi/linuxx64.efi.stub' -print -quit 2>/dev/null)") \
+    || die 'systemd linuxx64.efi.stub not found; pass arg 4 or set LINUX_EFI_STUB'
+busybox=$(find_busybox) || die 'full static x86-64 BusyBox not found; pass arg 3 or set BUSYBOX_STATIC'
+init_source=$(first_file "${LINUX_L1_INIT:-}" "$repo_root/scripts/x86_64/linux-l1-init") \
+    || die 'init source not found; set LINUX_L1_INIT'
+
+[[ "$($file_cmd -Lb -- "$kernel")" == *'Linux kernel x86 boot executable'* ]] || die "not an x86 bzImage: $kernel"
+[[ "$($file_cmd -Lb -- "$stub")" == *'PE32+ executable (EFI application) x86-64'* ]] || die "not an x86-64 EFI stub: $stub"
+[[ -n "$cmdline" && "$cmdline" != *$'\n'* ]] || die 'LINUX_L1_CMDLINE must be one non-empty line'
+for input in "$kernel" "$stub" "$busybox" "$init_source"; do
+    [[ ! -e "$output" || ! "$output" -ef "$input" ]] || die "output would overwrite input: $input"
+done
+
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+root=$work/root
+mkdir -p -- "$root/bin" "$root/dev" "$root/proc" "$root/sys" "$(dirname -- "$output")"
+install -m 0755 -- "$busybox" "$root/bin/busybox"
+for applet in sh mount grep setsid cttyhack; do
+    ln -s busybox "$root/bin/$applet"
+done
+install -m 0755 -- "$init_source" "$root/init"
+find "$root" -exec touch -h -d '@0' -- {} +
+
+(
+    cd -- "$root"
+    find . -print0 | sort -z | "$cpio" --null --create --format=newc --owner=0:0 --reproducible 2>/dev/null
+) | "$gzip" -9n >"$work/initrd.cpio.gz"
+
+printf '%s' "$cmdline" >"$work/cmdline"
+printf 'ID=thin-hv\nNAME="thin-hv Linux L1"\nVERSION_ID=1\n' >"$work/os-release"
+
+image_base_hex=
+image_size_hex=
+while read -r key value _; do
+    case $key in
+        ImageBase) image_base_hex=$value ;;
+        SizeOfImage) image_size_hex=$value ;;
+    esac
+done < <("$objdump" -p "$stub")
+[[ "$image_base_hex" =~ ^[0-9a-fA-F]+$ && "$image_size_hex" =~ ^[0-9a-fA-F]+$ ]] \
+    || die "could not read PE image layout from $stub"
+image_base=$((16#$image_base_hex))
+next_rva=$((((16#$image_size_hex + 0xfff) / 0x1000) * 0x1000))
+osrel_vma=$(printf '0x%x' "$((image_base + next_rva))")
+cmdline_vma=$(printf '0x%x' "$((image_base + next_rva + 0x1000))")
+linux_vma=$(printf '0x%x' "$((image_base + next_rva + 0x2000))")
+kernel_size=$(stat -Lc %s -- "$kernel")
+initrd_rva=$((((next_rva + 0x2000 + kernel_size + 0xfff) / 0x1000) * 0x1000))
+initrd_vma=$(printf '0x%x' "$((image_base + initrd_rva))")
+
+"$objcopy" \
+    --add-section .osrel="$work/os-release" --change-section-vma .osrel="$osrel_vma" \
+    --add-section .cmdline="$work/cmdline" --change-section-vma .cmdline="$cmdline_vma" \
+    --add-section .linux="$kernel" --change-section-vma .linux="$linux_vma" \
+    --add-section .initrd="$work/initrd.cpio.gz" --change-section-vma .initrd="$initrd_vma" \
+    --set-section-flags .osrel=contents,alloc,load,readonly,data \
+    --set-section-flags .cmdline=contents,alloc,load,readonly,data \
+    --set-section-flags .linux=contents,alloc,load,readonly,data \
+    --set-section-flags .initrd=contents,alloc,load,readonly,data \
+    "$stub" "$work/linux-l1.efi"
+
+install -m 0644 -- "$work/linux-l1.efi" "$output"
+description=$($file_cmd -Lb -- "$output")
+[[ "$description" == *'PE32+ executable (EFI application) x86-64'* ]] || die "generated artifact is not an x86-64 EFI application: $description"
+
+printf 'linux L1 UKI: artifact=%s\n' "$output"
+printf 'linux L1 UKI: file=%s\n' "$description"
+printf 'linux L1 UKI: size=%s bytes\n' "$(stat -Lc %s -- "$output")"

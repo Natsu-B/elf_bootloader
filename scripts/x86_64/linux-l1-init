@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+if grep -qw vmx /proc/cpuinfo; then
+    echo 'thin-hv: linux L1 /proc/cpuinfo vmx=1'
+else
+    echo 'thin-hv: linux L1 /proc/cpuinfo vmx=0'
+fi
+echo 'thin-hv: linux L1 shell'
+exec setsid cttyhack sh
