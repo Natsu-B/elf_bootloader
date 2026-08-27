@@ -2,7 +2,8 @@
 
 This document records only implementation and measurements that exist on
 `feat/x86-thin-monitor` as of 2026-08-28. Linux KVM and Windows boot results below come from
-actual runs; Windows Hyper-V and WSL2 remain untested.
+actual runs. Hyper-V and WSL2 passed as direct-OVMF controls without this monitor; Hyper-V has
+not started through the one-vCPU monitor, and WSL2 has not been attempted through it.
 
 ## Status summary
 
@@ -13,8 +14,10 @@ actual runs; Windows Hyper-V and WSL2 remain untested.
 | Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO` | SMP, a normal distribution userspace, and a faulting or long-mode L2 |
 | Trusted nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, VMLAUNCH, and VMRESUME through a direct hardware VMCS; external-interrupt, EPT-violation, and I/O exits were reflected to KVM | Non-empty MSR lists, CR2/XSAVE switching, optional VMX controls, and SMP |
 | Direct EPT | QEMU-only 8 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and bare-metal use |
-| UEFI variables | ABI-independent profile overlay for the four variable operations, with tests | Runtime-services table integration and OVMF/OS isolation test |
-| Windows | Windows 11 Enterprise Evaluation 25H2 boots directly and reaches the desktop through the one-vCPU monitor | Hyper-V, WSL2, Sandbox, VBS/HVCI, and SMP |
+| UEFI variables | In-place Runtime Services overlay for profile-private boot variables; focused OVMF profile-2 round trip, table CRC, Linux virtual-address transition, and a profile-1 Windows desktop boot measured | Cross-reboot/profile-switch persistence, Linux `efibootmgr`, and Windows BCD mutation/isolation |
+| Windows | Windows 11 Enterprise Evaluation 25H2 boots directly and reaches the desktop through the one-vCPU monitor, including after the variable hooks were installed | Monitor SMP, Sandbox, and VBS/HVCI |
+| Direct Hyper-V/WSL2 controls | Without this monitor, Hyper-V passed with two and one QEMU vCPUs; a matched two-vCPU A/B failed only when QEMU hid VPID/INVVPID; WSL 2.7.11 ran a two-vCPU WSL2 BusyBox guest to `uname` and `/proc/cpuinfo` | These controls do not exercise this L0 or prove its VPID implementation |
+| Monitor Hyper-V/WSL2 | A pre-variable-overlay Hyper-V-enabled Windows run reached VMX capability reads through the one-vCPU monitor | Current post-hook retest, Hyper-V startup/VMXON, a Hyper-V VM, and any monitor-mediated WSL2 run |
 
 Relevant commits include `af35d3b` (x86 HAL/VMX foundation), `d02d384` (four-operation
 variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UKI builder),
@@ -23,7 +26,10 @@ variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UK
 `c8bd855` (runtime-resident monitor, private `HOST_CR3`, and VMXON interception), `39019e8`
 (deterministic KVM L2 probe), `6a1547a` through `6a40b2b` (nested VMCS instructions and
 INVEPT), `8c83a42` (direct nested entry and exit reflection), `f16b53a` (chainload Windows from
-its installed ESP), and `c9c73f3` (reproducible Windows monitor test).
+its installed ESP), `c9c73f3` (reproducible Windows monitor test), `eff5ee9` (direct Hyper-V
+control), `366e4cf` (direct WSL2 control), `879a2cd` (immutable Windows backing during monitor
+tests), `90bd961` (firmware Runtime Services variable overlay), and `041a1aa` (reproducible
+Windows CPU-feature A/B selection).
 
 ## Architecture and late launch
 
@@ -54,16 +60,17 @@ OVMF / physical UEFI
   -> MONITORX64.EFI (EFI runtime driver, VMX root)
        4. allocate one 91-page EfiRuntimeServicesData block below 8 GiB
        5. build identity EPT and an L0-owned identity HOST_CR3
-       6. VMXON, VMCLEAR, VMPTRLD, VMLAUNCH
+       6. VMXON, then install the selected-profile Runtime Services overlay and update its CRC
+       7. VMCLEAR, VMPTRLD, VMLAUNCH
   -> guest_entry (VMX non-root L1)
-       7. firmware StartImage(preloaded payload, Linux UKI, or Windows boot manager)
-       8. small payload: VMCALL after StartImage returns
+       8. firmware StartImage(preloaded payload, Linux UKI, or Windows boot manager)
+       9. small payload: VMCALL after StartImage returns
           Linux UKI: ExitBootServices, load KVM, and continue running
           Windows: boot from its installed ESP and continue to the desktop
-       9. Linux only: kvm_intel programs its VMCS and enters the real-mode L2
+      10. Linux only: kvm_intel programs its VMCS and enters the real-mode L2
   -> L2 (the KVM probe)
-      10. direct L1 EPT and VMCS run in hardware
-      11. L0 reflects requested exits into KVM; userspace observes KVM_EXIT_IO
+      11. direct L1 EPT and VMCS run in hardware
+      12. L0 reflects requested exits into KVM; userspace observes KVM_EXIT_IO
 ```
 
 The runtime data block is 91 pages: one VMXON page, one VMCS page, ten EPT pages, one zeroed MSR
@@ -84,7 +91,7 @@ avoid shadow EPT and nested-page-table validation.
 The added TCB is intended to contain only:
 
 * the x86 loader, VM-entry/exit assembly, VMCS policy, and architecture wrappers;
-* the variable-overlay adapter once it is connected to firmware Runtime Services;
+* the variable-overlay policy and its bounded firmware Runtime Services hooks;
 * the physical UEFI firmware and the selected, explicitly trusted L1 OS/hypervisor.
 
 There is no device model, scheduler, virtual block/network device, filesystem in L0, ACPI AML
@@ -170,7 +177,7 @@ DriverOrder  Driver####
 monitor vendor GUID with the UTF-16 backend name `P<8-HEX-DIGIT-PROFILE>:<logical-name>`. All
 other namespaces and names, including PK/KEK/db/dbx, stay shared.
 
-The ABI-independent adapter implements the four UEFI variable operations from UEFI 2.11:
+The ABI-independent adapter defines the four-operation policy from UEFI 2.11:
 
 | Operation | Profile behavior |
 | --- | --- |
@@ -179,14 +186,53 @@ The ABI-independent adapter implements the four UEFI variable operations from UE
 | `GetNextVariableName` | Rebuild a bounded snapshot, hide raw private/other-profile/internal keys, and expose selected keys under logical names with a terminating NUL |
 | `QueryVariableInfo` | Pass through physical-store capacity for the requested attributes |
 
-Enumeration is bounded by compile-time entry/name capacities and returns out-of-resources when the
-snapshot cannot represent the store. This is the deliberate current ceiling.
+The runtime monitor installs bounded wrappers for `GetVariable`, `SetVariable`, and
+`GetNextVariableName` directly into OVMF's live `EFI_RUNTIME_SERVICES` table. It recomputes the
+table CRC with firmware `CalculateCrc32`; `QueryVariableInfo`, `UpdateCapsule`,
+`QueryCapsuleCapabilities`, Secure Boot variables, and every unrelated service remain the original
+firmware entry points. A virtual-address-change event applies the original firmware
+`ConvertPointer` to the three saved functions that are no longer present in the public table. If
+VM launch returns or fails, installation is rolled back, including the table entries, CRC, event,
+and any Memory Attributes Table edits.
 
-No adapter is installed into an actual `EFI_RUNTIME_SERVICES` table yet. Consequently this branch
-does not yet prove runtime table CRC handling, virtual-address transition, authenticated-variable
-interaction, OVMF persistence, Linux `efibootmgr`, Windows BCD behavior, or Windows/Linux profile
-isolation. `UpdateCapsule` and `QueryCapsuleCapabilities` are also not intercepted by this module;
-the intended policy is pass-through, but that integration does not exist yet.
+The bootstrap selects a stable profile from the chainload source and passes it to the runtime
+driver in a small `repr(C)` handoff: staged `GUESTX64.EFI` (the test payload or Linux UKI) selects
+profile 2, while an installed Windows `bootmgfw.efi` selects profile 1. This is source-based
+selection, not yet a partition-GUID policy or an interactive boot-profile selector.
+
+`GetNextVariableName` streams the firmware enumeration through a fixed 2,048-`CHAR16` scratch
+buffer. It hides physical profile keys, converts only the selected profile back to logical names,
+and returns `EFI_DEVICE_ERROR` if the firmware reports a longer name. UEFI normally forbids
+reentering `GetNextVariableName` or its variable-services reentry group while a call is busy, so
+the scratch buffer uses one blocking spin lock. The UEFI MCE/INIT/NMI reentry exception is not
+supported by this single-vCPU implementation; such reentry would deadlock and requires per-CPU or
+otherwise reentrant scratch before bare-metal use.
+
+The focused OVMF payload deletes both test backend keys, seeds profile 1's raw `BootOrder`, then
+uses the installed profile-2 hook to verify logical `SetVariable`/`GetVariable`, direct profile-2
+backend storage, profile-1 noninterference, filtered enumeration, pass-through
+`QueryVariableInfo`, and the live Runtime Services CRC. It prints:
+
+```text
+thin-hv: uefi variable overlay PASS
+```
+
+This is a real firmware-backend test but deliberately one boot with profile 2; deleting the two
+keys makes it deterministic, so it does not prove cross-reboot persistence or a profile switch.
+The backend uses nonvolatile OVMF variables and therefore has persistent wiring, but a two-boot
+Windows/Linux isolation test remains required. Linux has crossed its runtime virtual-address
+transition and reached the KVM L2 marker with the hooks installed. A later monitor run selected
+profile 1, patched one MAT descriptor, and reached the Windows desktop with the hooks installed.
+That boot proves hook lifetime and chainload compatibility, not Windows boot-variable mutation or
+cross-profile isolation.
+
+`BootNext` is currently only mapped and stored: the physical firmware has already selected and
+started the monitor, so the monitor does not consume a profile's `BootNext` or resolve its
+`Boot####` target on the next reset. `BootCurrent` is mapped like the other names but is not
+synthesized from the selected chainload target, so it is normally absent unless a backend value is
+seeded. Authenticated variable payloads bind the original variable name and GUID; changing both for
+backend storage means name-bound authenticated writes are unsupported. The boot variables under
+this policy are normally unauthenticated, but this remains an explicit ABI ceiling.
 
 ## Nix build and test commands
 
@@ -249,17 +295,24 @@ thin-hv: CPUID VMX=1
 thin-hv: loading runtime monitor
 thin-hv: uefi entry
 thin-hv: runtime monitor active
+thin-hv: variable overlay profile=2 mat_patches=1
 thin-hv: guest uefi payload
 thin-hv: VMEXIT cpu=0 level=1 reason=0xa qualification=0x0 ... instruction_len=2
 thin-hv: guest cpuid vmx=1 hypervisor=0
+thin-hv: uefi variable overlay PASS
 thin-hv: VMEXIT cpu=0 level=1 reason=0xa qualification=0x0 ... instruction_len=2
 thin-hv: VMEXIT cpu=0 level=1 reason=0x12 qualification=0x0 ... instruction_len=3
 thin-hv: vmx guest PASS start_image_status=0x0
 ```
 
-This validates the runtime-driver handoff and CPUID filtering for the small payload: leaf 1
-exposes VMX and clears the hypervisor-present bit, while the Hyper-V-reserved CPUID range is
-zeroed. Linux KVM initialization is measured separately below; Hyper-V remains untested.
+This validates the runtime-driver handoff, real OVMF variable wrappers, Runtime Services CRC, and
+CPUID filtering for the small payload: leaf 1 exposes VMX and clears the hypervisor-present bit,
+while the Hyper-V-reserved CPUID range is zeroed. Linux KVM initialization and the runtime virtual
+address transition are measured separately below. Hyper-V passed only in the direct-OVMF control
+described below, not through this monitor. Run through
+`nix develop`: its pinned OVMF 202505 exercised one Memory Attributes Table edit in this trace,
+while QEMU's separately bundled OVMF happened to publish the measured image allocation without
+RO/XP and therefore logged `mat_patches=0`.
 
 ## Linux UKI and direct OVMF control test
 
@@ -318,6 +371,27 @@ through `core::fmt` followed relocated formatting metadata while L0 intentionall
 its physical identity map. The VM-exit path now writes fixed byte strings and hexadecimal fields
 directly to COM1. Pre-launch firmware diagnostics may still use `core::fmt`; the persistent
 VM-exit path does not.
+
+The first variable-hook run reached Linux's virtual-address transition but faulted when Linux
+called the relocated `SetVariable` wrapper: the monitor instruction page was mapped NX. OVMF's
+`InsertImageRecord` stops adding the image-properties records used to split the MAT after
+`EndOfDxe`, while this monitor is loaded later by BDS. Runtime relocation registration still
+succeeds, but the Memory Attributes Table fallback labels the otherwise valid
+`EfiRuntimeServicesCode` allocation RO+XP. Immediately before VM launch, the monitor now validates
+MAT version, descriptor size/count and checked ranges, requires the complete monitor image to be
+covered by runtime-code descriptors, and clears only RO/XP on descriptors intersecting that late
+image. It leaves all other MAT entries untouched. The trusted-L1 threat model accepts that the
+measured containing allocation is RWX. Rollback restores those fields only if the configuration
+table still points to the same MAT buffer.
+
+With the Nix-shell OVMF 202505, one descriptor was changed (`mat_patches=1`); Linux then completed
+`SetVirtualAddressMap`, loaded `kvm_intel`, and reached `thin-hv: linux L1 L2 KVM PASS` in the same
+run. This workaround is deliberately OVMF-specific: a firmware that splits the loaded image into
+`EfiRuntimeServicesData`, uses a protected or differently structured MAT, or needs more than 16
+intersecting descriptors is rejected. A later runtime-code/data allocation could make OVMF
+regenerate the MAT and lose the edit. No such allocation was observed after installation in the
+measured boot; no extra ExitBootServices hook is added until a real workload demonstrates that
+need.
 
 After `cargo xbuild x86` and `scripts/x86_64/build-linux-uki.sh`, the measured L2 run is reproduced
 with this command from the Nix development shell:
@@ -386,28 +460,107 @@ needed if multiple Windows ESPs matter.
 The monitor test creates fresh `monitor-vars.fd` from the OVMF template so firmware boot entries
 cannot bypass the loader, then runs q35 with `pci-hole64-size=1G` and OVMF
 `X-PciMmio64Mb=1024`. This fresh variable store is a test-harness boot control, not the profile
-variable overlay described above; no Runtime Services hook is installed.
+variable overlay described above. QEMU's temporary disk snapshot keeps `windows.raw` immutable
+because the persistent Hyper-V qcow2 uses it as a backing file. The loader selected profile 1,
+installed the Runtime Services hooks, logged `mat_patches=1`, and reached the desktop marker in
+the same measured run.
 
 The ignored evidence captures are:
 
 * `bin/x86_64/windows/direct-install-pass.log` and
   `bin/x86_64/windows/direct-boot-pass.log`: `thin-hv: windows desktop`;
-* `bin/x86_64/windows/monitor-l0-windows-pass.log`: `thin-hv: runtime monitor active` and reads of
-  VMX capability MSRs `0x482` and `0x48b`;
-* `bin/x86_64/windows/monitor-desktop-pass.log`: `thinhvwindowsdesktop`, emitted to COM2 by the
-  harness's desktop-ready Run-dialog probe;
+* `bin/x86_64/windows/monitor-variable-overlay-pass.log`, SHA-256
+  `667a88f1a6272b166b4316b7c30e3f6c0ee2ff0789cb20c2fbdb1c103b54a690`: monitor startup,
+  `variable overlay profile=1 mat_patches=1`, and Windows VMX capability reads;
+* `bin/x86_64/windows/monitor-variable-overlay-desktop-pass.log`, SHA-256
+  `4709211153cfb7d89cd549a41d0299e02b6ebcbec5fd232c32ef607e7cc69d3b`: the
+  `thinhvwindowsdesktop` COM2 marker from that post-hook run;
 * `bin/x86_64/linux-l2-regression-pass.log`: `thin-hv: linux L1 L2 KVM PASS` after the Windows
   loader changes.
 
-These results prove `host KVM -> this L0 -> Windows desktop` with one vCPU. The observed Windows
-VMX capability reads do not prove that Hyper-V started. Hyper-V features have not been enabled,
-no Hyper-V VM has been started, and WSL2 has not run. Windows Sandbox and VBS/HVCI are also
-untested.
+These results prove `host KVM -> this L0 -> Windows desktop` with one vCPU after hook
+installation. They do not prove that Windows changed an overlaid boot variable or that a second
+profile remained isolated.
+
+### Direct Hyper-V and WSL2 controls
+
+The Hyper-V and WSL modes boot the persistent `windows-hyperv.qcow2`, its own OVMF variables, and
+its own TPM state directly under QEMU/KVM; `BOOTX64.EFI` and this monitor are absent. They are
+control experiments for the Windows image and outer KVM, not evidence that nested VMX works
+through this L0:
+
+```sh
+scripts/x86_64/windows/windows-test.sh hyperv
+scripts/x86_64/windows/windows-test.sh download-wsl
+scripts/x86_64/windows/windows-test.sh wsl
+```
+
+The default two-vCPU Hyper-V run enabled `Microsoft-Hyper-V`, set
+`hypervisorlaunchtype Auto`, rebooted, and reported:
+
+```text
+thin-hv: windows hyperv feature=Enabled present=1 vmms=Running event2=1
+thin-hv: windows hyperv PASS
+```
+
+A separate one-vCPU direct-OVMF A/B run produced the same result. The captures
+`hyperv-direct-pass.log` and `hyperv-direct-1vcpu-pass.log` both have SHA-256
+`cb9000c74c33d930ef842631e6c5a84d2a3d2e51043c86cc788f0654c1400fb6`. This rules out vCPU
+count alone as the explanation for the monitor-mediated failure below.
+
+Commit `041a1aa` exposes the QEMU CPU string as `WINDOWS_CPU`. A matched direct-OVMF test reused
+the same two-vCPU Hyper-V qcow2, OVMF variable store, and TPM state. The default
+`host,+vmx,-hypervisor` baseline emitted the Hyper-V PASS marker in under 60 seconds. Changing
+only the CPU string to `host,+vmx,-hypervisor,-vmx-vpid` booted Windows, emitted
+`thin-hv: windows hyperv enable begin`, rebooted into Windows again, and then timed out at 360
+seconds without the PASS marker. The ignored A/B evidence is:
+
+| Capture | SHA-256 |
+| --- | --- |
+| `bin/x86_64/windows/hyperv-vpid-baseline-desktop.log` | `cb9000c74c33d930ef842631e6c5a84d2a3d2e51043c86cc788f0654c1400fb6` |
+| `bin/x86_64/windows/hyperv-vpid-baseline-serial.log` | `54478a9dc16aa0c77bf969710e367e6f16800063764edba61fd013b344075c29` |
+| `bin/x86_64/windows/hyperv-vpid-baseline-qemu.log` | `f0d0033868787d250289d73ae3e7702354f0e3fbd2f982a164e5505827480a9b` |
+| `bin/x86_64/windows/hyperv-no-vpid-desktop.log` | `cd6e58617791cbc3bb6f4cb2ae6e56c0e8fc889bd80885c1541c4b9bda22d2e6` |
+| `bin/x86_64/windows/hyperv-no-vpid-serial.log` | `e46fe4794e55f443bf3ce1bb12f5b42fc3ea7a4c480cda2cf55e659d423efc6a` |
+| `bin/x86_64/windows/hyperv-no-vpid-qemu.log` | `2f291ce4de39860931f52d05106ca98ede199cec326773f1f4dec32a08b1db53` |
+
+QEMU's `-vmx-vpid` dependency group also removes the associated INVVPID exposure. The measured
+inference is therefore that Hyper-V requires the VPID/INVVPID capability group in this setup; it
+does not yet prove that advertising and forwarding those facilities in this L0 is sufficient or
+correct.
+
+The WSL control verified Microsoft's WSL 2.7.11.0 MSI (SHA-256
+`a611ddacee689d2fb1fb5319e58af7f3998864d86cdce632eadd8e61614a0f9d`), enabled
+`VirtualMachinePlatform`, and imported the deterministic BusyBox rootfs as `ThinHvTest` with WSL
+version 2. The final clean run reported Linux `6.18.33.2-microsoft-standard-WSL2`, processors 0
+and 1, `thin-hv-wsl2-guest-ok`, and `thin-hv: windows wsl2 PASS`. Its ignored artifacts are:
+
+* `bin/x86_64/windows/wsl-desktop-serial.log`, SHA-256
+  `111401172fdaf9f233348a7d220d59396241a900faa41ea9f72c23ef16e3d343`;
+* `bin/x86_64/windows/hyperv-media/thin-hv-wsl-rootfs.tar`, SHA-256
+  `ea99179cda2aed59ae7d5018005a95490f627cd7ade94f9d4c5c0f1abd8cd230`;
+* media stamp `3d0136133c2beda2c71788709efa297c6025aab0b89b1cb319ae10dcc3f0fa52`.
+
+### Monitor-mediated Hyper-V boundary
+
+`scripts/x86_64/windows/windows-test.sh monitor-hyperv` boots the Hyper-V-enabled qcow2 through
+the one-vCPU monitor. The measured attempt reached `thin-hv: runtime monitor active`, Windows set
+virtual CR4.VMXE, and it read the advertised `IA32_VMX_*` capability MSRs. It never issued the
+logged nested `VMXON` with a VMXON-region address and never emitted `thin-hv: windows hyperv
+PASS`; the harness timed out. The boundary captures are
+`monitor-hyperv-capability-boundary.log` (SHA-256
+`f3c20b75c2d4f2c5b5a35357337a81c26b08e44a0ceacc1fef4e78d561a830fa`) and
+`monitor-hyperv-no-pass.log` (SHA-256
+`f917801569044170bbbc3fe64b695455a9bd302102b499bd05c19e86d5dca540`). The exact missing
+capability or state handling has not yet been isolated. These boundary captures predate
+`90bd961`; the post-hook image has not yet repeated `monitor-hyperv`. No Hyper-V VM has run
+through this L0, and monitor-mediated WSL2 has not been attempted.
 
 The repository contains only the conservative standard-VMX policy needed to begin those tests.
 It does not implement or advertise Hyper-V CPUID leaves, SynIC, VP Assist Page, enlightened VMCS,
 or enlightened VM-entry. The design goal remains to expose bare-metal-style VMX (`VMX=1`,
-`hypervisor-present=0`) to trusted Windows; testing Hyper-V itself is still required.
+`hypervisor-present=0`) to trusted Windows. Windows Sandbox and VBS/HVCI remain untested in both
+configurations.
 
 ## Known limitations and bare-metal boundary
 
@@ -422,9 +575,12 @@ or enlightened VM-entry. The design goal remains to expose bare-metal-style VMX 
   uses an L0-owned `HOST_CR3`. L0 still reuses firmware GDT/IDT/TSS state; private descriptor
   tables and fault handlers are required before bare-metal use.
 * `MONITORX64.EFI` is currently the application PE copied with its subsystem changed to EFI
-  runtime driver. It has no runtime virtual-address-change handler or self-relocated resident
-  core. Raw VM-exit logging works across the measured Linux relocation and Windows boot, but this
-  is not a general bare-metal firmware runtime-PE solution.
+  runtime driver. Its virtual-address-change handler converts the three saved firmware variable
+  entry points, but the monitor has no self-relocated resident core. The OVMF-specific MAT
+  workaround requires complete `EfiRuntimeServicesCode` coverage and may be lost if a later
+  runtime allocation regenerates the table. Raw VM-exit logging works across the measured Linux
+  relocation and the post-hook Windows boot, but this is not a general bare-metal firmware
+  runtime-PE solution.
 * The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle and chainloads
   Windows from the first other filesystem containing `bootmgfw.efi`. Multiple Windows installs
   need profile-owned ESP selection instead of firmware enumeration order.
@@ -438,15 +594,23 @@ or enlightened VM-entry. The design goal remains to expose bare-metal-style VMX 
   SIMD-using, SMP, or Hyper-V L2 workload.
 * Linux KVM has run one VM/vCPU to `KVM_EXIT_IO`; an L2 Linux kernel, KVM SMP, and sustained or
   device-heavy workloads have not run.
-* The profile variable adapter has no firmware ABI hook, persistent backend wiring, or real OVMF
-  profile test. Monitor-mode Windows deliberately starts from a fresh OVMF variable template;
-  that prevents boot-entry bypass but does not test profile isolation.
+* Hyper-V and WSL2 pass only in direct-OVMF controls without this L0. The one-vCPU
+  `monitor-hyperv` run stopped after VMX capability reads, before a logged nested VMXON or the
+  Hyper-V PASS marker. Monitor-mediated WSL2 has not run.
+* The profile variable hooks have one real OVMF profile-2 round-trip/enumeration/CRC test and use
+  the firmware's nonvolatile backend. That focused payload deletes both test keys, so it does not
+  prove cross-reboot persistence or switching between profiles. A profile-1 Windows desktop boot
+  proves hook lifetime but not variable isolation; Linux `efibootmgr` and Windows BCD mutation
+  remain untested. `BootNext` is not consumed on reset, `BootCurrent` is not synthesized, and
+  name-bound authenticated writes are unsupported.
 * No physical PCI/NVMe/GPU/USB/NIC handoff has been tested. There is no IOMMU setup.
 * Serial diagnostics have no compile-time release trace switch and are not yet removed from the
   VM-exit hot path in release builds.
 * Development under host KVM creates another nesting level. The tiny
   `host KVM -> this L0 -> Linux KVM -> L2` chain passed, but failures from features beyond this
-  probe must still be separated between the monitor and outer KVM's nested-nested support.
+  probe must still be separated between the monitor and outer KVM's nested-nested support. The
+  direct Hyper-V/WSL2 controls use one fewer monitor layer and therefore do not settle that
+  boundary.
 * The bootstrap, runtime monitor, and guests are unsigned. Secure Boot was disabled for the QEMU
   measurements; signing and verification policy must be added before a Secure Boot test.
 * `cargo xbuild x86` produces bare-metal-stagable bootstrap and runtime EFI images under ignored
