@@ -10,5 +10,15 @@ if grep -qw vmx /proc/cpuinfo; then
 else
     echo 'thin-hv: linux L1 /proc/cpuinfo vmx=0'
 fi
+if modprobe kvm_intel && [ -d /sys/module/kvm_intel ]; then
+    echo 'thin-hv: linux L1 kvm_intel=1'
+else
+    echo 'thin-hv: linux L1 kvm_intel=0'
+fi
+if [ -c /dev/kvm ]; then
+    echo 'thin-hv: linux L1 /dev/kvm=1'
+else
+    echo 'thin-hv: linux L1 /dev/kvm=0'
+fi
 echo 'thin-hv: linux L1 shell'
 exec setsid cttyhack sh

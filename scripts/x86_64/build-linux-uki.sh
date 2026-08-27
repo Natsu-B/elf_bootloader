@@ -47,6 +47,8 @@ objcopy=$(first_command "${OBJCOPY:-}" objcopy llvm-objcopy) || die 'objcopy not
 objdump=$(first_command "${OBJDUMP:-}" objdump llvm-objdump) || die 'objdump not found; set OBJDUMP'
 cpio=$(first_command "${CPIO:-}" cpio) || die 'cpio not found; set CPIO'
 gzip=$(first_command "${GZIP:-}" gzip) || die 'gzip not found; set GZIP'
+modprobe=$(first_command "${MODPROBE:-}" modprobe) || die 'modprobe not found; set MODPROBE'
+depmod=$(first_command "${DEPMOD:-}" depmod) || die 'depmod not found; set DEPMOD'
 
 valid_busybox() {
     local candidate=$1 applet applets description
@@ -54,7 +56,7 @@ valid_busybox() {
     description=$($file_cmd -Lb -- "$candidate")
     [[ "$description" == *x86-64* && "$description" == *'statically linked'* ]] || return 1
     applets=$($candidate --list 2>/dev/null) || return 1
-    for applet in sh mount grep setsid cttyhack; do
+    for applet in sh mount grep modprobe setsid cttyhack; do
         grep -Fxq -- "$applet" <<<"$applets" || return 1
     done
 }
@@ -91,10 +93,14 @@ stub=$(first_file "$stub_override" /run/current-system/sw/lib/systemd/boot/efi/l
 busybox=$(find_busybox) || die 'full static x86-64 BusyBox not found; pass arg 3 or set BUSYBOX_STATIC'
 init_source=$(first_file "${LINUX_L1_INIT:-}" "$repo_root/scripts/x86_64/linux-l1-init") \
     || die 'init source not found; set LINUX_L1_INIT'
+kernel_release=${LINUX_KERNEL_RELEASE:-$(uname -r)}
+modules_prefix=${LINUX_MODULES_PREFIX:-/run/current-system/kernel-modules}
+modules_root=$modules_prefix/lib/modules/$kernel_release
 
 [[ "$($file_cmd -Lb -- "$kernel")" == *'Linux kernel x86 boot executable'* ]] || die "not an x86 bzImage: $kernel"
 [[ "$($file_cmd -Lb -- "$stub")" == *'PE32+ executable (EFI application) x86-64'* ]] || die "not an x86-64 EFI stub: $stub"
 [[ -n "$cmdline" && "$cmdline" != *$'\n'* ]] || die 'LINUX_L1_CMDLINE must be one non-empty line'
+[[ -r "$modules_root/modules.dep" ]] || die "kernel modules not found: $modules_root"
 for input in "$kernel" "$stub" "$busybox" "$init_source"; do
     [[ ! -e "$output" || ! "$output" -ef "$input" ]] || die "output would overwrite input: $input"
 done
@@ -104,10 +110,20 @@ trap 'rm -rf -- "$work"' EXIT
 root=$work/root
 mkdir -p -- "$root/bin" "$root/dev" "$root/proc" "$root/sys" "$(dirname -- "$output")"
 install -m 0755 -- "$busybox" "$root/bin/busybox"
-for applet in sh mount grep setsid cttyhack; do
+for applet in sh mount grep modprobe setsid cttyhack; do
     ln -s busybox "$root/bin/$applet"
 done
 install -m 0755 -- "$init_source" "$root/init"
+
+while read -r action module_path _; do
+    [[ "$action" == insmod ]] || continue
+    [[ "$module_path" == "$modules_root/"* ]] || die "module outside $modules_root: $module_path"
+    install -Dm 0644 -- "$module_path" "$root/lib/modules/$kernel_release/${module_path#"$modules_root/"}"
+done < <("$modprobe" -d "$modules_prefix" -S "$kernel_release" --show-depends kvm_intel)
+find "$root/lib/modules/$kernel_release" -name 'kvm-intel.ko*' -print -quit | grep -q . \
+    || die "kvm-intel module not found for $kernel_release"
+install -m 0644 -- "$modules_root"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kernel_release/"
+"$depmod" -b "$root" "$kernel_release"
 find "$root" -exec touch -h -d '@0' -- {} +
 
 (

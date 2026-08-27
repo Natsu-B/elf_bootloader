@@ -41,6 +41,7 @@
             pkgs.dtc
             pkgs.file
             pkgs.gzip
+            pkgs.kmod
             pkgs.cargo-binutils
             pkgs.gdb
           ];
