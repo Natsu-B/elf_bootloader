@@ -9,6 +9,10 @@ use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+use mutex::SpinLock;
+use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
+use nested_vmx::VMXERR_VMCLEAR_VMXON_POINTER;
+use nested_vmx::VcpuState;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
@@ -56,6 +60,8 @@ const EXIT_REASON_RDMSR: u64 = 31;
 const EXIT_REASON_CR_ACCESS: u64 = 28;
 /// VMXON basic exit reason.
 const EXIT_REASON_VMXON: u64 = 27;
+/// VMCLEAR basic exit reason.
+const EXIT_REASON_VMCLEAR: u64 = 19;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
 /// VM-entry interruption information for #UD without an error code.
@@ -136,9 +142,9 @@ static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
 /// XCR0 restored when the bounded smoke leaves VMX operation.
 static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
 static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// L1's VMXON page for the current single-vCPU smoke run.
-// ponytail: replace this atomic with per-pCPU `VcpuState` before SMP.
-static L1_VMXON_REGION: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Nested VMX state for the current single-vCPU smoke run.
+// ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
+static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 4 == MONITOR_PAGES as u64);
 
@@ -752,7 +758,7 @@ fn configure_and_launch(
     GUEST_RAN.store(0, Ordering::Release);
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
     CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
-    L1_VMXON_REGION.store(u64::MAX, Ordering::Relaxed);
+    *L1_VCPU_STATE.lock() = VcpuState::new();
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
         "VMLAUNCH",
@@ -1234,6 +1240,11 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         return;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCLEAR {
+        handle_l1_vmclear(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
@@ -1289,7 +1300,7 @@ fn handle_l1_vmxon(
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    if L1_VMXON_REGION.load(Ordering::Relaxed) != u64::MAX {
+    if L1_VCPU_STATE.lock().in_vmx_operation() {
         complete_vmx_instruction(
             VmInstructionResult::VmfailInvalid,
             reason,
@@ -1306,6 +1317,174 @@ fn handle_l1_vmxon(
         return;
     }
 
+    let region_address = read_l1_vmx_pointer(
+        b"VMXON",
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+    log_l1_vmxon(b"region", region_address);
+
+    let result = validate_l1_vmxon_region(region_address).map_or(
+        VmInstructionResult::VmfailInvalid,
+        |region| {
+            L1_VCPU_STATE.lock().record_vmxon_success(region);
+            VmInstructionResult::Vmsucceed
+        },
+    );
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Executes L1's VMCLEAR directly while retaining VMCS01 as current.
+fn handle_l1_vmclear(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    let address = read_l1_vmx_pointer(
+        b"VMCLEAR",
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+    log_l1_vmx(b"VMCLEAR", b"region", address);
+    let Some(region) = validate_l1_vmcs_address(address) else {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_VMCLEAR_INVALID_ADDRESS),
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    };
+    if state
+        .vmxon_region()
+        .is_some_and(|vmxon| vmxon.get() == region.get())
+    {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_VMCLEAR_VMXON_POINTER),
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    }
+
+    let mut carrier = u64::MAX;
+    if unsafe { vmx::vmptrst(&mut carrier) } != VmxStatus::Success || carrier == region.get() {
+        // ponytail: the trusted L1 allocator and reserved runtime block are
+        // disjoint; stop on a carrier collision instead of virtualizing it.
+        stop_unexpected_exit(
+            b"VMCLEAR targets VMCS01",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let status = unsafe { vmx::vmclear(region) };
+    let result = match status {
+        VmxStatus::Success => {
+            L1_VCPU_STATE.lock().record_vmclear_success(region);
+            VmInstructionResult::Vmsucceed
+        }
+        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
+        VmxStatus::FailValid => {
+            let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+                .ok()
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                stop_unexpected_exit(
+                    b"reading VMCLEAR error failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            l1_vmx_failure(&state, error)
+        }
+    };
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Converts a VMfail error according to whether L1 has a current VMCS.
+fn l1_vmx_failure(state: &VcpuState, error: u32) -> VmInstructionResult {
+    if state.current_vmcs().is_some() {
+        // ponytail: write this error into L1's direct VMCS when VMPTRLD makes
+        // one current; today's observed VMCLEAR sequence has no current VMCS.
+        VmInstructionResult::VmfailValid(error)
+    } else {
+        VmInstructionResult::VmfailInvalid
+    }
+}
+
+/// Logs one cold-path VMXON decode value.
+fn log_l1_vmxon(name: &[u8], value: u64) {
+    log_l1_vmx(b"VMXON", name, value);
+}
+
+/// Logs one cold-path nested-VMX decode value without runtime formatting.
+fn log_l1_vmx(instruction: &[u8], name: &[u8], value: u64) {
+    let mut serial = SerialPort;
+    serial.init();
+    serial.write_bytes(b"thin-hv: L1 ");
+    serial.write_bytes(instruction);
+    serial.write_byte(b' ');
+    serial.write_bytes(name);
+    serial.write_byte(b'=');
+    serial.write_hex(value);
+    serial.write_byte(b'\r');
+    serial.write_byte(b'\n');
+}
+
+/// Decodes and reads one nested-VMX m64 pointer operand.
+fn read_l1_vmx_pointer(
+    instruction: &[u8],
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) -> u64 {
     let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
         .ok()
         .and_then(|value| u32::try_from(value).ok());
@@ -1322,7 +1501,7 @@ fn handle_l1_vmxon(
     });
     let Some(linear) = linear else {
         stop_unexpected_exit(
-            b"decoding VMXON operand failed",
+            b"decoding VMX pointer failed",
             reason,
             qualification,
             guest_rip,
@@ -1330,12 +1509,12 @@ fn handle_l1_vmxon(
             registers,
         );
     };
-    log_l1_vmxon(b"operand_linear", linear);
-    let Some(region_address) = read_l1_linear_u64(linear) else {
+    log_l1_vmx(instruction, b"operand_linear", linear);
+    let Some(pointer) = read_l1_linear_u64(linear) else {
         // ponytail: trusted long-mode L1 uses a valid operand. Add precise
         // #PF/#GP/#SS synthesis before accepting untrusted or 32-bit L1s.
         stop_unexpected_exit(
-            b"reading VMXON operand failed",
+            b"reading VMX pointer failed",
             reason,
             qualification,
             guest_rip,
@@ -1343,35 +1522,7 @@ fn handle_l1_vmxon(
             registers,
         );
     };
-    log_l1_vmxon(b"region", region_address);
-
-    let result = validate_l1_vmxon_region(region_address).map_or(
-        VmInstructionResult::VmfailInvalid,
-        |region| {
-            L1_VMXON_REGION.store(region.get(), Ordering::Relaxed);
-            VmInstructionResult::Vmsucceed
-        },
-    );
-    complete_vmx_instruction(
-        result,
-        reason,
-        qualification,
-        guest_rip,
-        instruction_len,
-        registers,
-    );
-}
-
-/// Logs one cold-path VMXON decode value.
-fn log_l1_vmxon(name: &[u8], value: u64) {
-    let mut serial = SerialPort;
-    serial.init();
-    serial.write_bytes(b"thin-hv: L1 VMXON ");
-    serial.write_bytes(name);
-    serial.write_byte(b'=');
-    serial.write_hex(value);
-    serial.write_byte(b'\r');
-    serial.write_byte(b'\n');
+    pointer
 }
 
 /// Checks the fixed-bit contract used by VMXON.
@@ -1384,6 +1535,16 @@ fn vmx_control_registers_valid(cr0: u64, cr4: u64) -> bool {
         && cr0 & !cr0_fixed1 == 0
         && cr4 & cr4_fixed0 == cr4_fixed0
         && cr4 & !cr4_fixed1 == 0
+}
+
+/// Validates one direct VMCS physical operand without inspecting its header.
+fn validate_l1_vmcs_address(address: u64) -> Option<VmcsPhys> {
+    let bits = max_physical_address_bits()?;
+    let end = address.checked_add(PAGE_SIZE)?;
+    if end > 1_u64 << bits || end > IDENTITY_MAP_LIMIT {
+        return None;
+    }
+    VmcsPhys::new(address)
 }
 
 /// Reads an m64 operand through L1's current long-mode page tables.

@@ -28,6 +28,10 @@ const RFLAGS_OF: u64 = 1 << 11;
 const VMX_STATUS_RFLAGS: u64 =
     RFLAGS_CF | RFLAGS_PF | RFLAGS_AF | RFLAGS_ZF | RFLAGS_SF | RFLAGS_OF;
 
+/// `VM_INSTRUCTION_ERROR` for VMCLEAR with an invalid physical address.
+pub const VMXERR_VMCLEAR_INVALID_ADDRESS: u32 = 2;
+/// `VM_INSTRUCTION_ERROR` for VMCLEAR targeting the active VMXON region.
+pub const VMXERR_VMCLEAR_VMXON_POINTER: u32 = 3;
 /// `VM_INSTRUCTION_ERROR` for VMLAUNCH with a launched current VMCS.
 pub const VMXERR_VMLAUNCH_NONCLEAR_VMCS: u32 = 4;
 /// `VM_INSTRUCTION_ERROR` for VMRESUME with a clear current VMCS.
