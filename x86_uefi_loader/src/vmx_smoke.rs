@@ -71,6 +71,8 @@ const EXIT_REASON_VMPTRLD: u64 = 21;
 const EXIT_REASON_VMREAD: u64 = 23;
 /// VMWRITE basic exit reason.
 const EXIT_REASON_VMWRITE: u64 = 25;
+/// INVEPT basic exit reason.
+const EXIT_REASON_INVEPT: u64 = 50;
 /// VM-entry interruption information for #GP with an error code.
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
 /// VM-entry interruption information for #UD without an error code.
@@ -1273,6 +1275,11 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) {
         return;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_INVEPT {
+        handle_l1_invept(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
@@ -1780,6 +1787,105 @@ fn handle_l1_vmcs_access(
             );
         }
     }
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Applies one trusted L1 EPT invalidation directly to hardware.
+fn handle_l1_invept(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+        .ok()
+        .and_then(|value| u32::try_from(value).ok());
+    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+    let operands = instruction_info.and_then(|information| {
+        let kind = guest_gpr(registers, ((information >> 28) & 0xf) as u8)?;
+        let linear = vmx::memory_operand_address_64(
+            information,
+            qualification,
+            |register| guest_gpr(registers, register),
+            fs_base,
+            gs_base,
+        )?;
+        Some((kind, linear))
+    });
+    let Some((kind, linear)) = operands else {
+        stop_unexpected_exit(
+            b"decoding INVEPT operands failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let descriptor = read_l1_linear_u64(linear).and_then(|ept_pointer| {
+        read_l1_linear_u64(linear.checked_add(8)?).map(|reserved| vmx::InveptDescriptor {
+            ept_pointer,
+            reserved,
+        })
+    });
+    let Some(descriptor) = descriptor else {
+        // ponytail: trusted long-mode L1 supplies a valid m128 operand. Add
+        // precise #PF/#GP/#SS synthesis before accepting untrusted L1 input.
+        stop_unexpected_exit(
+            b"reading INVEPT descriptor failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    log_l1_vmx(b"INVEPT", b"kind", kind);
+
+    let status = unsafe { vmx::invept(kind, &descriptor) };
+    let result = match status {
+        VmxStatus::Success => VmInstructionResult::Vmsucceed,
+        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
+        VmxStatus::FailValid => {
+            let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+                .ok()
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                stop_unexpected_exit(
+                    b"reading INVEPT error failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            // ponytail: type-2 with a zero descriptor is the measured path;
+            // switch to L1's VMCS before supporting observable failure errors.
+            l1_vmx_failure(&state, error)
+        }
+    };
     complete_vmx_instruction(
         result,
         reason,
