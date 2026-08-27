@@ -9,17 +9,19 @@ Windows Hyper-V, or WSL2 success from the smaller UEFI VMX smoke test.
 | Area | Current evidence | Not yet demonstrated |
 | --- | --- | --- |
 | x86-64 UEFI entry | Builds as `x86_64-unknown-uefi`; boots under QEMU/KVM + OVMF | Physical-machine boot |
-| First VMX launch | One vCPU reaches VMX non-root; the small payload returns by VMCALL and the Linux path crosses `ExitBootServices` | L0 interrupt reflection, SMP, and reclaim-safe long-lived L0 ownership |
-| Linux UKI | Reproducible UKI build; both direct OVMF and this L0 reach the initramfs serial shell with `vmx=1` | `kvm_intel`, QEMU/KVM L2, SMP, or a normal distribution userspace |
-| Trusted nested VMX | Heap-free state/capability/direct-VMCS patch policy and tests | VMX-instruction interception, VM-exit reflection, Linux KVM or Hyper-V execution |
+| First VMX launch | One vCPU reaches VMX non-root from a runtime EFI driver; the small payload returns by VMCALL and Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, interrupt reflection, SMP, and bare-metal lifetime validation |
+| Linux UKI | Reproducible UKI build; this L0 reaches the initramfs shell with `vmx=1`, `kvm_intel=1`, and `/dev/kvm=1` | QEMU/KVM L2, SMP, or a normal distribution userspace |
+| Trusted nested VMX | Conservative capability masking plus live CR4.VMXE and VMXON interception are sufficient for `kvm_intel nested=0` initialization | VMCLEAR/VMPTRLD/VMREAD/VMWRITE/VMLAUNCH and the remaining nested-exit path; an L2 guest |
 | Direct EPT | QEMU-only 4 GiB identity EPT; direct-L1-EPT policy is encoded | Platform-derived RAM/MMIO memory typing and a live L1 EPT |
 | UEFI variables | ABI-independent profile overlay for the four variable operations, with tests | Runtime-services table integration and OVMF/OS isolation test |
 | Windows | None | Windows boot, Hyper-V, WSL2, Sandbox, VBS/HVCI |
 
 Relevant commits include `af35d3b` (x86 HAL/VMX foundation), `d02d384` (four-operation
 variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UKI builder),
-`e38b217` (Nix UKI tools), `1f9b344` (CPUID dispatch and VMRESUME), `4549597` (Linux L1 shell),
-and `28294ff` (parameterized smoke runner).
+`1f9b344` (CPUID dispatch and VMRESUME), `4549597` (Linux L1 shell), `ced873a` (long-mode
+walk and VMX operand decode), `8d4cfc2` (conservative nested capability mask), `c8bd855`
+(runtime-resident monitor, private `HOST_CR3`, and VMXON interception), and `d04f31b`
+(`kvm_intel nested=0` initialization probe).
 
 ## Architecture and late launch
 
@@ -36,32 +38,33 @@ crates:
 * `uefi_variable_overlay`: safe, heap-free profile-selection policy independent of VMX and the
   firmware ABI.
 
-The current smoke uses a late launch while UEFI Boot Services are still live:
+The current smoke uses an application copy only as a bootstrap. `cargo xbuild x86` also copies
+the same PE image and changes its subsystem to EFI runtime driver with
+`objcopy --subsystem=efi-rtd`. OVMF loads that second image as `EfiRuntimeServicesCode`, so Linux
+preserves its pages across `ExitBootServices`:
 
 ```text
 OVMF / physical UEFI
-  -> x86_uefi_loader (VMX root)
-       1. LoadImage(GUESTX64.EFI) while still in root mode
-       2. reserve the VMX/EPT/MSR-bitmap/stack pages as EFI_RESERVED_MEMORY_TYPE
-       3. VMXON, VMCLEAR, VMPTRLD, VMLAUNCH
-  -> guest_entry (VMX non-root)
-       4. firmware StartImage(preloaded image)
-       5. VMCALL after StartImage returns
-  -> L0 VM-exit target and serial result
+  -> BOOTX64.EFI (ordinary EFI application)
+       1. LoadImage(GUESTX64.EFI)
+       2. LoadImage(MONITORX64.EFI), pass the guest handle in LoadOptions
+       3. StartImage(runtime monitor)
+  -> MONITORX64.EFI (EFI runtime driver, VMX root)
+       4. allocate one 83-page EfiRuntimeServicesData block below 4 GiB
+       5. build identity EPT and an L0-owned identity HOST_CR3
+       6. VMXON, VMCLEAR, VMPTRLD, VMLAUNCH
+  -> guest_entry (VMX non-root L1)
+       7. firmware StartImage(preloaded guest)
+       8. small payload: VMCALL after StartImage returns
+          Linux UKI: ExitBootServices and continue running
 ```
 
-The current QEMU smoke reserves 77 pages: one VMXON page, one VMCS page, six EPT paging pages, one
-zeroed MSR-bitmap page, four host-stack pages, and 64 guest-stack pages (256 KiB). This proves the
-basic transition and lets firmware load and relocate a variable-sized EFI image before launch,
-subject to available firmware memory and the EPT ceiling below. It is not yet a persistent
-Type-1 monitor: the loader's executable pages are still ordinary UEFI application memory. Linux
-does call `ExitBootServices`, but the reserved lifetime of all live L0 executable/data pages has
-not yet been established for bare metal.
-
-The intended late-launch continuation is to leave firmware and the selected OS in L1 while L0
-retains only VM-exit, VMX, variable-overlay, and reserved-memory state. Moving all live L0 code,
-data, stacks, descriptors, and page tables to non-reclaimable memory is required before that
-continuation is safe.
+The runtime data block is 83 pages: one VMXON page, one VMCS page, six EPT pages, one zeroed MSR
+bitmap, four host-stack pages, 64 guest-stack pages (256 KiB), and six L0 page-table pages (PML4,
+PDPT, and four page directories). Linux reports the runtime image and data as `device reserved`.
+The VMCS uses the private identity table as `HOST_CR3`, rather than firmware's Boot Services page
+tables. This is enough for the measured one-vCPU QEMU/Linux path, but the monitor still reuses
+firmware GDT/IDT/TSS state and is not ready for a bare-metal fault or interrupt.
 
 ## Threat model and TCB boundary
 
@@ -119,6 +122,15 @@ the state and policy pieces:
 * a 30-field direct-VMCS patch manifest: 26 host-state fields plus both address/count pairs for
   the VM-exit MSR store and load lists.
 
+The running one-vCPU monitor now applies the conservative `IA32_VMX_*` masks, keeps hardware
+CR4.VMXE set while exposing L1's requested value through the VMCS read shadow, and handles VMXON.
+The VMXON path checks virtual CR4.VMXE, CPL, VMX fixed bits, operand encoding, L1 long-mode page
+translation, physical width/alignment, and the hardware revision ID. It records the accepted
+region and returns architectural VMsucceed/VMfail flags without issuing a second hardware VMXON.
+This is the exact path exercised by the measured `kvm_intel nested=0` load. The current
+single-vCPU state is deliberately one atomic VMXON-region value; it must become per-pCPU state
+before SMP.
+
 Before an L2 entry, L0 must save L1's VMCS host state and replace it with L0's CRs, segment bases,
 descriptor-table bases, SYSENTER state, PAT/EFER, RSP/RIP, and applicable CET state. Hardware then
 lands at L0 on an L2 exit. For an exit requested by L1, L0 applies the saved L1 host state as the
@@ -135,10 +147,11 @@ MSRs and would expose stores caused by L0-only exits. The encoded model therefor
 | `VM_EXIT_MSR_STORE_ADDR/COUNT` | Save L1 metadata; point at an L0-owned mirror | Copy captured values to L1's original store list | Discard mirror values |
 | `VM_EXIT_MSR_LOAD_ADDR/COUNT` | Save L1 metadata; point at an L0 list that restores L0-safe MSRs | Apply L1-requested host MSRs before returning to L1 | Keep/restore L0 state and resume L2 |
 
-The policy caps each mirrored list at 512 entries. The mirror buffers, list copying, guest-memory
-adapter, VMX-instruction decoder, hardware VMCS patch/restore loop, and nested-exit synthesizer are
-not implemented in the running monitor yet. VMCS shadowing, VPID, APICv, posted interrupts,
-VMFUNC, PML, TSC scaling, and eVMCS are deliberately not advertised by the policy.
+The policy caps each mirrored list at 512 entries. The mirror buffers, list copying, complete
+guest-memory fault synthesis, VMCLEAR/VMPTRLD/VMREAD/VMWRITE/VMLAUNCH handlers, hardware VMCS
+patch/restore loop, and nested-exit synthesizer are not implemented in the running monitor yet.
+VMCS shadowing, VPID, APICv, posted interrupts, VMFUNC, PML, TSC scaling, and eVMCS are
+deliberately not advertised by the policy.
 
 ## UEFI variable profile model
 
@@ -184,7 +197,8 @@ The shell supplies nightly Rust with the AArch64 and x86 UEFI targets, QEMU, OVM
 `cpio`, `file`, `gzip`, a static BusyBox, and the systemd x86 EFI stub. It exports `OVMF_CODE`,
 `OVMF_VARS`, `BUSYBOX_STATIC`, and `LINUX_EFI_STUB`.
 
-Build the two x86 EFI applications and stage them under ignored `bin/x86_64/`:
+Build the bootstrap application, its runtime-driver copy, and the test payload under ignored
+`bin/x86_64/`:
 
 ```sh
 cargo xbuild x86
@@ -212,7 +226,8 @@ required.
 ## QEMU/KVM + OVMF UEFI smoke
 
 `scripts/x86_64/run-uefi-smoke.sh` creates a fresh copy of the OVMF variable template, stages the
-loader as `EFI/BOOT/BOOTX64.EFI`, stages the payload as `EFI/BOOT/GUESTX64.EFI`, and runs one vCPU:
+loader as `EFI/BOOT/BOOTX64.EFI`, the runtime copy as `EFI/BOOT/MONITORX64.EFI`, and the payload
+as `EFI/BOOT/GUESTX64.EFI`, then runs one vCPU:
 
 ```text
 -machine q35,accel=kvm
@@ -227,6 +242,9 @@ twice:
 ```text
 thin-hv: uefi entry
 thin-hv: CPUID VMX=1
+thin-hv: loading runtime monitor
+thin-hv: uefi entry
+thin-hv: runtime monitor active
 thin-hv: guest uefi payload
 thin-hv: VMEXIT cpu=0 level=1 reason=0xa qualification=0x0 ... instruction_len=2
 thin-hv: guest cpuid vmx=1 hypervisor=0
@@ -235,9 +253,9 @@ thin-hv: VMEXIT cpu=0 level=1 reason=0x12 qualification=0x0 ... instruction_len=
 thin-hv: vmx guest PASS start_image_status=0x0
 ```
 
-This validates CPUID filtering only for the small payload: leaf 1 exposes VMX and clears the
-hypervisor-present bit, while the Hyper-V-reserved CPUID range is zeroed. It is not evidence that
-KVM or Hyper-V can initialize.
+This validates the runtime-driver handoff and CPUID filtering for the small payload: leaf 1
+exposes VMX and clears the hypervisor-present bit, while the Hyper-V-reserved CPUID range is
+zeroed. Linux KVM initialization is measured separately below; Hyper-V remains untested.
 
 ## Linux UKI and direct OVMF control test
 
@@ -248,13 +266,8 @@ Build the test UKI from the running NixOS kernel, static BusyBox initramfs, syst
 scripts/x86_64/build-linux-uki.sh
 ```
 
-The artifact regenerated inside the Nix development shell was:
-
-```text
-linux L1 UKI: artifact=.../bin/x86_64/linux-l1.efi
-linux L1 UKI: file=PE32+ executable (EFI application) x86-64 (stripped to external PDB), for MS Windows, 10 sections
-linux L1 UKI: size=14982656 bytes
-```
+The builder writes `bin/x86_64/linux-l1.efi`, verifies that it is an x86-64 EFI application, and
+prints its exact size for the current kernel and module closure.
 
 The direct-OVMF control can be reproduced without the monitor as follows. Exit status 124 is
 expected when `timeout` stops the interactive shell.
@@ -286,90 +299,61 @@ thin-hv: linux L1 shell
 
 This separates UKI construction and the Linux image itself from failures in this monitor.
 
-## Monitor-to-Linux debug progression and result
+## Monitor persistence fixes and Linux KVM initialization
 
-The Linux UKI was then used as `GUESTX64.EFI` with 768 MiB and a 12-second timeout. The captured
-pre-handler failure was:
+Loading `kvm_intel` forced the first late VM exit after Linux had reclaimed Boot Services memory
+and exposed two L0 lifetime bugs. First, an ordinary EFI application's code pages were reclaimed,
+so its saved `HOST_RIP` no longer contained monitor code. Loading the monitor a second time as an
+EFI runtime driver keeps its PE sections reserved. Second, the VMCS still used firmware's
+`HOST_CR3`; Linux reclaimed the page-table pages behind it. The six additional pages in the
+83-page runtime allocation now provide an L0-owned four-level identity map and are installed as
+`HOST_CR3` before launch.
 
-```text
-thin-hv: guest cr0=0x80010033 cr3=0x2fc01000 cr4=0x2668 efer=0xd00 rip=0x2e118450 rsp=0x2fb38ff8
-thin-hv: VMEXIT cpu=0 level=1 reason=0xa qualification=0x0 guest_rip=0x2ee3ee95 instruction_len=2
-thin-hv: vmx guest FAIL marker=0x7468696e68764d58 start_image_status=0xffffffffffffffff vmxoff=Success
-```
+Linux also performs the EFI runtime virtual-address transition. Post-transition VM-exit logging
+through `core::fmt` followed relocated formatting metadata while L0 intentionally continued under
+its physical identity map. The VM-exit path now writes fixed byte strings and hexadecimal fields
+directly to COM1. Pre-launch firmware diagnostics may still use `core::fmt`; the persistent
+VM-exit path does not.
 
-Intel defines basic exit reason `10` (`0xA`) as CPUID. The all-ones `start_image_status` shows that
-the exit occurred inside firmware/UKI execution before `StartImage` returned. This is not an EPT
-violation and not a UKI-build failure.
-
-A CPUID save/dispatch/resume path is implemented. The historical failure was captured with the UKI
-as the second argument; marker checks are disabled because the Linux image never reached them:
-
-```sh
-X86_UEFI_MEMORY=768M \
-X86_UEFI_TIMEOUT_SECONDS=12 \
-X86_RETURN_MARKER= \
-X86_GUEST_MARKER= \
-scripts/x86_64/run-uefi-smoke.sh \
-  bin/x86_64/x86-uefi-loader.efi \
-  bin/x86_64/linux-l1.efi
-```
-
-Linux was then rerun with CPUID dispatch and a zeroed MSR bitmap. Six CPUID exits resumed before
-the first address-space blocker:
-
-```text
-thin-hv: guest cr0=0x80010033 cr3=0x2fc01000 cr4=0x2668 efer=0xd00 rip=0x2e113520 rsp=0x2fb38ff8
-thin-hv: vmx guest FAIL: unhandled VM exit reason=0x30 qualification=0x182 guest_rip=0x2ee3e624 instruction_len=3 vm_instruction_error=0x0 cpuid_exits=6 rax=0xfee00000 rbx=0xfee000b0 rcx=0x1b rdx=0xfee00900
-thin-hv: VMXOFF status=Success
-```
-
-Basic exit reason `0x30` is an EPT violation. The access reached the local-APIC physical range at
-`0xFEE00000`, which was outside the smoke EPT's `[0, 1 GiB)` map. This separated the address-space
-ceiling from the CPUID handler.
-
-The next run used the QEMU-specific 4 GiB identity map, with low test RAM as write-back and the
-upper 3 GiB as uncacheable. It passed 188 CPUID exits and reached a high Linux kernel RIP before
-stopping:
-
-```text
-thin-hv: guest cr0=0x80010033 cr3=0x2fc01000 cr4=0x2668 efer=0xd00 rip=0x2e111830 rsp=0x2fb38ff8
-thin-hv: vmx guest FAIL: unhandled VM exit reason=0x2 qualification=0x0 guest_rip=0xffffffff820b1a60 instruction_len=3 vm_instruction_error=0x0 cpuid_exits=188 rax=0x21690000 rbx=0x800 rcx=0x70 rdx=0x1060
-thin-hv: VMXOFF status=Success
-```
-
-Intel defines basic exit reason `2` as triple fault. That run emitted no Linux initramfs serial
-marker, but proved that CPUID handling and the APIC address-space extension moved execution into
-the kernel.
-
-The remaining QEMU/Linux bring-up used a 256 KiB guest stack and made the directly executed
-controls agree with the passthrough CPUID view: RDTSCP, INVPCID, XSAVES/XRSTORS, and
-UMWAIT/TPAUSE are enabled when required. CR4.VMXE is present in the hardware guest state but
-hidden through the VMCS mask/read shadow so Linux initially sees its pre-launch CR4; actual nested
-VMX transitions are not implemented. Unconditional XSETBV exits are applied directly for this
-trusted L1 and the RIP is advanced. The zero MSR bitmap lets covered MSRs execute directly; a
-bitmap-outside RDMSR used by Linux's feature probing receives an injected `#GP(0)`.
-
-With those bounded handlers, the same monitor command reached the shell:
+The measured default-path test can be reproduced exactly from a clean build with:
 
 ```sh
-X86_UEFI_MEMORY=768M \
-X86_UEFI_TIMEOUT_SECONDS=45 \
-X86_RETURN_MARKER= \
-X86_GUEST_MARKER='thin-hv: linux L1 shell' \
-scripts/x86_64/run-uefi-smoke.sh \
-  bin/x86_64/x86-uefi-loader.efi \
-  bin/x86_64/linux-l1.efi
+nix develop --accept-flake-config --command bash -c '
+set -eu
+cargo xbuild x86
+scripts/x86_64/build-linux-uki.sh
+env X86_RETURN_MARKER= \
+  X86_GUEST_MARKER="thin-hv: linux L1 kvm_intel=1" \
+  X86_UEFI_TIMEOUT_SECONDS=25 \
+  X86_UEFI_MEMORY=768M \
+  scripts/x86_64/run-uefi-smoke.sh \
+    bin/x86_64/x86-uefi-loader.efi \
+    bin/x86_64/linux-l1.efi
+'
 ```
 
+The initramfs loads the generic KVM module first and then runs `modprobe kvm_intel nested=0`.
+The captured log contains:
+
 ```text
-[    0.477802] Run /init as init process
+thin-hv: loading runtime monitor
+thin-hv: runtime monitor active
 thin-hv: linux L1 /proc/cpuinfo vmx=1
+thin-hv: linux L1 modprobe kvm begin
+thin-hv: linux L1 modprobe kvm end rc=0
+thin-hv: linux L1 modprobe kvm_intel begin
+thin-hv: L1 VMXON entry=0x000000000000001b
+thin-hv: L1 VMXON operand_linear=0xffffcf2c400c7dc8
+thin-hv: L1 VMXON region=0x0000000002096000
+thin-hv: linux L1 kvm_intel=1
+thin-hv: linux L1 /dev/kvm=1
 thin-hv: linux L1 shell
-~ #
 ```
 
-This is an actual `OVMF -> L0 -> Linux L1` serial-shell result. It proves neither that
-`kvm_intel` initializes nor that an L2 guest runs; those are separate pending tests.
+This proves `OVMF -> this L0 -> Linux L1`, VMXON emulation, successful `kvm_intel`
+initialization, and `/dev/kvm` creation on the measured host. `nested=0` avoids asking L1 KVM to
+offer VMX to its own guests; it does not prevent an ordinary L2. No KVM ioctl or L2 guest has been
+run through this monitor yet.
 
 ## Windows, Hyper-V, and WSL2 status
 
@@ -380,8 +364,8 @@ been started, and WSL2 has not run. Windows Sandbox and VBS/HVCI are also untest
 The repository contains only the conservative standard-VMX policy needed to begin those tests.
 It does not implement or advertise Hyper-V CPUID leaves, SynIC, VP Assist Page, enlightened VMCS,
 or enlightened VM-entry. The design goal remains to expose bare-metal-style VMX (`VMX=1`,
-`hypervisor-present=0`) to trusted Windows, but the small CPUID payload is the only measurement of
-that view so far.
+`hypervisor-present=0`) to trusted Windows. The small payload and Linux KVM probe measure that
+view, but Windows and Hyper-V do not yet.
 
 ## Known limitations and bare-metal boundary
 
@@ -390,23 +374,35 @@ that view so far.
   interrupt handling.
 * The smoke EPT covers only the first 4 GiB and uses a QEMU-specific low-WB/upper-UC split. It is
   not safe for a general bare-metal RAM/MMIO layout.
-* The 77 reserved pages survive firmware allocation, but the UEFI loader's own executable/data
-  lifetime after `ExitBootServices` has not been made safe.
+* The runtime PE sections and 83-page data block survive Linux `ExitBootServices`, and the VMCS
+  uses an L0-owned `HOST_CR3`. L0 still reuses firmware GDT/IDT/TSS state; private descriptor
+  tables and fault handlers are required before bare-metal use.
+* `MONITORX64.EFI` is currently the application PE copied with its subsystem changed to EFI
+  runtime driver. It has no runtime virtual-address-change handler or self-relocated resident
+  core. Raw VM-exit logging works across the measured Linux relocation, but this is not a general
+  Windows or firmware runtime-PE solution.
+* The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle. A production
+  Windows chain needs an explicit monitor/guest device-path handoff instead of assuming the test
+  ESP and fallback boot path.
 * The VM-exit path currently handles only CPUID, trusted XSETBV, one unsupported-RDMSR `#GP`
-  path, and the VMCALL test. Invalid XSETBV operands are not converted to guest `#GP`; general
-  exception/interrupt, I/O, MSR, EPT, and nested-VMX exit routing is absent.
-* `nested_vmx` is a policy crate, not a live instruction emulator. Linux has not loaded
-  `kvm_intel` under L0, and no L2 Linux has booted.
+  path, CR4 writes, VMX capability reads, VMXON, and the VMCALL test. Invalid XSETBV operands are
+  not converted to guest `#GP`; general exception/interrupt, I/O, MSR, EPT, and remaining
+  nested-VMX exit routing is absent.
+* Linux loads `kvm_intel nested=0` and creates `/dev/kvm` under L0, but no KVM VM-creation ioctl or
+  L2 Linux has run. All nested VMX instructions after VMXON remain to be implemented.
 * The profile variable adapter has no firmware ABI hook, persistent backend wiring, or real OVMF
   profile test. Each QEMU smoke starts from a copied OVMF variable template.
 * No physical PCI/NVMe/GPU/USB/NIC handoff has been tested. There is no IOMMU setup.
-* Serial diagnostics are not yet compiled out in a release configuration.
+* Serial diagnostics have no compile-time release trace switch and are not yet removed from the
+  VM-exit hot path in release builds.
 * Development under host KVM creates another nesting level. A future
   `host KVM -> this L0 -> Linux KVM/Hyper-V -> L2` failure must be separated from this monitor's
   behavior; no such three-level execution has been attempted yet.
-* `cargo xbuild x86` produces a bare-metal-stagable EFI application under ignored `bin/x86_64/`,
-  but it is unsigned and has not been booted on physical hardware. The QEMU-specific 4 GiB map and
-  UEFI-memory-lifetime issue must be replaced before that test can establish OS readiness.
+* The bootstrap, runtime monitor, and guests are unsigned. Secure Boot was disabled for the QEMU
+  measurements; signing and verification policy must be added before a Secure Boot test.
+* `cargo xbuild x86` produces bare-metal-stagable bootstrap and runtime EFI images under ignored
+  `bin/x86_64/`, but neither has booted on physical hardware. The QEMU-specific map, descriptor
+  tables, runtime relocation, and device-path assumptions must be resolved first.
 
 All generated EFI files, ESP directories, OVMF variable stores, serial logs, UKIs, future ISO or
 qcow2 files, and other large artifacts belong under `bin/` (or another ignored build directory).
