@@ -1,0 +1,11 @@
+[package]
+name = "x86_guest_uefi_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+r-efi = "=6.0.0"
+x86_64_hal = { path = "../arch_hal/x86_64_hal" }
+
+[lints]
+workspace = true

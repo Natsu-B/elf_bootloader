@@ -20,6 +20,7 @@ members = [
     "typestate_macro",
     "uefi_variable_overlay",
     "virtio",
+    "x86_guest_uefi_test",
     "x86_uefi_loader",
     "xtask",
 ]

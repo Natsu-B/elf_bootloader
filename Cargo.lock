@@ -395,6 +395,14 @@ name = "x86_64_hal"
 version = "0.1.0"
 
 [[package]]
+name = "x86_guest_uefi_test"
+version = "0.1.0"
+dependencies = [
+ "r-efi",
+ "x86_64_hal",
+]
+
+[[package]]
 name = "x86_uefi_loader"
 version = "0.1.0"
 dependencies = [
