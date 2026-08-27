@@ -8,5 +8,6 @@ compile_error!("x86_64_hal requires an x86_64 target");
 pub mod addr;
 pub mod cpu;
 pub mod ept;
+pub mod paging;
 pub mod vmcs;
 pub mod vmx;

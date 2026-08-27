@@ -111,6 +111,55 @@ pub const fn restrict_controls(capability: u64, allowed: u32) -> u64 {
     required as u64 | ((((can_be_one & allowed) | required) as u64) << 32)
 }
 
+/// Decodes the memory operand of a VMX instruction executed in 64-bit mode.
+///
+/// VM-exit instruction information supplies the base, index, scale, address
+/// size, and segment. Exit qualification supplies only the displacement.
+/// The register callback uses Intel's 0..15 GPR encoding.
+#[must_use]
+pub fn memory_operand_address_64(
+    instruction_info: u32,
+    displacement: u64,
+    mut read_register: impl FnMut(u8) -> Option<u64>,
+    fs_base: u64,
+    gs_base: u64,
+) -> Option<u64> {
+    if instruction_info & (1 << 10) != 0 {
+        return None;
+    }
+    let address_size = (instruction_info >> 7) & 7;
+    let segment = (instruction_info >> 15) & 7;
+    if address_size > 2 || segment > 5 {
+        return None;
+    }
+
+    let mut offset = match address_size {
+        0 => displacement & u64::from(u16::MAX),
+        1 => displacement & u64::from(u32::MAX),
+        2 => displacement,
+        _ => unreachable!(),
+    };
+    if instruction_info & (1 << 27) == 0 {
+        offset = offset.wrapping_add(read_register(((instruction_info >> 23) & 0xf) as u8)?);
+    }
+    if instruction_info & (1 << 22) == 0 {
+        let index = read_register(((instruction_info >> 18) & 0xf) as u8)?;
+        offset = offset.wrapping_add(index.wrapping_shl(instruction_info & 3));
+    }
+    offset = match address_size {
+        0 => offset & u64::from(u16::MAX),
+        1 => offset & u64::from(u32::MAX),
+        2 => offset,
+        _ => unreachable!(),
+    };
+
+    Some(offset.wrapping_add(match segment {
+        4 => fs_base,
+        5 => gs_base,
+        _ => 0,
+    }))
+}
+
 /// Executes VMXON on a page containing the hardware revision identifier.
 ///
 /// # Safety
@@ -421,6 +470,7 @@ unsafe fn vm_entry_instruction(resume: bool) -> VmxStatus {
 mod tests {
     use super::VmxBasic;
     use super::adjust_controls;
+    use super::memory_operand_address_64;
     use super::restrict_controls;
 
     #[test]
@@ -445,6 +495,21 @@ mod tests {
                 physical_address_width_32: false,
                 true_controls: true,
             }
+        );
+    }
+
+    #[test]
+    fn linux_vmxon_stack_operand_is_decoded() {
+        let rsp = 0xffff_8f07_006d_4000;
+        assert_eq!(
+            memory_operand_address_64(
+                0x6261_4924,
+                0,
+                |register| (register == 4).then_some(rsp),
+                0,
+                0,
+            ),
+            Some(rsp)
         );
     }
 }
