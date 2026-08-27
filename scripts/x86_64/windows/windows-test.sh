@@ -187,6 +187,13 @@ run_windows() {
     qemu_pid=$!
     printf 'Windows x86 test: %s running as PID %s; VNC %s\n' \
         "$mode" "$qemu_pid" "${WINDOWS_VNC:-127.0.0.1:1}"
+    if [[ "$mode" == install ]]; then
+        # Microsoft's UEFI DVD loader waits for "Press any key" before Setup.
+        for _ in {1..20}; do
+            sleep 1
+            printf 'sendkey spc\n' >&9
+        done
+    fi
 
     while ((elapsed < timeout_seconds)); do
         if grep -Fq -- "$marker" "$serial_log"; then
