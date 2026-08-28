@@ -68,6 +68,8 @@ const EXIT_REASON_XSETBV: u64 = 55;
 const EXIT_REASON_RDMSR: u64 = 31;
 /// Control-register-access basic exit reason.
 const EXIT_REASON_CR_ACCESS: u64 = 28;
+/// VMXOFF basic exit reason.
+const EXIT_REASON_VMXOFF: u64 = 26;
 /// VMXON basic exit reason.
 const EXIT_REASON_VMXON: u64 = 27;
 /// VMCLEAR basic exit reason.
@@ -1507,6 +1509,11 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         return VMEXIT_ACTION_RESUME;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMXOFF {
+        handle_l1_vmxoff(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCLEAR {
         handle_l1_vmclear(reason, qualification, guest_rip, instruction_len, registers);
         return VMEXIT_ACTION_RESUME;
@@ -1650,6 +1657,37 @@ fn handle_l1_vmxon(
     );
     complete_vmx_instruction(
         result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Emulates L1's exit from VMX operation while L0 remains in VMX root mode.
+fn handle_l1_vmxoff(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    L1_VCPU_STATE.lock().record_vmxoff_success();
+    complete_vmx_instruction(
+        VmInstructionResult::Vmsucceed,
         reason,
         qualification,
         guest_rip,
