@@ -309,6 +309,8 @@ pub const SECONDARY_VMCS_SHADOWING: u32 = 1 << 14;
 pub const SECONDARY_ENABLE_PML: u32 = 1 << 17;
 /// Secondary TSC scaling, deliberately hidden.
 pub const SECONDARY_TSC_SCALING: u32 = 1 << 25;
+/// Secondary control allowing guest `UMWAIT` and `TPAUSE` execution.
+pub const SECONDARY_ENABLE_USER_WAIT_PAUSE: u32 = 1 << 26;
 
 /// VM-exit save-debug-controls control.
 pub const EXIT_SAVE_DEBUG_CONTROLS: u32 = 1 << 2;
@@ -354,7 +356,8 @@ pub const KVM_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_DEBUG_CONTROLS | ENTRY_I
 /// Primary controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 = PRIMARY_TPR_SHADOW;
 /// Secondary controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_ACCESSES;
+pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 =
+    SECONDARY_VIRTUALIZE_APIC_ACCESSES | SECONDARY_ENABLE_USER_WAIT_PAUSE;
 /// VM-exit controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 = EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
 /// VM-entry controls required by Hyper-V's nested VMX path.
@@ -863,7 +866,7 @@ mod tests {
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
-        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_00a3);
+        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0400_00a3);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0030_8204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_8204);
 
@@ -958,6 +961,13 @@ mod tests {
             restrict_vmx_capability(
                 vmx::IA32_VMX_PROCBASED_CTLS2,
                 hardware & !(u64::from(SECONDARY_VIRTUALIZE_APIC_ACCESSES) << 32)
+            ),
+            None
+        );
+        assert_eq!(
+            restrict_vmx_capability(
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                hardware & !(u64::from(SECONDARY_ENABLE_USER_WAIT_PAUSE) << 32)
             ),
             None
         );
