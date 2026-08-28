@@ -291,6 +291,8 @@ pub const PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const SECONDARY_VIRTUALIZE_APIC_ACCESSES: u32 = 1 << 0;
 /// Secondary EPT enable.
 pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+/// Secondary RDTSCP enable.
+pub const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
 /// Secondary x2APIC virtualization, deliberately hidden.
 pub const SECONDARY_VIRTUALIZE_X2APIC: u32 = 1 << 4;
 /// Secondary VPID enable.
@@ -301,12 +303,16 @@ pub const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 pub const SECONDARY_APIC_REGISTER_VIRTUALIZATION: u32 = 1 << 8;
 /// Secondary virtual-interrupt delivery, deliberately hidden.
 pub const SECONDARY_VIRTUAL_INTERRUPT_DELIVERY: u32 = 1 << 9;
+/// Secondary INVPCID enable.
+pub const SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 /// Secondary VMFUNC enable, deliberately hidden.
 pub const SECONDARY_ENABLE_VMFUNC: u32 = 1 << 13;
 /// Secondary VMCS shadowing, deliberately hidden.
 pub const SECONDARY_VMCS_SHADOWING: u32 = 1 << 14;
 /// Secondary PML enable, deliberately hidden.
 pub const SECONDARY_ENABLE_PML: u32 = 1 << 17;
+/// Secondary XSAVES/XRSTORS enable.
+pub const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
 /// Secondary TSC scaling, deliberately hidden.
 pub const SECONDARY_TSC_SCALING: u32 = 1 << 25;
 /// Secondary control allowing guest `UMWAIT` and `TPAUSE` execution.
@@ -356,8 +362,11 @@ pub const KVM_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_DEBUG_CONTROLS | ENTRY_I
 /// Primary controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 = PRIMARY_TPR_SHADOW;
 /// Secondary controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 =
-    SECONDARY_VIRTUALIZE_APIC_ACCESSES | SECONDARY_ENABLE_USER_WAIT_PAUSE;
+pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_ACCESSES
+    | SECONDARY_ENABLE_RDTSCP
+    | SECONDARY_ENABLE_INVPCID
+    | SECONDARY_ENABLE_XSAVES
+    | SECONDARY_ENABLE_USER_WAIT_PAUSE;
 /// VM-exit controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 = EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
 /// VM-entry controls required by Hyper-V's nested VMX path.
@@ -866,7 +875,7 @@ mod tests {
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
-        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0400_00a3);
+        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_10ab);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0030_8204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_8204);
 
@@ -957,20 +966,21 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            restrict_vmx_capability(
-                vmx::IA32_VMX_PROCBASED_CTLS2,
-                hardware & !(u64::from(SECONDARY_VIRTUALIZE_APIC_ACCESSES) << 32)
-            ),
-            None
-        );
-        assert_eq!(
-            restrict_vmx_capability(
-                vmx::IA32_VMX_PROCBASED_CTLS2,
-                hardware & !(u64::from(SECONDARY_ENABLE_USER_WAIT_PAUSE) << 32)
-            ),
-            None
-        );
+        for control in [
+            SECONDARY_VIRTUALIZE_APIC_ACCESSES,
+            SECONDARY_ENABLE_RDTSCP,
+            SECONDARY_ENABLE_INVPCID,
+            SECONDARY_ENABLE_XSAVES,
+            SECONDARY_ENABLE_USER_WAIT_PAUSE,
+        ] {
+            assert_eq!(
+                restrict_vmx_capability(
+                    vmx::IA32_VMX_PROCBASED_CTLS2,
+                    hardware & !(u64::from(control) << 32)
+                ),
+                None
+            );
+        }
         assert_eq!(
             restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, hardware).unwrap() >> 32,
             u64::from(TRUSTED_SECONDARY_CONTROLS)
