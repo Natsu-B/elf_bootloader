@@ -249,6 +249,8 @@ impl VcpuState {
 pub const PIN_EXTERNAL_INTERRUPT_EXITING: u32 = 1 << 0;
 /// Pin-based NMI exiting.
 pub const PIN_NMI_EXITING: u32 = 1 << 3;
+/// Pin-based virtual-NMI processing.
+pub const PIN_VIRTUAL_NMIS: u32 = 1 << 5;
 /// Pin-based posted-interrupt processing, deliberately hidden.
 pub const PIN_POSTED_INTERRUPTS: u32 = 1 << 7;
 
@@ -274,6 +276,8 @@ pub const PRIMARY_CR8_LOAD_EXITING: u32 = 1 << 19;
 pub const PRIMARY_CR8_STORE_EXITING: u32 = 1 << 20;
 /// Primary TPR shadowing.
 pub const PRIMARY_TPR_SHADOW: u32 = 1 << 21;
+/// Primary NMI-window exiting.
+pub const PRIMARY_NMI_WINDOW_EXITING: u32 = 1 << 22;
 /// Primary MOV-DR exiting.
 pub const PRIMARY_MOV_DR_EXITING: u32 = 1 << 23;
 /// Primary unconditional I/O exiting.
@@ -369,8 +373,10 @@ pub const KVM_REQUIRED_EXIT_CONTROLS: u32 =
     EXIT_SAVE_DEBUG_CONTROLS | EXIT_HOST_ADDRESS_SPACE_SIZE | EXIT_ACKNOWLEDGE_INTERRUPT;
 /// Stock x86-64 KVM's required allowed-one VM-entry controls.
 pub const KVM_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_DEBUG_CONTROLS | ENTRY_IA32E_MODE;
+/// Pin controls required by Hyper-V's nested VMX path.
+pub const HYPERV_REQUIRED_PIN_CONTROLS: u32 = PIN_VIRTUAL_NMIS;
 /// Primary controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 = PRIMARY_TPR_SHADOW;
+pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 = PRIMARY_TPR_SHADOW | PRIMARY_NMI_WINDOW_EXITING;
 /// Secondary controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_ACCESSES
     | SECONDARY_ENABLE_RDTSCP
@@ -388,7 +394,7 @@ pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 =
     ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL | ENTRY_LOAD_IA32_PAT | ENTRY_LOAD_IA32_EFER;
 
 /// Conservative allowed-one pin controls exposed to trusted L1.
-pub const TRUSTED_PIN_CONTROLS: u32 = KVM_REQUIRED_PIN_CONTROLS;
+pub const TRUSTED_PIN_CONTROLS: u32 = KVM_REQUIRED_PIN_CONTROLS | HYPERV_REQUIRED_PIN_CONTROLS;
 /// Conservative allowed-one primary controls exposed to trusted L1.
 pub const TRUSTED_PRIMARY_CONTROLS: u32 = KVM_REQUIRED_PRIMARY_CONTROLS
     | HYPERV_REQUIRED_PRIMARY_CONTROLS
@@ -470,7 +476,11 @@ pub const fn restrict_vmx_capability(msr: u32, hardware: u64) -> Option<u64> {
             }
         }
         vmx::IA32_VMX_PINBASED_CTLS | vmx::IA32_VMX_TRUE_PINBASED_CTLS => {
-            restrict_control_capability(hardware, TRUSTED_PIN_CONTROLS, KVM_REQUIRED_PIN_CONTROLS)
+            restrict_control_capability(
+                hardware,
+                TRUSTED_PIN_CONTROLS,
+                KVM_REQUIRED_PIN_CONTROLS | HYPERV_REQUIRED_PIN_CONTROLS,
+            )
         }
         vmx::IA32_VMX_PROCBASED_CTLS | vmx::IA32_VMX_TRUE_PROCBASED_CTLS => {
             restrict_control_capability(
@@ -900,8 +910,8 @@ mod tests {
             HYPERV_REQUIRED_EPT_CAPABILITIES
         );
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
-        assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
-        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
+        assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0029);
+        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3f9_8e8c);
         assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_10ab);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x003c_9204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_e204);
@@ -909,6 +919,10 @@ mod tests {
         assert_eq!(
             TRUSTED_PIN_CONTROLS & KVM_REQUIRED_PIN_CONTROLS,
             KVM_REQUIRED_PIN_CONTROLS
+        );
+        assert_eq!(
+            TRUSTED_PIN_CONTROLS & HYPERV_REQUIRED_PIN_CONTROLS,
+            HYPERV_REQUIRED_PIN_CONTROLS
         );
         assert_eq!(
             TRUSTED_PRIMARY_CONTROLS & KVM_REQUIRED_PRIMARY_CONTROLS,
@@ -988,11 +1002,20 @@ mod tests {
         );
         assert_eq!(
             restrict_vmx_capability(
-                vmx::IA32_VMX_PROCBASED_CTLS,
-                hardware & !(u64::from(PRIMARY_TPR_SHADOW) << 32)
+                vmx::IA32_VMX_PINBASED_CTLS,
+                hardware & !(u64::from(PIN_VIRTUAL_NMIS) << 32)
             ),
             None
         );
+        for control in [PRIMARY_TPR_SHADOW, PRIMARY_NMI_WINDOW_EXITING] {
+            assert_eq!(
+                restrict_vmx_capability(
+                    vmx::IA32_VMX_PROCBASED_CTLS,
+                    hardware & !(u64::from(control) << 32)
+                ),
+                None
+            );
+        }
         for control in [
             SECONDARY_VIRTUALIZE_APIC_ACCESSES,
             SECONDARY_ENABLE_RDTSCP,
