@@ -272,7 +272,7 @@ pub const PRIMARY_CR3_STORE_EXITING: u32 = 1 << 16;
 pub const PRIMARY_CR8_LOAD_EXITING: u32 = 1 << 19;
 /// Primary CR8-store exiting.
 pub const PRIMARY_CR8_STORE_EXITING: u32 = 1 << 20;
-/// Primary TPR shadowing, deliberately hidden with `APICv`.
+/// Primary TPR shadowing.
 pub const PRIMARY_TPR_SHADOW: u32 = 1 << 21;
 /// Primary MOV-DR exiting.
 pub const PRIMARY_MOV_DR_EXITING: u32 = 1 << 23;
@@ -287,7 +287,7 @@ pub const PRIMARY_MONITOR_EXITING: u32 = 1 << 29;
 /// Primary secondary-control activation.
 pub const PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 
-/// Secondary APIC-access virtualization, deliberately hidden.
+/// Secondary APIC-access virtualization.
 pub const SECONDARY_VIRTUALIZE_APIC_ACCESSES: u32 = 1 << 0;
 /// Secondary EPT enable.
 pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
@@ -351,6 +351,10 @@ pub const KVM_REQUIRED_EXIT_CONTROLS: u32 =
     EXIT_SAVE_DEBUG_CONTROLS | EXIT_HOST_ADDRESS_SPACE_SIZE | EXIT_ACKNOWLEDGE_INTERRUPT;
 /// Stock x86-64 KVM's required allowed-one VM-entry controls.
 pub const KVM_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_DEBUG_CONTROLS | ENTRY_IA32E_MODE;
+/// Primary controls required by Hyper-V's nested VMX path.
+pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 = PRIMARY_TPR_SHADOW;
+/// Secondary controls required by Hyper-V's nested VMX path.
+pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_ACCESSES;
 /// VM-exit controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 = EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
 /// VM-entry controls required by Hyper-V's nested VMX path.
@@ -360,11 +364,13 @@ pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_IA32_EFER;
 pub const TRUSTED_PIN_CONTROLS: u32 = KVM_REQUIRED_PIN_CONTROLS;
 /// Conservative allowed-one primary controls exposed to trusted L1.
 pub const TRUSTED_PRIMARY_CONTROLS: u32 = KVM_REQUIRED_PRIMARY_CONTROLS
+    | HYPERV_REQUIRED_PRIMARY_CONTROLS
     | PRIMARY_USE_IO_BITMAPS
     | PRIMARY_USE_MSR_BITMAPS
     | PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
 /// Conservative allowed-one secondary controls exposed to trusted L1.
-pub const TRUSTED_SECONDARY_CONTROLS: u32 = KVM_REQUIRED_SECONDARY_CONTROLS | SECONDARY_ENABLE_VPID;
+pub const TRUSTED_SECONDARY_CONTROLS: u32 =
+    KVM_REQUIRED_SECONDARY_CONTROLS | HYPERV_REQUIRED_SECONDARY_CONTROLS | SECONDARY_ENABLE_VPID;
 /// Conservative allowed-one VM-exit controls exposed to trusted L1.
 pub const TRUSTED_EXIT_CONTROLS: u32 = KVM_REQUIRED_EXIT_CONTROLS | HYPERV_REQUIRED_EXIT_CONTROLS;
 /// Conservative allowed-one VM-entry controls exposed to trusted L1.
@@ -437,7 +443,7 @@ pub const fn restrict_vmx_capability(msr: u32, hardware: u64) -> Option<u64> {
             restrict_control_capability(
                 hardware,
                 TRUSTED_PRIMARY_CONTROLS,
-                KVM_REQUIRED_PRIMARY_CONTROLS,
+                KVM_REQUIRED_PRIMARY_CONTROLS | HYPERV_REQUIRED_PRIMARY_CONTROLS,
             )
         }
         vmx::IA32_VMX_EXIT_CTLS | vmx::IA32_VMX_TRUE_EXIT_CTLS => restrict_control_capability(
@@ -453,7 +459,7 @@ pub const fn restrict_vmx_capability(msr: u32, hardware: u64) -> Option<u64> {
         vmx::IA32_VMX_PROCBASED_CTLS2 => restrict_control_capability(
             hardware,
             TRUSTED_SECONDARY_CONTROLS,
-            KVM_REQUIRED_SECONDARY_CONTROLS,
+            KVM_REQUIRED_SECONDARY_CONTROLS | HYPERV_REQUIRED_SECONDARY_CONTROLS,
         ),
         vmx::IA32_VMX_EPT_VPID_CAP => restrict_ept_vpid_capability(hardware),
         vmx::IA32_VMX_MISC => Some(hardware & TRUSTED_MISC_MASK),
@@ -842,9 +848,7 @@ mod tests {
             0,
             "posted interrupts must remain hidden"
         );
-        assert_eq!(TRUSTED_PRIMARY_CONTROLS & PRIMARY_TPR_SHADOW, 0);
-        let hidden_secondary = SECONDARY_VIRTUALIZE_APIC_ACCESSES
-            | SECONDARY_VIRTUALIZE_X2APIC
+        let hidden_secondary = SECONDARY_VIRTUALIZE_X2APIC
             | SECONDARY_APIC_REGISTER_VIRTUALIZATION
             | SECONDARY_VIRTUAL_INTERRUPT_DELIVERY
             | SECONDARY_ENABLE_VMFUNC
@@ -858,8 +862,8 @@ mod tests {
         );
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
-        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb399_8e8c);
-        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_00a2);
+        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
+        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_00a3);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0030_8204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_8204);
 
@@ -870,6 +874,10 @@ mod tests {
         assert_eq!(
             TRUSTED_PRIMARY_CONTROLS & KVM_REQUIRED_PRIMARY_CONTROLS,
             KVM_REQUIRED_PRIMARY_CONTROLS
+        );
+        assert_eq!(
+            TRUSTED_PRIMARY_CONTROLS & HYPERV_REQUIRED_PRIMARY_CONTROLS,
+            HYPERV_REQUIRED_PRIMARY_CONTROLS
         );
         assert_eq!(
             TRUSTED_EXIT_CONTROLS & KVM_REQUIRED_EXIT_CONTROLS,
@@ -890,6 +898,10 @@ mod tests {
         assert_eq!(
             TRUSTED_SECONDARY_CONTROLS & KVM_REQUIRED_SECONDARY_CONTROLS,
             KVM_REQUIRED_SECONDARY_CONTROLS
+        );
+        assert_eq!(
+            TRUSTED_SECONDARY_CONTROLS & HYPERV_REQUIRED_SECONDARY_CONTROLS,
+            HYPERV_REQUIRED_SECONDARY_CONTROLS
         );
         assert_eq!(
             TRUSTED_EPT_VPID_CAPABILITIES & KVM_REQUIRED_EPT_CAPABILITIES,
@@ -936,6 +948,20 @@ mod tests {
             None
         );
         assert_eq!(
+            restrict_vmx_capability(
+                vmx::IA32_VMX_PROCBASED_CTLS,
+                hardware & !(u64::from(PRIMARY_TPR_SHADOW) << 32)
+            ),
+            None
+        );
+        assert_eq!(
+            restrict_vmx_capability(
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                hardware & !(u64::from(SECONDARY_VIRTUALIZE_APIC_ACCESSES) << 32)
+            ),
+            None
+        );
+        assert_eq!(
             restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, hardware).unwrap() >> 32,
             u64::from(TRUSTED_SECONDARY_CONTROLS)
         );
@@ -956,7 +982,7 @@ mod tests {
             )
             .unwrap()
                 >> 32,
-            u64::from(KVM_REQUIRED_SECONDARY_CONTROLS)
+            u64::from(KVM_REQUIRED_SECONDARY_CONTROLS | HYPERV_REQUIRED_SECONDARY_CONTROLS)
         );
         assert_eq!(
             restrict_ept_vpid_capability(TRUSTED_EPT_VPID_CAPABILITIES),
