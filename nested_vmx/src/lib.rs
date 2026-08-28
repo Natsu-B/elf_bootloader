@@ -389,6 +389,8 @@ pub const TRUSTED_EXIT_CONTROLS: u32 = KVM_REQUIRED_EXIT_CONTROLS | HYPERV_REQUI
 pub const TRUSTED_ENTRY_CONTROLS: u32 =
     KVM_REQUIRED_ENTRY_CONTROLS | HYPERV_REQUIRED_ENTRY_CONTROLS;
 
+/// EPT supports execute-only translations.
+pub const EPT_EXECUTE_ONLY: u64 = 1 << 0;
 /// EPT supports four-level walks.
 pub const EPT_PAGE_WALK_4: u64 = 1 << 6;
 /// EPTP supports write-back memory type.
@@ -412,6 +414,8 @@ pub const VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS: u64 = 1 << 43;
 /// EPT capability bits stock KVM requires in order to enable EPT.
 pub const KVM_REQUIRED_EPT_CAPABILITIES: u64 =
     EPT_PAGE_WALK_4 | EPTP_WRITE_BACK | EPT_INVEPT | EPT_INVEPT_GLOBAL_CONTEXT;
+/// EPT capabilities required by Hyper-V's nested VMX path.
+pub const HYPERV_REQUIRED_EPT_CAPABILITIES: u64 = EPT_EXECUTE_ONLY;
 /// INVVPID capabilities required by Hyper-V when VPID is exposed.
 pub const HYPERV_REQUIRED_VPID_CAPABILITIES: u64 = VPID_INVVPID
     | VPID_INVVPID_INDIVIDUAL_ADDRESS
@@ -419,8 +423,10 @@ pub const HYPERV_REQUIRED_VPID_CAPABILITIES: u64 = VPID_INVVPID
     | VPID_INVVPID_ALL_CONTEXTS
     | VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS;
 /// EPT/VPID capabilities exposed to trusted L1.
-pub const TRUSTED_EPT_VPID_CAPABILITIES: u64 =
-    KVM_REQUIRED_EPT_CAPABILITIES | EPT_INVEPT_SINGLE_CONTEXT | HYPERV_REQUIRED_VPID_CAPABILITIES;
+pub const TRUSTED_EPT_VPID_CAPABILITIES: u64 = KVM_REQUIRED_EPT_CAPABILITIES
+    | HYPERV_REQUIRED_EPT_CAPABILITIES
+    | EPT_INVEPT_SINGLE_CONTEXT
+    | HYPERV_REQUIRED_VPID_CAPABILITIES;
 /// VMFUNC functions exposed to trusted L1; VMFUNC is deliberately hidden.
 pub const TRUSTED_VMFUNC_CAPABILITIES: u64 = 0;
 /// `IA32_VMX_BASIC` fields safe for direct hardware VMCS use.
@@ -507,7 +513,9 @@ pub const fn restrict_control_capability(
 #[must_use]
 pub const fn restrict_ept_vpid_capability(hardware: u64) -> Option<u64> {
     let advertised = hardware & TRUSTED_EPT_VPID_CAPABILITIES;
-    let required = KVM_REQUIRED_EPT_CAPABILITIES | HYPERV_REQUIRED_VPID_CAPABILITIES;
+    let required = KVM_REQUIRED_EPT_CAPABILITIES
+        | HYPERV_REQUIRED_EPT_CAPABILITIES
+        | HYPERV_REQUIRED_VPID_CAPABILITIES;
     if advertised & required == required {
         Some(advertised)
     } else {
@@ -872,6 +880,10 @@ mod tests {
             TRUSTED_EPT_VPID_CAPABILITIES & HYPERV_REQUIRED_VPID_CAPABILITIES,
             HYPERV_REQUIRED_VPID_CAPABILITIES
         );
+        assert_eq!(
+            TRUSTED_EPT_VPID_CAPABILITIES & HYPERV_REQUIRED_EPT_CAPABILITIES,
+            HYPERV_REQUIRED_EPT_CAPABILITIES
+        );
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
@@ -1011,6 +1023,12 @@ mod tests {
         assert_eq!(
             restrict_ept_vpid_capability(
                 TRUSTED_EPT_VPID_CAPABILITIES & !HYPERV_REQUIRED_VPID_CAPABILITIES
+            ),
+            None
+        );
+        assert_eq!(
+            restrict_ept_vpid_capability(
+                TRUSTED_EPT_VPID_CAPABILITIES & !HYPERV_REQUIRED_EPT_CAPABILITIES
             ),
             None
         );
