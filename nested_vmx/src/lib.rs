@@ -299,24 +299,32 @@ pub const PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 pub const SECONDARY_VIRTUALIZE_APIC_ACCESSES: u32 = 1 << 0;
 /// Secondary EPT enable.
 pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
+/// Secondary descriptor-table exiting.
+pub const SECONDARY_DESCRIPTOR_TABLE_EXITING: u32 = 1 << 2;
 /// Secondary RDTSCP enable.
 pub const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
 /// Secondary x2APIC virtualization, deliberately hidden.
 pub const SECONDARY_VIRTUALIZE_X2APIC: u32 = 1 << 4;
 /// Secondary VPID enable.
 pub const SECONDARY_ENABLE_VPID: u32 = 1 << 5;
+/// Secondary WBINVD exiting, deliberately hidden.
+pub const SECONDARY_WBINVD_EXITING: u32 = 1 << 6;
 /// Secondary unrestricted-guest enable.
 pub const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
 /// Secondary APIC-register virtualization, deliberately hidden.
 pub const SECONDARY_APIC_REGISTER_VIRTUALIZATION: u32 = 1 << 8;
 /// Secondary virtual-interrupt delivery, deliberately hidden.
 pub const SECONDARY_VIRTUAL_INTERRUPT_DELIVERY: u32 = 1 << 9;
+/// Secondary RDRAND exiting.
+pub const SECONDARY_RDRAND_EXITING: u32 = 1 << 11;
 /// Secondary INVPCID enable.
 pub const SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
 /// Secondary VMFUNC enable, deliberately hidden.
 pub const SECONDARY_ENABLE_VMFUNC: u32 = 1 << 13;
 /// Secondary VMCS shadowing, deliberately hidden.
 pub const SECONDARY_VMCS_SHADOWING: u32 = 1 << 14;
+/// Secondary RDSEED exiting, deliberately hidden.
+pub const SECONDARY_RDSEED_EXITING: u32 = 1 << 16;
 /// Secondary PML enable, deliberately hidden.
 pub const SECONDARY_ENABLE_PML: u32 = 1 << 17;
 /// Secondary XSAVES/XRSTORS enable.
@@ -384,7 +392,9 @@ pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 =
     PRIMARY_RDTSC_EXITING | PRIMARY_TPR_SHADOW | PRIMARY_NMI_WINDOW_EXITING | PRIMARY_PAUSE_EXITING;
 /// Secondary controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_ACCESSES
+    | SECONDARY_DESCRIPTOR_TABLE_EXITING
     | SECONDARY_ENABLE_RDTSCP
+    | SECONDARY_RDRAND_EXITING
     | SECONDARY_ENABLE_INVPCID
     | SECONDARY_ENABLE_XSAVES
     | SECONDARY_ENABLE_USER_WAIT_PAUSE;
@@ -899,10 +909,12 @@ mod tests {
             "posted interrupts must remain hidden"
         );
         let hidden_secondary = SECONDARY_VIRTUALIZE_X2APIC
+            | SECONDARY_WBINVD_EXITING
             | SECONDARY_APIC_REGISTER_VIRTUALIZATION
             | SECONDARY_VIRTUAL_INTERRUPT_DELIVERY
             | SECONDARY_ENABLE_VMFUNC
             | SECONDARY_VMCS_SHADOWING
+            | SECONDARY_RDSEED_EXITING
             | SECONDARY_ENABLE_PML
             | SECONDARY_TSC_SCALING;
         assert_eq!(TRUSTED_SECONDARY_CONTROLS & hidden_secondary, 0);
@@ -917,7 +929,7 @@ mod tests {
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0029);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xf3f9_9e8c);
-        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_10ab);
+        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_18af);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x003c_9204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_e204);
 
@@ -1028,7 +1040,9 @@ mod tests {
         }
         for control in [
             SECONDARY_VIRTUALIZE_APIC_ACCESSES,
+            SECONDARY_DESCRIPTOR_TABLE_EXITING,
             SECONDARY_ENABLE_RDTSCP,
+            SECONDARY_RDRAND_EXITING,
             SECONDARY_ENABLE_INVPCID,
             SECONDARY_ENABLE_XSAVES,
             SECONDARY_ENABLE_USER_WAIT_PAUSE,
