@@ -316,10 +316,16 @@ pub const EXIT_SAVE_DEBUG_CONTROLS: u32 = 1 << 2;
 pub const EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 /// VM-exit interrupt acknowledgement.
 pub const EXIT_ACKNOWLEDGE_INTERRUPT: u32 = 1 << 15;
+/// VM-exit save `IA32_EFER` control.
+pub const EXIT_SAVE_IA32_EFER: u32 = 1 << 20;
+/// VM-exit load `IA32_EFER` control.
+pub const EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 /// VM-entry load-debug-controls control.
 pub const ENTRY_LOAD_DEBUG_CONTROLS: u32 = 1 << 2;
 /// VM-entry IA-32e guest-mode control.
 pub const ENTRY_IA32E_MODE: u32 = 1 << 9;
+/// VM-entry load `IA32_EFER` control.
+pub const ENTRY_LOAD_IA32_EFER: u32 = 1 << 15;
 
 /// Stock x86-64 KVM's required allowed-one pin controls.
 pub const KVM_REQUIRED_PIN_CONTROLS: u32 = PIN_EXTERNAL_INTERRUPT_EXITING | PIN_NMI_EXITING;
@@ -345,6 +351,10 @@ pub const KVM_REQUIRED_EXIT_CONTROLS: u32 =
     EXIT_SAVE_DEBUG_CONTROLS | EXIT_HOST_ADDRESS_SPACE_SIZE | EXIT_ACKNOWLEDGE_INTERRUPT;
 /// Stock x86-64 KVM's required allowed-one VM-entry controls.
 pub const KVM_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_DEBUG_CONTROLS | ENTRY_IA32E_MODE;
+/// VM-exit controls required by Hyper-V's nested VMX path.
+pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 = EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
+/// VM-entry controls required by Hyper-V's nested VMX path.
+pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_IA32_EFER;
 
 /// Conservative allowed-one pin controls exposed to trusted L1.
 pub const TRUSTED_PIN_CONTROLS: u32 = KVM_REQUIRED_PIN_CONTROLS;
@@ -356,9 +366,10 @@ pub const TRUSTED_PRIMARY_CONTROLS: u32 = KVM_REQUIRED_PRIMARY_CONTROLS
 /// Conservative allowed-one secondary controls exposed to trusted L1.
 pub const TRUSTED_SECONDARY_CONTROLS: u32 = KVM_REQUIRED_SECONDARY_CONTROLS | SECONDARY_ENABLE_VPID;
 /// Conservative allowed-one VM-exit controls exposed to trusted L1.
-pub const TRUSTED_EXIT_CONTROLS: u32 = KVM_REQUIRED_EXIT_CONTROLS;
+pub const TRUSTED_EXIT_CONTROLS: u32 = KVM_REQUIRED_EXIT_CONTROLS | HYPERV_REQUIRED_EXIT_CONTROLS;
 /// Conservative allowed-one VM-entry controls exposed to trusted L1.
-pub const TRUSTED_ENTRY_CONTROLS: u32 = KVM_REQUIRED_ENTRY_CONTROLS;
+pub const TRUSTED_ENTRY_CONTROLS: u32 =
+    KVM_REQUIRED_ENTRY_CONTROLS | HYPERV_REQUIRED_ENTRY_CONTROLS;
 
 /// EPT supports four-level walks.
 pub const EPT_PAGE_WALK_4: u64 = 1 << 6;
@@ -429,13 +440,15 @@ pub const fn restrict_vmx_capability(msr: u32, hardware: u64) -> Option<u64> {
                 KVM_REQUIRED_PRIMARY_CONTROLS,
             )
         }
-        vmx::IA32_VMX_EXIT_CTLS | vmx::IA32_VMX_TRUE_EXIT_CTLS => {
-            restrict_control_capability(hardware, TRUSTED_EXIT_CONTROLS, KVM_REQUIRED_EXIT_CONTROLS)
-        }
+        vmx::IA32_VMX_EXIT_CTLS | vmx::IA32_VMX_TRUE_EXIT_CTLS => restrict_control_capability(
+            hardware,
+            TRUSTED_EXIT_CONTROLS,
+            KVM_REQUIRED_EXIT_CONTROLS | HYPERV_REQUIRED_EXIT_CONTROLS,
+        ),
         vmx::IA32_VMX_ENTRY_CTLS | vmx::IA32_VMX_TRUE_ENTRY_CTLS => restrict_control_capability(
             hardware,
             TRUSTED_ENTRY_CONTROLS,
-            KVM_REQUIRED_ENTRY_CONTROLS,
+            KVM_REQUIRED_ENTRY_CONTROLS | HYPERV_REQUIRED_ENTRY_CONTROLS,
         ),
         vmx::IA32_VMX_PROCBASED_CTLS2 => restrict_control_capability(
             hardware,
@@ -847,8 +860,8 @@ mod tests {
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb399_8e8c);
         assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_00a2);
-        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0000_8204);
-        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_0204);
+        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0030_8204);
+        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_8204);
 
         assert_eq!(
             TRUSTED_PIN_CONTROLS & KVM_REQUIRED_PIN_CONTROLS,
@@ -865,6 +878,14 @@ mod tests {
         assert_eq!(
             TRUSTED_ENTRY_CONTROLS & KVM_REQUIRED_ENTRY_CONTROLS,
             KVM_REQUIRED_ENTRY_CONTROLS
+        );
+        assert_eq!(
+            TRUSTED_EXIT_CONTROLS & HYPERV_REQUIRED_EXIT_CONTROLS,
+            HYPERV_REQUIRED_EXIT_CONTROLS
+        );
+        assert_eq!(
+            TRUSTED_ENTRY_CONTROLS & HYPERV_REQUIRED_ENTRY_CONTROLS,
+            HYPERV_REQUIRED_ENTRY_CONTROLS
         );
         assert_eq!(
             TRUSTED_SECONDARY_CONTROLS & KVM_REQUIRED_SECONDARY_CONTROLS,
@@ -895,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_restriction_rejects_missing_kvm_requirements() {
+    fn capability_restriction_rejects_missing_target_requirements() {
         let hardware = u64::from(u32::MAX) << 32;
         let advertised = restrict_control_capability(
             hardware,
@@ -918,6 +939,16 @@ mod tests {
             restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, hardware).unwrap() >> 32,
             u64::from(TRUSTED_SECONDARY_CONTROLS)
         );
+        for (msr, control) in [
+            (vmx::IA32_VMX_EXIT_CTLS, EXIT_SAVE_IA32_EFER),
+            (vmx::IA32_VMX_EXIT_CTLS, EXIT_LOAD_IA32_EFER),
+            (vmx::IA32_VMX_ENTRY_CTLS, ENTRY_LOAD_IA32_EFER),
+        ] {
+            assert_eq!(
+                restrict_vmx_capability(msr, hardware & !(u64::from(control) << 32)),
+                None
+            );
+        }
         assert_eq!(
             restrict_vmx_capability(
                 vmx::IA32_VMX_PROCBASED_CTLS2,

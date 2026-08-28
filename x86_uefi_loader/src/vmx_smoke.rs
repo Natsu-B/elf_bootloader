@@ -236,6 +236,7 @@ struct NestedRun {
     carrier: VmcsPhys,
     direct: VmcsPhys,
     saved_direct: [u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    exit_loaded_l1_efer: Option<u64>,
     l1_interruptibility: u64,
     outer_reason: u64,
     outer_qualification: u64,
@@ -867,10 +868,16 @@ fn configure_and_launch(
             | vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE,
         unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) },
     );
-    let exit = vmx::adjust_controls(vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE, unsafe {
-        cpu::rdmsr(exit_msr)
-    });
-    let entry = vmx::adjust_controls(vmcs::VM_ENTRY_IA32E_MODE, unsafe { cpu::rdmsr(entry_msr) });
+    let exit = vmx::adjust_controls(
+        vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+            | vmcs::VM_EXIT_SAVE_IA32_EFER
+            | vmcs::VM_EXIT_LOAD_IA32_EFER,
+        unsafe { cpu::rdmsr(exit_msr) },
+    );
+    let entry = vmx::adjust_controls(
+        vmcs::VM_ENTRY_IA32E_MODE | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+        unsafe { cpu::rdmsr(entry_msr) },
+    );
     if primary & vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS == 0
         || primary & vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_EPT == 0
@@ -879,7 +886,10 @@ fn configure_and_launch(
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_XSAVES == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE == 0
         || exit & vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0
+        || exit & vmcs::VM_EXIT_SAVE_IA32_EFER == 0
+        || exit & vmcs::VM_EXIT_LOAD_IA32_EFER == 0
         || entry & vmcs::VM_ENTRY_IA32E_MODE == 0
+        || entry & vmcs::VM_ENTRY_LOAD_IA32_EFER == 0
     {
         return Err(Error::Capability(
             "VM-entry controls",
@@ -1996,16 +2006,26 @@ fn handle_l1_vmentry(
     let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
     let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.unwrap_or(u64::MAX);
     let entry_controls = unsafe { vmx::vmread(vmcs::VM_ENTRY_CONTROLS) }.unwrap_or(u64::MAX);
+    let exit_efer_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_EFER | vmcs::VM_EXIT_LOAD_IA32_EFER);
+    let entry_efer_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_EFER);
+    let exit_efer_controls = exit_controls & exit_efer_mask;
+    let entry_efer_controls = entry_controls & entry_efer_mask;
+    let supported_efer_controls = (exit_efer_controls == 0 && entry_efer_controls == 0)
+        || (exit_efer_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0
+            && entry_efer_controls == entry_efer_mask);
     if exit_store_count != Some(0)
         || exit_load_count != Some(0)
         || entry_load_count != Some(0)
         || exit_controls & (1 << 12) != 0
-        || exit_controls >> 18 != 0
-        || entry_controls >> 13 != 0
+        || (exit_controls & !exit_efer_mask) >> 18 != 0
+        || (entry_controls & !entry_efer_mask) >> 13 != 0
+        || !supported_efer_controls
     {
-        // ponytail: the measured KVM probe has empty MSR lists and no optional
-        // host-state loads. Add bounded L0 MSR mirrors when a real workload
-        // first supplies a non-empty list.
+        // ponytail: the measured KVM probe has empty MSR lists. Add bounded L0
+        // MSR mirrors when a real workload first supplies a non-empty list.
+        // ponytail: accept measured trusted KVM's all-clear controls (its EFER
+        // writes are intercepted), or sets that load L2 and restore L1 EFER.
+        // Add forced-control shadowing before allowing other partial sets.
         stop_unexpected_exit(
             b"unsupported nested VM-entry state",
             reason,
@@ -2015,6 +2035,9 @@ fn handle_l1_vmentry(
             registers,
         );
     }
+    let exit_loaded_l1_efer = (exit_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0)
+        .then(|| direct_patch_value(&saved_direct, VmcsField::HostIa32Efer))
+        .flatten();
     if !patch_direct_vmcs(&carrier_values) {
         stop_unexpected_exit(
             b"patching direct VMCS failed",
@@ -2041,6 +2064,7 @@ fn handle_l1_vmentry(
         carrier,
         direct: current.address(),
         saved_direct,
+        exit_loaded_l1_efer,
         l1_interruptibility,
         outer_reason: reason,
         outer_qualification: qualification,
@@ -2130,6 +2154,9 @@ fn reflect_l2_vmexit(
             registers,
         );
     }
+    let l1_efer = run
+        .exit_loaded_l1_efer
+        .unwrap_or_else(|| unsafe { cpu::rdmsr(cpu::IA32_EFER) });
     if !restore_direct_vmcs(&run.saved_direct) {
         stop_unexpected_exit(
             b"restoring direct VMCS after L2 exit failed",
@@ -2161,7 +2188,7 @@ fn reflect_l2_vmexit(
             registers,
         );
     }
-    if write_reflected_l1_state(&run).is_none() {
+    if write_reflected_l1_state(&run, l1_efer).is_none() {
         stop_unexpected_exit(
             b"reflecting L1 host state failed",
             reason,
@@ -2179,7 +2206,7 @@ fn reflect_l2_vmexit(
 }
 
 /// Writes the architectural 64-bit VM-exit host state as VMCS01 guest state.
-fn write_reflected_l1_state(run: &NestedRun) -> Option<()> {
+fn write_reflected_l1_state(run: &NestedRun, l1_efer: u64) -> Option<()> {
     let host = |field| direct_patch_value(&run.saved_direct, field);
     let es = host(VmcsField::HostEsSelector)?;
     let cs = host(VmcsField::HostCsSelector)?;
@@ -2242,6 +2269,7 @@ fn write_reflected_l1_state(run: &NestedRun) -> Option<()> {
         (vmcs::GUEST_INTERRUPTIBILITY_INFO, run.l1_interruptibility),
         (vmcs::GUEST_ACTIVITY_STATE, 0),
         (vmcs::GUEST_IA32_DEBUGCTL, 0),
+        (vmcs::GUEST_IA32_EFER, l1_efer),
         (
             vmcs::GUEST_SYSENTER_CS,
             host(VmcsField::HostIa32SysenterCs)?,
