@@ -290,6 +290,8 @@ pub const PRIMARY_USE_IO_BITMAPS: u32 = 1 << 25;
 pub const PRIMARY_USE_MSR_BITMAPS: u32 = 1 << 28;
 /// Primary MONITOR exiting.
 pub const PRIMARY_MONITOR_EXITING: u32 = 1 << 29;
+/// Primary PAUSE exiting.
+pub const PRIMARY_PAUSE_EXITING: u32 = 1 << 30;
 /// Primary secondary-control activation.
 pub const PRIMARY_ACTIVATE_SECONDARY_CONTROLS: u32 = 1 << 31;
 
@@ -379,7 +381,7 @@ pub const KVM_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_DEBUG_CONTROLS | ENTRY_I
 pub const HYPERV_REQUIRED_PIN_CONTROLS: u32 = PIN_VIRTUAL_NMIS;
 /// Primary controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_PRIMARY_CONTROLS: u32 =
-    PRIMARY_RDTSC_EXITING | PRIMARY_TPR_SHADOW | PRIMARY_NMI_WINDOW_EXITING;
+    PRIMARY_RDTSC_EXITING | PRIMARY_TPR_SHADOW | PRIMARY_NMI_WINDOW_EXITING | PRIMARY_PAUSE_EXITING;
 /// Secondary controls required by Hyper-V's nested VMX path.
 pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_ACCESSES
     | SECONDARY_ENABLE_RDTSCP
@@ -914,7 +916,7 @@ mod tests {
         );
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0029);
-        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3f9_9e8c);
+        assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xf3f9_9e8c);
         assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_10ab);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x003c_9204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_e204);
@@ -1014,6 +1016,7 @@ mod tests {
             PRIMARY_RDTSC_EXITING,
             PRIMARY_TPR_SHADOW,
             PRIMARY_NMI_WINDOW_EXITING,
+            PRIMARY_PAUSE_EXITING,
         ] {
             assert_eq!(
                 restrict_vmx_capability(
