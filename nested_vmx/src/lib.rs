@@ -40,6 +40,8 @@ pub const VMXERR_VMRESUME_NONLAUNCHED_VMCS: u32 = 5;
 pub const VMXERR_VMPTRLD_INVALID_ADDRESS: u32 = 9;
 /// `VM_INSTRUCTION_ERROR` for VMPTRLD targeting the active VMXON region.
 pub const VMXERR_VMPTRLD_VMXON_POINTER: u32 = 10;
+/// `VM_INSTRUCTION_ERROR` for an invalid INVEPT or INVVPID operand.
+pub const VMXERR_INVALID_INVEPT_INVVPID_OPERAND: u32 = 28;
 
 /// Architectural completion status of an emulated VMX instruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,7 +293,7 @@ pub const SECONDARY_VIRTUALIZE_APIC_ACCESSES: u32 = 1 << 0;
 pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 /// Secondary x2APIC virtualization, deliberately hidden.
 pub const SECONDARY_VIRTUALIZE_X2APIC: u32 = 1 << 4;
-/// Secondary VPID enable, deliberately hidden.
+/// Secondary VPID enable.
 pub const SECONDARY_ENABLE_VPID: u32 = 1 << 5;
 /// Secondary unrestricted-guest enable.
 pub const SECONDARY_UNRESTRICTED_GUEST: u32 = 1 << 7;
@@ -335,6 +337,9 @@ pub const KVM_REQUIRED_PRIMARY_CONTROLS: u32 = PRIMARY_INTERRUPT_WINDOW_EXITING
     | PRIMARY_MOV_DR_EXITING
     | PRIMARY_UNCONDITIONAL_IO_EXITING
     | PRIMARY_MONITOR_EXITING;
+/// Stock x86-64 KVM's required allowed-one secondary controls.
+pub const KVM_REQUIRED_SECONDARY_CONTROLS: u32 =
+    SECONDARY_ENABLE_EPT | SECONDARY_UNRESTRICTED_GUEST;
 /// Stock x86-64 KVM's required allowed-one VM-exit controls.
 pub const KVM_REQUIRED_EXIT_CONTROLS: u32 =
     EXIT_SAVE_DEBUG_CONTROLS | EXIT_HOST_ADDRESS_SPACE_SIZE | EXIT_ACKNOWLEDGE_INTERRUPT;
@@ -349,7 +354,7 @@ pub const TRUSTED_PRIMARY_CONTROLS: u32 = KVM_REQUIRED_PRIMARY_CONTROLS
     | PRIMARY_USE_MSR_BITMAPS
     | PRIMARY_ACTIVATE_SECONDARY_CONTROLS;
 /// Conservative allowed-one secondary controls exposed to trusted L1.
-pub const TRUSTED_SECONDARY_CONTROLS: u32 = SECONDARY_ENABLE_EPT | SECONDARY_UNRESTRICTED_GUEST;
+pub const TRUSTED_SECONDARY_CONTROLS: u32 = KVM_REQUIRED_SECONDARY_CONTROLS | SECONDARY_ENABLE_VPID;
 /// Conservative allowed-one VM-exit controls exposed to trusted L1.
 pub const TRUSTED_EXIT_CONTROLS: u32 = KVM_REQUIRED_EXIT_CONTROLS;
 /// Conservative allowed-one VM-entry controls exposed to trusted L1.
@@ -365,12 +370,28 @@ pub const EPT_INVEPT: u64 = 1 << 20;
 pub const EPT_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
 /// Global-context INVEPT is available.
 pub const EPT_INVEPT_GLOBAL_CONTEXT: u64 = 1 << 26;
+/// INVVPID is available.
+pub const VPID_INVVPID: u64 = 1 << 32;
+/// Individual-address INVVPID is available.
+pub const VPID_INVVPID_INDIVIDUAL_ADDRESS: u64 = 1 << 40;
+/// Single-context INVVPID is available.
+pub const VPID_INVVPID_SINGLE_CONTEXT: u64 = 1 << 41;
+/// All-context INVVPID is available.
+pub const VPID_INVVPID_ALL_CONTEXTS: u64 = 1 << 42;
+/// Single-context-retaining-globals INVVPID is available.
+pub const VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS: u64 = 1 << 43;
 /// EPT capability bits stock KVM requires in order to enable EPT.
 pub const KVM_REQUIRED_EPT_CAPABILITIES: u64 =
     EPT_PAGE_WALK_4 | EPTP_WRITE_BACK | EPT_INVEPT | EPT_INVEPT_GLOBAL_CONTEXT;
-/// EPT/VPID capabilities exposed to trusted L1; upper VPID bits remain zero.
+/// INVVPID capabilities required by Hyper-V when VPID is exposed.
+pub const HYPERV_REQUIRED_VPID_CAPABILITIES: u64 = VPID_INVVPID
+    | VPID_INVVPID_INDIVIDUAL_ADDRESS
+    | VPID_INVVPID_SINGLE_CONTEXT
+    | VPID_INVVPID_ALL_CONTEXTS
+    | VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS;
+/// EPT/VPID capabilities exposed to trusted L1.
 pub const TRUSTED_EPT_VPID_CAPABILITIES: u64 =
-    KVM_REQUIRED_EPT_CAPABILITIES | EPT_INVEPT_SINGLE_CONTEXT;
+    KVM_REQUIRED_EPT_CAPABILITIES | EPT_INVEPT_SINGLE_CONTEXT | HYPERV_REQUIRED_VPID_CAPABILITIES;
 /// VMFUNC functions exposed to trusted L1; VMFUNC is deliberately hidden.
 pub const TRUSTED_VMFUNC_CAPABILITIES: u64 = 0;
 /// `IA32_VMX_BASIC` fields safe for direct hardware VMCS use.
@@ -419,7 +440,7 @@ pub const fn restrict_vmx_capability(msr: u32, hardware: u64) -> Option<u64> {
         vmx::IA32_VMX_PROCBASED_CTLS2 => restrict_control_capability(
             hardware,
             TRUSTED_SECONDARY_CONTROLS,
-            TRUSTED_SECONDARY_CONTROLS,
+            KVM_REQUIRED_SECONDARY_CONTROLS,
         ),
         vmx::IA32_VMX_EPT_VPID_CAP => restrict_ept_vpid_capability(hardware),
         vmx::IA32_VMX_MISC => Some(hardware & TRUSTED_MISC_MASK),
@@ -451,11 +472,12 @@ pub const fn restrict_control_capability(
     }
 }
 
-/// Restricts `IA32_VMX_EPT_VPID_CAP` to direct EPT and no VPID.
+/// Restricts `IA32_VMX_EPT_VPID_CAP` to direct EPT and INVVPID.
 #[must_use]
 pub const fn restrict_ept_vpid_capability(hardware: u64) -> Option<u64> {
     let advertised = hardware & TRUSTED_EPT_VPID_CAPABILITIES;
-    if advertised & KVM_REQUIRED_EPT_CAPABILITIES == KVM_REQUIRED_EPT_CAPABILITIES {
+    let required = KVM_REQUIRED_EPT_CAPABILITIES | HYPERV_REQUIRED_VPID_CAPABILITIES;
+    if advertised & required == required {
         Some(advertised)
     } else {
         None
@@ -810,7 +832,6 @@ mod tests {
         assert_eq!(TRUSTED_PRIMARY_CONTROLS & PRIMARY_TPR_SHADOW, 0);
         let hidden_secondary = SECONDARY_VIRTUALIZE_APIC_ACCESSES
             | SECONDARY_VIRTUALIZE_X2APIC
-            | SECONDARY_ENABLE_VPID
             | SECONDARY_APIC_REGISTER_VIRTUALIZATION
             | SECONDARY_VIRTUAL_INTERRUPT_DELIVERY
             | SECONDARY_ENABLE_VMFUNC
@@ -818,11 +839,14 @@ mod tests {
             | SECONDARY_ENABLE_PML
             | SECONDARY_TSC_SCALING;
         assert_eq!(TRUSTED_SECONDARY_CONTROLS & hidden_secondary, 0);
-        assert_eq!(TRUSTED_EPT_VPID_CAPABILITIES >> 32, 0);
+        assert_eq!(
+            TRUSTED_EPT_VPID_CAPABILITIES & HYPERV_REQUIRED_VPID_CAPABILITIES,
+            HYPERV_REQUIRED_VPID_CAPABILITIES
+        );
         assert_eq!(TRUSTED_VMFUNC_CAPABILITIES, 0);
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb399_8e8c);
-        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_0082);
+        assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0000_00a2);
         assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0000_8204);
         assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_0204);
 
@@ -841,6 +865,10 @@ mod tests {
         assert_eq!(
             TRUSTED_ENTRY_CONTROLS & KVM_REQUIRED_ENTRY_CONTROLS,
             KVM_REQUIRED_ENTRY_CONTROLS
+        );
+        assert_eq!(
+            TRUSTED_SECONDARY_CONTROLS & KVM_REQUIRED_SECONDARY_CONTROLS,
+            KVM_REQUIRED_SECONDARY_CONTROLS
         );
         assert_eq!(
             TRUSTED_EPT_VPID_CAPABILITIES & KVM_REQUIRED_EPT_CAPABILITIES,
@@ -887,9 +915,40 @@ mod tests {
             None
         );
         assert_eq!(
+            restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, hardware).unwrap() >> 32,
+            u64::from(TRUSTED_SECONDARY_CONTROLS)
+        );
+        assert_eq!(
+            restrict_vmx_capability(
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                hardware & !(u64::from(SECONDARY_ENABLE_VPID) << 32)
+            )
+            .unwrap()
+                >> 32,
+            u64::from(KVM_REQUIRED_SECONDARY_CONTROLS)
+        );
+        assert_eq!(
             restrict_ept_vpid_capability(TRUSTED_EPT_VPID_CAPABILITIES),
             Some(TRUSTED_EPT_VPID_CAPABILITIES)
         );
+        assert_eq!(
+            restrict_ept_vpid_capability(
+                TRUSTED_EPT_VPID_CAPABILITIES & !HYPERV_REQUIRED_VPID_CAPABILITIES
+            ),
+            None
+        );
+        for capability in [
+            VPID_INVVPID,
+            VPID_INVVPID_INDIVIDUAL_ADDRESS,
+            VPID_INVVPID_SINGLE_CONTEXT,
+            VPID_INVVPID_ALL_CONTEXTS,
+            VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBALS,
+        ] {
+            assert_eq!(
+                restrict_ept_vpid_capability(TRUSTED_EPT_VPID_CAPABILITIES & !capability),
+                None
+            );
+        }
         assert_eq!(
             restrict_ept_vpid_capability(
                 TRUSTED_EPT_VPID_CAPABILITIES & !EPT_INVEPT_GLOBAL_CONTEXT

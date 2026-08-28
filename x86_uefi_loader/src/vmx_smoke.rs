@@ -13,6 +13,7 @@ use core::sync::atomic::Ordering;
 use mutex::SpinLock;
 use nested_vmx::DIRECT_VMCS_PATCH_MANIFEST;
 use nested_vmx::PatchKind;
+use nested_vmx::VMXERR_INVALID_INVEPT_INVVPID_OPERAND;
 use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMCLEAR_VMXON_POINTER;
 use nested_vmx::VMXERR_VMPTRLD_INVALID_ADDRESS;
@@ -83,6 +84,8 @@ const EXIT_REASON_VMREAD: u64 = 23;
 const EXIT_REASON_VMWRITE: u64 = 25;
 /// INVEPT basic exit reason.
 const EXIT_REASON_INVEPT: u64 = 50;
+/// INVVPID basic exit reason.
+const EXIT_REASON_INVVPID: u64 = 53;
 /// Continue the current carrier VMCS after dispatch.
 const VMEXIT_ACTION_RESUME: u64 = 0;
 /// Restore the saved GPR frame and enter L1's direct VMCS.
@@ -326,6 +329,9 @@ pub(crate) fn run(
     let ept_capability = unsafe { cpu::rdmsr(vmx::IA32_VMX_EPT_VPID_CAP) };
     if ept_capability & ept::REQUIRED_EPT_CAPS != ept::REQUIRED_EPT_CAPS {
         return Err(Error::Capability("EPT", ept_capability));
+    }
+    if restrict_vmx_capability(vmx::IA32_VMX_EPT_VPID_CAP, ept_capability).is_none() {
+        return Err(Error::Capability("nested EPT/VPID", ept_capability));
     }
 
     let (guest_image, profile) = runtime_handoff(loaded_image).ok_or(Error::Firmware(
@@ -1529,6 +1535,11 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         return VMEXIT_ACTION_RESUME;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_INVVPID {
+        handle_l1_invvpid(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
@@ -2568,6 +2579,114 @@ fn handle_l1_invept(
             };
             // ponytail: type-2 with a zero descriptor is the measured path;
             // switch to L1's VMCS before supporting observable failure errors.
+            l1_vmx_failure(&state, error)
+        }
+    };
+    complete_vmx_instruction(
+        result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Applies one trusted L1 VPID invalidation directly to hardware.
+fn handle_l1_invvpid(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+        .ok()
+        .and_then(|value| u32::try_from(value).ok());
+    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+    let operands = instruction_info.and_then(|information| {
+        let kind = guest_gpr(registers, ((information >> 28) & 0xf) as u8)?;
+        let linear = vmx::memory_operand_address_64(
+            information,
+            qualification,
+            |register| guest_gpr(registers, register),
+            fs_base,
+            gs_base,
+        )?;
+        Some((kind, linear))
+    });
+    let Some((kind, linear)) = operands else {
+        stop_unexpected_exit(
+            b"decoding INVVPID operands failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    if kind > 3 {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_INVALID_INVEPT_INVVPID_OPERAND),
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    }
+    let descriptor = read_l1_linear_u64(linear).and_then(|first| {
+        read_l1_linear_u64(linear.checked_add(8)?)
+            .map(|address| vmx::InvvpidDescriptor::from_words(first, address))
+    });
+    let Some(descriptor) = descriptor else {
+        // ponytail: trusted long-mode L1 supplies a valid m128 operand. Add
+        // precise #PF/#GP/#SS synthesis before accepting untrusted L1 input.
+        stop_unexpected_exit(
+            b"reading INVVPID descriptor failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    log_l1_vmx(b"INVVPID", b"kind", kind);
+
+    // ponytail: VPID tags are direct and globally shared with this trusted
+    // one-vCPU L1; add per-pCPU VPID ownership before monitor SMP.
+    let status = unsafe { vmx::invvpid(kind, &descriptor) };
+    let result = match status {
+        VmxStatus::Success => VmInstructionResult::Vmsucceed,
+        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
+        VmxStatus::FailValid => {
+            let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+                .ok()
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                stop_unexpected_exit(
+                    b"reading INVVPID error failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
             l1_vmx_failure(&state, error)
         }
     };

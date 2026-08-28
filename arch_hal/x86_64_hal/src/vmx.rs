@@ -323,6 +323,22 @@ pub struct InvvpidDescriptor {
     pub linear_address: u64,
 }
 
+impl InvvpidDescriptor {
+    /// Decodes the two little-endian words of an architectural m128 operand.
+    #[must_use]
+    pub const fn from_words(first: u64, linear_address: u64) -> Self {
+        Self {
+            vpid: first as u16,
+            reserved: [
+                (first >> 16) as u16,
+                (first >> 32) as u16,
+                (first >> 48) as u16,
+            ],
+            linear_address,
+        }
+    }
+}
+
 /// Executes INVEPT.
 ///
 /// # Safety
@@ -490,6 +506,7 @@ unsafe fn vm_entry_instruction(resume: bool) -> VmxStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::InvvpidDescriptor;
     use super::VmxBasic;
     use super::adjust_controls;
     use super::memory_operand_address_64;
@@ -540,5 +557,17 @@ mod tests {
     fn linux_vmwrite_register_operands_are_decoded() {
         assert_eq!(register_operand_indices(0x0361_cd34), Some((6, 0)));
         assert_eq!(register_operand_indices(0x0361_c934), None);
+    }
+
+    #[test]
+    fn invvpid_m128_operand_is_decoded_without_losing_reserved_bits() {
+        assert_eq!(
+            InvvpidDescriptor::from_words(0x7766_5544_3322_1100, 0xffff_8000_1234_5000),
+            InvvpidDescriptor {
+                vpid: 0x1100,
+                reserved: [0x3322, 0x5544, 0x7766],
+                linear_address: 0xffff_8000_1234_5000,
+            }
+        );
     }
 }
