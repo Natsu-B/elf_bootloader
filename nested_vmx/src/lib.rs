@@ -324,6 +324,10 @@ pub const EXIT_SAVE_DEBUG_CONTROLS: u32 = 1 << 2;
 pub const EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
 /// VM-exit interrupt acknowledgement.
 pub const EXIT_ACKNOWLEDGE_INTERRUPT: u32 = 1 << 15;
+/// VM-exit save `IA32_PAT` control.
+pub const EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
+/// VM-exit load `IA32_PAT` control.
+pub const EXIT_LOAD_IA32_PAT: u32 = 1 << 19;
 /// VM-exit save `IA32_EFER` control.
 pub const EXIT_SAVE_IA32_EFER: u32 = 1 << 20;
 /// VM-exit load `IA32_EFER` control.
@@ -332,6 +336,8 @@ pub const EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 pub const ENTRY_LOAD_DEBUG_CONTROLS: u32 = 1 << 2;
 /// VM-entry IA-32e guest-mode control.
 pub const ENTRY_IA32E_MODE: u32 = 1 << 9;
+/// VM-entry load `IA32_PAT` control.
+pub const ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
 /// VM-entry load `IA32_EFER` control.
 pub const ENTRY_LOAD_IA32_EFER: u32 = 1 << 15;
 
@@ -368,9 +374,10 @@ pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_AC
     | SECONDARY_ENABLE_XSAVES
     | SECONDARY_ENABLE_USER_WAIT_PAUSE;
 /// VM-exit controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 = EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
+pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 =
+    EXIT_SAVE_IA32_PAT | EXIT_LOAD_IA32_PAT | EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
 /// VM-entry controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_IA32_EFER;
+pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_IA32_PAT | ENTRY_LOAD_IA32_EFER;
 
 /// Conservative allowed-one pin controls exposed to trusted L1.
 pub const TRUSTED_PIN_CONTROLS: u32 = KVM_REQUIRED_PIN_CONTROLS;
@@ -888,8 +895,8 @@ mod tests {
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
         assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_10ab);
-        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x0030_8204);
-        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_8204);
+        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x003c_8204);
+        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_c204);
 
         assert_eq!(
             TRUSTED_PIN_CONTROLS & KVM_REQUIRED_PIN_CONTROLS,
@@ -998,8 +1005,11 @@ mod tests {
             u64::from(TRUSTED_SECONDARY_CONTROLS)
         );
         for (msr, control) in [
+            (vmx::IA32_VMX_EXIT_CTLS, EXIT_SAVE_IA32_PAT),
+            (vmx::IA32_VMX_EXIT_CTLS, EXIT_LOAD_IA32_PAT),
             (vmx::IA32_VMX_EXIT_CTLS, EXIT_SAVE_IA32_EFER),
             (vmx::IA32_VMX_EXIT_CTLS, EXIT_LOAD_IA32_EFER),
+            (vmx::IA32_VMX_ENTRY_CTLS, ENTRY_LOAD_IA32_PAT),
             (vmx::IA32_VMX_ENTRY_CTLS, ENTRY_LOAD_IA32_EFER),
         ] {
             assert_eq!(
