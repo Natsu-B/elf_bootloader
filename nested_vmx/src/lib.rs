@@ -322,6 +322,8 @@ pub const SECONDARY_ENABLE_USER_WAIT_PAUSE: u32 = 1 << 26;
 pub const EXIT_SAVE_DEBUG_CONTROLS: u32 = 1 << 2;
 /// VM-exit host-address-space-size control.
 pub const EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
+/// VM-exit load `IA32_PERF_GLOBAL_CTRL` control.
+pub const EXIT_LOAD_IA32_PERF_GLOBAL_CTRL: u32 = 1 << 12;
 /// VM-exit interrupt acknowledgement.
 pub const EXIT_ACKNOWLEDGE_INTERRUPT: u32 = 1 << 15;
 /// VM-exit save `IA32_PAT` control.
@@ -336,6 +338,8 @@ pub const EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 pub const ENTRY_LOAD_DEBUG_CONTROLS: u32 = 1 << 2;
 /// VM-entry IA-32e guest-mode control.
 pub const ENTRY_IA32E_MODE: u32 = 1 << 9;
+/// VM-entry load `IA32_PERF_GLOBAL_CTRL` control.
+pub const ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL: u32 = 1 << 13;
 /// VM-entry load `IA32_PAT` control.
 pub const ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
 /// VM-entry load `IA32_EFER` control.
@@ -374,10 +378,14 @@ pub const HYPERV_REQUIRED_SECONDARY_CONTROLS: u32 = SECONDARY_VIRTUALIZE_APIC_AC
     | SECONDARY_ENABLE_XSAVES
     | SECONDARY_ENABLE_USER_WAIT_PAUSE;
 /// VM-exit controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 =
-    EXIT_SAVE_IA32_PAT | EXIT_LOAD_IA32_PAT | EXIT_SAVE_IA32_EFER | EXIT_LOAD_IA32_EFER;
+pub const HYPERV_REQUIRED_EXIT_CONTROLS: u32 = EXIT_LOAD_IA32_PERF_GLOBAL_CTRL
+    | EXIT_SAVE_IA32_PAT
+    | EXIT_LOAD_IA32_PAT
+    | EXIT_SAVE_IA32_EFER
+    | EXIT_LOAD_IA32_EFER;
 /// VM-entry controls required by Hyper-V's nested VMX path.
-pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 = ENTRY_LOAD_IA32_PAT | ENTRY_LOAD_IA32_EFER;
+pub const HYPERV_REQUIRED_ENTRY_CONTROLS: u32 =
+    ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL | ENTRY_LOAD_IA32_PAT | ENTRY_LOAD_IA32_EFER;
 
 /// Conservative allowed-one pin controls exposed to trusted L1.
 pub const TRUSTED_PIN_CONTROLS: u32 = KVM_REQUIRED_PIN_CONTROLS;
@@ -688,8 +696,6 @@ pub enum VmcsField {
     HostIa32Pat = 0x2c00,
     /// Host `IA32_EFER`.
     HostIa32Efer = 0x2c02,
-    /// Host `IA32_PERF_GLOBAL_CTRL`.
-    HostIa32PerfGlobalControl = 0x2c04,
     /// L1's VM-exit MSR-store count.
     VmExitMsrStoreCount = 0x400e,
     /// L1's VM-exit MSR-load count.
@@ -774,8 +780,11 @@ impl DirectVmcsPatch {
     }
 }
 
-/// Complete direct-VMCS host and VM-exit-MSR patch manifest.
-pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 30] = [
+/// Direct-VMCS host and VM-exit-MSR fields L0 must replace.
+///
+/// `HOST_IA32_PERF_GLOBAL_CTRL` stays direct because L0 does not use the PMU;
+/// a trusted L1 may therefore count or interrupt monitor execution.
+pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 29] = [
     DirectVmcsPatch::host(VmcsField::HostEsSelector),
     DirectVmcsPatch::host(VmcsField::HostCsSelector),
     DirectVmcsPatch::host(VmcsField::HostSsSelector),
@@ -785,7 +794,6 @@ pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 30] = [
     DirectVmcsPatch::host(VmcsField::HostTrSelector),
     DirectVmcsPatch::host(VmcsField::HostIa32Pat),
     DirectVmcsPatch::host(VmcsField::HostIa32Efer),
-    DirectVmcsPatch::host(VmcsField::HostIa32PerfGlobalControl),
     DirectVmcsPatch::host(VmcsField::HostIa32SysenterCs),
     DirectVmcsPatch::host(VmcsField::HostCr0),
     DirectVmcsPatch::host(VmcsField::HostCr3),
@@ -895,8 +903,8 @@ mod tests {
         assert_eq!(TRUSTED_PIN_CONTROLS, 0x0000_0009);
         assert_eq!(TRUSTED_PRIMARY_CONTROLS, 0xb3b9_8e8c);
         assert_eq!(TRUSTED_SECONDARY_CONTROLS, 0x0410_10ab);
-        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x003c_8204);
-        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_c204);
+        assert_eq!(TRUSTED_EXIT_CONTROLS, 0x003c_9204);
+        assert_eq!(TRUSTED_ENTRY_CONTROLS, 0x0000_e204);
 
         assert_eq!(
             TRUSTED_PIN_CONTROLS & KVM_REQUIRED_PIN_CONTROLS,
@@ -1005,10 +1013,12 @@ mod tests {
             u64::from(TRUSTED_SECONDARY_CONTROLS)
         );
         for (msr, control) in [
+            (vmx::IA32_VMX_EXIT_CTLS, EXIT_LOAD_IA32_PERF_GLOBAL_CTRL),
             (vmx::IA32_VMX_EXIT_CTLS, EXIT_SAVE_IA32_PAT),
             (vmx::IA32_VMX_EXIT_CTLS, EXIT_LOAD_IA32_PAT),
             (vmx::IA32_VMX_EXIT_CTLS, EXIT_SAVE_IA32_EFER),
             (vmx::IA32_VMX_EXIT_CTLS, EXIT_LOAD_IA32_EFER),
+            (vmx::IA32_VMX_ENTRY_CTLS, ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL),
             (vmx::IA32_VMX_ENTRY_CTLS, ENTRY_LOAD_IA32_PAT),
             (vmx::IA32_VMX_ENTRY_CTLS, ENTRY_LOAD_IA32_EFER),
         ] {
@@ -1088,7 +1098,7 @@ mod tests {
                 .iter()
                 .filter(|patch| patch.kind == PatchKind::HostState)
                 .count(),
-            26
+            25
         );
         assert_eq!(
             DIRECT_VMCS_PATCH_MANIFEST

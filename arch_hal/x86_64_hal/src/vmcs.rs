@@ -177,6 +177,8 @@ pub const SECONDARY_EXEC_UNRESTRICTED_GUEST: u32 = 1 << 7;
 
 /// VM-exit control selecting 64-bit host mode.
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;
+/// VM-exit control that loads `IA32_PERF_GLOBAL_CTRL`.
+pub const VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL: u32 = 1 << 12;
 /// VM-exit control that saves `IA32_PAT`.
 pub const VM_EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
 /// VM-exit control that loads `IA32_PAT`.
@@ -188,6 +190,8 @@ pub const VM_EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 
 /// VM-entry control selecting IA-32e guest mode.
 pub const VM_ENTRY_IA32E_MODE: u32 = 1 << 9;
+/// VM-entry control that loads `IA32_PERF_GLOBAL_CTRL`.
+pub const VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL: u32 = 1 << 13;
 /// VM-entry control that loads `IA32_PAT`.
 pub const VM_ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
 /// VM-entry control that loads `IA32_EFER`.

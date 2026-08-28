@@ -2015,6 +2015,10 @@ fn handle_l1_vmentry(
     let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
     let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.unwrap_or(u64::MAX);
     let entry_controls = unsafe { vmx::vmread(vmcs::VM_ENTRY_CONTROLS) }.unwrap_or(u64::MAX);
+    // ponytail: keep PERF_GLOBAL_CTRL direct because L0 does not use the PMU;
+    // outer KVM advertises the VMCS pair even when direct MSR access would #GP.
+    let exit_perf_mask = u64::from(vmcs::VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
+    let entry_perf_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL);
     let exit_pat_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_PAT);
     let entry_pat_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PAT);
     let exit_pat_controls = exit_controls & exit_pat_mask;
@@ -2032,9 +2036,8 @@ fn handle_l1_vmentry(
     if exit_store_count != Some(0)
         || exit_load_count != Some(0)
         || entry_load_count != Some(0)
-        || exit_controls & (1 << 12) != 0
-        || (exit_controls & !(exit_pat_mask | exit_efer_mask)) >> 18 != 0
-        || (entry_controls & !(entry_pat_mask | entry_efer_mask)) >> 13 != 0
+        || (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18 != 0
+        || (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 != 0
         || !supported_pat_controls
         || !supported_efer_controls
     {
