@@ -2377,7 +2377,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
     );
 }
 
-/// Executes one register-form L1 VMREAD or VMWRITE on its direct VMCS.
+/// Executes one L1 VMREAD or VMWRITE on its direct VMCS.
 fn handle_l1_vmcs_access(
     write: bool,
     reason: u64,
@@ -2409,15 +2409,12 @@ fn handle_l1_vmcs_access(
         return;
     };
 
-    let operands = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+    let Some(instruction_info) = (unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) })
         .ok()
         .and_then(|value| u32::try_from(value).ok())
-        .and_then(vmx::register_operand_indices);
-    let Some((register1, field_register)) = operands else {
-        // ponytail: Linux's observed VMCS accesses are register-form; add
-        // translated guest-memory access only when an L1 uses memory-form.
+    else {
         stop_unexpected_exit(
-            b"unsupported memory-form VMCS access",
+            b"reading VMCS-access instruction information failed",
             reason,
             qualification,
             guest_rip,
@@ -2425,9 +2422,63 @@ fn handle_l1_vmcs_access(
             registers,
         );
     };
+    let (register1, memory_linear, field_register) = if let Some((register1, field_register)) =
+        vmx::register_operand_indices(instruction_info)
+    {
+        (Some(register1), None, field_register)
+    } else {
+        let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+        let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+        let linear = vmx::memory_operand_address_64(
+            instruction_info,
+            qualification,
+            |register| guest_gpr(registers, register),
+            fs_base,
+            gs_base,
+        );
+        let Some(linear) = linear else {
+            // ponytail: trusted long-mode L1 supplies a valid mapped m64
+            // operand; synthesize precise memory faults before relaxing it.
+            stop_unexpected_exit(
+                b"decoding memory-form VMCS access failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        (None, Some(linear), ((instruction_info >> 28) & 0xf) as u8)
+    };
     let field_value = guest_gpr(registers, field_register);
     let write_value = if write {
-        guest_gpr(registers, register1)
+        if let Some(register1) = register1 {
+            let Some(value) = guest_gpr(registers, register1) else {
+                stop_unexpected_exit(
+                    b"invalid VMWRITE value register",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            Some(value)
+        } else {
+            let Some(value) = memory_linear.and_then(read_l1_linear_u64) else {
+                // ponytail: trusted L1 memory operands fail-stop until this
+                // path synthesizes the architectural #PF/#GP/#SS exception.
+                stop_unexpected_exit(
+                    b"reading memory-form VMWRITE source failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            Some(value)
+        }
     } else {
         None
     };
@@ -2441,17 +2492,6 @@ fn handle_l1_vmcs_access(
             registers,
         );
     };
-    if write && write_value.is_none() {
-        stop_unexpected_exit(
-            b"invalid VMWRITE value register",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    }
-
     let mut carrier_address = u64::MAX;
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         stop_unexpected_exit(
@@ -2530,9 +2570,25 @@ fn handle_l1_vmcs_access(
         }
     };
     if let Some(value) = read_value {
-        if !set_guest_gpr(registers, register1, value) {
+        if let Some(register1) = register1 {
+            if !set_guest_gpr(registers, register1, value) {
+                stop_unexpected_exit(
+                    b"writing VMREAD destination failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+        } else if memory_linear
+            .and_then(|linear| write_l1_linear_u64(linear, value))
+            .is_none()
+        {
+            // ponytail: trusted L1 memory operands fail-stop until this path
+            // synthesizes the architectural #PF/#GP/#SS exception.
             stop_unexpected_exit(
-                b"writing VMREAD destination failed",
+                b"writing memory-form VMREAD destination failed",
                 reason,
                 qualification,
                 guest_rip,
@@ -2881,6 +2937,29 @@ fn read_l1_linear_u64(linear: u64) -> Option<u64> {
         *byte = unsafe { ptr::read_volatile(physical as *const u8) };
     }
     Some(u64::from_le_bytes(bytes))
+}
+
+/// Writes an m64 operand through L1's current long-mode page tables.
+fn write_l1_linear_u64(linear: u64, value: u64) -> Option<()> {
+    let cr3 = unsafe { vmx::vmread(vmcs::GUEST_CR3) }.ok()?;
+    let cr4 = unsafe { vmx::vmread(vmcs::GUEST_CR4) }.ok()?;
+    let max_physical_bits = max_physical_address_bits()?;
+    // ponytail: mirror the read path's eight walks so an m64 crossing a page
+    // boundary remains valid without adding a translation cache to the TCB.
+    for (index, byte) in value.to_le_bytes().iter().enumerate() {
+        let address = linear.checked_add(index as u64)?;
+        let physical =
+            paging::translate_long_mode(address, cr3, cr4, max_physical_bits, |entry| {
+                read_l1_physical_u64(entry)
+            })?;
+        if physical >= IDENTITY_MAP_LIMIT {
+            return None;
+        }
+        // SAFETY: the trusted L1 page walk resolved this byte inside the
+        // identity-mapped eight-gibibyte smoke address space.
+        unsafe { ptr::write_volatile(physical as *mut u8, *byte) };
+    }
+    Some(())
 }
 
 /// Reads one aligned paging entry from identity-mapped L1 physical memory.
