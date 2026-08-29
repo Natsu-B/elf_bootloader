@@ -2320,12 +2320,10 @@ fn handle_l1_vmentry(
         outer_instruction_len: instruction_len,
     });
     drop(active);
-    let (name, action) = match instruction {
-        VmEntryInstruction::Vmlaunch => (b"VMLAUNCH".as_slice(), VMEXIT_ACTION_VMLAUNCH),
-        VmEntryInstruction::Vmresume => (b"VMRESUME".as_slice(), VMEXIT_ACTION_VMRESUME),
-    };
-    log_l1_vmx(name, b"direct", current.address().get());
-    action
+    match instruction {
+        VmEntryInstruction::Vmlaunch => VMEXIT_ACTION_VMLAUNCH,
+        VmEntryInstruction::Vmresume => VMEXIT_ACTION_VMRESUME,
+    }
 }
 
 /// Reads every field whose direct-VMCS value must survive L0 patching.
@@ -2441,8 +2439,6 @@ fn reflect_l2_vmexit(
 
     // ponytail: the fault-free real-mode probe leaves CR2 untouched. Save it
     // in the entry stub before allowing an L2 that can fault.
-    log_l1_vmx(b"L2 EXIT", b"reason", reason);
-    log_l1_vmx(b"L2 EXIT", b"qualification", qualification);
 }
 
 /// Writes the architectural 64-bit VM-exit host state as VMCS01 guest state.
