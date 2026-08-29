@@ -207,6 +207,9 @@ static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
 /// Host fields of the immutable single-vCPU carrier VMCS.
 static CARRIER_PATCH_VALUES: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]>> =
     SpinLock::new(None);
+/// Last restored host fields of L1's current direct VMCS.
+static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_MANIFEST.len()])>> =
+    SpinLock::new(None);
 /// State abandoned on the L0 stack while a direct L2 is running.
 // ponytail: one global direct run is sufficient for the current one-pCPU
 // probe; move this into per-pCPU storage before enabling SMP.
@@ -961,6 +964,7 @@ fn configure_and_launch(
     CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
     *L1_VCPU_STATE.lock() = VcpuState::new();
     *CARRIER_PATCH_VALUES.lock() = None;
+    *DIRECT_PATCH_VALUES.lock() = None;
     *NESTED_RUN.lock() = None;
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
@@ -1775,6 +1779,7 @@ fn handle_l1_vmxon(
         VmInstructionResult::VmfailInvalid,
         |region| {
             L1_VCPU_STATE.lock().record_vmxon_success(region);
+            *DIRECT_PATCH_VALUES.lock() = None;
             VmInstructionResult::Vmsucceed
         },
     );
@@ -1809,6 +1814,7 @@ fn handle_l1_vmxoff(
     }
 
     L1_VCPU_STATE.lock().record_vmxoff_success();
+    *DIRECT_PATCH_VALUES.lock() = None;
     complete_vmx_instruction(
         VmInstructionResult::Vmsucceed,
         reason,
@@ -1884,6 +1890,13 @@ fn handle_l1_vmclear(
     let result = match status {
         VmxStatus::Success => {
             L1_VCPU_STATE.lock().record_vmclear_success(region);
+            let mut cached = DIRECT_PATCH_VALUES.lock();
+            if cached
+                .as_ref()
+                .is_some_and(|(address, _)| *address == region)
+            {
+                *cached = None;
+            }
             VmInstructionResult::Vmsucceed
         }
         VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
@@ -2208,15 +2221,25 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let Some(saved_direct) = read_direct_patch_fields() else {
-        stop_unexpected_exit(
-            b"saving direct VMCS patch fields failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
+    let saved_direct = {
+        let mut cached = DIRECT_PATCH_VALUES.lock();
+        match *cached {
+            Some((address, values)) if address == current.address() => values,
+            _ => {
+                let Some(values) = read_direct_patch_fields() else {
+                    stop_unexpected_exit(
+                        b"saving direct VMCS patch fields failed",
+                        reason,
+                        qualification,
+                        guest_rip,
+                        instruction_len,
+                        registers,
+                    );
+                };
+                *cached = Some((current.address(), values));
+                values
+            }
+        }
     };
     let exit_store_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrStoreCount);
     let exit_load_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrLoadCount);
@@ -2743,6 +2766,20 @@ fn handle_l1_vmcs_access(
             instruction_len,
             registers,
         );
+    }
+
+    if write && status == VmxStatus::Success {
+        let mut cached = DIRECT_PATCH_VALUES.lock();
+        let patches_cached_vmcs = cached
+            .as_ref()
+            .is_some_and(|(address, _)| *address == current.address());
+        let patches_cached_field = DIRECT_VMCS_PATCH_MANIFEST.iter().any(|patch| {
+            let encoding = patch.field as u32;
+            field == encoding || field == (encoding | 1)
+        });
+        if patches_cached_vmcs && patches_cached_field {
+            *cached = None;
+        }
     }
 
     let result = match status {
