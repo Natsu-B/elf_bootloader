@@ -80,6 +80,8 @@ const EXIT_REASON_VMLAUNCH: u64 = 20;
 const EXIT_REASON_VMRESUME: u64 = 24;
 /// VMPTRLD basic exit reason.
 const EXIT_REASON_VMPTRLD: u64 = 21;
+/// VMPTRST basic exit reason.
+const EXIT_REASON_VMPTRST: u64 = 22;
 /// VMREAD basic exit reason.
 const EXIT_REASON_VMREAD: u64 = 23;
 /// VMWRITE basic exit reason.
@@ -1524,6 +1526,11 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         return VMEXIT_ACTION_RESUME;
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMPTRST {
+        handle_l1_vmptrst(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+
     if reason & (1 << 31) == 0
         && matches!(reason & 0xffff, EXIT_REASON_VMLAUNCH | EXIT_REASON_VMRESUME)
     {
@@ -1932,6 +1939,75 @@ fn handle_l1_vmptrld(
     };
     complete_vmx_instruction(
         result,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
+}
+
+/// Stores L1's tracked current-VMCS pointer without switching hardware VMCSes.
+fn handle_l1_vmptrst(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let state = *L1_VCPU_STATE.lock();
+    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
+        inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    if cs & 3 != 0 {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    }
+
+    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+        .ok()
+        .and_then(|value| u32::try_from(value).ok());
+    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+    let linear = instruction_info.and_then(|information| {
+        vmx::memory_operand_address_64(
+            information,
+            qualification,
+            |register| guest_gpr(registers, register),
+            fs_base,
+            gs_base,
+        )
+    });
+    let Some(linear) = linear else {
+        stop_unexpected_exit(
+            b"decoding VMPTRST destination failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let current = state
+        .current_vmcs()
+        .map_or(u64::MAX, |vmcs| vmcs.address().get());
+    if write_l1_linear_u64(linear, current).is_none() {
+        // ponytail: trusted long-mode L1 supplies a valid mapped m64
+        // destination; synthesize precise memory faults before relaxing it.
+        stop_unexpected_exit(
+            b"writing VMPTRST destination failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    complete_vmx_instruction(
+        VmInstructionResult::Vmsucceed,
         reason,
         qualification,
         guest_rip,
