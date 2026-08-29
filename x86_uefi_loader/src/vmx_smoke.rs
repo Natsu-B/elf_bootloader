@@ -212,6 +212,8 @@ static CARRIER_PATCH_VALUES: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.le
 // per-VMCS storage only when the trusted single-vCPU path needs concurrency.
 static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_MANIFEST.len()])>> =
     SpinLock::new(None);
+/// Validated direct-VMCS entry policy, invalidated by its three writable fields.
+static DIRECT_ENTRY_POLICY: SpinLock<Option<(VmcsPhys, u64)>> = SpinLock::new(None);
 /// State abandoned on the L0 stack while a direct L2 is running.
 // ponytail: one global direct run is sufficient for the current one-pCPU
 // probe; move this into per-pCPU storage before enabling SMP.
@@ -967,6 +969,7 @@ fn configure_and_launch(
     *L1_VCPU_STATE.lock() = VcpuState::new();
     *CARRIER_PATCH_VALUES.lock() = None;
     *DIRECT_PATCH_VALUES.lock() = None;
+    *DIRECT_ENTRY_POLICY.lock() = None;
     *NESTED_RUN.lock() = None;
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
@@ -1404,15 +1407,16 @@ extern "sysv64" fn vmexit_entry() -> ! {
 unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64 {
     // SAFETY: `vmexit_entry` passes its live, uniquely owned stack frame.
     let registers = unsafe { &mut *registers };
+    let nested_run = NESTED_RUN.lock().take();
+    if let Some(run) = nested_run {
+        reflect_l2_vmexit(&run, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+
     let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
     let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
     let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
-
-    if NESTED_RUN.lock().is_some() {
-        reflect_l2_vmexit(reason, qualification, guest_rip, instruction_len, registers);
-        return VMEXIT_ACTION_RESUME;
-    }
 
     // VM-entry event fields persist in the VMCS after delivery.
     let clear_event = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
@@ -2287,35 +2291,52 @@ fn handle_l1_vmentry(
     };
     let exit_store_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrStoreCount);
     let exit_load_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrLoadCount);
-    let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
-    let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.unwrap_or(u64::MAX);
-    let entry_controls = unsafe { vmx::vmread(vmcs::VM_ENTRY_CONTROLS) }.unwrap_or(u64::MAX);
-    // ponytail: keep PERF_GLOBAL_CTRL direct because L0 does not use the PMU;
-    // outer KVM advertises the VMCS pair even when direct MSR access would #GP.
-    let exit_perf_mask = u64::from(vmcs::VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
-    let entry_perf_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL);
-    let exit_pat_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_PAT);
-    let entry_pat_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PAT);
-    let exit_pat_controls = exit_controls & exit_pat_mask;
-    let entry_pat_controls = entry_controls & entry_pat_mask;
-    let supported_pat_controls = (exit_pat_controls == 0 && entry_pat_controls == 0)
-        || (exit_pat_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_PAT) != 0
-            && entry_pat_controls == entry_pat_mask);
-    let exit_efer_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_EFER | vmcs::VM_EXIT_LOAD_IA32_EFER);
-    let entry_efer_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_EFER);
-    let exit_efer_controls = exit_controls & exit_efer_mask;
-    let entry_efer_controls = entry_controls & entry_efer_mask;
-    let supported_efer_controls = (exit_efer_controls == 0 && entry_efer_controls == 0)
-        || (exit_efer_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0
-            && entry_efer_controls == entry_efer_mask);
-    if exit_store_count != Some(0)
-        || exit_load_count != Some(0)
-        || entry_load_count != Some(0)
-        || (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18 != 0
-        || (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 != 0
-        || !supported_pat_controls
-        || !supported_efer_controls
+    let cached_exit_controls = match *DIRECT_ENTRY_POLICY.lock() {
+        Some((address, exit_controls)) if address == current.address() => Some(exit_controls),
+        Some(_) => stop_unexpected_exit(
+            b"cached entry policy does not match current pointer",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        ),
+        None => None,
+    };
+    let cache_entry_policy = cached_exit_controls.is_none();
+    let (exit_controls, supported_entry_policy) = if let Some(exit_controls) = cached_exit_controls
     {
+        (exit_controls, true)
+    } else {
+        let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
+        let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.unwrap_or(u64::MAX);
+        let entry_controls = unsafe { vmx::vmread(vmcs::VM_ENTRY_CONTROLS) }.unwrap_or(u64::MAX);
+        // ponytail: keep PERF_GLOBAL_CTRL direct because L0 does not use the PMU;
+        // outer KVM advertises the VMCS pair even when direct MSR access would #GP.
+        let exit_perf_mask = u64::from(vmcs::VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
+        let entry_perf_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL);
+        let exit_pat_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_PAT);
+        let entry_pat_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PAT);
+        let exit_pat_controls = exit_controls & exit_pat_mask;
+        let entry_pat_controls = entry_controls & entry_pat_mask;
+        let supported_pat_controls = (exit_pat_controls == 0 && entry_pat_controls == 0)
+            || (exit_pat_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_PAT) != 0
+                && entry_pat_controls == entry_pat_mask);
+        let exit_efer_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_EFER | vmcs::VM_EXIT_LOAD_IA32_EFER);
+        let entry_efer_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_EFER);
+        let exit_efer_controls = exit_controls & exit_efer_mask;
+        let entry_efer_controls = entry_controls & entry_efer_mask;
+        let supported_efer_controls = (exit_efer_controls == 0 && entry_efer_controls == 0)
+            || (exit_efer_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0
+                && entry_efer_controls == entry_efer_mask);
+        let supported = entry_load_count == Some(0)
+            && (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18 == 0
+            && (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 == 0
+            && supported_pat_controls
+            && supported_efer_controls;
+        (exit_controls, supported)
+    };
+    if exit_store_count != Some(0) || exit_load_count != Some(0) || !supported_entry_policy {
         // ponytail: the measured KVM probe has empty MSR lists. Add bounded L0
         // MSR mirrors when a real workload first supplies a non-empty list.
         // ponytail: PAT controls follow the same all-clear or entry+exit-load
@@ -2350,6 +2371,9 @@ fn handle_l1_vmentry(
             );
         }
         *DIRECT_PATCH_VALUES.lock() = Some((current.address(), saved_direct));
+    }
+    if cache_entry_policy {
+        *DIRECT_ENTRY_POLICY.lock() = Some((current.address(), exit_controls));
     }
 
     let mut active = NESTED_RUN.lock();
@@ -2510,37 +2534,15 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
         return false;
     }
     *cached = None;
+    *DIRECT_ENTRY_POLICY.lock() = None;
     true
 }
 
 /// Reflects a hardware L2 exit through VMCS01 into Linux KVM's host RIP.
-fn reflect_l2_vmexit(
-    reason: u64,
-    qualification: u64,
-    guest_rip: u64,
-    instruction_len: u64,
-    registers: &GuestRegisters,
-) {
-    let Some(run) = NESTED_RUN.lock().take() else {
-        stop_unexpected_exit(
-            b"missing nested run state",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    };
+fn reflect_l2_vmexit(run: &NestedRun, registers: &GuestRegisters) {
     let mut current = u64::MAX;
     if unsafe { vmx::vmptrst(&mut current) } != VmxStatus::Success || current != run.direct.get() {
-        stop_unexpected_exit(
-            b"unexpected direct VMCS on L2 exit",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
+        stop_nested_exit(b"unexpected direct VMCS on L2 exit", run.direct, registers);
     }
     let l1_pat = run
         .exit_loaded_l1_pat
@@ -2549,29 +2551,38 @@ fn reflect_l2_vmexit(
         .exit_loaded_l1_efer
         .unwrap_or_else(|| unsafe { cpu::rdmsr(cpu::IA32_EFER) });
     if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
-        stop_unexpected_exit(
+        stop_nested_exit(
             b"restoring carrier after L2 exit failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
+            run.direct,
             registers,
         );
     }
 
-    if write_reflected_l1_state(&run, l1_pat, l1_efer).is_none() {
-        stop_unexpected_exit(
-            b"reflecting L1 host state failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
+    if write_reflected_l1_state(run, l1_pat, l1_efer).is_none() {
+        stop_nested_exit(b"reflecting L1 host state failed", run.direct, registers);
     }
 
     // ponytail: the fault-free real-mode probe leaves CR2 untouched. Save it
     // in the entry stub before allowing an L2 that can fault.
+}
+
+/// Stops after recovering L2's exit diagnostics only on an error path.
+fn stop_nested_exit(message: &'static [u8], direct: VmcsPhys, registers: &GuestRegisters) -> ! {
+    if unsafe { vmx::vmptrld(direct) } != VmxStatus::Success {
+        stop_unexpected_exit(message, u64::MAX, u64::MAX, u64::MAX, u64::MAX, registers);
+    }
+    let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+    stop_unexpected_exit(
+        message,
+        reason,
+        qualification,
+        guest_rip,
+        instruction_len,
+        registers,
+    );
 }
 
 /// Writes the architectural 64-bit VM-exit host state as VMCS01 guest state.
@@ -2915,6 +2926,15 @@ fn handle_l1_vmcs_access(
         }
         (status, read_value, hardware_error)
     };
+    if status == VmxStatus::Success
+        && write_value.is_some()
+        && matches!(
+            field,
+            vmcs::VM_ENTRY_MSR_LOAD_COUNT | vmcs::VM_EXIT_CONTROLS | vmcs::VM_ENTRY_CONTROLS
+        )
+    {
+        *DIRECT_ENTRY_POLICY.lock() = None;
+    }
 
     let result = match status {
         VmxStatus::Success => VmInstructionResult::Vmsucceed,
