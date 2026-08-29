@@ -22,7 +22,6 @@ use nested_vmx::VcpuState;
 use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
-use nested_vmx::VmcsLaunchState;
 use nested_vmx::restrict_vmx_capability;
 use r_efi::efi;
 use uefi_variable_overlay::ProfileId;
@@ -247,7 +246,6 @@ struct NestedRun {
     outer_qualification: u64,
     outer_rip: u64,
     outer_instruction_len: u64,
-    instruction: VmEntryInstruction,
 }
 
 /// Failure from the bounded VMX smoke launch.
@@ -1915,11 +1913,7 @@ fn handle_l1_vmptrld(
 
     let result = match status {
         VmxStatus::Success => {
-            // ponytail: the single-vCPU probe selects the VMCS it just cleared;
-            // track launch state per page before allowing multiple L1 VMCSes.
-            L1_VCPU_STATE
-                .lock()
-                .record_vmptrld_success(region, VmcsLaunchState::Clear);
+            L1_VCPU_STATE.lock().record_vmptrld_success(region);
             VmInstructionResult::Vmsucceed
         }
         VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
@@ -2034,18 +2028,6 @@ fn handle_l1_vmentry(
     let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
-        return VMEXIT_ACTION_RESUME;
-    }
-    let entry_result = state.entry_result(instruction);
-    if entry_result != VmInstructionResult::Vmsucceed {
-        complete_vmx_instruction(
-            entry_result,
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
         return VMEXIT_ACTION_RESUME;
     }
     let Some(current) = state.current_vmcs() else {
@@ -2210,7 +2192,6 @@ fn handle_l1_vmentry(
         outer_qualification: qualification,
         outer_rip: guest_rip,
         outer_instruction_len: instruction_len,
-        instruction,
     });
     drop(active);
     let (name, action) = match instruction {
@@ -2321,16 +2302,6 @@ fn reflect_l2_vmexit(
         );
     }
 
-    if reason & (1 << 31) == 0 && !L1_VCPU_STATE.lock().record_entry_success(run.instruction) {
-        stop_unexpected_exit(
-            b"recording nested VMLAUNCH success failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    }
     if write_reflected_l1_state(&run, l1_pat, l1_efer).is_none() {
         stop_unexpected_exit(
             b"reflecting L1 host state failed",

@@ -32,10 +32,6 @@ const VMX_STATUS_RFLAGS: u64 =
 pub const VMXERR_VMCLEAR_INVALID_ADDRESS: u32 = 2;
 /// `VM_INSTRUCTION_ERROR` for VMCLEAR targeting the active VMXON region.
 pub const VMXERR_VMCLEAR_VMXON_POINTER: u32 = 3;
-/// `VM_INSTRUCTION_ERROR` for VMLAUNCH with a launched current VMCS.
-pub const VMXERR_VMLAUNCH_NONCLEAR_VMCS: u32 = 4;
-/// `VM_INSTRUCTION_ERROR` for VMRESUME with a clear current VMCS.
-pub const VMXERR_VMRESUME_NONLAUNCHED_VMCS: u32 = 5;
 /// `VM_INSTRUCTION_ERROR` for VMPTRLD with an invalid physical address.
 pub const VMXERR_VMPTRLD_INVALID_ADDRESS: u32 = 9;
 /// `VM_INSTRUCTION_ERROR` for VMPTRLD targeting the active VMXON region.
@@ -79,15 +75,6 @@ impl VmInstructionResult {
     }
 }
 
-/// VMCS launch state maintained for the current direct VMCS.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VmcsLaunchState {
-    /// VMCLEAR has established the clear state.
-    Clear,
-    /// A successful VMLAUNCH has established the launched state.
-    Launched,
-}
-
 /// The VM-entry instruction requested by L1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VmEntryInstruction {
@@ -102,8 +89,6 @@ pub enum VmEntryInstruction {
 pub struct CurrentVmcs {
     /// Direct hardware VMCS physical address.
     address: VmcsPhys,
-    /// Clear or launched state known by the instruction adapter.
-    launch_state: VmcsLaunchState,
 }
 
 impl CurrentVmcs {
@@ -112,24 +97,14 @@ impl CurrentVmcs {
     pub const fn address(self) -> VmcsPhys {
         self.address
     }
-
-    /// Returns the current launch state.
-    #[must_use]
-    pub const fn launch_state(self) -> VmcsLaunchState {
-        self.launch_state
-    }
 }
 
 /// Trusted nested-VMX state owned by one L1 virtual CPU.
-///
-/// VMCS launch state for a newly selected address is supplied by the direct
-/// VMCS adapter. This keeps page tracking and guest-memory access out of the
-/// policy crate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct VcpuState {
     /// L1's active VMXON region, if it is in VMX operation.
     vmxon_region: Option<VmxonPhys>,
-    /// L1's current VMCS and its known launch state.
+    /// L1's current direct VMCS.
     current_vmcs: Option<CurrentVmcs>,
 }
 
@@ -175,26 +150,19 @@ impl VcpuState {
     }
 
     /// Records a successful VMPTRLD.
-    ///
-    /// `launch_state` comes from the adapter's direct-VMCS bookkeeping. The
-    /// CPU remains the authority for field and revision validation.
-    pub fn record_vmptrld_success(&mut self, address: VmcsPhys, launch_state: VmcsLaunchState) {
+    pub fn record_vmptrld_success(&mut self, address: VmcsPhys) {
         debug_assert!(self.in_vmx_operation());
         debug_assert!(
             self.vmxon_region
                 .is_none_or(|region| region.get() != address.get())
         );
-        self.current_vmcs = Some(CurrentVmcs {
-            address,
-            launch_state,
-        });
+        self.current_vmcs = Some(CurrentVmcs { address });
     }
 
     /// Records a successful VMCLEAR.
     ///
     /// VMCLEAR invalidates the current-VMCS pointer when it names the current
-    /// VMCS. Launch state for a non-current page stays in the adapter that
-    /// owns the direct VMCS pages.
+    /// VMCS.
     pub fn record_vmclear_success(&mut self, address: VmcsPhys) {
         if self
             .current_vmcs
@@ -202,46 +170,6 @@ impl VcpuState {
         {
             self.current_vmcs = None;
         }
-    }
-
-    /// Checks the current VMCS launch state for VMLAUNCH or VMRESUME.
-    ///
-    /// The decoder must handle the non-VMX-operation #UD case before calling
-    /// this function. A missing current VMCS produces `VMfailInvalid`.
-    #[must_use]
-    pub const fn entry_result(&self, instruction: VmEntryInstruction) -> VmInstructionResult {
-        let Some(current) = self.current_vmcs else {
-            return VmInstructionResult::VmfailInvalid;
-        };
-        match (instruction, current.launch_state) {
-            (VmEntryInstruction::Vmlaunch, VmcsLaunchState::Clear)
-            | (VmEntryInstruction::Vmresume, VmcsLaunchState::Launched) => {
-                VmInstructionResult::Vmsucceed
-            }
-            (VmEntryInstruction::Vmlaunch, VmcsLaunchState::Launched) => {
-                VmInstructionResult::VmfailValid(VMXERR_VMLAUNCH_NONCLEAR_VMCS)
-            }
-            (VmEntryInstruction::Vmresume, VmcsLaunchState::Clear) => {
-                VmInstructionResult::VmfailValid(VMXERR_VMRESUME_NONLAUNCHED_VMCS)
-            }
-        }
-    }
-
-    /// Records a successful hardware VM entry.
-    ///
-    /// Returns `false` without changing state if the recorded precondition is
-    /// inconsistent with a successful entry.
-    pub fn record_entry_success(&mut self, instruction: VmEntryInstruction) -> bool {
-        if self.entry_result(instruction) != VmInstructionResult::Vmsucceed {
-            return false;
-        }
-        if instruction == VmEntryInstruction::Vmlaunch {
-            let Some(current) = self.current_vmcs.as_mut() else {
-                return false;
-            };
-            current.launch_state = VmcsLaunchState::Launched;
-        }
-        true
     }
 }
 
@@ -870,33 +798,24 @@ mod tests {
     }
 
     #[test]
-    fn vcpu_tracks_current_vmcs_launch_state() {
+    fn vcpu_tracks_current_vmcs_across_reselection() {
         let vmxon = VmxonPhys::new(0x1000).unwrap();
-        let vmcs = VmcsPhys::new(0x2000).unwrap();
+        let first = VmcsPhys::new(0x2000).unwrap();
+        let second = VmcsPhys::new(0x3000).unwrap();
         let mut state = VcpuState::new();
 
         state.record_vmxon_success(vmxon);
-        state.record_vmptrld_success(vmcs, VmcsLaunchState::Clear);
-        assert_eq!(
-            state.entry_result(VmEntryInstruction::Vmresume),
-            VmInstructionResult::VmfailValid(VMXERR_VMRESUME_NONLAUNCHED_VMCS)
-        );
-        assert!(state.record_entry_success(VmEntryInstruction::Vmlaunch));
-        assert_eq!(
-            state.entry_result(VmEntryInstruction::Vmlaunch),
-            VmInstructionResult::VmfailValid(VMXERR_VMLAUNCH_NONCLEAR_VMCS)
-        );
-        assert_eq!(
-            state.entry_result(VmEntryInstruction::Vmresume),
-            VmInstructionResult::Vmsucceed
-        );
+        state.record_vmptrld_success(first);
+        assert_eq!(state.current_vmcs().map(CurrentVmcs::address), Some(first));
+        state.record_vmptrld_success(second);
+        assert_eq!(state.current_vmcs().map(CurrentVmcs::address), Some(second));
+        state.record_vmptrld_success(first);
+        assert_eq!(state.current_vmcs().map(CurrentVmcs::address), Some(first));
 
-        state.record_vmclear_success(vmcs);
+        state.record_vmclear_success(second);
+        assert_eq!(state.current_vmcs().map(CurrentVmcs::address), Some(first));
+        state.record_vmclear_success(first);
         assert_eq!(state.current_vmcs(), None);
-        assert_eq!(
-            state.entry_result(VmEntryInstruction::Vmlaunch),
-            VmInstructionResult::VmfailInvalid
-        );
         state.record_vmxoff_success();
         assert!(!state.in_vmx_operation());
     }
