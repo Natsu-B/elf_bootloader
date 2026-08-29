@@ -22,6 +22,7 @@ std soc
 std typestate
 std typestate_macro
 std xtask
+std x86_uefi_loader --bin x86-uefi-loader
 # Select host GDB integrations explicitly; the remaining integrations target UEFI.
 unit gdb_remote
 std gdb_remote --test rsp_binary_decode --test rsp_frame_assembler

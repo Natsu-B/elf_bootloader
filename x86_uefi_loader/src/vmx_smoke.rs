@@ -12,6 +12,9 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use mutex::SpinLock;
 use nested_vmx::DIRECT_VMCS_PATCH_MANIFEST;
+use nested_vmx::EXIT_ACKNOWLEDGE_INTERRUPT;
+use nested_vmx::PIN_EXTERNAL_INTERRUPT_EXITING;
+use nested_vmx::PRIMARY_INTERRUPT_WINDOW_EXITING;
 use nested_vmx::PatchKind;
 use nested_vmx::VMXERR_INVALID_INVEPT_INVVPID_OPERAND;
 use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
@@ -61,6 +64,10 @@ const IDENTITY_MAP_LIMIT: u64 = 1 << 33;
 const EXIT_REASON_VMCALL: u64 = 18;
 /// CPUID basic exit reason.
 const EXIT_REASON_CPUID: u64 = 10;
+/// External-interrupt basic exit reason.
+const EXIT_REASON_EXTERNAL_INTERRUPT: u64 = 1;
+/// Interrupt-window basic exit reason.
+const EXIT_REASON_INTERRUPT_WINDOW: u64 = 7;
 /// XSETBV basic exit reason.
 const EXIT_REASON_XSETBV: u64 = 55;
 /// RDMSR basic exit reason.
@@ -99,6 +106,8 @@ const VMEXIT_ACTION_VMRESUME: u64 = 2;
 const INJECT_GENERAL_PROTECTION: u64 = (1 << 31) | (1 << 11) | (3 << 8) | 13;
 /// VM-entry interruption information for #UD without an error code.
 const INJECT_INVALID_OPCODE: u64 = (1 << 31) | (3 << 8) | 6;
+/// Valid VM-entry interruption information for an external interrupt vector.
+const INJECT_EXTERNAL_INTERRUPT: u64 = 1 << 31;
 /// AMD-specific MSR range, which raises #GP when probed on this Intel target.
 const AMD_MSR_RANGE: core::ops::RangeInclusive<u32> = 0xc001_0000..=0xc001_ffff;
 /// VMX capability MSRs exposed through the conservative nested policy.
@@ -192,6 +201,8 @@ static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
 /// XCR0 restored when the bounded smoke leaves VMX operation.
 static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
 static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Acknowledged external interrupts awaiting an interruptible L1 window.
+static PENDING_EXTERNAL_INTERRUPTS: SpinLock<[u64; 4]> = SpinLock::new([0; 4]);
 /// Nested VMX state for the current single-vCPU smoke run.
 // ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
 static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
@@ -858,10 +869,13 @@ fn configure_and_launch(
     } else {
         vmx::IA32_VMX_ENTRY_CTLS
     };
-    let pin = vmx::adjust_controls(0, unsafe { cpu::rdmsr(pin_msr) });
+    let pin = vmx::adjust_controls(PIN_EXTERNAL_INTERRUPT_EXITING, unsafe {
+        cpu::rdmsr(pin_msr)
+    });
+    let primary_capability = unsafe { cpu::rdmsr(primary_msr) };
     let primary = vmx::adjust_controls(
         vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS | vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS,
-        unsafe { cpu::rdmsr(primary_msr) },
+        primary_capability,
     );
     let secondary = vmx::adjust_controls(
         vmcs::SECONDARY_EXEC_ENABLE_EPT
@@ -876,6 +890,7 @@ fn configure_and_launch(
     let exit_capability = unsafe { cpu::rdmsr(exit_msr) };
     let exit = vmx::adjust_controls(
         vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+            | EXIT_ACKNOWLEDGE_INTERRUPT
             | vmcs::VM_EXIT_SAVE_IA32_PAT
             | vmcs::VM_EXIT_SAVE_IA32_EFER
             | vmcs::VM_EXIT_LOAD_IA32_EFER,
@@ -892,7 +907,11 @@ fn configure_and_launch(
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_INVPCID == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_XSAVES == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE == 0
+        || pin & PIN_EXTERNAL_INTERRUPT_EXITING == 0
+        || primary & PRIMARY_INTERRUPT_WINDOW_EXITING != 0
+        || (primary_capability >> 32) as u32 & PRIMARY_INTERRUPT_WINDOW_EXITING == 0
         || exit & vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0
+        || exit & EXIT_ACKNOWLEDGE_INTERRUPT == 0
         || exit & vmcs::VM_EXIT_SAVE_IA32_PAT == 0
         || exit & vmcs::VM_EXIT_LOAD_IA32_PAT != 0
         || (exit_capability >> 32) as u32 & vmcs::VM_EXIT_LOAD_IA32_PAT == 0
@@ -939,6 +958,7 @@ fn configure_and_launch(
     GUEST_RAN.store(0, Ordering::Release);
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
     CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
+    *PENDING_EXTERNAL_INTERRUPTS.lock() = [0; 4];
     *L1_VCPU_STATE.lock() = VcpuState::new();
     *NESTED_RUN.lock() = None;
     let launch = unsafe { vmx::vmlaunch() };
@@ -1400,6 +1420,51 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         );
     }
 
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_EXTERNAL_INTERRUPT {
+        let interruption = unsafe { vmx::vmread(vmcs::VM_EXIT_INTR_INFO) }.unwrap_or(0);
+        if !queue_external_interrupt(interruption) {
+            stop_unexpected_exit(
+                b"queueing external interrupt failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        let ready = guest_accepts_external_interrupt();
+        let prepared = if ready == Some(true) {
+            inject_pending_external_interrupt()
+        } else {
+            ready == Some(false) && set_interrupt_window_exiting(true)
+        };
+        if !prepared {
+            stop_unexpected_exit(
+                b"preparing external interrupt failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        return VMEXIT_ACTION_RESUME;
+    }
+
+    if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_INTERRUPT_WINDOW {
+        if !inject_pending_external_interrupt() {
+            stop_unexpected_exit(
+                b"completing interrupt-window exit failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        return VMEXIT_ACTION_RESUME;
+    }
+
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_CPUID {
         CPUID_EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
         let leaf = registers.rax as u32;
@@ -1584,6 +1649,67 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         instruction_len,
         registers,
     );
+}
+
+/// Records one acknowledged external-interrupt vector.
+fn queue_external_interrupt(interruption: u64) -> bool {
+    if interruption & !0xff != INJECT_EXTERNAL_INTERRUPT {
+        return false;
+    }
+    let vector = interruption as usize & 0xff;
+    PENDING_EXTERNAL_INTERRUPTS.lock()[vector / 64] |= 1_u64 << (vector % 64);
+    true
+}
+
+/// Removes the highest-priority pending vector and reports whether more remain.
+fn take_pending_external_interrupt() -> Option<(u64, bool)> {
+    let mut pending = PENDING_EXTERNAL_INTERRUPTS.lock();
+    for word_index in (0..pending.len()).rev() {
+        let word = pending[word_index];
+        if word == 0 {
+            continue;
+        }
+        let bit = 63 - word.leading_zeros() as usize;
+        pending[word_index] &= !(1_u64 << bit);
+        let more = pending.iter().any(|word| *word != 0);
+        let vector = (word_index * 64 + bit) as u64;
+        return Some((INJECT_EXTERNAL_INTERRUPT | vector, more));
+    }
+    None
+}
+
+/// Reports whether L1 can accept an external interrupt on the next VM entry.
+fn guest_accepts_external_interrupt() -> Option<bool> {
+    let rflags = unsafe { vmx::vmread(vmcs::GUEST_RFLAGS) }.ok()?;
+    let interruptibility = unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.ok()?;
+    let activity = unsafe { vmx::vmread(vmcs::GUEST_ACTIVITY_STATE) }.ok()?;
+    if activity > 1 {
+        return None;
+    }
+    Some(rflags & (1 << 9) != 0 && interruptibility & 0b11 == 0)
+}
+
+/// Updates interrupt-window exiting without disturbing other primary controls.
+fn set_interrupt_window_exiting(enabled: bool) -> bool {
+    let Ok(primary) = (unsafe { vmx::vmread(vmcs::CPU_BASED_VM_EXEC_CONTROL) }) else {
+        return false;
+    };
+    let mask = u64::from(PRIMARY_INTERRUPT_WINDOW_EXITING);
+    let primary = if enabled {
+        primary | mask
+    } else {
+        primary & !mask
+    };
+    (unsafe { vmx::vmwrite(vmcs::CPU_BASED_VM_EXEC_CONTROL, primary) }) == VmxStatus::Success
+}
+
+/// Injects the highest-priority queued interrupt and arms a window for the rest.
+fn inject_pending_external_interrupt() -> bool {
+    let Some((interruption, more)) = take_pending_external_interrupt() else {
+        return false;
+    };
+    (unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, interruption) }) == VmxStatus::Success
+        && set_interrupt_window_exiting(more)
 }
 
 /// Enables read exits for the complete VMX capability range.
@@ -3398,4 +3524,39 @@ fn leave_vmx() -> VmxStatus {
         restore_control_registers();
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::INJECT_EXTERNAL_INTERRUPT;
+    use super::PENDING_EXTERNAL_INTERRUPTS;
+    use super::queue_external_interrupt;
+    use super::take_pending_external_interrupt;
+
+    #[test]
+    fn pending_external_interrupts_validate_and_prioritize_vectors() {
+        *PENDING_EXTERNAL_INTERRUPTS.lock() = [0; 4];
+        assert!(!queue_external_interrupt(0));
+        assert!(!queue_external_interrupt(
+            INJECT_EXTERNAL_INTERRUPT | (1 << 8) | 0x20
+        ));
+
+        for vector in [0x20, 0x40, 0xff, 0x40] {
+            assert!(queue_external_interrupt(INJECT_EXTERNAL_INTERRUPT | vector));
+        }
+
+        assert_eq!(
+            take_pending_external_interrupt(),
+            Some((INJECT_EXTERNAL_INTERRUPT | 0xff, true))
+        );
+        assert_eq!(
+            take_pending_external_interrupt(),
+            Some((INJECT_EXTERNAL_INTERRUPT | 0x40, true))
+        );
+        assert_eq!(
+            take_pending_external_interrupt(),
+            Some((INJECT_EXTERNAL_INTERRUPT | 0x20, false))
+        );
+        assert_eq!(take_pending_external_interrupt(), None);
+    }
 }

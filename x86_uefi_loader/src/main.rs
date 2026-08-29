@@ -1,10 +1,11 @@
 //! Minimal x86-64 UEFI entry point for the thin hypervisor.
 
-#![no_main]
-#![no_std]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), no_std)]
 
 use core::fmt;
 use core::fmt::Write;
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 use r_efi::efi;
 use x86_64_hal::cpu;
@@ -125,6 +126,7 @@ pub extern "efiapi" fn efi_main(
 }
 
 /// Emits a stable marker even when formatting the panic itself would be unsafe.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     let mut serial = SerialPort;
