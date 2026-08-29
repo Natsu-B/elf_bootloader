@@ -216,6 +216,7 @@ static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_M
 static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
+const _: () = assert!(DIRECT_VMCS_PATCH_MANIFEST.len() <= u32::BITS as usize);
 
 /// Bootstrap-to-runtime handoff copied before entering VMX non-root mode.
 #[repr(C)]
@@ -254,6 +255,7 @@ struct NestedRun {
     carrier: VmcsPhys,
     direct: VmcsPhys,
     saved_direct: [u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    patched_direct_fields: u32,
     exit_loaded_l1_pat: Option<u64>,
     exit_loaded_l1_efer: Option<u64>,
     l1_interruptibility: u64,
@@ -2294,7 +2296,7 @@ fn handle_l1_vmentry(
     let exit_loaded_l1_efer = (exit_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0)
         .then(|| direct_patch_value(&saved_direct, VmcsField::HostIa32Efer))
         .flatten();
-    if !patch_direct_vmcs(&carrier_values) {
+    let Some(patched_direct_fields) = patch_direct_vmcs(&saved_direct, &carrier_values) else {
         stop_unexpected_exit(
             b"patching direct VMCS failed",
             reason,
@@ -2303,7 +2305,7 @@ fn handle_l1_vmentry(
             instruction_len,
             registers,
         );
-    }
+    };
 
     let mut active = NESTED_RUN.lock();
     if active.is_some() {
@@ -2320,6 +2322,7 @@ fn handle_l1_vmentry(
         carrier,
         direct: current.address(),
         saved_direct,
+        patched_direct_fields,
         exit_loaded_l1_pat,
         exit_loaded_l1_efer,
         l1_interruptibility,
@@ -2355,23 +2358,37 @@ fn direct_patch_value(
         .map(|index| values[index])
 }
 
-/// Replaces L1 host state with VMCS01 host state and disables exit MSR lists.
-fn patch_direct_vmcs(carrier_values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
+/// Replaces differing L1 host state with VMCS01 state and disables exit MSR lists.
+fn patch_direct_vmcs(
+    saved_direct: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    carrier_values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+) -> Option<u32> {
+    let mut patched_fields = 0;
     for (index, patch) in DIRECT_VMCS_PATCH_MANIFEST.iter().enumerate() {
         let value = match patch.kind {
             PatchKind::HostState => carrier_values[index],
             PatchKind::ExitMsrStore | PatchKind::ExitMsrLoad => 0,
         };
-        if unsafe { vmx::vmwrite(patch.field as u32, value) } != VmxStatus::Success {
-            return false;
+        if saved_direct[index] == value {
+            continue;
         }
+        if unsafe { vmx::vmwrite(patch.field as u32, value) } != VmxStatus::Success {
+            return None;
+        }
+        patched_fields |= 1 << index;
     }
-    true
+    Some(patched_fields)
 }
 
-/// Restores all direct-VMCS fields hidden while L0 handled an L2 exit.
-fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
-    for (value, patch) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST) {
+/// Restores direct-VMCS fields changed before the L2 entry.
+fn restore_direct_vmcs(
+    values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    patched_fields: u32,
+) -> bool {
+    for (index, (value, patch)) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST).enumerate() {
+        if patched_fields & (1 << index) == 0 {
+            continue;
+        }
         if unsafe { vmx::vmwrite(patch.field as u32, *value) } != VmxStatus::Success {
             return false;
         }
@@ -2414,7 +2431,7 @@ fn reflect_l2_vmexit(
     let l1_efer = run
         .exit_loaded_l1_efer
         .unwrap_or_else(|| unsafe { cpu::rdmsr(cpu::IA32_EFER) });
-    if !restore_direct_vmcs(&run.saved_direct) {
+    if !restore_direct_vmcs(&run.saved_direct, run.patched_direct_fields) {
         stop_unexpected_exit(
             b"restoring direct VMCS after L2 exit failed",
             reason,
@@ -2571,7 +2588,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
             registers,
         );
     };
-    if !restore_direct_vmcs(&run.saved_direct)
+    if !restore_direct_vmcs(&run.saved_direct, run.patched_direct_fields)
         || unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success
     {
         stop_unexpected_exit(
