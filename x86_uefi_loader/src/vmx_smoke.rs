@@ -204,6 +204,9 @@ static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Nested VMX state for the current single-vCPU smoke run.
 // ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
 static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
+/// Host fields of the immutable single-vCPU carrier VMCS.
+static CARRIER_PATCH_VALUES: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]>> =
+    SpinLock::new(None);
 /// State abandoned on the L0 stack while a direct L2 is running.
 // ponytail: one global direct run is sufficient for the current one-pCPU
 // probe; move this into per-pCPU storage before enabling SMP.
@@ -957,6 +960,7 @@ fn configure_and_launch(
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
     CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
     *L1_VCPU_STATE.lock() = VcpuState::new();
+    *CARRIER_PATCH_VALUES.lock() = None;
     *NESTED_RUN.lock() = None;
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
@@ -2172,15 +2176,24 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let Some(carrier_values) = read_direct_patch_fields() else {
-        stop_unexpected_exit(
-            b"saving carrier host state failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
+    let carrier_values = {
+        let mut cached = CARRIER_PATCH_VALUES.lock();
+        if let Some(values) = *cached {
+            values
+        } else {
+            let Some(values) = read_direct_patch_fields() else {
+                stop_unexpected_exit(
+                    b"saving carrier host state failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            *cached = Some(values);
+            values
+        }
     };
     let l1_interruptibility =
         unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
