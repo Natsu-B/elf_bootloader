@@ -1763,14 +1763,8 @@ fn handle_l1_vmxon(
         return;
     }
 
-    let region_address = read_l1_vmx_pointer(
-        b"VMXON",
-        reason,
-        qualification,
-        guest_rip,
-        instruction_len,
-        registers,
-    );
+    let region_address =
+        read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
     log_l1_vmxon(b"region", region_address);
 
     let result = validate_l1_vmxon_region(region_address).map_or(
@@ -1841,14 +1835,7 @@ fn handle_l1_vmclear(
         return;
     }
 
-    let address = read_l1_vmx_pointer(
-        b"VMCLEAR",
-        reason,
-        qualification,
-        guest_rip,
-        instruction_len,
-        registers,
-    );
+    let address = read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
     log_l1_vmx(b"VMCLEAR", b"region", address);
     let Some(region) = validate_l1_vmcs_address(address) else {
         complete_vmx_instruction(
@@ -1965,15 +1952,7 @@ fn handle_l1_vmptrld(
         return;
     }
 
-    let address = read_l1_vmx_pointer(
-        b"VMPTRLD",
-        reason,
-        qualification,
-        guest_rip,
-        instruction_len,
-        registers,
-    );
-    log_l1_vmx(b"VMPTRLD", b"region", address);
+    let address = read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
     let Some(region) = validate_l1_vmcs_address(address) else {
         complete_vmx_instruction(
             l1_vmx_failure(&state, VMXERR_VMPTRLD_INVALID_ADDRESS),
@@ -3047,7 +3026,6 @@ fn log_l1_vmx(instruction: &[u8], name: &[u8], value: u64) {
 
 /// Decodes and reads one nested-VMX m64 pointer operand.
 fn read_l1_vmx_pointer(
-    instruction: &[u8],
     reason: u64,
     qualification: u64,
     guest_rip: u64,
@@ -3078,7 +3056,6 @@ fn read_l1_vmx_pointer(
             registers,
         );
     };
-    log_l1_vmx(instruction, b"operand_linear", linear);
     let Some(pointer) = read_l1_linear_u64(linear) else {
         // ponytail: trusted long-mode L1 uses a valid operand. Add precise
         // #PF/#GP/#SS synthesis before accepting untrusted or 32-bit L1s.
