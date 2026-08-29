@@ -207,7 +207,9 @@ static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
 /// Host fields of the immutable single-vCPU carrier VMCS.
 static CARRIER_PATCH_VALUES: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]>> =
     SpinLock::new(None);
-/// Last restored host fields of L1's current direct VMCS.
+/// L1-visible fields of the one direct VMCS retained with L0 host patches.
+// ponytail: materialize this single cached VMCS on pointer changes; add
+// per-VMCS storage only when the trusted single-vCPU path needs concurrency.
 static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_MANIFEST.len()])>> =
     SpinLock::new(None);
 /// State abandoned on the L0 stack while a direct L2 is running.
@@ -216,7 +218,6 @@ static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_M
 static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
-const _: () = assert!(DIRECT_VMCS_PATCH_MANIFEST.len() <= u32::BITS as usize);
 
 /// Bootstrap-to-runtime handoff copied before entering VMX non-root mode.
 #[repr(C)]
@@ -255,7 +256,6 @@ struct NestedRun {
     carrier: VmcsPhys,
     direct: VmcsPhys,
     saved_direct: [u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
-    patched_direct_fields: u32,
     exit_loaded_l1_pat: Option<u64>,
     exit_loaded_l1_efer: Option<u64>,
     l1_interruptibility: u64,
@@ -1780,8 +1780,17 @@ fn handle_l1_vmxon(
     let result = validate_l1_vmxon_region(region_address).map_or(
         VmInstructionResult::VmfailInvalid,
         |region| {
+            if !materialize_direct_patch(None) {
+                stop_unexpected_exit(
+                    b"restoring direct VMCS before VMXON failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
             L1_VCPU_STATE.lock().record_vmxon_success(region);
-            *DIRECT_PATCH_VALUES.lock() = None;
             VmInstructionResult::Vmsucceed
         },
     );
@@ -1815,8 +1824,17 @@ fn handle_l1_vmxoff(
         return;
     }
 
+    if !materialize_direct_patch(None) {
+        stop_unexpected_exit(
+            b"restoring direct VMCS before VMXOFF failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
     L1_VCPU_STATE.lock().record_vmxoff_success();
-    *DIRECT_PATCH_VALUES.lock() = None;
     complete_vmx_instruction(
         VmInstructionResult::Vmsucceed,
         reason,
@@ -1888,17 +1906,20 @@ fn handle_l1_vmclear(
             registers,
         );
     }
+    if !materialize_direct_patch(Some(region)) {
+        stop_unexpected_exit(
+            b"restoring direct VMCS before VMCLEAR failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
     let status = unsafe { vmx::vmclear(region) };
     let result = match status {
         VmxStatus::Success => {
             L1_VCPU_STATE.lock().record_vmclear_success(region);
-            let mut cached = DIRECT_PATCH_VALUES.lock();
-            if cached
-                .as_ref()
-                .is_some_and(|(address, _)| *address == region)
-            {
-                *cached = None;
-            }
             VmInstructionResult::Vmsucceed
         }
         VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
@@ -2002,6 +2023,17 @@ fn handle_l1_vmptrld(
         // virtualize a colliding carrier only if that trusted layout changes.
         stop_unexpected_exit(
             b"VMPTRLD targets VMCS01",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let old_current = state.current_vmcs().map(|current| current.address());
+    if old_current != Some(region) && !materialize_direct_patch(None) {
+        stop_unexpected_exit(
+            b"restoring old direct VMCS before VMPTRLD failed",
             reason,
             qualification,
             guest_rip,
@@ -2191,9 +2223,23 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let carrier_values = {
+    let cached_direct = match *DIRECT_PATCH_VALUES.lock() {
+        Some((address, values)) if address == current.address() => Some(values),
+        Some(_) => stop_unexpected_exit(
+            b"cached direct VMCS does not match current pointer",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        ),
+        None => None,
+    };
+    let carrier_values = if cached_direct.is_some() {
+        None
+    } else {
         let mut cached = CARRIER_PATCH_VALUES.lock();
-        if let Some(values) = *cached {
+        let values = if let Some(values) = *cached {
             values
         } else {
             let Some(values) = read_direct_patch_fields() else {
@@ -2208,7 +2254,8 @@ fn handle_l1_vmentry(
             };
             *cached = Some(values);
             values
-        }
+        };
+        Some(values)
     };
     let l1_interruptibility =
         unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
@@ -2223,25 +2270,20 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let saved_direct = {
-        let mut cached = DIRECT_PATCH_VALUES.lock();
-        match *cached {
-            Some((address, values)) if address == current.address() => values,
-            _ => {
-                let Some(values) = read_direct_patch_fields() else {
-                    stop_unexpected_exit(
-                        b"saving direct VMCS patch fields failed",
-                        reason,
-                        qualification,
-                        guest_rip,
-                        instruction_len,
-                        registers,
-                    );
-                };
-                *cached = Some((current.address(), values));
-                values
-            }
-        }
+    let saved_direct = if let Some(values) = cached_direct {
+        values
+    } else {
+        let Some(values) = read_direct_patch_fields() else {
+            stop_unexpected_exit(
+                b"saving direct VMCS patch fields failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        values
     };
     let exit_store_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrStoreCount);
     let exit_load_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrLoadCount);
@@ -2296,16 +2338,19 @@ fn handle_l1_vmentry(
     let exit_loaded_l1_efer = (exit_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0)
         .then(|| direct_patch_value(&saved_direct, VmcsField::HostIa32Efer))
         .flatten();
-    let Some(patched_direct_fields) = patch_direct_vmcs(&saved_direct, &carrier_values) else {
-        stop_unexpected_exit(
-            b"patching direct VMCS failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    };
+    if let Some(carrier_values) = carrier_values {
+        if !patch_direct_vmcs(&saved_direct, &carrier_values) {
+            stop_unexpected_exit(
+                b"patching direct VMCS failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        *DIRECT_PATCH_VALUES.lock() = Some((current.address(), saved_direct));
+    }
 
     let mut active = NESTED_RUN.lock();
     if active.is_some() {
@@ -2322,7 +2367,6 @@ fn handle_l1_vmentry(
         carrier,
         direct: current.address(),
         saved_direct,
-        patched_direct_fields,
         exit_loaded_l1_pat,
         exit_loaded_l1_efer,
         l1_interruptibility,
@@ -2358,12 +2402,64 @@ fn direct_patch_value(
         .map(|index| values[index])
 }
 
+/// Finds a full or architecturally valid high-half manifest field.
+fn direct_patch_field(field: u32) -> Option<(usize, bool)> {
+    DIRECT_VMCS_PATCH_MANIFEST
+        .iter()
+        .enumerate()
+        .find_map(|(index, patch)| {
+            let encoding = patch.field as u32;
+            if field == encoding {
+                Some((index, false))
+            } else if (encoding >> 13) & 3 == 1 && field == (encoding | 1) {
+                Some((index, true))
+            } else {
+                None
+            }
+        })
+}
+
+/// Reads one L1-visible manifest field from retained direct-VMCS state.
+fn read_direct_patch_field(
+    values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    field: u32,
+) -> Option<u64> {
+    direct_patch_field(field).map(|(index, high)| {
+        if high {
+            values[index] >> 32
+        } else {
+            values[index]
+        }
+    })
+}
+
+/// Writes one L1-visible manifest field with architectural width semantics.
+fn write_direct_patch_field(
+    values: &mut [u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    field: u32,
+    value: u64,
+) -> bool {
+    let Some((index, high)) = direct_patch_field(field) else {
+        return false;
+    };
+    let encoding = DIRECT_VMCS_PATCH_MANIFEST[index].field as u32;
+    values[index] = if high {
+        (values[index] & u64::from(u32::MAX)) | ((value & u64::from(u32::MAX)) << 32)
+    } else {
+        match (encoding >> 13) & 3 {
+            0 => value & u64::from(u16::MAX),
+            2 => value & u64::from(u32::MAX),
+            _ => value,
+        }
+    };
+    true
+}
+
 /// Replaces differing L1 host state with VMCS01 state and disables exit MSR lists.
 fn patch_direct_vmcs(
     saved_direct: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
     carrier_values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
-) -> Option<u32> {
-    let mut patched_fields = 0;
+) -> bool {
     for (index, patch) in DIRECT_VMCS_PATCH_MANIFEST.iter().enumerate() {
         let value = match patch.kind {
             PatchKind::HostState => carrier_values[index],
@@ -2373,26 +2469,47 @@ fn patch_direct_vmcs(
             continue;
         }
         if unsafe { vmx::vmwrite(patch.field as u32, value) } != VmxStatus::Success {
-            return None;
+            return false;
         }
-        patched_fields |= 1 << index;
     }
-    Some(patched_fields)
+    true
 }
 
-/// Restores direct-VMCS fields changed before the L2 entry.
-fn restore_direct_vmcs(
-    values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
-    patched_fields: u32,
-) -> bool {
-    for (index, (value, patch)) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST).enumerate() {
-        if patched_fields & (1 << index) == 0 {
-            continue;
-        }
+/// Restores every L1-visible field before exposing a retained direct VMCS.
+fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
+    for (value, patch) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST) {
         if unsafe { vmx::vmwrite(patch.field as u32, *value) } != VmxStatus::Success {
             return false;
         }
     }
+    true
+}
+
+/// Materializes one retained direct VMCS while VMCS01 is current.
+fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
+    let mut cached = DIRECT_PATCH_VALUES.lock();
+    let Some((direct, values)) = *cached else {
+        return true;
+    };
+    if only.is_some_and(|address| address != direct) {
+        return true;
+    }
+
+    let mut carrier_address = u64::MAX;
+    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+        return false;
+    }
+    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+        return false;
+    };
+    if carrier == direct
+        || unsafe { vmx::vmptrld(direct) } != VmxStatus::Success
+        || !restore_direct_vmcs(&values)
+        || unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success
+    {
+        return false;
+    }
+    *cached = None;
     true
 }
 
@@ -2431,16 +2548,6 @@ fn reflect_l2_vmexit(
     let l1_efer = run
         .exit_loaded_l1_efer
         .unwrap_or_else(|| unsafe { cpu::rdmsr(cpu::IA32_EFER) });
-    if !restore_direct_vmcs(&run.saved_direct, run.patched_direct_fields) {
-        stop_unexpected_exit(
-            b"restoring direct VMCS after L2 exit failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    }
     if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"restoring carrier after L2 exit failed",
@@ -2588,9 +2695,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
             registers,
         );
     };
-    if !restore_direct_vmcs(&run.saved_direct, run.patched_direct_fields)
-        || unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success
-    {
+    if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"restoring carrier after VMLAUNCH failure failed",
             run.outer_reason,
@@ -2725,79 +2830,91 @@ fn handle_l1_vmcs_access(
             registers,
         );
     };
-    let mut carrier_address = u64::MAX;
-    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
-        stop_unexpected_exit(
-            b"saving VMCS-access carrier failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    }
-    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
-        stop_unexpected_exit(
-            b"invalid VMCS-access carrier",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    };
-    if carrier == current.address()
-        || unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success
-    {
-        stop_unexpected_exit(
-            b"selecting L1 VMCS for access failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    }
-
-    let (status, read_value) = if write {
-        (unsafe { vmx::vmwrite(field, write_value.unwrap()) }, None)
-    } else {
-        match unsafe { vmx::vmread(field) } {
-            Ok(value) => (VmxStatus::Success, Some(value)),
-            Err(status) => (status, None),
-        }
-    };
-    let hardware_error = if status == VmxStatus::FailValid {
-        (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
-            .ok()
-            .and_then(|value| u32::try_from(value).ok())
-    } else {
-        None
-    };
-    if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
-        stop_unexpected_exit(
-            b"restoring VMCS-access carrier failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    }
-
-    if write && status == VmxStatus::Success {
+    let shadowed = {
         let mut cached = DIRECT_PATCH_VALUES.lock();
-        let patches_cached_vmcs = cached
-            .as_ref()
-            .is_some_and(|(address, _)| *address == current.address());
-        let patches_cached_field = DIRECT_VMCS_PATCH_MANIFEST.iter().any(|patch| {
-            let encoding = patch.field as u32;
-            field == encoding || field == (encoding | 1)
-        });
-        if patches_cached_vmcs && patches_cached_field {
-            *cached = None;
+        match cached.as_mut() {
+            Some((address, _)) if *address != current.address() => stop_unexpected_exit(
+                b"cached direct VMCS does not match VMCS access",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            ),
+            Some((_, values)) => {
+                if let Some(value) = write_value {
+                    write_direct_patch_field(values, field, value).then_some(None)
+                } else {
+                    read_direct_patch_field(values, field).map(Some)
+                }
+            }
+            None => None,
         }
-    }
+    };
+    let (status, read_value, hardware_error) = if let Some(read_value) = shadowed {
+        (VmxStatus::Success, read_value, None)
+    } else {
+        let mut carrier_address = u64::MAX;
+        if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+            stop_unexpected_exit(
+                b"saving VMCS-access carrier failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+            stop_unexpected_exit(
+                b"invalid VMCS-access carrier",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        if carrier == current.address()
+            || unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success
+        {
+            stop_unexpected_exit(
+                b"selecting L1 VMCS for access failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+
+        let (status, read_value) = if let Some(value) = write_value {
+            (unsafe { vmx::vmwrite(field, value) }, None)
+        } else {
+            match unsafe { vmx::vmread(field) } {
+                Ok(value) => (VmxStatus::Success, Some(value)),
+                Err(status) => (status, None),
+            }
+        };
+        let hardware_error = if status == VmxStatus::FailValid {
+            (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+                .ok()
+                .and_then(|value| u32::try_from(value).ok())
+        } else {
+            None
+        };
+        if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+            stop_unexpected_exit(
+                b"restoring VMCS-access carrier failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+        (status, read_value, hardware_error)
+    };
 
     let result = match status {
         VmxStatus::Success => VmInstructionResult::Vmsucceed,
@@ -3562,8 +3679,12 @@ fn leave_vmx() -> VmxStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::DIRECT_VMCS_PATCH_MANIFEST;
     use super::INJECT_EXTERNAL_INTERRUPT;
+    use super::VmcsField;
     use super::acknowledged_external_interrupt;
+    use super::read_direct_patch_field;
+    use super::write_direct_patch_field;
 
     #[test]
     fn acknowledged_external_interrupt_requires_a_plain_external_vector() {
@@ -3577,5 +3698,39 @@ mod tests {
             acknowledged_external_interrupt(INJECT_EXTERNAL_INTERRUPT | (1 << 8) | 0x20),
             Err(())
         );
+    }
+
+    #[test]
+    fn retained_direct_fields_preserve_vmcs_width_semantics() {
+        let mut values = [0; DIRECT_VMCS_PATCH_MANIFEST.len()];
+        let selector = VmcsField::HostEsSelector as u32;
+        let count = VmcsField::VmExitMsrStoreCount as u32;
+        let pat = VmcsField::HostIa32Pat as u32;
+        let cr0 = VmcsField::HostCr0 as u32;
+
+        assert!(write_direct_patch_field(&mut values, selector, u64::MAX));
+        assert_eq!(read_direct_patch_field(&values, selector), Some(0xffff));
+        assert_eq!(read_direct_patch_field(&values, selector | 1), None);
+
+        assert!(write_direct_patch_field(&mut values, count, u64::MAX));
+        assert_eq!(
+            read_direct_patch_field(&values, count),
+            Some(u64::from(u32::MAX))
+        );
+
+        assert!(write_direct_patch_field(
+            &mut values,
+            pat,
+            0x1122_3344_5566_7788
+        ));
+        assert_eq!(read_direct_patch_field(&values, pat | 1), Some(0x1122_3344));
+        assert!(write_direct_patch_field(&mut values, pat | 1, u64::MAX));
+        assert_eq!(
+            read_direct_patch_field(&values, pat),
+            Some(0xffff_ffff_5566_7788)
+        );
+
+        assert!(write_direct_patch_field(&mut values, cr0, u64::MAX));
+        assert_eq!(read_direct_patch_field(&values, cr0), Some(u64::MAX));
     }
 }
