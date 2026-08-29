@@ -3055,8 +3055,6 @@ fn handle_l1_invept(
             registers,
         );
     };
-    log_l1_vmx(b"INVEPT", b"kind", kind);
-
     let status = unsafe { vmx::invept(kind, &descriptor) };
     let result = match status {
         VmxStatus::Success => VmInstructionResult::Vmsucceed,
@@ -3163,8 +3161,6 @@ fn handle_l1_invvpid(
             registers,
         );
     };
-    log_l1_vmx(b"INVVPID", b"kind", kind);
-
     // ponytail: VPID tags are direct and globally shared with this trusted
     // one-vCPU L1; add per-pCPU VPID ownership before monitor SMP.
     let status = unsafe { vmx::invvpid(kind, &descriptor) };
