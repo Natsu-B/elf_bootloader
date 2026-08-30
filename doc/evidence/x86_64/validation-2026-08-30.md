@@ -8,8 +8,10 @@ boot markers. Windows disks, dumps, and raw serial logs are intentionally not co
 - Branch: feat/x86-thin-monitor
 - Later non-runtime build-input commit: a86492c12221b413b481030ad7b09b060313a273
   (adds curl to the Nix development shell)
+- Trusted startup optimization follow-up: 63c5d2b48fe5a377b02b701a1cf479644f9f95f3
 
-Only documentation and that Nix build input changed after the validated code HEAD.
+The original sections below describe the validated code HEAD. The separately labelled startup
+optimization follow-up records its subsequent code, artifacts, and validation.
 
 ## Trust boundary
 
@@ -173,9 +175,51 @@ QEMU 10.0.2, and GNU Binutils 2.44. Building the newly changed shell was blocked
 stale external Nix sandbox path, /mnt/data. The already-realized validated shell at the code commit
 was used for all tests above.
 
+## Trusted startup optimization follow-up
+
+Code commit `63c5d2b48fe5a377b02b701a1cf479644f9f95f3` removes two trusted-only CPUID
+probes, 116 successful-boot COM1 bytes, and 14 redundant COM1 initialization writes. This removes
+at least 246 port-I/O instructions, excluding transmitter poll retries. At 115200 8N1, the removed
+bytes represent 10.069 ms of serialized wire time. The trusted build now links firmware error
+formatting and an unreachable fallback only; direct VMX formatters are absent.
+
+| Release artifact | PE bytes | `.text` bytes | `.rdata` bytes | Decoded VMX sites | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| x86-uefi-monitor.efi | 81,920 | 69,689 | 8,757 | 303 | 97982ba69ec153a33d8989ee580adef221d226c19bd5cd694660f3522551ff28 |
+| x86-uefi-kvm-monitor.efi | 23,040 | 17,593 | 2,213 | 0 | dc0cf60a072a7ca4c6a9d14db86c45f9c9d8617d045b03ed6cf8140e08aaf499 |
+| x86-uefi-loader.efi | 81,920 | - | - | - | e4e9127e55fb24aa127614c4cd88c920d8d7bac078cf31a5b25650d5b586c4c9 |
+| x86-uefi-kvm-loader.efi | 23,040 | - | - | - | 6fede470e343823ced64e8de0638e49b9de6dba710e754e546a35011b8b41ab5 |
+
+Relative to the preceding trusted artifact, the PE shrank by 1,536 bytes (6.25%), `.text` by
+1,344 bytes (7.10%), and `.rdata` by 728 bytes (24.75%). GNU objdump still decodes zero VMX
+sites and zero CPUID instructions in the trusted runtime. The removed CPUID/backend markers and
+direct VMX error strings are absent.
+
+The pre-optimization tracked [A/B measurements](trusted-kvm-overhead-2026-08-30.tsv), SHA-256
+`cda0fc8f3fb2e7bcb5436135dcb0e5f58e5910b81d5f38a5a14904604ff86ca3`, used independent
+children of one immutable Windows baseline. Pair 2 was excluded because an unrelated formatting
+command overlapped its first run. Valid pairs 1, 3, and 4 produced:
+
+| Mode | n | Mean | Sample SD |
+| --- | ---: | ---: | ---: |
+| direct QEMU/KVM control | 3 | 24.675 s | 2.388 s |
+| trusted outer KVM | 3 | 24.154 s | 1.461 s |
+
+The paired trusted-minus-direct mean was -0.520 seconds with sample SD 1.418 seconds and a 95% t
+interval of [-4.044, +3.003] seconds. The earlier +1.009-second single-pair result was therefore
+boot variance, not evidence of trusted-path overhead. The valid pairs all ran direct first, so
+cache/order bias is not excluded.
+
+One fresh post-optimization trusted child reached the Hyper-V PASS marker in 22.898 seconds. It
+reported runtime/profile 1, contained no direct VMLAUNCH marker, passed `qemu-img check`, and left
+the baseline disk, UEFI variables, TPM state, and artifact hashes unchanged. Its serial log SHA-256
+is `c29314a893c6d292c17ee130d1f5891cca7dc5fee138347a350979172de1dd8d`.
+Direct/trusted loader unit tests, overlay tests, both UEFI smoke paths, the AArch64 build, and all
+17 filtered std/unit plan entries passed.
+
 ## Limits
 
-The Windows A/B pair is one measurement, not a performance distribution. Windows media, qcow2
-images, TPM state, raw logs, and dumps are not distributable repository fixtures. Physical x86
-hardware, VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a complete non-interactive cargo xtest
-remain unproven.
+The three valid Windows A/B pairs are still too few for a narrow performance bound and retain an
+order-bias caveat. Windows media, qcow2 images, TPM state, raw logs, and dumps are not distributable
+repository fixtures. Physical x86 hardware, VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a
+complete non-interactive cargo xtest remain unproven.

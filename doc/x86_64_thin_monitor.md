@@ -115,12 +115,12 @@ remain available for the bare-metal-oriented monitor work.
 
 | Release runtime artifact | PE size | `.text` size | Decoded VMX instruction sites |
 | --- | ---: | ---: | ---: |
-| `x86-uefi-monitor.efi` | 81,920 bytes | 69,801 bytes | 303 |
-| `x86-uefi-kvm-monitor.efi` | 24,576 bytes | 18,937 bytes | 0 |
+| `x86-uefi-monitor.efi` | 81,920 bytes | 69,689 bytes | 303 |
+| `x86-uefi-kvm-monitor.efi` | 23,040 bytes | 17,593 bytes | 0 |
 
 These figures come from `cargo xbuild x86 --release`, `stat`, and GNU `objdump` 2.44; the VMX
-count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 70.0% smaller
-overall and 72.9% smaller in `.text`. These measurements show the active implementation
+count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 71.9% smaller
+overall and 74.8% smaller in `.text`. These measurements show the active implementation
 reduction; they are not a formal TCB proof.
 
 ## Direct EPT and its current ceiling
@@ -586,11 +586,13 @@ scripts/x86_64/windows/windows-test.sh trusted-kvm-wsl
 ```
 
 The Hyper-V run emitted `thin-hv: windows hyperv PASS`, selected overlay profile 1, and contained
-no `thin-hv: L1 VMLAUNCH direct=` marker. A same-baseline A/B pair used independent qcow2
-children and copies of the same starting UEFI-variable and TPM state. The direct QEMU/KVM control
-reached its marker in 33.335 seconds and the trusted path in 34.344 seconds: 1.009 seconds, or
-3.0%, slower. This single boot-to-marker pair is a sanity check rather than a steady-state
-benchmark; structurally, the trusted path has no project VM-exit-reflection loop.
+no `thin-hv: L1 VMLAUNCH direct=` marker. An initial same-baseline A/B pair measured the direct
+QEMU/KVM control at 33.335 seconds and the trusted path at 34.344 seconds. Before the startup
+trimming summarized above, a follow-up used fresh qcow2, UEFI-variable, and TPM children for each
+run. Three valid pairs averaged 24.675 seconds direct and 24.154 seconds trusted; the paired
+trusted-minus-direct mean was -0.520 seconds with a 95% t interval of -4.044 to +3.003 seconds. No
+trusted-path boot overhead was resolved. All valid pairs ran direct first, so cache/order bias
+remains; structurally, the trusted path has no project VM-exit-reflection loop.
 
 The trusted WSL2 run passed with WSL 2.7.11.0, kernel `6.18.33.2-2`, and both guest processors.
 Including its setup reboot, it reached `thin-hv: windows wsl2 PASS` in 216.732 seconds. COM1 showed
