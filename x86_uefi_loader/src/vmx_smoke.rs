@@ -303,6 +303,17 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "trusted-outer-kvm")]
+        {
+            return match *self {
+                Self::Firmware(service, status) => {
+                    write!(formatter, "{service} status={status:#x}")
+                }
+                _ => formatter.write_str("unreachable direct-monitor error"),
+            };
+        }
+
+        #[cfg(not(feature = "trusted-outer-kvm"))]
         match *self {
             Self::Capability(name, value) => write!(formatter, "capability {name}={value:#x}"),
             Self::Allocate(status) => write!(formatter, "AllocatePages status={status:#x}"),
@@ -328,23 +339,20 @@ impl fmt::Display for Error {
 pub(crate) fn run(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
+    serial: &mut SerialPort,
 ) -> Result<(), Error> {
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
     if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
-        let mut serial = SerialPort;
-        serial.init();
         let _ = writeln!(serial, "thin-hv: loading runtime monitor");
         return start_runtime_monitor(parent_image, system_table);
     }
-    let mut serial = SerialPort;
-    serial.init();
     #[cfg(not(feature = "trusted-outer-kvm"))]
     let _ = writeln!(serial, "thin-hv: runtime monitor active");
     // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
     // path; use a self-relocated resident core before Windows or bare metal.
 
     #[cfg(feature = "trusted-outer-kvm")]
-    return run_trusted_outer_kvm(loaded_image, system_table, &mut serial);
+    return run_trusted_outer_kvm(loaded_image, system_table, serial);
 
     #[cfg(not(feature = "trusted-outer-kvm"))]
     return run_direct_monitor(loaded_image, system_table, serial);
@@ -354,7 +362,7 @@ pub(crate) fn run(
 fn run_direct_monitor(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
     system_table: *mut efi::SystemTable,
-    mut serial: SerialPort,
+    serial: &mut SerialPort,
 ) -> Result<(), Error> {
     let vmx_basic_raw = unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) };
     let basic = vmx::VmxBasic::from_msr(vmx_basic_raw);

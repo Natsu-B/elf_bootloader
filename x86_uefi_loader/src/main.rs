@@ -87,15 +87,16 @@ pub extern "efiapi" fn efi_main(
 ) -> efi::Status {
     let mut serial = SerialPort;
     serial.init();
+    #[cfg(not(feature = "trusted-outer-kvm"))]
     let vmx_present = cpu::has_vmx();
 
     let _ = writeln!(serial, "thin-hv: uefi entry");
+    #[cfg(not(feature = "trusted-outer-kvm"))]
     let _ = writeln!(serial, "thin-hv: CPUID VMX={}", u8::from(vmx_present));
 
     #[cfg(feature = "trusted-outer-kvm")]
     {
-        let _ = writeln!(serial, "thin-hv: trusted outer KVM backend");
-        if let Err(error) = vmx_smoke::run(image, system_table) {
+        if let Err(error) = vmx_smoke::run(image, system_table, &mut serial) {
             let _ = writeln!(serial, "thin-hv: trusted outer KVM FAIL: {error}");
             return efi::Status::DEVICE_ERROR;
         }
@@ -131,7 +132,7 @@ pub extern "efiapi" fn efi_main(
             u8::from(vmx_basic.true_controls)
         );
 
-        if let Err(error) = vmx_smoke::run(image, system_table) {
+        if let Err(error) = vmx_smoke::run(image, system_table, &mut serial) {
             let _ = writeln!(serial, "thin-hv: vmx smoke FAIL: {error}");
             return efi::Status::DEVICE_ERROR;
         }
