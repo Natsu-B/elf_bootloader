@@ -584,9 +584,11 @@ fn run_trusted_outer_kvm(
             .map_err(|status| Error::Firmware("install variable overlay", status.as_usize()))?;
     let _ = writeln!(
         serial,
-        "thin-hv: trusted outer KVM runtime active profile={} mat_patches={}",
+        "thin-hv: trusted outer KVM runtime active profile={} mat_patches={} image_base={:#x} image_size={:#x}",
         profile.0,
-        variable_overlay.memory_attribute_patch_count()
+        variable_overlay.memory_attribute_patch_count(),
+        image_base,
+        image_size
     );
 
     let mut exit_data_size = 0;
