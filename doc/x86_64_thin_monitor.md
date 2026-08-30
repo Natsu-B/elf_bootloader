@@ -1,10 +1,12 @@
 # x86_64 thin monitor: architecture and validation status
 
 This document records only implementation and measurements that exist on
-`feat/x86-thin-monitor` as of 2026-08-30. Linux KVM and Windows boot results below come from
-actual runs. Hyper-V and WSL2 pass both as direct-OVMF controls and through the trusted outer-KVM
-variable-overlay path. The one-vCPU direct-VMCS monitor reaches nested VMX, but has not emitted the
-Hyper-V PASS marker and its longer run ended in a watchdog bugcheck.
+`feat/x86-thin-monitor` through 2026-08-31. The daily-use candidate trusts the upper Linux/KVM,
+QEMU, and OVMF stack, directly chainloads the selected guest, and keeps firmware state in a separate
+OVMF variable store for each VM. It installs no resident runtime image or Runtime Services hook.
+Linux deep S3 and Windows S4 results below come from actual resume runs. The one-vCPU direct-VMCS
+backend remains a research path: it reaches nested VMX, but its longer Hyper-V run ended in a
+watchdog bugcheck.
 
 ## Status summary
 
@@ -12,11 +14,12 @@ Hyper-V PASS marker and its longer run ended in a watchdog bugcheck.
 | --- | --- | --- |
 | x86-64 UEFI entry | Builds as `x86_64-unknown-uefi`; boots under QEMU/KVM + OVMF | Physical-machine boot |
 | Direct-VMCS launch | One vCPU reaches VMX non-root from a runtime EFI driver; Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, SMP, and bare-metal lifetime validation |
-| Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO` | SMP, a normal distribution userspace, and a faulting or long-mode L2 |
+| Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO`; a two-vCPU L1 repeated deep S3 three times and reran the KVM probe after every resume | L2 SMP, a normal distribution userspace, and a faulting or long-mode L2 |
 | Direct-VMCS nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, INVVPID, VMLAUNCH, and VMRESUME through a direct hardware VMCS; a sparse Windows Hyper-V diagnostic crossed 524,288 balanced direct entries/exits | Non-empty MSR lists, independent CR2/XSAVE state, optional VMX controls, and SMP |
-| Trusted outer KVM | A separate runtime artifact installs profile-1 variable hooks and chainloads without entering project VMX; two-vCPU Hyper-V/WSL2 passed, as did bounded reboot soaks on Linux and Windows | Physical-machine boot, multi-hour operation, Sandbox, and VBS/HVCI |
+| Trusted outer KVM | The 10,752-byte loader directly chainloads without a resident project runtime, variable hook, or project VMX; two-vCPU Hyper-V/WSL2, Linux S3, Windows S4, and bounded reboot soaks passed | Physical-machine boot, multi-hour operation, Sandbox, and VBS/HVCI |
 | Direct EPT | QEMU-only 8 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and bare-metal use |
-| UEFI variables | In-place Runtime Services overlay for profile-private boot variables; focused OVMF profile-2 round trip, table CRC, Linux virtual-address transition, and a profile-1 Windows desktop boot measured | Cross-reboot/profile-switch persistence, Linux `efibootmgr`, and Windows BCD mutation/isolation |
+| UEFI variables | The legacy in-place profile overlay passed a focused OVMF round trip and survived Linux S3, but caused the measured Windows S4 restoration failure; the daily path instead uses one complete OVMF variable store per VM | Same-store profile isolation suitable for Windows S4; Linux `efibootmgr` and Windows BCD mutation/isolation |
+| Guest suspend/resume | Linux completed three deep-S3 cycles with CPU1, KVM, and EFI Runtime Services live; Windows direct QEMU/KVM and trusted no-hook chainload both restored the original S4 process with disk, UEFI, and WSL2 checks passing | Physical-host suspend, bare-metal resume, long-duration repetition, and modern standby |
 | Direct-VMCS Windows | Windows 11 Enterprise Evaluation 25H2 boots and reaches the desktop through the one-vCPU monitor, including after the variable hooks were installed | Direct-monitor SMP, Sandbox, and VBS/HVCI |
 | Direct Hyper-V/WSL2 controls | Without this monitor, Hyper-V passed with two and one QEMU vCPUs; a matched two-vCPU A/B failed only when QEMU hid VPID/INVVPID; WSL 2.7.11 ran a two-vCPU WSL2 BusyBox guest to `uname` and `/proc/cpuinfo` | These controls do not exercise this L0 or prove its VPID implementation |
 | Direct-VMCS Hyper-V/WSL2 | The EFER.SCE corruption that caused `smss.exe` to terminate was corrected, but a later long Hyper-V run hit `DPC_WATCHDOG_VIOLATION`; WSL2 has not run through this path | Hyper-V PASS, practical nested performance, a Hyper-V VM, and a direct-VMCS WSL2 run |
@@ -32,6 +35,11 @@ its installed ESP), `c9c73f3` (reproducible Windows monitor test), `eff5ee9` (di
 control), `366e4cf` (direct WSL2 control), `879a2cd` (immutable Windows backing during monitor
 tests), `90bd961` (firmware Runtime Services variable overlay), and `041a1aa` (reproducible
 Windows CPU-feature A/B selection).
+
+Later daily-use work includes `b54ff62` (trusted upper KVM), `63c5d2b` and `72df83d` (startup
+trimming), `e36cbe5` and `e2aec2a` (deep-S3 exercise), `93d556e` (`BootCurrent` pass-through),
+`e4886e8` (private-hook liveness after S3), and `0b695c8` (same-process Windows S4 verification).
+The final `1ad50dc` change removes the trusted resident runtime and its variable hooks.
 
 ## Architecture and late launch
 
@@ -102,25 +110,27 @@ to remain shared. PK, KEK, db, and dbx are also shared by policy.
 
 ### Trusted outer-KVM boundary
 
-`cargo xbuild x86` also emits `x86-uefi-kvm-loader.efi` and
-`x86-uefi-kvm-monitor.efi`. This pair trusts CPU microcode, host Linux/KVM, QEMU, OVMF, and the
-selected L1 OS/hypervisor. Its project-owned TCB is the UEFI bootstrap/runtime handoff and the
-three profile-variable hooks; it does not mediate CPU execution or defend state from that trusted
-outer stack.
+The current `cargo xbuild x86` emits only `x86-uefi-kvm-loader.efi` for the trusted path; previous
+builds also emitted `x86-uefi-kvm-monitor.efi`. It trusts CPU microcode, host Linux/KVM, QEMU,
+OVMF, and the selected L1 OS/hypervisor. Its
+project-owned active path is the UEFI bootstrap and direct `StartImage` chainload; it does not
+mediate CPU execution or defend state from that trusted outer stack. Firmware-variable isolation
+comes from a complete per-VM OVMF variable store rather than an in-place project hook.
 
-The trusted runtime installs the same `GetVariable`, `SetVariable`, and `GetNextVariableName`
-overlay and directly calls `StartImage`. It executes no project `VMXON` or `VMLAUNCH`: KVM remains
-L0, Windows/Hyper-V is L1, and KVM handles Hyper-V's nested VMX. The default direct-VMCS artifacts
-remain available for the bare-metal-oriented monitor work.
+The trusted loader executes no project `VMXON` or `VMLAUNCH`, does not load `MONITORX64.EFI`, and
+leaves no resident project runtime: KVM remains L0, Windows/Hyper-V is L1, and KVM handles Hyper-V's
+nested VMX. The direct-VMCS artifacts remain available for bare-metal-oriented research.
 
-| Release runtime artifact | PE size | `.text` size | Decoded VMX instruction sites |
+| Release artifact | PE size | `.text` size | Decoded VMX instruction sites |
 | --- | ---: | ---: | ---: |
-| `x86-uefi-monitor.efi` | 81,408 bytes | 69,273 bytes | 303 |
-| `x86-uefi-kvm-monitor.efi` | 22,016 bytes | 16,825 bytes | 0 |
+| direct `x86-uefi-loader.efi` | 80,896 bytes | 69,113 bytes | 303 |
+| trusted `x86-uefi-kvm-loader.efi` | 10,752 bytes | 6,657 bytes | 0 |
 
 These figures come from `cargo xbuild x86 --release`, `stat`, and GNU `objdump` 2.44; the VMX
-count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 73.0% smaller
-overall and 75.7% smaller in `.text`. These measurements show the active implementation
+count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 86.7% smaller
+overall and 90.4% smaller in `.text`. Its SHA-256 is
+`68b77e9f4b412c4c5ee6fe0ad745c380c825b3ba4cd911ce407d1e9e12cf0fb8`; the direct loader's is
+`ec4dfd421df923edab35be109cc9c7424659459ddaaea57eb8c51c5323acd384`. These measurements show the active implementation
 reduction; they are not a formal TCB proof.
 
 ## Direct EPT and its current ceiling
@@ -195,17 +205,24 @@ posted interrupts, VMFUNC, PML, TSC scaling, and eVMCS remain unadvertised.
 
 ## UEFI variable profile model
 
+The overlay below remains implemented and tested for the direct research path, but it is no longer
+part of the trusted daily-use path. The Windows S4 A/B isolated the restoration failure to these
+hooks, so trusted guests now receive an unmodified firmware Runtime Services table and use a
+separate OVMF variable store per VM.
+
 `uefi_variable_overlay` treats the following exact names in the EFI global-variable namespace as
 profile-private:
 
 ```text
-BootOrder  BootNext  BootCurrent  Boot####
+BootOrder  BootNext  Boot####
 DriverOrder  Driver####
 ```
 
 `####` is exactly four uppercase hexadecimal digits. A private logical key is stored under the
 monitor vendor GUID with the UTF-16 backend name `P<8-HEX-DIGIT-PROFILE>:<logical-name>`. All
-other namespaces and names, including PK/KEK/db/dbx, stay shared.
+other namespaces and names, including `BootCurrent` and PK/KEK/db/dbx, stay shared. `BootCurrent`
+therefore remains the firmware-selected boot entry rather than a value synthesized for the
+chainloaded guest.
 
 The ABI-independent adapter defines the four-operation policy from UEFI 2.11:
 
@@ -249,18 +266,18 @@ thin-hv: uefi variable overlay PASS
 
 This is a real firmware-backend test but deliberately one boot with profile 2; deleting the two
 keys makes it deterministic, so it does not prove cross-reboot persistence or a profile switch.
-The backend uses nonvolatile OVMF variables and therefore has persistent wiring, but a two-boot
-Windows/Linux isolation test remains required. Linux has crossed its runtime virtual-address
-transition and reached the KVM L2 marker with the hooks installed. A later monitor run selected
-profile 1, patched one MAT descriptor, and reached the Windows desktop with the hooks installed.
-That boot proves hook lifetime and chainload compatibility, not Windows boot-variable mutation or
-cross-profile isolation.
+The backend uses nonvolatile OVMF variables and therefore has persistent wiring. Linux later
+crossed its runtime virtual-address transition, completed three deep-S3 cycles, and after every
+resume reran KVM and a private EFI variable write/read/delete probe with the hooks installed.
+Windows reached the desktop with the hooks installed, but restoration of an actual S4 image failed;
+the no-hook controls resumed successfully. The hooks are therefore excluded from the trusted
+daily-use configuration.
 
 `BootNext` is currently only mapped and stored: the physical firmware has already selected and
 started the monitor, so the monitor does not consume a profile's `BootNext` or resolve its
-`Boot####` target on the next reset. `BootCurrent` is mapped like the other names but is not
-synthesized from the selected chainload target, so it is normally absent unless a backend value is
-seeded. Authenticated variable payloads bind the original variable name and GUID; changing both for
+`Boot####` target on the next reset. `BootCurrent` passes through unchanged; it is not synthesized
+from the selected chainload target. Authenticated variable payloads bind the original variable name
+and GUID; changing both for
 backend storage means name-bound authenticated writes are unsupported. The boot variables under
 this policy are normally unauthenticated, but this remains an explicit ABI ceiling.
 
@@ -276,8 +293,8 @@ The shell supplies nightly Rust with the AArch64 and x86 UEFI targets, QEMU, OVM
 binutils, `cpio`, `file`, `gzip`, a static BusyBox, and the systemd x86 EFI stub. It exports
 `OVMF_CODE`, `OVMF_VARS`, `BUSYBOX_STATIC`, and `LINUX_EFI_STUB`.
 
-Build both direct-VMCS and trusted outer-KVM bootstrap/runtime pairs, plus the test payload, under
-ignored `bin/x86_64/`:
+Build the direct-VMCS bootstrap/runtime pair, the trusted outer-KVM bootstrap, and the test payload
+under ignored `bin/x86_64/`:
 
 ```sh
 cargo xbuild x86
@@ -306,8 +323,11 @@ authenticate in the non-interactive session.
 ## QEMU/KVM + OVMF UEFI smoke
 
 `scripts/x86_64/run-uefi-smoke.sh` creates a fresh copy of the OVMF variable template, stages the
-loader as `EFI/BOOT/BOOTX64.EFI`, the runtime copy as `EFI/BOOT/MONITORX64.EFI`, and the payload
-as `EFI/BOOT/GUESTX64.EFI`, then runs one vCPU:
+loader as `EFI/BOOT/BOOTX64.EFI`, and stages the payload as `EFI/BOOT/GUESTX64.EFI`.
+`MONITORX64.EFI` is staged only when a runtime image is explicitly supplied; the trusted path
+removes it. S3 and S4 are disabled by default. After the required markers arrive the harness asks
+QEMU to quit, and an outer timeout exit of 124 is a failure rather than a successful smoke result.
+It then runs one vCPU:
 
 ```text
 -machine q35,accel=kvm
@@ -339,15 +359,18 @@ This validates the runtime-driver handoff, real OVMF variable wrappers, Runtime 
 CPUID filtering for the small payload: leaf 1 exposes VMX and clears the hypervisor-present bit,
 while the Hyper-V-reserved CPUID range is zeroed. Linux KVM initialization and the runtime virtual
 address transition are measured separately below. The trusted artifact delegates VMX exposure to
-the outer KVM/QEMU stack and passes this payload with nested VMX exposed:
+the outer KVM/QEMU stack and directly chainloads this payload with nested VMX exposed:
 
 ```sh
-env X86_MONITOR_IMAGE="$PWD/bin/x86_64/x86-uefi-kvm-monitor.efi" \
+env X86_MONITOR_IMAGE= \
   X86_RETURN_MARKER='thin-hv: trusted outer KVM guest PASS' \
   X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
   scripts/x86_64/run-uefi-smoke.sh \
   bin/x86_64/x86-uefi-kvm-loader.efi bin/x86_64/x86_guest_uefi_test.efi
 ```
+
+This trusted smoke requires `thin-hv: uefi native variables PASS` and the direct-chainload guest
+marker; it does not expect a runtime-monitor or variable-overlay marker.
 
 Run through `nix develop`: its pinned OVMF 202505 exercised one Memory Attributes Table edit in
 the direct trace, while QEMU's separately bundled OVMF happened to publish the measured image
@@ -476,6 +499,23 @@ Exit reason `0x1` is an external interrupt, `0x30` is an EPT violation resolved 
 7.1.5/kvm_intel -> real-mode L2`, including direct L1 EPT, nested VMRESUME, and delivery of
 `KVM_EXIT_IO` to L1 userspace. `nested=0` only prevents L1 KVM from advertising VMX to L2.
 
+### Trusted Linux deep S3
+
+The trusted upper-KVM configuration enables QEMU/OVMF ACPI S3 only for the dedicated test:
+
+```sh
+scripts/x86_64/run-linux-suspend-test.sh
+```
+
+Linux 7.1.5 booted with two CPUs and completed three `PM: suspend entry (deep)` cycles. CPU1 went
+offline and returned on every cycle. The real `/dev/kvm` probe passed before the first suspend and
+after all three resumes. Each cycle also created a valid inactive disposable `DriverFFFF` EFI load
+option through native firmware Runtime Services, read it back, remounted `efivarfs` after resume,
+verified the same value, deleted it, and confirmed its absence. The final marker was
+`thin-hv: linux S3 nested KVM PASS cycles=3`. The run used the trusted direct-chainload loader with
+no `MONITORX64.EFI` or project variable hook. It proves QEMU guest S3, not physical-host or
+bare-metal suspend.
+
 ## Windows, Hyper-V, and WSL2 status
 
 The Microsoft-hosted Windows 11 Enterprise Evaluation 25H2 English ISO was downloaded as ignored
@@ -580,10 +620,12 @@ and 1, `thin-hv-wsl2-guest-ok`, and `thin-hv: windows wsl2 PASS`. Its ignored ar
   `ea99179cda2aed59ae7d5018005a95490f627cd7ade94f9d4c5c0f1abd8cd230`;
 * media stamp `3d0136133c2beda2c71788709efa297c6025aab0b89b1cb319ae10dcc3f0fa52`.
 
-### Trusted outer-KVM Hyper-V and WSL2
+### Historical trusted outer-KVM overlay Hyper-V and WSL2
 
-The trusted modes reuse the Hyper-V-enabled image and TPM state, but boot through the small
-profile-overlay artifacts with two vCPUs:
+Before the Runtime Services hooks were removed from the trusted path, the trusted modes reused the
+Hyper-V-enabled image and TPM state and booted through the small profile-overlay artifacts with two
+vCPUs. The commands below are historical transcripts from `0b695c8`, not current reproduction
+commands; at `1ad50dc` the same mode names use the no-hook direct-chainload path:
 
 ```sh
 scripts/x86_64/windows/windows-test.sh trusted-kvm-hyperv
@@ -602,7 +644,8 @@ Including its setup reboot, it reached `thin-hv: windows wsl2 PASS` in 216.732 s
 two boot epochs, each with `thin-hv: trusted outer KVM runtime active profile=1`, and neither
 contained a direct `VMLAUNCH` marker. `qemu-img check` found no errors afterward.
 These results validate the UEFI overlay in front of KVM's ordinary nested virtualization; they do
-not exercise the direct-VMCS monitor below.
+not exercise the direct-VMCS monitor below. They are retained as historical boot and bounded-soak
+evidence, not as the current S4-safe trusted configuration.
 
 A later bounded stability run repeated 256 MiB Windows memory hashing, 128 MiB disk write/read,
 64 MiB TCP loopback, and WSL2 CPU/data hashing before and after a Windows reboot. It completed in
@@ -614,6 +657,35 @@ claim of indefinite daily-use stability.
 
 The exact commands, timestamps, environment, artifact hashes, and coherent Windows log hashes are
 recorded in the [2026-08-30 validation manifest](evidence/x86_64/validation-2026-08-30.md).
+
+### Windows S4 isolation and trusted direct chainload
+
+The S4 verifier requires an in-memory nonce initialized before `SetSuspendState` to survive in the
+same PowerShell process. This invalidated an earlier apparent trusted PASS: a scheduled startup
+script had read a phase file after a normal fallback boot and produced a false positive.
+
+The corrected direct QEMU/KVM control (`windows-test.sh wsl-s4`) powered off through S4, cold-started
+with the same qcow2, OVMF variables, and TPM state, and restored the original process in 17.123
+seconds. Disk persistence, `SecureBoot=00`, WSL2, the event scan, and
+`process_continuation=PASS` all passed.
+
+The old trusted runtime with all three variable hooks powered off cleanly but did not restore the
+hibernation image. Windows recorded Kernel-Boot event 16 with `FailureStatus=0xC0000001`, followed
+by bugcheck `0x7E` with exception `0xC0000005`. Its 1,073,900-byte minidump has SHA-256
+`e92a56f3b8da6a2197e98c4855124ade5b0ea7e5fbab620c04bf206bb5e8baa4`. A hook-active build without
+the MAT edit boot-looped and never reached the WSL marker within 120 seconds, so it did not produce
+an S4 result. Retaining the MAT edit while omitting the hooks passed in 15.92 seconds, and a
+no-overlay runtime control passed in 17.668 seconds. This A/B isolates the measured S4 failure to
+installing the variable hooks, but does not identify which hook or Windows restoration check
+rejected them.
+
+The final trusted configuration removes the resident runtime and directly chainloads under the
+upper KVM, using the VM's own OVMF variable store. The retained evidence directory
+`/tmp/thin-hv-windows-s4-direct-chainload.Fyv1VP` exited zero and restored the original process in
+18.631 seconds. The persistent-file SHA-256 was
+`55fb6791b8ff592a00291ec24d865f8029a088bfe67b52d8980a8bf45801aa9a`; `SecureBoot=00`, WSL2,
+bugcheck/WHEA and Hyper-V error counts of zero, and `process_continuation=PASS` were all verified.
+`qemu-img check` found no errors afterward.
 
 ### Direct-VMCS Hyper-V boundary
 
@@ -729,25 +801,31 @@ configurations.
   KVM SMP, and sustained or device-heavy workloads have not run.
 * Hyper-V through the direct-VMCS L0 has not reached PASS. The EFER.SCE fix removed the earlier
   `0xEF`, but the long run ended in `0x133` after extreme reflection overhead; WSL2 has not run
-  through that L0. Hyper-V and WSL2 both pass through the trusted outer-KVM overlay, which provides
-  no CPU, memory, or device isolation from Linux/KVM, QEMU, or OVMF.
+  through that L0. Hyper-V and WSL2 both pass through the trusted outer-KVM direct-chainload path,
+  which provides no CPU, memory, or device isolation from Linux/KVM, QEMU, or OVMF.
 * The profile variable hooks have one real OVMF profile-2 round-trip/enumeration/CRC test and use
   the firmware's nonvolatile backend. That focused payload deletes both test keys, so it does not
-  prove cross-reboot persistence or switching between profiles. A profile-1 Windows desktop boot
-  proves hook lifetime but not variable isolation; Linux `efibootmgr` and Windows BCD mutation
-  remain untested. `BootNext` is not consumed on reset, `BootCurrent` is not synthesized, and
-  name-bound authenticated writes are unsupported.
+  prove switching between profiles. Linux S3 proves hook lifetime, but the corrected Windows S4
+  test failed restoration while no-hook controls passed, so these hooks are excluded from the
+  trusted daily path. Linux `efibootmgr` and Windows BCD mutation remain untested. `BootNext` is not
+  consumed on reset, `BootCurrent` passes through firmware unchanged, and name-bound authenticated
+  writes are unsupported.
 * No physical PCI/NVMe/GPU/USB/NIC handoff has been tested. There is no IOMMU setup.
 * Direct-monitor serial diagnostics have no compile-time release trace switch and are not yet
   removed from the VM-exit hot path in release builds.
 * Development of the direct backend under host KVM adds the measured
   `host KVM -> this L0 -> L1 hypervisor -> L2` nesting and reflection cost. The trusted path
   deliberately removes this project's L0 layer and accepts the outer KVM/QEMU/OVMF stack as TCB.
-* The bootstrap, runtime monitor, and guests are unsigned. Secure Boot was disabled for the QEMU
+* The bootstrap, direct runtime monitor, and guests are unsigned. Secure Boot was disabled for the QEMU
   measurements; signing and verification policy must be added before a Secure Boot test.
-* `cargo xbuild x86` produces both artifact pairs under ignored `bin/x86_64/`, but neither has
-  booted on physical hardware. The direct path's QEMU-specific map and descriptor-table lifetime,
-  plus both paths' firmware runtime and device-path assumptions, remain unverified there.
+* `cargo xbuild x86` produces the direct loader/runtime pair and the trusted loader under ignored
+  `bin/x86_64/`, but none has booted on physical hardware. The direct path's QEMU-specific map and
+  descriptor-table lifetime, plus both paths' firmware and device-path assumptions, remain
+  unverified there.
+* The measured S3 and S4 cycles are QEMU guest power states. Physical-host suspend, bare-metal
+  resume, interactive GUI use, audio, USB, external networking, modern standby, multi-hour use,
+  and long repeated suspend/hibernate operation remain untested. VBS/HVCI and Windows Sandbox are
+  also untested.
 
 All generated EFI files, ESP directories, OVMF variable stores, serial logs, UKIs, ISO or qcow2
 files, and other large artifacts belong under `bin/` (or another ignored build directory).

@@ -3,23 +3,29 @@
 This manifest ties the compact claims in the architecture document to exact commands, hashes, and
 boot markers. Windows disks, dumps, and raw serial logs are intentionally not committed.
 
-- Validated code HEAD: 2e4af630c7566ee070aaa1276ac80ce087f5e12a
+- Historical validation baseline: 2e4af630c7566ee070aaa1276ac80ce087f5e12a
 - Upstream refactor merged at: 065a40125daed43ff7e19ff0b591c8e4bb09f30c
 - Branch: feat/x86-thin-monitor
+- Committed base for the final suspend follow-up: 0b695c875333557728783afd6a7dbffc5e3c0dd1
+- Final no-hook direct-chainload code: 1ad50dc5a9ff12c1b132c0fbf55220467a8587f8
 - Later non-runtime build-input commit: a86492c12221b413b481030ad7b09b060313a273
   (adds curl to the Nix development shell)
 - Trusted startup optimization follow-up: 63c5d2b48fe5a377b02b701a1cf479644f9f95f3
 
-The original sections below describe the validated code HEAD. The separately labelled startup
-optimization follow-up records its subsequent code, artifacts, and validation.
+The original sections below describe the historical validation baseline. Separately labelled
+follow-ups record later code, artifacts, and validation through 2026-08-31.
 
 ## Trust boundary
 
-The trusted-outer-kvm feature installs the same profile-specific UEFI Runtime Services overlay and
-then calls StartImage. It executes no project VMXON, VMLAUNCH, VMRESUME, or VM-exit reflection
-loop. CPU microcode, Linux KVM, QEMU, OVMF, Windows, and Hyper-V are therefore in the trusted
-computing base. The project-owned active path is the UEFI loader, runtime handoff, and three
-variable hooks.
+The current trusted-outer-kvm feature directly calls `StartImage` on the selected guest. It installs
+no resident project runtime or UEFI Runtime Services hook and executes no project VMXON, VMLAUNCH,
+VMRESUME, or VM-exit reflection loop. CPU microcode, Linux KVM, QEMU, OVMF, Windows, and Hyper-V
+are therefore in the trusted computing base. The project-owned active path is the UEFI bootstrap
+and chainload; each VM receives a separate complete OVMF variable store.
+
+The earlier profile-overlay implementation remains tested and is retained in the direct research
+path. Its historical measurements below remain evidence for boot and hook behavior, but corrected
+Windows S4 testing excludes it from the daily-use trusted configuration.
 
 The direct-VMCS backend remains available as an explicitly unsafe research path. Its measured
 Windows watchdog result is kept separate from the trusted KVM passes below.
@@ -46,9 +52,9 @@ nix develop --accept-flake-config \
   --command COMMAND
 ~~~
 
-## Release artifacts and active-code proxy
+## Historical baseline release artifacts and active-code proxy
 
-After cargo xbuild x86 --release:
+At the historical `2e4af63` baseline, after `cargo xbuild x86 --release`:
 
 | Artifact | PE bytes | .text bytes | Decoded VMX sites | SHA-256 |
 | --- | ---: | ---: | ---: | --- |
@@ -57,13 +63,13 @@ After cargo xbuild x86 --release:
 | x86-uefi-loader.efi | 81,920 | - | - | 0585343580b84deceb201abe932abb52c165e485ebaeabc3e31e211fbd0d60cb |
 | x86-uefi-kvm-loader.efi | 24,576 | - | - | f73e538f8e89e50bd618b2789b60786943b0b975228486eba281cd0edae6c941 |
 
-The trusted runtime PE is 70.0% smaller and its .text is 72.9% smaller. This is an active-code proxy,
-not a formal TCB proof. VMX sites were counted from GNU objdump -d output for vmcall, vmclear,
+That historical trusted runtime PE was 70.0% smaller and its .text was 72.9% smaller. This is an
+historical active-code proxy, not a formal TCB proof. VMX sites were counted from GNU objdump -d output for vmcall, vmclear,
 vmlaunch, vmresume, vmptrld, vmptrst, vmread, vmwrite, vmxoff, vmxon, invept, invvpid, and vmfunc.
 LLVM objdump does not decode the same byte sequences identically; use GNU objdump from the Nix
 shell for this measurement.
 
-## Current-HEAD build and automated checks
+## Historical baseline build and automated checks
 
 | Check | Result | Local raw-log SHA-256 |
 | --- | --- | --- |
@@ -82,7 +88,7 @@ ff72ef1868831c7c788402f240d89ace6644f5905a657a6f80d67d4c933cebdb. It contains Li
 direct L1 VMLAUNCH/VMRESUME markers, deterministic KVM exits, and
 thin-hv: linux L1 L2 KVM PASS.
 
-## Same-baseline Windows Hyper-V A/B
+## Historical same-baseline Windows Hyper-V A/B
 
 Both runs used independent qcow2 children of the same successful Windows baseline and copies of the
 same starting UEFI variable store and TPM state. The harness command differed only by mode.
@@ -110,7 +116,7 @@ check, not a steady-state benchmark. Structurally, the trusted path has no proje
 
 Both post-run qemu-img checks reported no errors.
 
-## Coherent trusted WSL2 run
+## Historical coherent trusted WSL2 run
 
 The final WSL run used one work directory for its harness, COM1, COM2, QEMU, and image-check logs.
 The wsl-ready marker was deliberately absent, so the harness exercised its setup/reboot path.
@@ -175,7 +181,7 @@ QEMU 10.0.2, and GNU Binutils 2.44. Building the newly changed shell was blocked
 stale external Nix sandbox path, /mnt/data. The already-realized validated shell at the code commit
 was used for all tests above.
 
-## Trusted startup optimization follow-up
+## Historical trusted startup optimization follow-up
 
 Code commit `63c5d2b48fe5a377b02b701a1cf479644f9f95f3` removes two trusted-only CPUID
 probes, 116 successful-boot COM1 bytes, and 14 redundant COM1 initialization writes. This removes
@@ -217,7 +223,7 @@ is `c29314a893c6d292c17ee130d1f5891cca7dc5fee138347a350979172de1dd8d`.
 Direct/trusted loader unit tests, overlay tests, both UEFI smoke paths, the AArch64 build, and all
 17 filtered std/unit plan entries passed.
 
-## Protocol-cache and OS-specific follow-up
+## Historical protocol-cache and OS-specific follow-up
 
 Code commit `72df83d6c9baa7871693e71574e6fd5c45ff5422` reuses the parent LoadedImage
 metadata and the firmware's shared DevicePathUtilities protocol while loading the guest and runtime
@@ -306,7 +312,7 @@ The flake-pinned `cargo fmt --all -- --check`, `cargo xtest -p x86_uefi_loader` 
 and `cargo xbuild x86 --release` passed. Separate direct and trusted UEFI/KVM smoke boots also
 passed guest CPUID, variable-overlay, and final direct-VMX or trusted-guest markers.
 
-## Nested execution and bounded stability soak
+## Historical nested execution and bounded stability soak
 
 The soak host was an Intel Core Ultra 9 185H running Linux 7.1.5. The Linux soak used QEMU 10.1.5;
 the flake-pinned Windows runner and direct A/B used QEMU 10.0.2. Its
@@ -382,10 +388,132 @@ The ordered evidence-list SHA-256 is
 are `4581b7d04f6154622c296cfbcc0b759f9d9ff77462d30e9588530f1edb02e195` and
 `4bc1616999bdfa80fb5c8eb2841db18481c7b9bd6de69d06a157d49a7cba93c4`.
 
-This test covers a real WSL2 L2 utility VM but remains a bounded synthetic soak. Its Windows
-network load was loopback only; external network traffic, interactive GUI applications, audio,
-USB, suspend/resume, dedicated WSL event-channel scanning, and multi-hour operation remain
-untested.
+This historical test covers a real WSL2 L2 utility VM but remains a bounded synthetic soak. Its
+Windows network load was loopback only; external network traffic, interactive GUI applications,
+audio, USB, dedicated WSL event-channel scanning, and multi-hour operation remain untested.
+
+## Final no-hook suspend and artifact follow-up
+
+### Current trusted artifact boundary
+
+The final trusted build emits only `x86-uefi-kvm-loader.efi`. It directly chainloads the selected
+guest, prints `resident_runtime=0`, does not stage `MONITORX64.EFI`, and uses the VM's existing OVMF
+variable store. The previous trusted runtime-driver artifact in the historical table above is not a
+current output or execution dependency.
+
+| Current release artifact | PE bytes | `.text` bytes | GNU objdump 2.44 VMX sites | SHA-256 |
+| --- | ---: | ---: | ---: | --- |
+| trusted `x86-uefi-kvm-loader.efi` | 10,752 | 6,657 | 0 | `68b77e9f4b412c4c5ee6fe0ad745c380c825b3ba4cd911ce407d1e9e12cf0fb8` |
+| direct `x86-uefi-loader.efi` | 80,896 | 69,113 | 303 | `ec4dfd421df923edab35be109cc9c7424659459ddaaea57eb8c51c5323acd384` |
+
+The trusted binary is 86.7% smaller overall and 90.4% smaller in `.text`. A string audit found the
+direct-chainload marker in the trusted binary and no runtime-monitor, variable-overlay,
+install/restore-hook, or VMX markers. The direct binary retained all of those markers. This is an
+active-code measurement, not a formal proof of the complete host KVM/QEMU/OVMF TCB.
+
+### Linux trusted direct-chainload S3
+
+`scripts/x86_64/run-linux-suspend-test.sh` booted Linux 7.1.5 with two CPUs through the trusted
+loader and no resident project runtime. It completed three deep-S3 cycles. CPU1 went offline and
+returned on every cycle; the real `/dev/kvm` probe passed before suspend and after each resume.
+Every cycle wrote and read a disposable valid `DriverFFFF` EFI load option through native firmware
+Runtime Services, remounted `efivarfs`, verified it after resume, deleted it, and confirmed absence.
+The run ended with `thin-hv: linux S3 nested KVM PASS cycles=3` and exit status zero.
+
+### Corrected Windows S4 and root-cause isolation
+
+The S4 verifier now requires an in-memory nonce created before `SetSuspendState` to survive in the
+same PowerShell process. The earlier apparent trusted PASS was a false positive: a scheduled startup
+script saw the persisted phase file after a normal fallback boot. That result is withdrawn.
+
+The corrected direct QEMU/KVM control restored the original process in 17.123 seconds. Its disk
+SHA-256 was `1b1744a3b313072047b1a929d5b441ea8514cc9ae729fb9dd1d8e8842f6a2e6e`;
+`SecureBoot=00`, WSL2, zero bugcheck/WHEA and Hyper-V errors, and
+`process_continuation=PASS` all passed.
+
+The old trusted runtime with the three variable hooks powered off through S4 with QEMU status zero,
+but Windows failed restoration. Kernel-Boot event 16 recorded `FailureStatus=0xC0000001`; the
+following bugcheck was `0x7E` with exception `0xC0000005`. The 1,073,900-byte minidump has SHA-256
+`e92a56f3b8da6a2197e98c4855124ade5b0ea7e5fbab620c04bf206bb5e8baa4`. A hook-active build without
+the MAT edit boot-looped and did not reach the WSL marker within 120 seconds, so it produced no S4
+result. Keeping the MAT edit but omitting the hooks restored the original process in 15.92 seconds,
+and a no-overlay runtime control did so in 17.668 seconds. The measured S4 differentiator is
+therefore installation of the variable hooks; the evidence does not identify a specific hook or
+Windows restoration check as the internal cause.
+
+The final trusted direct-chainload run is retained locally at
+`/tmp/thin-hv-windows-s4-direct-chainload.Fyv1VP`. QEMU powered off cleanly, cold-started with the
+same qcow2, OVMF variable store, and TPM state, and exited zero after restoration. The original
+process resumed in 18.631 seconds with:
+
+```text
+thin-hv: windows hibernate disk_persist=1 sha256=55fb6791b8ff592a00291ec24d865f8029a088bfe67b52d8980a8bf45801aa9a
+thin-hv: windows hibernate firmware_variable=1 SecureBoot=00
+thin-hv: windows hibernate wsl2_after=PASS
+thin-hv: windows hibernate events bugcheck_whea=0 hyperv_errors=0
+thin-hv: windows hibernate process_continuation=PASS
+thin-hv: windows hibernate PASS state=S4 guest_resume=1
+```
+
+`qemu-img check` reported no errors. This makes trusted Linux S3 and no-hook Windows S4
+conditional-GO results for the tested QEMU/KVM configuration. The old Windows hook configuration,
+the direct-VMCS backend, physical hardware, and bare-metal suspend remain NO-GO for daily use.
+
+## Claude Opus daily-use review
+
+Claude Code ran two authenticated `claude-opus-5` reviews at maximum effort under the approved
+USD 20 ceiling:
+
+| Review | Turns | Cost (USD) | Prompt SHA-256 | Result SHA-256 |
+| --- | ---: | ---: | --- | --- |
+| initial | 46 | 5.2573025 | `efae1a8ec70c4c8d912a6758ad638a14fa2a90fb0e1ca9d194ff88d70b3b4821` | `647839a2ccf31daa6163b4008f2d5a264f74e6b2c58472aca65de2f6cf71ad8d` |
+| re-review | 39 | 4.312761 | `a0bae01d4add094e0ada30d55cc284e7593924bd0277ab210e48053885bb4aa1` | `b8e5bf718fdd5af69cb13c11a2263f7f8ad69de01cfb6c99e0d000d8266de767` |
+
+Total reported cost was USD 9.5700635. The second review correctly required proof that S4 resumed
+the original process; implementing that check exposed the false positive above. At review time its
+verdict was conditional-GO for trusted Linux and Windows, unmeasured for host suspend, and NO-GO
+for physical/bare-metal and direct-VMCS daily use. The old-hook Windows verdict was superseded by
+the corrected failure. The final no-hook root-cause isolation and direct-chainload PASS happened
+after the re-review, so Claude did not review the final configuration and is not the source of its
+conditional-GO classification.
+
+Accepted and implemented findings:
+
+* `VAR-001`: `BootCurrent` now passes through firmware (`93d556e`); synthesizing a chainload value
+  was rejected because it would misreport the firmware-selected entry.
+* `NEW-RESUME-001`: EFI Runtime Services are exercised after every Linux S3 resume (`e4886e8` and
+  the final native-variable follow-up).
+* `NEW-S4-002` and `NEW-S4-003`: the harness states its S3 policy explicitly and requires the
+  same-process continuation nonce (`0b695c8`).
+* `TEST-001`: smoke completion and timeout handling were tightened, and the dedicated S3 runner was
+  added. Stale documentation findings `NEW-DOC-005/006` are corrected here.
+
+Partially valid findings retained as explicit limits:
+
+* `BOOT-001`: source-based guest selection is hardcoded, but separate VM/ESP configurations already
+  select the daily OS. A full `EFI_LOAD_OPTION` parser would enlarge the TCB and is not yet needed.
+* `MAT-001`: the direct runtime allocation remains RWX. VBS/HVCI and bare-metal use remain NO-GO
+  until code and data permissions are split; the final trusted path has no resident runtime.
+* `SECBOOT-001`: the artifacts are unsigned and Secure Boot was disabled. The stronger claim that
+  this always forces BitLocker recovery was not supported.
+* `NEW-CI-007`: the suspend tests are dedicated scripts rather than `cargo xtest` plan entries.
+* `NEW-SMOKE-004`: HMP reply pairing has a latent race if unrelated monitor traffic is introduced;
+  no such failure was observed in these single-client runs.
+
+Findings judged invalid or not applicable to the trusted path:
+
+* `SUSPEND-001`, `HANG-001`, `EPT-001`, and `RELOC-001` assume project-owned VMX/EPT/resident state.
+  The trusted path has none; these are direct-VMCS research concerns.
+* `SUSPEND-002` broadly predicted unstable runtime placement. QEMU measurements were stable; only
+  physical firmware placement remains unknown.
+* `TIME-001` proposed an incomplete Hyper-V enlightenment set. Testing the dependency-complete
+  candidate made hibernation unavailable, so it was not adopted.
+* `TEST-002` claimed the UEFI test did not exercise live hooks; the historical payload did call the
+  installed Runtime Services table directly.
+* Requiring project ACPI suspend emulation is not applicable: the trusted path delegates guest
+  power states to QEMU, OVMF, and KVM.
+* Synthesizing `BootCurrent`, and the unconditional BitLocker-recovery claim, were rejected for the
+  reasons above.
 
 ## Limits
 
@@ -394,4 +522,6 @@ Six Windows pairs and six Linux pairs still leave broad end-to-end bounds, and t
 state, raw logs, and dumps are not distributable repository fixtures. The 33.576-second Linux and
 265.595-second Windows soaks demonstrate bounded stability, not that either OS cannot fail during
 indefinite daily use. Physical x86 hardware, VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a
-complete non-interactive cargo xtest remain unproven.
+complete non-interactive cargo xtest remain unproven. Physical-host suspend, bare-metal resume,
+interactive GUI use, audio, USB, external networking, modern standby, and multi-hour or long
+repeated S3/S4 use are also unproven.
