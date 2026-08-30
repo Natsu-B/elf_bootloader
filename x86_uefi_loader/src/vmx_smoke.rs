@@ -9,6 +9,7 @@ use core::fmt;
 use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
@@ -202,6 +203,8 @@ static ORIGINAL_CR0: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
 /// XCR0 restored when the bounded smoke leaves VMX operation.
 static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
+/// Physical-address width exposed unchanged to the current one-vCPU L1.
+static MAX_PHYSICAL_ADDRESS_BITS: AtomicU8 = AtomicU8::new(0);
 static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Nested VMX state for the current single-vCPU smoke run.
 // ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
@@ -3462,11 +3465,21 @@ fn read_l1_physical_u64(physical: u64) -> Option<u64> {
 
 /// Returns the physical-address width exposed unchanged to L1 by CPUID.
 fn max_physical_address_bits() -> Option<u8> {
-    if cpu::cpuid(0x8000_0000, 0).eax < 0x8000_0008 {
-        return Some(36);
+    let cached = MAX_PHYSICAL_ADDRESS_BITS.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Some(cached);
     }
-    let bits = u8::try_from(cpu::cpuid(0x8000_0008, 0).eax & 0xff).ok()?;
-    (12..=52).contains(&bits).then_some(bits)
+
+    let bits = if cpu::cpuid(0x8000_0000, 0).eax < 0x8000_0008 {
+        36
+    } else {
+        u8::try_from(cpu::cpuid(0x8000_0008, 0).eax & 0xff).ok()?
+    };
+    if !(12..=52).contains(&bits) {
+        return None;
+    }
+    MAX_PHYSICAL_ADDRESS_BITS.store(bits, Ordering::Relaxed);
+    Some(bits)
 }
 
 /// Validates the VMXON GPA and its direct-hardware revision identifier.
@@ -3808,10 +3821,13 @@ fn leave_vmx() -> VmxStatus {
 mod tests {
     use super::DIRECT_VMCS_PATCH_MANIFEST;
     use super::INJECT_EXTERNAL_INTERRUPT;
+    use super::MAX_PHYSICAL_ADDRESS_BITS;
     use super::VmcsField;
     use super::acknowledged_external_interrupt;
+    use super::max_physical_address_bits;
     use super::read_direct_patch_field;
     use super::write_direct_patch_field;
+    use core::sync::atomic::Ordering;
 
     #[test]
     fn acknowledged_external_interrupt_requires_a_plain_external_vector() {
@@ -3825,6 +3841,14 @@ mod tests {
             acknowledged_external_interrupt(INJECT_EXTERNAL_INTERRUPT | (1 << 8) | 0x20),
             Err(())
         );
+    }
+
+    #[test]
+    fn physical_address_width_is_retained_after_discovery() {
+        let bits = max_physical_address_bits().expect("x86-64 physical-address width");
+
+        assert_eq!(MAX_PHYSICAL_ADDRESS_BITS.load(Ordering::Relaxed), bits);
+        assert_eq!(max_physical_address_bits(), Some(bits));
     }
 
     #[test]
