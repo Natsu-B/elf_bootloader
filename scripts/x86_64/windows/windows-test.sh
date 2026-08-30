@@ -30,6 +30,9 @@ desktop_marker=thinhvwindowsdesktop
 hyperv_marker='thin-hv: windows hyperv PASS'
 wsl_marker='thin-hv: windows wsl2 PASS'
 wsl_fail_marker='thin-hv: windows wsl2 FAIL'
+s4_request_marker='thin-hv: windows hibernate request'
+s4_pass_marker='thin-hv: windows hibernate PASS state=S4 guest_resume=1'
+s4_fail_marker='thin-hv: windows hibernate FAIL'
 
 die() {
     printf 'Windows x86 test: %s\n' "$*" >&2
@@ -176,6 +179,7 @@ prepare_wsl_media() (
     ln -f -- "$wsl_msi" "$hyperv_media/$(basename -- "$wsl_msi")"
     install -m 0644 -- "$source/wsl-enable.ps1" "$hyperv_media/wsl-enable.ps1"
     install -m 0644 -- "$source/wsl-verify.ps1" "$hyperv_media/wsl-verify.ps1"
+    install -m 0644 -- "$source/hibernate-verify.ps1" "$hyperv_media/hibernate-verify.ps1"
     sha256sum -- "$hyperv_media/thin-hv-wsl-rootfs.tar"
 )
 
@@ -234,24 +238,40 @@ probe_wsl_enable() {
     printf 'sendkey alt-y 20\n' >&9
 }
 
+probe_s4() {
+    run_dialog_command 'powershell -nop -ep bypass -f d:\hibernate-verify.ps1 -reset' ctrl-shift-ret
+    sleep 5
+    printf 'sendkey alt-y 20\n' >&9
+}
+
 run_windows() {
     local mode=$1
-    local timeout_seconds memory smp cpu disk_size ovmf_code ovmf_vars active_vars
+    local s4_phase=${2:-}
+    local timeout_seconds memory smp cpu disk_size ovmf_code ovmf_vars active_vars disable_s4=1
     local disk_image=$disk disk_format=raw disk_snapshot=off
     local tpm_dir=$base_tpm_dir tpm_instance=base
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
     local expected_marker marker_log media_file wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
     local marker_seen=0 wsl_failed=0 wsl_monitor_offset=-1 wsl_probe_offset=0
+    local s4_probe_elapsed=-1
     local wsl_ready_matches=0
-    local is_trusted=0 is_wsl=0
+    local is_trusted=0 is_wsl=0 is_s4=0
     local -a media_args
 
-    if [[ "$mode" == trusted-kvm-hyperv || "$mode" == trusted-kvm-wsl ]]; then
+    if [[ "$mode" == trusted-kvm-hyperv || "$mode" == trusted-kvm-wsl || \
+        "$mode" == trusted-kvm-s4 ]]; then
         is_trusted=1
     fi
-    if [[ "$mode" == wsl || "$mode" == trusted-kvm-wsl ]]; then
+    if [[ "$mode" == wsl || "$mode" == wsl-s4 || "$mode" == trusted-kvm-wsl || \
+        "$mode" == trusted-kvm-s4 ]]; then
         is_wsl=1
+    fi
+    if [[ "$mode" == wsl-s4 || "$mode" == trusted-kvm-s4 ]]; then
+        is_s4=1
+        disable_s4=0
+        [[ "$s4_phase" == request || "$s4_phase" == resume ]] || \
+            die "$mode phase must be request or resume"
     fi
 
     need_command qemu-system-x86_64
@@ -268,8 +288,9 @@ run_windows() {
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
         smp=1
-    elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == trusted-kvm-hyperv || \
-        "$mode" == trusted-kvm-wsl ]]; then
+    elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == wsl-s4 || \
+        "$mode" == trusted-kvm-hyperv || \
+        "$mode" == trusted-kvm-wsl || "$mode" == trusted-kvm-s4 ]]; then
         [[ "$memory" == 4G ]] || die 'Hyper-V control currently requires WINDOWS_MEMORY=4G'
         smp=2
     else
@@ -286,7 +307,8 @@ run_windows() {
     flock -n 8 || die "another Windows test is using $work"
     if [[ -f "$hyperv_disk" && "$mode" != monitor && "$mode" != hyperv && \
         "$mode" != monitor-hyperv && "$mode" != trusted-kvm-hyperv && \
-        "$mode" != trusted-kvm-wsl && "$mode" != wsl ]]; then
+        "$mode" != trusted-kvm-wsl && "$mode" != trusted-kvm-s4 && \
+        "$mode" != wsl && "$mode" != wsl-s4 ]]; then
         # ponytail: keep the raw backing immutable instead of duplicating its
         # allocated blocks; remove all Hyper-V state before changing the base.
         die "Hyper-V overlay exists; remove its disk, vars, TPM, and ready marker together before changing the base"
@@ -357,6 +379,12 @@ run_windows() {
         if [[ -f "$wsl_ready" && "$(<"$wsl_ready")" == "$wsl_media_stamp" ]]; then
             wsl_ready_matches=1
         fi
+        if ((is_s4 && wsl_ready_matches == 0)); then
+            if ((is_trusted)); then
+                die "WSL2 PASS missing for this media; run '$0 trusted-kvm-wsl' first"
+            fi
+            die "WSL2 PASS missing for this media; run '$0 wsl' first"
+        fi
         timeout_seconds=${WINDOWS_WSL_TIMEOUT_SECONDS:-1800}
         active_vars=$hyperv_vars
         disk_image=$hyperv_disk
@@ -369,8 +397,12 @@ run_windows() {
                 cp -fL --remove-destination --reflink=auto -- \
                     "$media_file" "$monitor_esp/${media_file##*/}"
             done
-            install -m 0600 -- "$ovmf_vars" "$monitor_vars"
-            active_vars=$monitor_vars
+            if ((is_s4)); then
+                active_vars=$hyperv_vars
+            else
+                install -m 0600 -- "$ovmf_vars" "$monitor_vars"
+                active_vars=$monitor_vars
+            fi
             media_args=(
                 -drive "if=none,id=monitor-esp,format=raw,snapshot=on,file=fat:ro:$monitor_esp"
                 -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
@@ -429,16 +461,19 @@ run_windows() {
 
     tpm_socket="$work/swtpm-$tpm_instance.sock"
     tpm_pid_file="$work/swtpm-$tpm_instance.pid"
-    monitor_fifo="$work/qemu-monitor-$mode.in"
-    serial_log="$work/$mode-serial.log"
-    desktop_serial_log="$work/$mode-desktop-serial.log"
-    qemu_log="$work/$mode-qemu.log"
+    monitor_fifo="$work/qemu-monitor-$mode${s4_phase:+-$s4_phase}.in"
+    serial_log="$work/$mode${s4_phase:+-$s4_phase}-serial.log"
+    desktop_serial_log="$work/$mode${s4_phase:+-$s4_phase}-desktop-serial.log"
+    qemu_log="$work/$mode${s4_phase:+-$s4_phase}-qemu.log"
     stop_pid_file "$tpm_pid_file"
     rm -f -- "$tpm_socket" "$tpm_pid_file" "$monitor_fifo"
     : >"$serial_log"
     : >"$desktop_serial_log"
     : >"$qemu_log"
-    if ((is_wsl)); then
+    if ((is_s4)) && [[ "$s4_phase" == resume ]]; then
+        expected_marker=$s4_pass_marker
+        marker_log=$desktop_serial_log
+    elif ((is_wsl)); then
         expected_marker="$wsl_marker stamp=$wsl_media_stamp"
         marker_log=$desktop_serial_log
     elif [[ "$mode" == hyperv || "$mode" == monitor-hyperv || \
@@ -485,6 +520,8 @@ run_windows() {
     # launch must derive RAM/MMIO ranges from firmware resources.
     "$qemu" \
         -machine q35,accel=kvm,smm=on \
+        -global ICH9-LPC.disable_s3=1 \
+        -global "ICH9-LPC.disable_s4=$disable_s4" \
         -global q35-pcihost.pci-hole64-size=1G \
         -cpu "$cpu" \
         -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024 \
@@ -535,6 +572,15 @@ run_windows() {
         elif grep -Fq -- "$expected_marker" "$marker_log"; then
             marker_seen=1
         fi
+        if ((is_s4 && marker_seen && !setup_probe_sent)) && \
+            [[ "$s4_phase" == request ]]; then
+            printf 'Windows x86 test: observed %s; requesting S4\n' "$expected_marker"
+            probe_s4
+            setup_probe_sent=1
+            s4_probe_elapsed=$elapsed
+            expected_marker=$s4_request_marker
+            marker_seen=0
+        fi
         if ((marker_seen)); then
             printf 'Windows x86 test: observed %s\n' "$expected_marker"
             break
@@ -548,9 +594,21 @@ run_windows() {
                 grep -F -- "$wsl_fail_marker" >/dev/null; then
             wsl_failed=1
         fi
+        if grep -Fq -- "$s4_fail_marker" "$marker_log"; then
+            tail -n 80 -- "$marker_log" >&2
+            die "guest reported $s4_fail_marker; logs: $serial_log $marker_log $qemu_log"
+        fi
+        if ((is_s4)) && [[ "$s4_phase" == resume ]] && \
+            grep -Fq -- "$wsl_marker stamp=$wsl_media_stamp" "$marker_log"; then
+            die "normal WSL boot completed before S4 resume; logs: $serial_log $marker_log $qemu_log"
+        fi
         if ((wsl_failed)); then
             tail -n 80 -- "$marker_log" >&2
             die "guest reported $wsl_fail_marker; logs: $serial_log $marker_log $qemu_log"
+        fi
+        if ((is_s4 && setup_probe_sent && s4_probe_elapsed >= 0 && \
+            elapsed >= s4_probe_elapsed + 120)) && [[ "$s4_phase" == request ]]; then
+            die "guest did not request S4 within 120 seconds; logs: $serial_log $marker_log $qemu_log"
         fi
         if ! kill -0 "$qemu_pid" 2>/dev/null; then
             set +e
@@ -587,6 +645,7 @@ run_windows() {
     elif ((is_wsl)); then
         printf '%s\n' "$wsl_media_stamp" >"$wsl_ready"
     fi
+
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
@@ -604,6 +663,29 @@ run_windows() {
         fi
     fi
 
+    if ((is_s4)) && [[ "$s4_phase" == request ]]; then
+        for _ in {1..120}; do
+            kill -0 "$qemu_pid" 2>/dev/null || break
+            if grep -Fq -- "$s4_fail_marker" "$marker_log"; then
+                tail -n 80 -- "$marker_log" >&2
+                die "guest reported $s4_fail_marker; logs: $serial_log $marker_log $qemu_log"
+            fi
+            sleep 1
+        done
+        kill -0 "$qemu_pid" 2>/dev/null && \
+            die "QEMU did not exit after S4 request; logs: $serial_log $marker_log $qemu_log"
+        set +e
+        wait "$qemu_pid"
+        qemu_status=$?
+        set -e
+        qemu_pid=
+        ((qemu_status == 0)) || die "QEMU S4 exit status $qemu_status; log: $qemu_log"
+        printf 'Windows x86 test: S4 powered off cleanly; cold restarting\n'
+        cleanup
+        trap - EXIT INT TERM
+        return
+    fi
+
     printf 'system_powerdown\n' >&9
     for _ in {1..120}; do
         kill -0 "$qemu_pid" 2>/dev/null || break
@@ -619,8 +701,26 @@ run_windows() {
     trap - EXIT INT TERM
 }
 
+run_windows_s4() {
+    local mode=$1 request_image resume_image
+
+    run_windows "$mode" request
+    sleep 1
+    run_windows "$mode" resume
+    [[ "$mode" == trusted-kvm-s4 ]] || return 0
+    request_image=$(grep -Eo 'image_base=0x[0-9a-f]+ image_size=0x[0-9a-f]+' \
+        "$work/$mode-request-serial.log" | tail -n 1) || \
+        die 'trusted runtime image marker missing before S4'
+    resume_image=$(grep -Eo 'image_base=0x[0-9a-f]+ image_size=0x[0-9a-f]+' \
+        "$work/$mode-resume-serial.log" | tail -n 1) || \
+        die 'trusted runtime image marker missing after S4'
+    [[ "$request_image" == "$resume_image" ]] || \
+        die "trusted runtime image moved across S4: $request_image -> $resume_image"
+    printf 'Windows x86 test: trusted runtime image stable across S4: %s\n' "$resume_image"
+}
+
 usage() {
-    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl\n' "$0"
+    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-s4\n' "$0"
 }
 
 case ${1:-} in
@@ -633,9 +733,11 @@ case ${1:-} in
     monitor) run_windows monitor ;;
     hyperv) run_windows hyperv ;;
     wsl) run_windows wsl ;;
+    wsl-s4) run_windows_s4 wsl-s4 ;;
     monitor-hyperv) run_windows monitor-hyperv ;;
     trusted-kvm-hyperv) run_windows trusted-kvm-hyperv ;;
     trusted-kvm-wsl) run_windows trusted-kvm-wsl ;;
+    trusted-kvm-s4) run_windows_s4 trusted-kvm-s4 ;;
     -h | --help | help) usage ;;
     *) usage >&2; exit 2 ;;
 esac
