@@ -158,7 +158,7 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: elf-${{ github.ref_name }}-${{ github.sha }}
+          name: elf-${{ github.sha }}
           path: |
             bin/*.elf
             bin/*.img
