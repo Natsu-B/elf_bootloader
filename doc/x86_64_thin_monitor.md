@@ -115,12 +115,12 @@ remain available for the bare-metal-oriented monitor work.
 
 | Release runtime artifact | PE size | `.text` size | Decoded VMX instruction sites |
 | --- | ---: | ---: | ---: |
-| `x86-uefi-monitor.efi` | 81,920 bytes | 69,689 bytes | 303 |
-| `x86-uefi-kvm-monitor.efi` | 23,040 bytes | 17,593 bytes | 0 |
+| `x86-uefi-monitor.efi` | 81,408 bytes | 69,273 bytes | 303 |
+| `x86-uefi-kvm-monitor.efi` | 22,016 bytes | 16,825 bytes | 0 |
 
 These figures come from `cargo xbuild x86 --release`, `stat`, and GNU `objdump` 2.44; the VMX
-count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 71.9% smaller
-overall and 74.8% smaller in `.text`. These measurements show the active implementation
+count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 73.0% smaller
+overall and 75.7% smaller in `.text`. These measurements show the active implementation
 reduction; they are not a formal TCB proof.
 
 ## Direct EPT and its current ceiling
@@ -333,13 +333,13 @@ thin-hv: vmx guest PASS start_image_status=0x0
 This validates the runtime-driver handoff, real OVMF variable wrappers, Runtime Services CRC, and
 CPUID filtering for the small payload: leaf 1 exposes VMX and clears the hypervisor-present bit,
 while the Hyper-V-reserved CPUID range is zeroed. Linux KVM initialization and the runtime virtual
-address transition are measured separately below. The trusted artifact also passes this smoke with
-VMX hidden from CPUID:
+address transition are measured separately below. The trusted artifact delegates VMX exposure to
+the outer KVM/QEMU stack and passes this payload with nested VMX exposed:
 
 ```sh
 env X86_MONITOR_IMAGE="$PWD/bin/x86_64/x86-uefi-kvm-monitor.efi" \
   X86_RETURN_MARKER='thin-hv: trusted outer KVM guest PASS' \
-  X86_UEFI_CPU='host,-vmx,-hypervisor' \
+  X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
   scripts/x86_64/run-uefi-smoke.sh \
   bin/x86_64/x86-uefi-kvm-loader.efi bin/x86_64/x86_guest_uefi_test.efi
 ```
@@ -586,18 +586,16 @@ scripts/x86_64/windows/windows-test.sh trusted-kvm-wsl
 ```
 
 The Hyper-V run emitted `thin-hv: windows hyperv PASS`, selected overlay profile 1, and contained
-no `thin-hv: L1 VMLAUNCH direct=` marker. An initial same-baseline A/B pair measured the direct
-QEMU/KVM control at 33.335 seconds and the trusted path at 34.344 seconds. Before the startup
-trimming summarized above, a follow-up used fresh qcow2, UEFI-variable, and TPM children for each
-run. Three valid pairs averaged 24.675 seconds direct and 24.154 seconds trusted; the paired
-trusted-minus-direct mean was -0.520 seconds with a 95% t interval of -4.044 to +3.003 seconds. No
-trusted-path boot overhead was resolved. All valid pairs ran direct first, so cache/order bias
-remains; structurally, the trusted path has no project VM-exit-reflection loop.
+no `thin-hv: L1 VMLAUNCH direct=` marker. Six counterbalanced same-baseline pairs with fresh qcow2,
+UEFI-variable, and TPM children averaged 23.601 seconds direct and 22.933 seconds trusted before
+the latest startup trimming. Six post-change pairs averaged 23.430 and 23.370 seconds. The paired
+trusted-minus-direct 95% intervals were [-1.726, +0.391] and [-0.803, +0.681] seconds respectively,
+so neither trusted overhead nor an end-to-end speedup was resolved.
 
 The trusted WSL2 run passed with WSL 2.7.11.0, kernel `6.18.33.2-2`, and both guest processors.
 Including its setup reboot, it reached `thin-hv: windows wsl2 PASS` in 216.732 seconds. COM1 showed
-two boot epochs, each with `thin-hv: trusted outer KVM runtime active` and variable-overlay profile
-1, and neither contained a direct `VMLAUNCH` marker. `qemu-img check` found no errors afterward.
+two boot epochs, each with `thin-hv: trusted outer KVM runtime active profile=1`, and neither
+contained a direct `VMLAUNCH` marker. `qemu-img check` found no errors afterward.
 These results validate the UEFI overlay in front of KVM's ordinary nested virtualization; they do
 not exercise the direct-VMCS monitor below.
 

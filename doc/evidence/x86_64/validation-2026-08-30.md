@@ -217,9 +217,65 @@ is `c29314a893c6d292c17ee130d1f5891cca7dc5fee138347a350979172de1dd8d`.
 Direct/trusted loader unit tests, overlay tests, both UEFI smoke paths, the AArch64 build, and all
 17 filtered std/unit plan entries passed.
 
+## Protocol-cache and OS-specific follow-up
+
+Code commit `72df83d6c9baa7871693e71574e6fd5c45ff5422` reuses the parent LoadedImage
+metadata and the firmware's shared DevicePathUtilities protocol while loading the guest and runtime
+image. A successful Linux-profile
+boot avoids two parent `HandleProtocol(LoadedImage)` calls and one
+`LocateProtocol(DevicePathUtilities)` call. The measured Windows topology avoids three and two
+respectively. The trusted bootstrap no longer initializes COM1 or emits successful-path messages;
+the runtime entry initializes it once and combines the runtime/profile report. This removes one
+seven-OUT initialization and 82 serial bytes, at least 171 port-I/O instructions when every
+transmitter poll succeeds. The bytes occupy 7.118 ms on a physical 115200 8N1 link; QEMU's emulated
+UART does not serialize them at physical wire rate.
+
+| Release artifact | PE bytes | `.text` bytes | `.rdata` bytes | Decoded VMX sites | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| x86-uefi-monitor.efi | 81,408 | 69,273 | 8,757 | 303 | 592dcfc752e8a8cd21d24a310b95e5e88e6e2620efb3b82f32717a22dadfd505 |
+| x86-uefi-kvm-monitor.efi | 22,016 | 16,825 | 2,149 | 0 | 5abbe2a5f89472d067bc1fd8870f596776233fd6659ce61b3cb80afe8a78dbde |
+| x86-uefi-loader.efi | 81,408 | 69,273 | 8,757 | 303 | a33c672b4a79702244f3895b2479c7f16e698b5408d94d1f1e58930cc6f784c7 |
+| x86-uefi-kvm-loader.efi | 22,016 | 16,825 | 2,149 | 0 | 1f4add14176ec1629a8c843150411a71391992c03be49f91bfadf03ff0abec40 |
+
+Relative to `b86f4fc`, each trusted PE is 1,024 bytes smaller (4.44%), `.text` is 768 bytes smaller
+(4.37%), and `.rdata` is 64 bytes smaller (2.89%). The direct PE also shrank by 512 bytes while its
+decoded VMX-site count stayed at 303. The trusted PE still decodes zero VMX and zero CPUID sites.
+
+Windows and Linux were measured separately with six AB/BA-counterbalanced pairs per phase. Every
+Windows sample used a fresh child of one immutable Hyper-V baseline, fresh variables and TPM state,
+and passed the marker, status, and `qemu-img check` gates. Every Linux sample booted the same
+15,682,560-byte UKI (SHA-256
+`5d2ab8dff5ff2a82873eb494882c81c1e140f3278b1eaaaa83cd93f12eea2d94`) with fresh ESP and
+variables, and proved VMX, `kvm_intel`, `/dev/kvm`, profile 2, and the final PASS marker.
+
+| OS / phase | Direct mean | Trusted mean | Paired trusted-direct mean | 95% paired t interval |
+| --- | ---: | ---: | ---: | ---: |
+| Windows before | 23.601 s | 22.933 s | -0.668 s | [-1.726, +0.391] s |
+| Windows after | 23.430 s | 23.370 s | -0.061 s | [-0.803, +0.681] s |
+| Linux before | 1.145571 s | 1.120474 s | -0.025097 s | [-0.053715, +0.003521] s |
+| Linux after | 1.120421 s | 1.137510 s | +0.017090 s | [-0.024685, +0.058864] s |
+
+All four intervals include zero. Linux marker detection used 50 ms polling, visible as quantization
+in the tracked [OS paired data](trusted-kvm-os-speed-2026-08-30.tsv), so its nominal before/after
+shift is not evidence of a regression. The Windows raw TSV hashes are
+`930686e8583fe00e02c6355a0eceadba438edd81eca733e6d2f8bb547c1cbd6c` before and
+`67497b021c663bffce2b07c754953226208fdde5690e944a60b70cd37b330b7b` after. The corresponding
+Linux paired TSV hashes are `7d24925b3fd5bdf1d5ffa7dfe83f5f617c401df32f7322c5da99decd23456229`
+and `c7c32b03fd7c47949f996d7e71afcd353bbc6e3e768928ba6982053ae2a9febb`.
+
+A separate no-polling benchmark compared the exact `b86f4fc` trusted artifacts with the new ones.
+A blocking serial reader timestamped the common runtime-active line for 20 AB/BA-balanced pairs;
+all 42 runs including warmups passed overlay and final guest checks. Spawn-to-runtime averaged
+657.296 ms before and 658.538 ms after. The paired new-minus-old mean was +1.242 ms with a 95%
+interval of [-5.238, +7.721] ms, so the smaller deterministic startup path produced no detectable
+QEMU wall-time change or regression. The tracked
+[paired samples](trusted-kvm-uefi-startup-2026-08-30.tsv) come from raw tree SHA-256
+`6a6c73506f05843cef294c48ed903b7972ba6e4407faef1171b55ead4466c3db`.
+
 ## Limits
 
-The three valid Windows A/B pairs are still too few for a narrow performance bound and retain an
-order-bias caveat. Windows media, qcow2 images, TPM state, raw logs, and dumps are not distributable
-repository fixtures. Physical x86 hardware, VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a
-complete non-interactive cargo xtest remain unproven.
+Six Windows pairs and six Linux pairs still leave broad end-to-end bounds, and the Linux runner's
+50 ms polling cannot resolve single-digit-millisecond changes. Windows media, qcow2 images, TPM
+state, raw logs, and dumps are not distributable repository fixtures. Physical x86 hardware,
+VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a complete non-interactive cargo xtest remain
+unproven.
