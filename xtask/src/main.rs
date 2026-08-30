@@ -1106,17 +1106,8 @@ fn spawn_output_pumps(child: &mut Child) -> (thread::JoinHandle<()>, thread::Joi
         .take()
         .expect("child stderr should be piped for output forwarding");
 
-    let stdout_handle = thread::spawn(move || {
-        let stdout_handle = io::stdout();
-        let mut stdout_lock = stdout_handle.lock();
-        pump_filtered_output(stdout, &mut stdout_lock);
-    });
-
-    let stderr_handle = thread::spawn(move || {
-        let stderr_handle = io::stderr();
-        let mut stderr_lock = stderr_handle.lock();
-        pump_filtered_output(stderr, &mut stderr_lock);
-    });
+    let stdout_handle = thread::spawn(move || pump_filtered_output(stdout, io::stdout()));
+    let stderr_handle = thread::spawn(move || pump_filtered_output(stderr, io::stderr()));
 
     (stdout_handle, stderr_handle)
 }
@@ -2054,6 +2045,16 @@ mod tests {
     use super::AnsiQueryFilter;
     use super::apply_testname_filters;
     use super::parse_xtest_cli_args;
+    #[cfg(unix)]
+    use super::run_guest_test_with_timeout;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::process::Stdio;
+    #[cfg(unix)]
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
 
     fn filter_chunks(chunks: &[&[u8]]) -> Vec<u8> {
         let mut filter = AnsiQueryFilter::new();
@@ -2218,5 +2219,25 @@ mod tests {
         assert!(uboot_unit_tests.is_empty());
         assert_eq!(uefi_tests.len(), 1);
         assert_eq!(uefi_tests[0].1, "uefi_packet_size");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_is_not_blocked_by_output_forwarders() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 6")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        let code = run_guest_test_with_timeout(cmd, "output-pump-timeout", 1, "test");
+
+        assert_eq!(code, 124);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout reporting waited for the child output pumps to exit"
+        );
     }
 }

@@ -6,18 +6,19 @@ compile_error!("This test is intended to run on aarch64 targets only");
 
 use aarch64_test::exit_failure;
 use aarch64_test::exit_success;
+use aarch64_test::semihost_write0;
 use core::convert::Infallible;
+use core::mem::MaybeUninit;
 use gdb_remote::GdbServer;
 use gdb_remote::Target;
 use gdb_remote::TargetCapabilities;
 use gdb_remote::TargetError;
-use print::debug_uart;
 use print::pl011::Pl011Uart;
 use print::stream::Pl011Stream;
 
-// Use the 2nd PL011 (UART1) on QEMU virt for the RSP channel.
-// UART0 is typically used as the UEFI firmware console and can inject non-RSP output.
-const UART_BASE: usize = 0x904_0000;
+// Use the DT-selected console PL011: recent EDK2 maps only this UART for UEFI apps.
+// The runner waits for READY before attaching GDB, after firmware console output is complete.
+const UART_BASE: usize = 0x900_0000;
 // QEMU virt PL011 UARTs run at 24MHz.
 const UART_CLOCK_HZ: u32 = 24 * 1_000_000;
 
@@ -26,15 +27,18 @@ const CORE_REG_BYTES: usize = 31 * 8 + 8 + 8 + 4;
 
 #[unsafe(no_mangle)]
 extern "C" fn efi_main() -> ! {
-    debug_uart::init(UART_BASE, UART_CLOCK_HZ as u64, 115200);
-
     let mut uart = Pl011Uart::new(UART_BASE, UART_CLOCK_HZ as u64);
     uart.init(115200);
-    // Drain any stale bytes (should be empty for UART1, but keep it defensive).
     uart.drain_rx();
-    let mut server: GdbServer<2048, 4096> = GdbServer::new();
+    let mut server = MaybeUninit::<GdbServer<2048, 4096>>::uninit();
+    GdbServer::init_in_place(&mut server);
+    // SAFETY: init_in_place initialized every field, and this stack slot remains
+    // alive and exclusively borrowed until the GDB session finishes.
+    let server = unsafe { server.assume_init_mut() };
     let mut target = DummyTarget;
     let mut stream = Pl011Stream::new(&uart);
+
+    semihost_write0(b"GDB_REMOTE_READY\n\0".as_ptr());
 
     if server
         .run_until_monitor_exit(&mut stream, &mut target)
