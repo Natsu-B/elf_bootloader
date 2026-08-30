@@ -892,14 +892,13 @@ fn configure_and_launch(
             | vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE,
         unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) },
     );
-    // ponytail: keep the trusted L1 PAT live across carrier exits so KVM's
-    // all-clear direct PAT controls retain native semantics.
+    // ponytail: keep the trusted L1 PAT and non-mode EFER bits live across
+    // carrier exits so all-clear direct controls retain native semantics.
     let exit_capability = unsafe { cpu::rdmsr(exit_msr) };
     let exit = vmx::adjust_controls(
         vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
             | vmcs::VM_EXIT_SAVE_IA32_PAT
-            | vmcs::VM_EXIT_SAVE_IA32_EFER
-            | vmcs::VM_EXIT_LOAD_IA32_EFER,
+            | vmcs::VM_EXIT_SAVE_IA32_EFER,
         exit_capability,
     );
     let entry = vmx::adjust_controls(
@@ -924,7 +923,7 @@ fn configure_and_launch(
         || exit & vmcs::VM_EXIT_LOAD_IA32_PAT != 0
         || (exit_capability >> 32) as u32 & vmcs::VM_EXIT_LOAD_IA32_PAT == 0
         || exit & vmcs::VM_EXIT_SAVE_IA32_EFER == 0
-        || exit & vmcs::VM_EXIT_LOAD_IA32_EFER == 0
+        || exit & vmcs::VM_EXIT_LOAD_IA32_EFER != 0
         || entry & vmcs::VM_ENTRY_IA32E_MODE == 0
         || entry & vmcs::VM_ENTRY_LOAD_IA32_PAT == 0
         || entry & vmcs::VM_ENTRY_LOAD_IA32_EFER == 0
@@ -2341,8 +2340,8 @@ fn handle_l1_vmentry(
         // MSR mirrors when a real workload first supplies a non-empty list.
         // ponytail: PAT controls follow the same all-clear or entry+exit-load
         // ceiling as EFER; add forced-control shadowing before relaxing it.
-        // ponytail: accept measured trusted KVM's all-clear controls (its EFER
-        // writes are intercepted), or sets that load L2 and restore L1 EFER.
+        // ponytail: accept measured trusted KVM's all-clear controls, which
+        // inherit live L1 EFER, or sets that load L2 and restore L1 EFER.
         // Add forced-control shadowing before allowing other partial sets.
         stop_unexpected_exit(
             b"unsupported nested VM-entry state",
@@ -2562,8 +2561,8 @@ fn reflect_l2_vmexit(run: &NestedRun, registers: &GuestRegisters) {
         stop_nested_exit(b"reflecting L1 host state failed", run.direct, registers);
     }
 
-    // ponytail: the fault-free real-mode probe leaves CR2 untouched. Save it
-    // in the entry stub before allowing an L2 that can fault.
+    // ponytail: CR2 remains shared with the trusted one-vCPU L1. Add explicit
+    // switching before faulting L2 workloads require independent CR2 state.
 }
 
 /// Stops after recovering L2's exit diagnostics only on an error path.

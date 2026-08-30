@@ -1,9 +1,10 @@
 # x86_64 thin monitor: architecture and validation status
 
 This document records only implementation and measurements that exist on
-`feat/x86-thin-monitor` as of 2026-08-28. Linux KVM and Windows boot results below come from
-actual runs. Hyper-V and WSL2 passed as direct-OVMF controls without this monitor; Hyper-V has
-not started through the one-vCPU monitor, and WSL2 has not been attempted through it.
+`feat/x86-thin-monitor` as of 2026-08-30. Linux KVM and Windows boot results below come from
+actual runs. Hyper-V and WSL2 passed as direct-OVMF controls without this monitor; Hyper-V now
+executes nested VMX through the one-vCPU monitor but has not reached its PASS marker, and WSL2 has
+not been attempted through it.
 
 ## Status summary
 
@@ -12,12 +13,12 @@ not started through the one-vCPU monitor, and WSL2 has not been attempted throug
 | x86-64 UEFI entry | Builds as `x86_64-unknown-uefi`; boots under QEMU/KVM + OVMF | Physical-machine boot |
 | First VMX launch | One vCPU reaches VMX non-root from a runtime EFI driver; Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, SMP, and bare-metal lifetime validation |
 | Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO` | SMP, a normal distribution userspace, and a faulting or long-mode L2 |
-| Trusted nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, VMLAUNCH, and VMRESUME through a direct hardware VMCS; external-interrupt, EPT-violation, and I/O exits were reflected to KVM | Non-empty MSR lists, CR2/XSAVE switching, optional VMX controls, and SMP |
+| Trusted nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, INVVPID, VMLAUNCH, and VMRESUME through a direct hardware VMCS; a sparse Windows Hyper-V diagnostic crossed 524,288 balanced direct entries/exits | Non-empty MSR lists, independent CR2/XSAVE state, optional VMX controls, and SMP |
 | Direct EPT | QEMU-only 8 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and bare-metal use |
 | UEFI variables | In-place Runtime Services overlay for profile-private boot variables; focused OVMF profile-2 round trip, table CRC, Linux virtual-address transition, and a profile-1 Windows desktop boot measured | Cross-reboot/profile-switch persistence, Linux `efibootmgr`, and Windows BCD mutation/isolation |
 | Windows | Windows 11 Enterprise Evaluation 25H2 boots directly and reaches the desktop through the one-vCPU monitor, including after the variable hooks were installed | Monitor SMP, Sandbox, and VBS/HVCI |
 | Direct Hyper-V/WSL2 controls | Without this monitor, Hyper-V passed with two and one QEMU vCPUs; a matched two-vCPU A/B failed only when QEMU hid VPID/INVVPID; WSL 2.7.11 ran a two-vCPU WSL2 BusyBox guest to `uname` and `/proc/cpuinfo` | These controls do not exercise this L0 or prove its VPID implementation |
-| Monitor Hyper-V/WSL2 | A pre-variable-overlay Hyper-V-enabled Windows run reached VMX capability reads through the one-vCPU monitor | Current post-hook retest, Hyper-V startup/VMXON, a Hyper-V VM, and any monitor-mediated WSL2 run |
+| Monitor Hyper-V/WSL2 | Hyper-V reaches direct nested execution. A carrier EFER bug that cleared SCE and caused `smss.exe` to terminate with `STATUS_ILLEGAL_INSTRUCTION` is fixed; the fresh retest remained on one boot without BSOD or monitor fault for 1200 seconds | Hyper-V PASS marker, nested-KVM performance closure, a Hyper-V VM, and any monitor-mediated WSL2 run |
 
 Relevant commits include `af35d3b` (x86 HAL/VMX foundation), `d02d384` (four-operation
 variable adapter), `767e120` (UEFI payload in VMX non-root), `a0c0bc8` (Linux UKI builder),
@@ -544,17 +545,52 @@ and 1, `thin-hv-wsl2-guest-ok`, and `thin-hv: windows wsl2 PASS`. Its ignored ar
 ### Monitor-mediated Hyper-V boundary
 
 `scripts/x86_64/windows/windows-test.sh monitor-hyperv` boots the Hyper-V-enabled qcow2 through
-the one-vCPU monitor. The measured attempt reached `thin-hv: runtime monitor active`, Windows set
-virtual CR4.VMXE, and it read the advertised `IA32_VMX_*` capability MSRs. It never issued the
-logged nested `VMXON` with a VMXON-region address and never emitted `thin-hv: windows hyperv
-PASS`; the harness timed out. The boundary captures are
-`monitor-hyperv-capability-boundary.log` (SHA-256
-`f3c20b75c2d4f2c5b5a35357337a81c26b08e44a0ceacc1fef4e78d561a830fa`) and
-`monitor-hyperv-no-pass.log` (SHA-256
-`f917801569044170bbbc3fe64b695455a9bd302102b499bd05c19e86d5dca540`). The exact missing
-capability or state handling has not yet been isolated. These boundary captures predate
-`90bd961`; the post-hook image has not yet repeated `monitor-hyperv`. No Hyper-V VM has run
-through this L0, and monitor-mediated WSL2 has not been attempted.
+the one-vCPU monitor. A fresh direct control reached `thin-hv: windows hyperv PASS` in about 210
+seconds; a separate `-smp 1` direct control reached the same marker in 60 seconds, excluding the
+monitor's one-vCPU limit as the cause of the nested timeout.
+
+The pre-fix monitor run crashed with bugcheck `0xEF`. Its active dump has SHA-256
+`b02e06df72ce806c7e1657052fb0bb2e8c4b43176d691179e8af48ffeb8c8066`. The terminating process
+was `smss.exe` with exit status `0xC000001D` (`STATUS_ILLEGAL_INSTRUCTION`); its preserved user RIP
+was `ntdll!NtQueryVirtualMemory+0x12`, on intact `0f 05` (`SYSCALL`) bytes. Sparse VMCS tracing
+then showed direct exit and entry EFER controls all clear, active L1 EFER `0xd00`, and more than
+524,288 balanced direct entries/exits. The carrier had loaded its L0 host EFER on the intercepted
+L1 `VMLAUNCH`, replacing the live L1 value `0xd01` with `0xd00`. The all-clear direct entry
+correctly inherited that bad value, so `SYSCALL` raised #UD because SCE was clear.
+
+The fix leaves `VM_EXIT_SAVE_IA32_EFER` enabled but removes carrier
+`VM_EXIT_LOAD_IA32_EFER`, preserving the trusted L1's live non-mode EFER bits across carrier
+exits. A fresh retest crossed the old crash boundary and ran for the full 1200-second harness
+limit with one `Boot0002`, one `thin-hv: runtime monitor active`, no BSOD, no monitor fault, and an
+animating Windows `Please wait` screen. It did not emit `thin-hv: windows hyperv PASS`, so this is
+crash-fix evidence rather than a nested Hyper-V pass. The remaining measured boundary is
+nested-under-KVM throughput; the reflected exit path still materializes the L1 host state with 54
+carrier VMWRITEs per direct exit.
+
+Reproduce from a direct-PASS work directory without mutating that control:
+
+```sh
+direct=/path/to/direct-pass-workdir
+WINDOWS_TEST_DIR="$direct" WINDOWS_HYPERV_TIMEOUT_SECONDS=1200 \
+  scripts/x86_64/windows/windows-test.sh hyperv
+
+monitor=$(mktemp -d /tmp/thin-hv-monitor.XXXXXX)
+cp -a --reflink=auto --sparse=always "$direct/." "$monitor/"
+
+WINDOWS_TEST_DIR="$monitor" WINDOWS_HYPERV_TIMEOUT_SECONDS=1200 \
+  scripts/x86_64/windows/windows-test.sh monitor-hyperv
+```
+
+Ignored evidence copies are under `bin/x86_64/windows/evidence/`. The fresh direct desktop log has
+SHA-256 `9e598901c04db859c7cf03824092c84213da20167768293dda2c4c338b420e4c`; the separate one-vCPU
+control log has SHA-256 `cb9000c74c33d930ef842631e6c5a84d2a3d2e51043c86cc788f0654c1400fb6`.
+The fixed monitor serial and QEMU logs have SHA-256
+`2cc19bcb039519e90840456ebb6ca55ad91def75ff28a7d144c09182beaaaec1` and
+`be134a8e4e6446f5db663641d898e53d1688d5258431935ea9e62718033faaf1`; the 1080-second screen
+capture has SHA-256 `d0152df71706b68d0735a715ee31097443c50725427c013eab7e0ad847d12d2a`,
+and `smss_context_probe.py` has SHA-256
+`37208d56f70ad6942528ee645caa603b9e752b974f856aeed275157223b55284`.
+No Hyper-V VM has run through this L0, and monitor-mediated WSL2 has not been attempted.
 
 The repository contains only the conservative standard-VMX policy needed to begin those tests.
 It does not implement or advertise Hyper-V CPUID leaves, SynIC, VP Assist Page, enlightened VMCS,
@@ -585,18 +621,19 @@ configurations.
   Windows from the first other filesystem containing `bootmgfw.efi`. Multiple Windows installs
   need profile-owned ESP selection instead of firmware enumeration order.
 * The measured nested path handles VMXON, VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE, INVEPT,
-  VMLAUNCH, and VMRESUME. Memory-form VMREAD/VMWRITE, VMXOFF, INVVPID, optional VMX controls, and
+  INVVPID, VMLAUNCH, and VMRESUME. Memory-form VMREAD/VMWRITE, VMXOFF, optional VMX controls, and
   VMX in L2 are not supported.
 * Direct entry currently requires zero VM-entry MSR-load, VM-exit MSR-store, and VM-exit MSR-load
   counts. Add bounded L0-owned mirrors before accepting non-empty lists.
-* The real-mode L2 probe is deliberately fault-free and does not exercise extended register
-  state. L0 does not save/switch CR2 or XSAVE state around a direct run; add both before a faulting,
-  SIMD-using, SMP, or Hyper-V L2 workload.
+* L0 shares CR2 and extended register state with its trusted one-vCPU L1 around a direct run.
+  Add independent CR2/XSAVE switching before accepting untrusted, SMP, or workloads that require
+  those states to remain private; the measured Hyper-V path has already entered L2 under this
+  trusted-state ceiling.
 * Linux KVM has run one VM/vCPU to `KVM_EXIT_IO`; an L2 Linux kernel, KVM SMP, and sustained or
   device-heavy workloads have not run.
-* Hyper-V and WSL2 pass only in direct-OVMF controls without this L0. The one-vCPU
-  `monitor-hyperv` run stopped after VMX capability reads, before a logged nested VMXON or the
-  Hyper-V PASS marker. Monitor-mediated WSL2 has not run.
+* Hyper-V and WSL2 pass only in direct-OVMF controls without this L0. `monitor-hyperv` now reaches
+  sustained nested execution and no longer reproduces the EFER.SCE-induced `0xEF`, but the fresh
+  1200-second run timed out at Windows `Please wait` before the Hyper-V PASS marker.
 * The profile variable hooks have one real OVMF profile-2 round-trip/enumeration/CRC test and use
   the firmware's nonvolatile backend. That focused payload deletes both test keys, so it does not
   prove cross-reboot persistence or switching between profiles. A profile-1 Windows desktop boot
