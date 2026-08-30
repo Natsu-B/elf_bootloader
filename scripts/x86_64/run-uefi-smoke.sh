@@ -14,6 +14,7 @@ return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
 payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 memory=${X86_UEFI_MEMORY:-256M}
+smp=${X86_UEFI_SMP:-1}
 cpu=${X86_UEFI_CPU:-host,+vmx,-hypervisor}
 
 die() {
@@ -37,6 +38,7 @@ first_file() {
 [[ -f "$guest" ]] || die "guest payload not found: $guest"
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
 [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
+[[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_SMP must be a positive integer'
 [[ -n "$cpu" ]] || die 'X86_UEFI_CPU must not be empty'
 command -v timeout >/dev/null || die "GNU timeout is required"
 
@@ -79,8 +81,10 @@ set +e
 timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     "$qemu" \
     -machine q35,accel=kvm \
+    -global ICH9-LPC.disable_s3=0 \
+    -global ICH9-LPC.disable_s4=0 \
     -cpu "$cpu" \
-    -smp 1 \
+    -smp "$smp" \
     -m "$memory" \
     -nodefaults \
     -display none \

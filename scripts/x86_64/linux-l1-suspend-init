@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+fail() {
+    echo "thin-hv: linux S3 FAIL $1"
+    /bin/busybox poweroff -f
+    exit 1
+}
+
+state=$(/bin/busybox cat /sys/power/state)
+mem_sleep=$(/bin/busybox cat /sys/power/mem_sleep)
+echo "thin-hv: linux suspend states=$state"
+echo "thin-hv: linux mem_sleep=$mem_sleep"
+
+case " $state " in
+    *' mem '*) ;;
+    *) fail 'mem unavailable' ;;
+esac
+case "$mem_sleep" in
+    *deep*) ;;
+    *) fail 'deep unavailable' ;;
+esac
+
+modprobe kvm
+modprobe kvm_intel nested=0
+modprobe efivarfs
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+firmware_var=$(/bin/busybox find /sys/firmware/efi/efivars -maxdepth 1 -type f \
+    | /bin/busybox head -n 1)
+[ -r "$firmware_var" ] || fail 'EFI variable unavailable'
+firmware_var_hash=$(/bin/busybox sha256sum "$firmware_var")
+echo "thin-hv: linux EFI runtime variable=$(/bin/busybox basename "$firmware_var")"
+/bin/kvm-probe
+echo deep >/sys/power/mem_sleep
+for cycle in 1 2 3; do
+    echo "thin-hv: linux S3 suspend begin cycle=$cycle"
+    /bin/busybox sync
+    echo mem >/sys/power/state
+    echo "thin-hv: linux S3 resume cycle=$cycle"
+    /bin/kvm-probe
+    /bin/busybox umount /sys/firmware/efi/efivars
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+    [ "$(/bin/busybox sha256sum "$firmware_var")" = "$firmware_var_hash" ] \
+        || fail 'EFI variable changed after resume'
+    echo "thin-hv: linux S3 EFI runtime PASS cycle=$cycle"
+done
+echo 'thin-hv: linux S3 nested KVM PASS cycles=3'
+/bin/busybox poweroff -f

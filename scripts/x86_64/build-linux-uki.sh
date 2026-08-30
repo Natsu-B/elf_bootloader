@@ -130,6 +130,13 @@ while read -r action module_path _; do
 done < <("$modprobe" -d "$modules_prefix" -S "$kernel_release" --show-depends kvm_intel)
 find "$root/lib/modules/$kernel_release" -name 'kvm-intel.ko*' -print -quit | grep -q . \
     || die "kvm-intel module not found for $kernel_release"
+while read -r action module_path _; do
+    [[ "$action" == insmod ]] || continue
+    [[ "$module_path" == "$modules_root/"* ]] || die "module outside $modules_root: $module_path"
+    install -Dm 0644 -- "$module_path" "$root/lib/modules/$kernel_release/${module_path#"$modules_root/"}"
+done < <("$modprobe" -d "$modules_prefix" -S "$kernel_release" --show-depends efivarfs)
+find "$root/lib/modules/$kernel_release" -name 'efivarfs.ko*' -print -quit | grep -q . \
+    || die "efivarfs module not found for $kernel_release"
 install -m 0644 -- "$modules_root"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kernel_release/"
 "$depmod" -b "$root" "$kernel_release"
 find "$root" -exec touch -h -d '@0' -- {} +
