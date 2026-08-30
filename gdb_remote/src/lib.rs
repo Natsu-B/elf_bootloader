@@ -314,6 +314,7 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
             core::ptr::addr_of_mut!((*p).rsp).write(RspFrameAssembler::new());
             core::ptr::addr_of_mut!((*p).advertised_packet_size).write(advertised_packet_size);
             core::ptr::addr_of_mut!((*p).ack_mode).write(true);
+            core::ptr::addr_of_mut!((*p).last_stop).write(LastStop::sigtrap());
         }
     }
 
@@ -884,11 +885,12 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
         let mut tx_buf = [0u8; 128];
         let mut tx_pos = 0usize;
         let mut tx_len = 0usize;
+        let mut exit_requested = false;
 
         loop {
             let mut progress = false;
 
-            loop {
+            while !exit_requested {
                 match stream.poll_read(&mut cx, &mut rx_buf) {
                     Poll::Ready(Ok(len)) => {
                         if len == 0 {
@@ -898,11 +900,8 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                         for &byte in &rx_buf[..len] {
                             match self.on_rx_byte_irq(target, byte) {
                                 Ok(ProcessResult::MonitorExit) => {
-                                    match stream.poll_flush(&mut cx) {
-                                        Poll::Ready(Ok(())) | Poll::Pending => {}
-                                        Poll::Ready(Err(err)) => match err {},
-                                    }
-                                    return Ok(());
+                                    exit_requested = true;
+                                    break;
                                 }
                                 Ok(ProcessResult::None)
                                 | Ok(ProcessResult::Resume(_))
@@ -912,6 +911,9 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                                 }
                                 Err(err) => return Err(err),
                             }
+                        }
+                        if exit_requested {
+                            break;
                         }
                     }
                     Poll::Pending => break,
@@ -961,6 +963,14 @@ impl<const MAX_PKT: usize, const TX_CAP: usize> GdbServer<MAX_PKT, TX_CAP> {
                         Poll::Pending => {}
                         Poll::Ready(Err(err)) => match err {},
                     }
+                }
+            }
+
+            if exit_requested && tx_pos == tx_len && !self.has_tx_pending() {
+                match stream.poll_flush(&mut cx) {
+                    Poll::Ready(Ok(())) => return Ok(()),
+                    Poll::Pending => {}
+                    Poll::Ready(Err(err)) => match err {},
                 }
             }
 
@@ -2556,6 +2566,9 @@ mod tests {
     use super::WatchpointKind;
     use super::parse_dec_u8;
     use core::convert::Infallible;
+    use core::task::Context;
+    use core::task::Poll;
+    use io_api::stream::PollByteStream;
     use std::vec::Vec;
 
     const REG_BYTES: usize = 356;
@@ -2604,6 +2617,43 @@ mod tests {
 
         fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), DummyError> {
             Ok(())
+        }
+    }
+
+    struct BufferedStream {
+        rx: Vec<u8>,
+        rx_pos: usize,
+        tx: Vec<u8>,
+    }
+
+    impl PollByteStream for BufferedStream {
+        type Error = Infallible;
+
+        fn poll_read(
+            &mut self,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<Result<usize, Self::Error>> {
+            if self.rx_pos == self.rx.len() {
+                return Poll::Pending;
+            }
+            let len = core::cmp::min(buf.len(), self.rx.len() - self.rx_pos);
+            buf[..len].copy_from_slice(&self.rx[self.rx_pos..self.rx_pos + len]);
+            self.rx_pos += len;
+            Poll::Ready(Ok(len))
+        }
+
+        fn poll_write(
+            &mut self,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, Self::Error>> {
+            self.tx.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
         }
     }
 
@@ -3027,6 +3077,45 @@ mod tests {
             packets.iter().any(|packet| packet.payload == b"S02"),
             "missing S02 stop reply in '?' path"
         );
+    }
+
+    #[test]
+    fn in_place_init_preserves_initial_sigtrap() {
+        let mut slot = core::mem::MaybeUninit::<GdbServer<256, 256>>::uninit();
+        GdbServer::init_in_place(&mut slot);
+        // SAFETY: init_in_place initialized every field immediately above, and the
+        // slot remains alive and immutably borrowed for this assertion.
+        let server = unsafe { slot.assume_init_ref() };
+
+        assert_eq!(server.last_stop.signal, 5);
+    }
+
+    #[test]
+    fn monitor_exit_flushes_queued_replies() {
+        let mut rx = build_qrcmd_frame(b"exit 0");
+        rx.push(b'+');
+        rx.extend_from_slice(&build_frame(b"vKill;1"));
+        let mut stream = BufferedStream {
+            rx,
+            rx_pos: 0,
+            tx: Vec::new(),
+        };
+        let mut server: GdbServer<256, 2048> = GdbServer::new();
+        let mut target = DummyTarget;
+
+        server
+            .run_until_monitor_exit(&mut stream, &mut target)
+            .expect("monitor exit failed");
+
+        let packets = parse_packets(&stream.tx);
+        assert_eq!(
+            packets
+                .iter()
+                .filter(|packet| packet.payload == b"OK")
+                .count(),
+            2
+        );
+        assert_eq!(stream.tx.iter().filter(|&&byte| byte == b'+').count(), 2);
     }
 
     #[test]
