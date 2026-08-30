@@ -38,6 +38,7 @@
             pkgs.OVMF.fd
             pkgs.OVMFFull.fd
             pkgs.binutils
+            pkgs.curl
             pkgs.cpio
             pkgs.dtc
             pkgs.file
