@@ -240,17 +240,26 @@ run_windows() {
     local disk_image=$disk disk_format=raw disk_snapshot=off
     local tpm_dir=$base_tpm_dir tpm_instance=base
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
-    local expected_marker marker_log wsl_media_stamp=''
+    local expected_marker marker_log media_file wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
-    local marker_seen=0 wsl_failed=0 wsl_probe_offset=0 wsl_ready_matches=0
+    local marker_seen=0 wsl_failed=0 wsl_monitor_offset=-1 wsl_probe_offset=0
+    local wsl_ready_matches=0
+    local is_trusted=0 is_wsl=0
     local -a media_args
+
+    if [[ "$mode" == trusted-kvm-hyperv || "$mode" == trusted-kvm-wsl ]]; then
+        is_trusted=1
+    fi
+    if [[ "$mode" == wsl || "$mode" == trusted-kvm-wsl ]]; then
+        is_wsl=1
+    fi
 
     need_command qemu-system-x86_64
     need_command swtpm
     qemu=$(command -v qemu-system-x86_64)
     swtpm=$(command -v swtpm)
     memory=${WINDOWS_MEMORY:-4G}
-    if [[ "$mode" == trusted-kvm-hyperv ]]; then
+    if ((is_trusted)); then
         cpu=${WINDOWS_CPU:-host,+vmx,-hypervisor,kvm=off}
     else
         cpu=${WINDOWS_CPU:-host,+vmx,-hypervisor}
@@ -259,7 +268,8 @@ run_windows() {
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
         smp=1
-    elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == trusted-kvm-hyperv ]]; then
+    elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == trusted-kvm-hyperv || \
+        "$mode" == trusted-kvm-wsl ]]; then
         [[ "$memory" == 4G ]] || die 'Hyper-V control currently requires WINDOWS_MEMORY=4G'
         smp=2
     else
@@ -275,7 +285,8 @@ run_windows() {
     exec 8>"$work/windows-test.lock"
     flock -n 8 || die "another Windows test is using $work"
     if [[ -f "$hyperv_disk" && "$mode" != monitor && "$mode" != hyperv && \
-        "$mode" != monitor-hyperv && "$mode" != trusted-kvm-hyperv && "$mode" != wsl ]]; then
+        "$mode" != monitor-hyperv && "$mode" != trusted-kvm-hyperv && \
+        "$mode" != trusted-kvm-wsl && "$mode" != wsl ]]; then
         # ponytail: keep the raw backing immutable instead of duplicating its
         # allocated blocks; remove all Hyper-V state before changing the base.
         die "Hyper-V overlay exists; remove its disk, vars, TPM, and ready marker together before changing the base"
@@ -331,7 +342,7 @@ run_windows() {
             -device "usb-storage,bus=xhci.0,drive=hyperv-media,removable=on"
             -boot "menu=off"
         )
-    elif [[ "$mode" == wsl ]]; then
+    elif ((is_wsl)); then
         need_command qemu-img
         prepare_hyperv_media
         [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
@@ -352,11 +363,26 @@ run_windows() {
         disk_format=qcow2
         tpm_dir=$hyperv_tpm_dir
         tpm_instance=hyperv
-        media_args=(
-            -drive "if=none,id=hyperv-media,format=raw,readonly=on,file=fat:$hyperv_media"
-            -device "usb-storage,bus=xhci.0,drive=hyperv-media,removable=on"
-            -boot "menu=off"
-        )
+        if ((is_trusted)); then
+            prepare_monitor_media "$trusted_kvm_loader" "$trusted_kvm_monitor"
+            for media_file in "$hyperv_media"/*; do
+                cp -fL --remove-destination --reflink=auto -- \
+                    "$media_file" "$monitor_esp/${media_file##*/}"
+            done
+            install -m 0600 -- "$ovmf_vars" "$monitor_vars"
+            active_vars=$monitor_vars
+            media_args=(
+                -drive "if=none,id=monitor-esp,format=raw,snapshot=on,file=fat:ro:$monitor_esp"
+                -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
+                -boot "menu=off,strict=on"
+            )
+        else
+            media_args=(
+                -drive "if=none,id=hyperv-media,format=raw,readonly=on,file=fat:$hyperv_media"
+                -device "usb-storage,bus=xhci.0,drive=hyperv-media,removable=on"
+                -boot "menu=off"
+            )
+        fi
     elif [[ "$mode" == monitor-hyperv ]]; then
         need_command qemu-img
         prepare_hyperv_media
@@ -412,7 +438,7 @@ run_windows() {
     : >"$serial_log"
     : >"$desktop_serial_log"
     : >"$qemu_log"
-    if [[ "$mode" == wsl ]]; then
+    if ((is_wsl)); then
         expected_marker="$wsl_marker stamp=$wsl_media_stamp"
         marker_log=$desktop_serial_log
     elif [[ "$mode" == hyperv || "$mode" == monitor-hyperv || \
@@ -500,10 +526,10 @@ run_windows() {
 
     while ((elapsed < timeout_seconds)); do
         marker_seen=0
-        if [[ "$mode" == wsl && $wsl_ready_matches -eq 0 ]]; then
+        if ((is_wsl && wsl_ready_matches == 0)); then
             if ((setup_probe_sent)) && \
                 tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
-                    grep -Fq -- "$expected_marker"; then
+                    grep -F -- "$expected_marker" >/dev/null; then
                 marker_seen=1
             fi
         elif grep -Fq -- "$expected_marker" "$marker_log"; then
@@ -514,12 +540,12 @@ run_windows() {
             break
         fi
         wsl_failed=0
-        if [[ "$mode" == wsl && $wsl_ready_matches -eq 1 ]] && \
+        if ((is_wsl && wsl_ready_matches == 1)) && \
             grep -Fq -- "$wsl_fail_marker" "$marker_log"; then
             wsl_failed=1
-        elif [[ "$mode" == wsl ]] && ((setup_probe_sent)) && \
+        elif ((is_wsl && setup_probe_sent)) && \
             tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
-                grep -Fq -- "$wsl_fail_marker"; then
+                grep -F -- "$wsl_fail_marker" >/dev/null; then
             wsl_failed=1
         fi
         if ((wsl_failed)); then
@@ -544,8 +570,8 @@ run_windows() {
             probe_hyperv_enable
             setup_probe_sent=1
         fi
-        if [[ "$mode" == wsl && $wsl_ready_matches -eq 0 ]] && \
-            ((elapsed >= 150 && !setup_probe_sent)); then
+        if ((is_wsl && wsl_ready_matches == 0 && elapsed >= 150 && !setup_probe_sent)); then
+            wsl_monitor_offset=$(stat -c %s -- "$serial_log")
             wsl_probe_offset=$(stat -c %s -- "$marker_log")
             probe_wsl_enable
             setup_probe_sent=1
@@ -558,17 +584,26 @@ run_windows() {
         die "marker timeout; logs: $serial_log $marker_log $qemu_log"
     if [[ "$mode" == hyperv ]]; then
         : >"$hyperv_ready"
-    elif [[ "$mode" == wsl ]]; then
+    elif ((is_wsl)); then
         printf '%s\n' "$wsl_media_stamp" >"$wsl_ready"
     fi
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
-    elif [[ "$mode" == trusted-kvm-hyperv ]]; then
-        grep -Fq -- 'thin-hv: trusted outer KVM runtime active' "$serial_log" || \
-            die "trusted outer KVM marker missing from $serial_log"
-        grep -Fq -- 'thin-hv: variable overlay profile=1 ' "$serial_log" || \
-            die "Windows variable-overlay profile marker missing from $serial_log"
+    elif ((is_trusted)); then
+        if ((wsl_monitor_offset >= 0)); then
+            tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
+                grep -F -- 'thin-hv: trusted outer KVM runtime active' >/dev/null || \
+                die "trusted outer KVM marker missing after WSL reboot in $serial_log"
+            tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
+                grep -F -- 'thin-hv: variable overlay profile=1 ' >/dev/null || \
+                die "Windows variable-overlay profile marker missing after WSL reboot in $serial_log"
+        else
+            grep -Fq -- 'thin-hv: trusted outer KVM runtime active' "$serial_log" || \
+                die "trusted outer KVM marker missing from $serial_log"
+            grep -Fq -- 'thin-hv: variable overlay profile=1 ' "$serial_log" || \
+                die "Windows variable-overlay profile marker missing from $serial_log"
+        fi
         if grep -Fq -- 'thin-hv: L1 VMLAUNCH direct=' "$serial_log"; then
             die "direct nested VMX unexpectedly active in $serial_log"
         fi
@@ -590,7 +625,7 @@ run_windows() {
 }
 
 usage() {
-    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|monitor-hyperv|trusted-kvm-hyperv\n' "$0"
+    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl\n' "$0"
 }
 
 case ${1:-} in
@@ -605,6 +640,7 @@ case ${1:-} in
     wsl) run_windows wsl ;;
     monitor-hyperv) run_windows monitor-hyperv ;;
     trusted-kvm-hyperv) run_windows trusted-kvm-hyperv ;;
+    trusted-kvm-wsl) run_windows trusted-kvm-wsl ;;
     -h | --help | help) usage ;;
     *) usage >&2; exit 2 ;;
 esac
