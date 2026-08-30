@@ -17,15 +17,7 @@ const EMPTY_REGION: MemoryRegions = MemoryRegions {
 };
 
 fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
-    if alignment == 0 {
-        return None;
-    }
-    let rem = value % alignment;
-    if rem == 0 {
-        Some(value)
-    } else {
-        value.checked_add(alignment - rem)
-    }
+    value.checked_next_multiple_of(alignment)
 }
 
 enum RegionData {
