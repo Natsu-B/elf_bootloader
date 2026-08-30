@@ -20,7 +20,6 @@ hyperv_media="$work/hyperv-media"
 loader="$repo_root/bin/x86_64/x86-uefi-loader.efi"
 runtime_monitor="$repo_root/bin/x86_64/x86-uefi-monitor.efi"
 trusted_kvm_loader="$repo_root/bin/x86_64/x86-uefi-kvm-loader.efi"
-trusted_kvm_monitor="$repo_root/bin/x86_64/x86-uefi-kvm-monitor.efi"
 expected_hash=a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9
 download_url='https://go.microsoft.com/fwlink/?clcid=0x409&country=us&culture=en-us&linkid=2334167'
 wsl_msi_hash=a611ddacee689d2fb1fb5319e58af7f3998864d86cdce632eadd8e61614a0f9d
@@ -33,6 +32,7 @@ wsl_fail_marker='thin-hv: windows wsl2 FAIL'
 s4_request_marker='thin-hv: windows hibernate request'
 s4_pass_marker='thin-hv: windows hibernate PASS state=S4 guest_resume=1'
 s4_fail_marker='thin-hv: windows hibernate FAIL'
+trusted_marker='thin-hv: trusted outer KVM direct chainload profile=1 resident_runtime=0'
 
 die() {
     printf 'Windows x86 test: %s\n' "$*" >&2
@@ -105,15 +105,21 @@ prepare_install_media() {
 
 prepare_monitor_media() {
     local boot_loader=${1:-$loader}
-    local monitor_image=${2:-$runtime_monitor}
+    local monitor_image=${2-$runtime_monitor}
 
     [[ -f "$boot_loader" ]] || die "loader not found: $boot_loader; run 'cargo xbuild x86'"
-    [[ -f "$monitor_image" ]] || die "runtime monitor not found: $monitor_image; run 'cargo xbuild x86'"
+    if [[ -n "$monitor_image" ]]; then
+        [[ -f "$monitor_image" ]] || \
+            die "runtime monitor not found: $monitor_image; run 'cargo xbuild x86'"
+    fi
 
     mkdir -p -- "$monitor_esp/EFI/BOOT"
-    rm -f -- "$monitor_esp/EFI/BOOT/GUESTX64.EFI"
+    rm -f -- "$monitor_esp/EFI/BOOT/GUESTX64.EFI" \
+        "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
     install -m 0644 -- "$boot_loader" "$monitor_esp/EFI/BOOT/BOOTX64.EFI"
-    install -m 0644 -- "$monitor_image" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
+    if [[ -n "$monitor_image" ]]; then
+        install -m 0644 -- "$monitor_image" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
+    fi
 }
 
 prepare_hyperv_media() {
@@ -392,17 +398,11 @@ run_windows() {
         tpm_dir=$hyperv_tpm_dir
         tpm_instance=hyperv
         if ((is_trusted)); then
-            prepare_monitor_media "$trusted_kvm_loader" "$trusted_kvm_monitor"
+            prepare_monitor_media "$trusted_kvm_loader" ''
             for media_file in "$hyperv_media"/*; do
                 cp -fL --remove-destination --reflink=auto -- \
                     "$media_file" "$monitor_esp/${media_file##*/}"
             done
-            if ((is_s4)); then
-                active_vars=$hyperv_vars
-            else
-                install -m 0600 -- "$ovmf_vars" "$monitor_vars"
-                active_vars=$monitor_vars
-            fi
             media_args=(
                 -drive "if=none,id=monitor-esp,format=raw,snapshot=on,file=fat:ro:$monitor_esp"
                 -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
@@ -436,10 +436,9 @@ run_windows() {
         need_command qemu-img
         prepare_hyperv_media
         [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
-        prepare_monitor_media "$trusted_kvm_loader" "$trusted_kvm_monitor"
-        install -m 0600 -- "$ovmf_vars" "$monitor_vars"
+        prepare_monitor_media "$trusted_kvm_loader" ''
         timeout_seconds=${WINDOWS_HYPERV_TIMEOUT_SECONDS:-600}
-        active_vars=$monitor_vars
+        active_vars=$hyperv_vars
         disk_image=$hyperv_disk
         disk_format=qcow2
         tpm_dir=$hyperv_tpm_dir
@@ -652,10 +651,10 @@ run_windows() {
     elif ((is_trusted)); then
         if ((wsl_monitor_offset >= 0)); then
             tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
-                grep -F -- 'thin-hv: trusted outer KVM runtime active profile=1 ' >/dev/null || \
+                grep -F -- "$trusted_marker" >/dev/null || \
                 die "trusted outer KVM marker missing after WSL reboot in $serial_log"
         else
-            grep -Fq -- 'thin-hv: trusted outer KVM runtime active profile=1 ' "$serial_log" || \
+            grep -Fq -- "$trusted_marker" "$serial_log" || \
                 die "trusted outer KVM marker missing from $serial_log"
         fi
         if grep -Fq -- 'thin-hv: L1 VMLAUNCH direct=' "$serial_log"; then
@@ -702,21 +701,11 @@ run_windows() {
 }
 
 run_windows_s4() {
-    local mode=$1 request_image resume_image
+    local mode=$1
 
     run_windows "$mode" request
     sleep 1
     run_windows "$mode" resume
-    [[ "$mode" == trusted-kvm-s4 ]] || return 0
-    request_image=$(grep -Eo 'image_base=0x[0-9a-f]+ image_size=0x[0-9a-f]+' \
-        "$work/$mode-request-serial.log" | tail -n 1) || \
-        die 'trusted runtime image marker missing before S4'
-    resume_image=$(grep -Eo 'image_base=0x[0-9a-f]+ image_size=0x[0-9a-f]+' \
-        "$work/$mode-resume-serial.log" | tail -n 1) || \
-        die 'trusted runtime image marker missing after S4'
-    [[ "$request_image" == "$resume_image" ]] || \
-        die "trusted runtime image moved across S4: $request_image -> $resume_image"
-    printf 'Windows x86 test: trusted runtime image stable across S4: %s\n' "$resume_image"
 }
 
 usage() {

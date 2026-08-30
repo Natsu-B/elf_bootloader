@@ -414,10 +414,6 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("bin")
         .join("x86_64")
         .join("x86-uefi-kvm-loader.efi");
-    let trusted_monitor_destination = workspace
-        .join("bin")
-        .join("x86_64")
-        .join("x86-uefi-kvm-monitor.efi");
     let guest_artifact = workspace
         .join("target")
         .join("x86_64-unknown-uefi")
@@ -496,27 +492,6 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             e
         )
     })?;
-    fs::copy(&artifact, &trusted_monitor_destination).map_err(|e| {
-        format!(
-            "Failed to copy {} to {}: {}",
-            artifact.display(),
-            trusted_monitor_destination.display(),
-            e
-        )
-    })?;
-    let status = Command::new("objcopy")
-        .arg("--subsystem=efi-rtd")
-        .arg(&trusted_monitor_destination)
-        .status()
-        .map_err(|e| format!("Failed to prepare trusted runtime driver: {}", e))?;
-    if !status.success() {
-        return Err(format!(
-            "objcopy failed for {} with status: {}",
-            trusted_monitor_destination.display(),
-            status
-        ));
-    }
-
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -591,8 +566,9 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
     eprintln!("\n--- Running trusted-outer-KVM x86 UEFI smoke test ---");
     let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
         .arg("bin/x86_64/x86-uefi-kvm-loader.efi")
-        .env("X86_MONITOR_IMAGE", "bin/x86_64/x86-uefi-kvm-monitor.efi")
+        .env("X86_MONITOR_IMAGE", "")
         .env("X86_RETURN_MARKER", "thin-hv: trusted outer KVM guest PASS")
+        .env("X86_VARIABLE_MARKER", "thin-hv: uefi native variables PASS")
         .env("X86_UEFI_CPU", "host,+vmx,-hypervisor,kvm=off")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

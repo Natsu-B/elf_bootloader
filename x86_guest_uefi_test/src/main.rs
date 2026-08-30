@@ -10,7 +10,7 @@ use x86_64_hal::cpu;
 
 /// Legacy COM1 base I/O port.
 const COM1: u16 = 0x03f8;
-/// UEFI global-variable namespace used by `BootOrder`.
+/// UEFI global-variable namespace used by the temporary driver key.
 const EFI_GLOBAL_VARIABLE_GUID: efi::Guid = efi::Guid::from_fields(
     0x8be4_df61,
     0x93ca,
@@ -28,12 +28,23 @@ const MONITOR_VENDOR_GUID: efi::Guid = efi::Guid::from_fields(
     0xd0,
     &[0x55, 0xd8, 0xd6, 0x6d, 0x3a, 0x42],
 );
-/// Logical boot-order variable exposed to the selected profile.
-const BOOT_ORDER: [efi::Char16; 10] = ascii_uefi_name(b"BootOrder\0");
-/// Physical Windows-profile backend variable.
-const WINDOWS_BOOT_ORDER: [efi::Char16; 20] = ascii_uefi_name(b"P00000001:BootOrder\0");
-/// Physical Linux-profile backend variable.
-const LINUX_BOOT_ORDER: [efi::Char16; 20] = ascii_uefi_name(b"P00000002:BootOrder\0");
+/// Logical scratch variable exposed to the selected profile.
+const TEST_DRIVER: [efi::Char16; 11] = ascii_uefi_name(b"DriverFFFF\0");
+/// Physical Windows-profile scratch variable.
+const WINDOWS_TEST_DRIVER: [efi::Char16; 21] = ascii_uefi_name(b"P00000001:DriverFFFF\0");
+/// Physical Linux-profile scratch variable.
+const LINUX_TEST_DRIVER: [efi::Char16; 21] = ascii_uefi_name(b"P00000002:DriverFFFF\0");
+/// Inactive EFI_LOAD_OPTION with an empty description and end-only device path.
+const INACTIVE_DRIVER_LOAD_OPTION: [u8; 12] = [0, 0, 0, 0, 4, 0, 0, 0, 0x7f, 0xff, 4, 0];
+
+/// Variable-service backend observed by the smoke payload.
+#[derive(Clone, Copy)]
+enum VariableBackend {
+    /// The monitor's live profile overlay maps logical driver state.
+    Overlay,
+    /// Native OVMF stores the per-VM scratch variable directly.
+    Native,
+}
 
 /// Converts one fixed ASCII fixture to a UEFI name.
 const fn ascii_uefi_name<const N: usize>(ascii: &[u8; N]) -> [efi::Char16; N] {
@@ -78,159 +89,243 @@ fn write_bytes(bytes: &[u8]) {
     }
 }
 
-/// Exercises the installed Linux-profile variable hook through the UEFI ABI.
-#[allow(clippy::too_many_lines)]
-fn variable_overlay_round_trip(system_table: *mut efi::SystemTable) -> bool {
+/// Exercises either the live profile overlay or native per-VM OVMF storage.
+fn variable_services_round_trip(
+    system_table: *mut efi::SystemTable,
+) -> (Option<VariableBackend>, bool) {
     if system_table.is_null() {
-        return false;
+        return (None, false);
     }
     // SAFETY: the firmware supplied the validated System Table to efi_main.
     let runtime = unsafe { (*system_table).runtime_services };
-    if runtime.is_null() {
-        return false;
+    if runtime.is_null() || !runtime_table_crc_is_valid(system_table) {
+        return (None, false);
     }
     let attributes = efi::VARIABLE_NON_VOLATILE
         | efi::VARIABLE_BOOTSERVICE_ACCESS
         | efi::VARIABLE_RUNTIME_ACCESS;
-    let mut global_guid = EFI_GLOBAL_VARIABLE_GUID;
-    let mut monitor_guid = MONITOR_VENDOR_GUID;
-    let mut logical_name = BOOT_ORDER;
-    let mut windows_name = WINDOWS_BOOT_ORDER;
-    let mut linux_name = LINUX_BOOT_ORDER;
+    let mut logical_name = TEST_DRIVER;
+    let mut windows_name = WINDOWS_TEST_DRIVER;
+    let mut linux_name = LINUX_TEST_DRIVER;
 
-    // Start from deterministic backend state even if a developer reuses a
-    // variable store instead of the smoke harness's fresh copy.
-    for name in [&mut windows_name, &mut linux_name] {
-        let mut guid = MONITOR_VENDOR_GUID;
-        // SAFETY: name and GUID storage remain live for the firmware call.
-        let status = unsafe {
-            ((*runtime).set_variable)(name.as_mut_ptr(), &raw mut guid, 0, 0, ptr::null_mut())
-        };
-        if status != efi::Status::SUCCESS && status != efi::Status::NOT_FOUND {
-            return false;
+    // Refuse to overwrite a developer's retained state. Both backends reserve
+    // these disposable scratch names for the duration of the smoke test.
+    if !variable_is_absent(runtime, &mut logical_name, EFI_GLOBAL_VARIABLE_GUID)
+        || !variable_is_absent(runtime, &mut windows_name, MONITOR_VENDOR_GUID)
+        || !variable_is_absent(runtime, &mut linux_name, MONITOR_VENDOR_GUID)
+    {
+        return (None, false);
+    }
+
+    let seed = 0x2222;
+    if !set_u16_variable(
+        runtime,
+        &mut linux_name,
+        MONITOR_VENDOR_GUID,
+        attributes,
+        seed,
+    ) || read_u16_variable(runtime, &mut linux_name, MONITOR_VENDOR_GUID)
+        != Ok((seed, attributes))
+    {
+        let _ = cleanup_test_variables(runtime);
+        return (None, false);
+    }
+
+    let backend = match read_u16_variable(runtime, &mut logical_name, EFI_GLOBAL_VARIABLE_GUID) {
+        Ok((value, returned_attributes)) if value == seed && returned_attributes == attributes => {
+            VariableBackend::Overlay
         }
-    }
+        Err(status) if status == efi::Status::NOT_FOUND => VariableBackend::Native,
+        _ => {
+            let _ = cleanup_test_variables(runtime);
+            return (None, false);
+        }
+    };
 
-    let mut windows_value = 0x1111_u16;
-    // SAFETY: all referenced values remain live through SetVariable.
-    if unsafe {
-        ((*runtime).set_variable)(
-            windows_name.as_mut_ptr(),
-            &raw mut monitor_guid,
-            attributes,
-            core::mem::size_of::<u16>(),
-            ptr::addr_of_mut!(windows_value).cast(),
-        )
-    } != efi::Status::SUCCESS
-    {
-        return false;
-    }
+    let backend_ok = match backend {
+        VariableBackend::Overlay => overlay_round_trip(runtime, attributes),
+        VariableBackend::Native => native_round_trip(runtime, attributes),
+    };
+    let variable_info_ok = query_variable_info_is_valid(runtime, attributes);
+    let cleanup_ok = cleanup_test_variables(runtime);
+    let crc_ok = runtime_table_crc_is_valid(system_table);
+    (
+        Some(backend),
+        backend_ok && variable_info_ok && cleanup_ok && crc_ok,
+    )
+}
 
-    let mut value = 0_u16;
-    let mut value_size = core::mem::size_of::<u16>();
-    // The other profile's physical key must not satisfy a logical read.
-    if unsafe {
-        ((*runtime).get_variable)(
-            logical_name.as_mut_ptr(),
-            &raw mut global_guid,
-            ptr::null_mut(),
-            &raw mut value_size,
-            ptr::addr_of_mut!(value).cast(),
-        )
-    } != efi::Status::NOT_FOUND
-    {
-        return false;
-    }
-
-    let mut linux_value = 0x2222_u16;
-    if unsafe {
-        ((*runtime).set_variable)(
-            logical_name.as_mut_ptr(),
-            &raw mut global_guid,
-            attributes,
-            core::mem::size_of::<u16>(),
-            ptr::addr_of_mut!(linux_value).cast(),
-        )
-    } != efi::Status::SUCCESS
-    {
-        return false;
-    }
-
-    value = 0;
-    value_size = core::mem::size_of::<u16>();
+/// Exercises native OVMF policy with a well-formed disposable Driver#### value.
+fn native_round_trip(runtime: *mut efi::RuntimeServices, attributes: u32) -> bool {
+    let mut name = TEST_DRIVER;
+    let mut guid = EFI_GLOBAL_VARIABLE_GUID;
+    let mut returned = [0; INACTIVE_DRIVER_LOAD_OPTION.len()];
+    let mut returned_size = returned.len();
     let mut returned_attributes = 0;
-    if unsafe {
+    // SAFETY: every input and output buffer remains live for the firmware calls.
+    let set_status = unsafe {
+        ((*runtime).set_variable)(
+            name.as_mut_ptr(),
+            &raw mut guid,
+            attributes,
+            INACTIVE_DRIVER_LOAD_OPTION.len(),
+            INACTIVE_DRIVER_LOAD_OPTION.as_ptr().cast_mut().cast(),
+        )
+    };
+    // SAFETY: every input and output buffer remains live for the firmware calls.
+    let get_status = unsafe {
         ((*runtime).get_variable)(
-            logical_name.as_mut_ptr(),
-            &raw mut global_guid,
+            name.as_mut_ptr(),
+            &raw mut guid,
             &raw mut returned_attributes,
-            &raw mut value_size,
-            ptr::addr_of_mut!(value).cast(),
+            &raw mut returned_size,
+            returned.as_mut_ptr().cast(),
         )
-    } != efi::Status::SUCCESS
-        || value != linux_value
-        || value_size != core::mem::size_of::<u16>()
-        || returned_attributes != attributes
-    {
-        return false;
-    }
+    };
+    set_status == efi::Status::SUCCESS
+        && get_status == efi::Status::SUCCESS
+        && returned_size == returned.len()
+        && returned_attributes == attributes
+        && returned == INACTIVE_DRIVER_LOAD_OPTION
+}
 
-    // A direct backend read proves the logical write used profile 2.
-    value = 0;
-    value_size = core::mem::size_of::<u16>();
-    monitor_guid = MONITOR_VENDOR_GUID;
-    if unsafe {
+/// Completes the profile-isolation checks after the Linux key detects hooks.
+fn overlay_round_trip(runtime: *mut efi::RuntimeServices, attributes: u32) -> bool {
+    let mut logical_name = TEST_DRIVER;
+    let mut windows_name = WINDOWS_TEST_DRIVER;
+    let mut linux_name = LINUX_TEST_DRIVER;
+    let windows_value = 0x1111;
+    let linux_value = 0x3333;
+
+    set_u16_variable(
+        runtime,
+        &mut windows_name,
+        MONITOR_VENDOR_GUID,
+        attributes,
+        windows_value,
+    ) && set_u16_variable(
+        runtime,
+        &mut logical_name,
+        EFI_GLOBAL_VARIABLE_GUID,
+        attributes,
+        linux_value,
+    ) && read_u16_variable(runtime, &mut logical_name, EFI_GLOBAL_VARIABLE_GUID)
+        == Ok((linux_value, attributes))
+        && read_u16_variable(runtime, &mut linux_name, MONITOR_VENDOR_GUID)
+            == Ok((linux_value, attributes))
+        && read_u16_variable(runtime, &mut windows_name, MONITOR_VENDOR_GUID)
+            == Ok((windows_value, attributes))
+        && enumeration_is_logical(runtime)
+}
+
+/// Reads one exact two-byte variable and its attributes.
+fn read_u16_variable(
+    runtime: *mut efi::RuntimeServices,
+    name: &mut [efi::Char16],
+    mut guid: efi::Guid,
+) -> Result<(u16, u32), efi::Status> {
+    let mut value = 0;
+    let mut value_size = core::mem::size_of::<u16>();
+    let mut attributes = 0;
+    // SAFETY: every buffer remains live and writable for the firmware call.
+    let status = unsafe {
         ((*runtime).get_variable)(
-            linux_name.as_mut_ptr(),
-            &raw mut monitor_guid,
-            ptr::null_mut(),
+            name.as_mut_ptr(),
+            &raw mut guid,
+            &raw mut attributes,
             &raw mut value_size,
             ptr::addr_of_mut!(value).cast(),
         )
-    } != efi::Status::SUCCESS
-        || value != linux_value
-    {
-        return false;
+    };
+    if status != efi::Status::SUCCESS {
+        Err(status)
+    } else if value_size != core::mem::size_of::<u16>() {
+        Err(efi::Status::DEVICE_ERROR)
+    } else {
+        Ok((value, attributes))
     }
+}
 
-    // Writing profile 2 must leave profile 1's persistent backend intact.
-    value = 0;
-    value_size = core::mem::size_of::<u16>();
-    monitor_guid = MONITOR_VENDOR_GUID;
-    if unsafe {
-        ((*runtime).get_variable)(
-            windows_name.as_mut_ptr(),
-            &raw mut monitor_guid,
-            ptr::null_mut(),
-            &raw mut value_size,
+/// Returns whether one variable is absent without changing it.
+fn variable_is_absent(
+    runtime: *mut efi::RuntimeServices,
+    name: &mut [efi::Char16],
+    guid: efi::Guid,
+) -> bool {
+    matches!(
+        read_u16_variable(runtime, name, guid),
+        Err(status) if status == efi::Status::NOT_FOUND
+    )
+}
+
+/// Writes one two-byte scratch variable.
+fn set_u16_variable(
+    runtime: *mut efi::RuntimeServices,
+    name: &mut [efi::Char16],
+    mut guid: efi::Guid,
+    attributes: u32,
+    mut value: u16,
+) -> bool {
+    // SAFETY: every buffer remains live for the firmware call.
+    (unsafe {
+        ((*runtime).set_variable)(
+            name.as_mut_ptr(),
+            &raw mut guid,
+            attributes,
+            core::mem::size_of::<u16>(),
             ptr::addr_of_mut!(value).cast(),
         )
-    } != efi::Status::SUCCESS
-        || value != windows_value
-    {
-        return false;
-    }
+    }) == efi::Status::SUCCESS
+}
 
-    if !enumeration_is_logical(runtime) {
-        return false;
-    }
+/// Deletes one scratch variable if present.
+fn delete_variable(
+    runtime: *mut efi::RuntimeServices,
+    name: &mut [efi::Char16],
+    mut guid: efi::Guid,
+) -> bool {
+    // SAFETY: name and GUID storage remain live for the firmware call.
+    let status = unsafe {
+        ((*runtime).set_variable)(name.as_mut_ptr(), &raw mut guid, 0, 0, ptr::null_mut())
+    };
+    status == efi::Status::SUCCESS || status == efi::Status::NOT_FOUND
+}
 
+/// Removes every scratch key and verifies that no logical key remains.
+fn cleanup_test_variables(runtime: *mut efi::RuntimeServices) -> bool {
+    let mut logical_name = TEST_DRIVER;
+    let mut windows_name = WINDOWS_TEST_DRIVER;
+    let mut linux_name = LINUX_TEST_DRIVER;
+    let logical_deleted = delete_variable(runtime, &mut logical_name, EFI_GLOBAL_VARIABLE_GUID);
+    let windows_deleted = delete_variable(runtime, &mut windows_name, MONITOR_VENDOR_GUID);
+    let linux_deleted = delete_variable(runtime, &mut linux_name, MONITOR_VENDOR_GUID);
+    let windows_absent = variable_is_absent(runtime, &mut windows_name, MONITOR_VENDOR_GUID);
+    let linux_absent = variable_is_absent(runtime, &mut linux_name, MONITOR_VENDOR_GUID);
+    let logical_absent = variable_is_absent(runtime, &mut logical_name, EFI_GLOBAL_VARIABLE_GUID);
+    logical_deleted
+        && windows_deleted
+        && linux_deleted
+        && windows_absent
+        && linux_absent
+        && logical_absent
+}
+
+/// Checks that the active variable store reports usable capacity.
+fn query_variable_info_is_valid(runtime: *mut efi::RuntimeServices, attributes: u32) -> bool {
     let mut maximum_storage = 0;
     let mut remaining_storage = 0;
     let mut maximum_variable = 0;
-    if unsafe {
+    // SAFETY: all output values remain writable for the firmware call.
+    (unsafe {
         ((*runtime).query_variable_info)(
             attributes,
             &raw mut maximum_storage,
             &raw mut remaining_storage,
             &raw mut maximum_variable,
         )
-    } != efi::Status::SUCCESS
-    {
-        return false;
-    }
-
-    runtime_table_crc_is_valid(system_table)
+    }) == efi::Status::SUCCESS
+        && maximum_storage >= remaining_storage
+        && maximum_variable > 0
 }
 
 /// Recomputes the live Runtime Services table CRC without mutating firmware.
@@ -295,12 +390,13 @@ fn enumeration_is_logical(runtime: *mut efi::RuntimeServices) -> bool {
             return false;
         };
         if guid == MONITOR_VENDOR_GUID
-            && (name[..length] == WINDOWS_BOOT_ORDER[..WINDOWS_BOOT_ORDER.len() - 1]
-                || name[..length] == LINUX_BOOT_ORDER[..LINUX_BOOT_ORDER.len() - 1])
+            && (name[..length] == WINDOWS_TEST_DRIVER[..WINDOWS_TEST_DRIVER.len() - 1]
+                || name[..length] == LINUX_TEST_DRIVER[..LINUX_TEST_DRIVER.len() - 1])
         {
             return false;
         }
-        if guid == EFI_GLOBAL_VARIABLE_GUID && name[..length] == BOOT_ORDER[..BOOT_ORDER.len() - 1]
+        if guid == EFI_GLOBAL_VARIABLE_GUID
+            && name[..length] == TEST_DRIVER[..TEST_DRIVER.len() - 1]
         {
             logical_count += 1;
         }
@@ -332,11 +428,21 @@ pub extern "efiapi" fn efi_main(
     write_byte(b'\r');
     write_byte(b'\n');
 
-    let variables_ok = variable_overlay_round_trip(system_table);
-    if variables_ok {
-        write_bytes(b"thin-hv: uefi variable overlay PASS\r\n");
-    } else {
-        write_bytes(b"thin-hv: uefi variable overlay FAIL\r\n");
+    let (variable_backend, variables_ok) = variable_services_round_trip(system_table);
+    match (variable_backend, variables_ok) {
+        (Some(VariableBackend::Overlay), true) => {
+            write_bytes(b"thin-hv: uefi variable overlay PASS\r\n");
+        }
+        (Some(VariableBackend::Overlay), false) => {
+            write_bytes(b"thin-hv: uefi variable overlay FAIL\r\n");
+        }
+        (Some(VariableBackend::Native), true) => {
+            write_bytes(b"thin-hv: uefi native variables PASS\r\n");
+        }
+        (Some(VariableBackend::Native), false) => {
+            write_bytes(b"thin-hv: uefi native variables FAIL\r\n");
+        }
+        (None, _) => write_bytes(b"thin-hv: uefi variable probe FAIL\r\n"),
     }
 
     let hypervisor_leaf = cpu::cpuid(0x4000_0000, 0);

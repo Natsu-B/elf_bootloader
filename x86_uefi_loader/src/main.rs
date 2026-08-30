@@ -12,6 +12,7 @@ use x86_64_hal::cpu;
 #[cfg(not(feature = "trusted-outer-kvm"))]
 use x86_64_hal::vmx;
 
+#[cfg(not(feature = "trusted-outer-kvm"))]
 mod runtime_variables;
 mod vmx_smoke;
 

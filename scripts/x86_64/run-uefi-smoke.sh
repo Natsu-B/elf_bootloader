@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
-monitor=${X86_MONITOR_IMAGE:-"$(dirname -- "$loader")/x86-uefi-monitor.efi"}
+monitor=${X86_MONITOR_IMAGE-"$(dirname -- "$loader")/x86-uefi-monitor.efi"}
 stage="$repo_root/bin/x86_64"
 esp="$stage/esp"
 serial_log="$stage/serial.log"
@@ -14,6 +14,14 @@ vars="$stage/OVMF_VARS.fd"
 marker='thin-hv: uefi entry'
 return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
 payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
+variable_marker=${X86_VARIABLE_MARKER-}
+if [[ ! ${X86_VARIABLE_MARKER+x} && ${guest##*/} == x86_guest_uefi_test.efi ]]; then
+    if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
+        variable_marker='thin-hv: uefi native variables PASS'
+    else
+        variable_marker='thin-hv: uefi variable overlay PASS'
+    fi
+fi
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 memory=${X86_UEFI_MEMORY:-256M}
 smp=${X86_UEFI_SMP:-1}
@@ -38,7 +46,7 @@ first_file() {
 }
 
 [[ -f "$loader" ]] || die "loader not found: $loader"
-[[ -f "$monitor" ]] || die "runtime monitor not found: $monitor"
+[[ -z "$monitor" || -f "$monitor" ]] || die "runtime monitor not found: $monitor"
 [[ -f "$guest" ]] || die "guest payload not found: $guest"
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
 [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
@@ -48,8 +56,7 @@ first_file() {
 [[ "$wake_cycles" =~ ^[0-9]+$ ]] || die 'X86_UEFI_WAKE_CYCLES must be a non-negative integer'
 ((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
 if ((acpi_s3)); then
-    [[ ${loader##*/} == x86-uefi-kvm-loader.efi &&
-        ${monitor##*/} == x86-uefi-kvm-monitor.efi ]] || \
+    [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]] || \
         die 'X86_UEFI_ACPI_S3 is restricted to trusted outer-KVM artifacts'
 fi
 command -v timeout >/dev/null || die "GNU timeout is required"
@@ -84,7 +91,11 @@ ovmf_vars=$(first_file \
 
 mkdir -p -- "$esp/EFI/BOOT"
 install -m 0644 -- "$loader" "$esp/EFI/BOOT/BOOTX64.EFI"
-install -m 0644 -- "$monitor" "$esp/EFI/BOOT/MONITORX64.EFI"
+if [[ -n "$monitor" ]]; then
+    install -m 0644 -- "$monitor" "$esp/EFI/BOOT/MONITORX64.EFI"
+else
+    rm -f -- "$esp/EFI/BOOT/MONITORX64.EFI"
+fi
 install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
 install -m 0600 -- "$ovmf_vars" "$vars"
 : >"$serial_log"
@@ -159,7 +170,8 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
     fi
     if grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
-        grep -Fq -- "$payload_marker" "$serial_log"; then
+        grep -Fq -- "$payload_marker" "$serial_log" &&
+        { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; }; then
         printf 'quit\n' >&9
         break
     fi
@@ -182,6 +194,9 @@ if [[ -n "$return_marker" ]]; then
     grep -Fq -- "$return_marker" "$serial_log" || die "marker '$return_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
 grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
+if [[ -n "$variable_marker" ]]; then
+    grep -Fq -- "$variable_marker" "$serial_log" || die "marker '$variable_marker' missing from $serial_log (QEMU status $qemu_status)"
+fi
 ((wake_cycle == wake_cycles)) || die "observed $wake_cycle of $wake_cycles requested suspend cycles"
 
 ((qemu_status == 0)) || die "QEMU exited with status $qemu_status"

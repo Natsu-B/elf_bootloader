@@ -3,6 +3,7 @@
 #![cfg_attr(feature = "trusted-outer-kvm", allow(dead_code, unused_imports))]
 
 use crate::SerialPort;
+#[cfg(not(feature = "trusted-outer-kvm"))]
 use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
@@ -150,6 +151,7 @@ const GUEST_IMAGE_PATH: [efi::Char16; 23] = [
     0,
 ];
 /// Runtime-driver copy of this monitor staged by `run-uefi-smoke.sh`.
+#[cfg(not(feature = "trusted-outer-kvm"))]
 const MONITOR_IMAGE_PATH: [efi::Char16; 25] = [
     b'\\' as u16,
     b'E' as u16,
@@ -226,13 +228,11 @@ static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
 
-/// Bootstrap-to-runtime handoff retained for the nested `StartImage` call.
-const RUNTIME_MODE: u32 = if cfg!(feature = "trusted-outer-kvm") {
-    1
-} else {
-    0
-};
+/// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
+#[cfg(not(feature = "trusted-outer-kvm"))]
+const RUNTIME_MODE: u32 = 0;
 
+#[cfg(not(feature = "trusted-outer-kvm"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RuntimeHandoff {
@@ -338,7 +338,7 @@ impl fmt::Display for Error {
     }
 }
 
-/// Starts the selected runtime backend.
+/// Starts the selected guest backend.
 pub(crate) fn run(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
@@ -346,26 +346,26 @@ pub(crate) fn run(
 ) -> Result<(), Error> {
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
     let parent_device = unsafe { (*loaded_image).device_handle };
-    if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
-        #[cfg(not(feature = "trusted-outer-kvm"))]
-        let _ = writeln!(serial, "thin-hv: loading runtime monitor");
-        return start_runtime_monitor(parent_image, parent_device, system_table);
-    }
+
     #[cfg(feature = "trusted-outer-kvm")]
     {
         serial.init();
         let _ = writeln!(serial, "thin-hv: uefi entry");
+        return start_trusted_outer_kvm(parent_image, parent_device, system_table, serial);
     }
-    #[cfg(not(feature = "trusted-outer-kvm"))]
-    let _ = writeln!(serial, "thin-hv: runtime monitor active");
-    // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
-    // path; use a self-relocated resident core before Windows or bare metal.
-
-    #[cfg(feature = "trusted-outer-kvm")]
-    return run_trusted_outer_kvm(loaded_image, system_table, serial);
 
     #[cfg(not(feature = "trusted-outer-kvm"))]
-    return run_direct_monitor(loaded_image, system_table, serial);
+    {
+        if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
+            let _ = writeln!(serial, "thin-hv: loading runtime monitor");
+            return start_runtime_monitor(parent_image, parent_device, system_table);
+        }
+        let _ = writeln!(serial, "thin-hv: runtime monitor active");
+        // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
+        // path; use a self-relocated resident core before Windows or bare metal.
+
+        run_direct_monitor(loaded_image, system_table, serial)
+    }
 }
 
 #[cfg(not(feature = "trusted-outer-kvm"))]
@@ -566,29 +566,24 @@ fn run_direct_monitor(
     }
 }
 
-/// Installs the profile overlay and lets trusted outer KVM run the guest directly.
+/// Lets trusted outer KVM run the selected guest as a plain UEFI application.
+///
+/// Firmware-variable isolation belongs to the per-VM OVMF VARS file on this
+/// path, so no resident runtime image or Runtime Services hook is installed.
 #[cfg(feature = "trusted-outer-kvm")]
-fn run_trusted_outer_kvm(
-    loaded_image: *mut efi::protocols::loaded_image::Protocol,
+fn start_trusted_outer_kvm(
+    parent_image: efi::Handle,
+    parent_device: efi::Handle,
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
-    let (guest_image, profile) = runtime_handoff(loaded_image).ok_or(Error::Firmware(
-        "runtime guest-image handoff",
-        efi::Status::INVALID_PARAMETER.as_usize(),
-    ))?;
-    let image_base = unsafe { (*loaded_image).image_base } as usize as u64;
-    let image_size = unsafe { (*loaded_image).image_size };
-    let variable_overlay =
-        runtime_variables::install(system_table, profile, image_base, image_size)
-            .map_err(|status| Error::Firmware("install variable overlay", status.as_usize()))?;
+    let utilities = device_path_utilities_protocol(system_table)?;
+    let (guest_image, profile) =
+        load_selected_guest(parent_image, parent_device, system_table, utilities)?;
     let _ = writeln!(
         serial,
-        "thin-hv: trusted outer KVM runtime active profile={} mat_patches={} image_base={:#x} image_size={:#x}",
-        profile.0,
-        variable_overlay.memory_attribute_patch_count(),
-        image_base,
-        image_size
+        "thin-hv: trusted outer KVM direct chainload profile={} resident_runtime=0",
+        profile.0
     );
 
     let mut exit_data_size = 0;
@@ -608,30 +603,28 @@ fn run_trusted_outer_kvm(
     } else {
         Ok(())
     };
-    variable_overlay
-        .rollback()
-        .map_err(|status| Error::Firmware("restore variable overlay", status.as_usize()))?;
+    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest_image) };
     result?;
     let _ = writeln!(serial, "thin-hv: trusted outer KVM guest PASS");
     Ok(())
 }
 
-/// Starts a runtime-driver copy whose code survives guest ExitBootServices.
-fn start_runtime_monitor(
+/// Loads the staged test/Linux image, or Windows from another filesystem.
+fn load_selected_guest(
     parent_image: efi::Handle,
     parent_device: efi::Handle,
     system_table: *mut efi::SystemTable,
-) -> Result<(), Error> {
-    let utilities = device_path_utilities_protocol(system_table)?;
-    let (guest, profile) = match load_image_on_device(
+    utilities: *mut efi::protocols::device_path_utilities::Protocol,
+) -> Result<(efi::Handle, ProfileId), Error> {
+    match load_image_on_device(
         parent_image,
         system_table,
         parent_device,
         utilities,
         GUEST_IMAGE_PATH,
     ) {
-        Ok(image) => (image, LINUX_PROFILE),
-        Err(error) if error.is_missing_image() => (
+        Ok(image) => Ok((image, LINUX_PROFILE)),
+        Err(error) if error.is_missing_image() => Ok((
             load_image_from_other_filesystem(
                 parent_image,
                 parent_device,
@@ -640,9 +633,21 @@ fn start_runtime_monitor(
                 WINDOWS_BOOT_IMAGE_PATH,
             )?,
             WINDOWS_PROFILE,
-        ),
-        Err(error) => return Err(error),
-    };
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// Starts a runtime-driver copy whose code survives guest ExitBootServices.
+#[cfg(not(feature = "trusted-outer-kvm"))]
+fn start_runtime_monitor(
+    parent_image: efi::Handle,
+    parent_device: efi::Handle,
+    system_table: *mut efi::SystemTable,
+) -> Result<(), Error> {
+    let utilities = device_path_utilities_protocol(system_table)?;
+    let (guest, profile) =
+        load_selected_guest(parent_image, parent_device, system_table, utilities)?;
     let monitor = match load_image_on_device(
         parent_image,
         system_table,
@@ -678,8 +683,7 @@ fn start_runtime_monitor(
     let status = unsafe {
         ((*(*system_table).boot_services).start_image)(monitor, &mut exit_data_size, &mut exit_data)
     };
-    // The direct backend never returns; the trusted backend returns only when
-    // its chainloaded guest does.
+    // The direct backend normally never returns; clean up if StartImage does.
     let _ = unsafe { ((*(*system_table).boot_services).unload_image)(monitor) };
     let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
     if status.is_error() {
@@ -693,6 +697,7 @@ fn start_runtime_monitor(
 }
 
 /// Reads the target handle and profile supplied by the boot application copy.
+#[cfg(not(feature = "trusted-outer-kvm"))]
 fn runtime_handoff(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
 ) -> Option<(efi::Handle, ProfileId)> {

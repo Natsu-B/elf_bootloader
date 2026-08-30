@@ -5,13 +5,13 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
-private_var=
-private_var_owned=0
+runtime_var=
+runtime_var_owned=0
 
 cleanup() {
-    if [ "$private_var_owned" = 1 ] && [ -n "$private_var" ]; then
-        /bin/busybox rm -f "$private_var" || true
-        private_var_owned=0
+    if [ "$runtime_var_owned" = 1 ] && [ -n "$runtime_var" ]; then
+        /bin/busybox rm -f "$runtime_var" || true
+        runtime_var_owned=0
     fi
 }
 
@@ -22,12 +22,12 @@ fail() {
     exit 1
 }
 
-verify_private_var() {
-    [ -r "$private_var" ] || fail 'private EFI probe variable unavailable'
-    [ "$(/bin/busybox dd if="$private_var" bs=1 skip=16 2>/dev/null)" = "$private_var_payload" ] \
-        || fail 'private EFI probe payload changed'
-    [ "$(/bin/busybox sha256sum "$private_var")" = "$private_var_hash" ] \
-        || fail 'private EFI probe hash changed'
+verify_runtime_var() {
+    [ -r "$runtime_var" ] || fail 'EFI runtime probe variable unavailable'
+    [ "$(/bin/busybox dd if="$runtime_var" bs=1 skip=16 2>/dev/null)" = "$runtime_var_payload" ] \
+        || fail 'EFI runtime probe payload changed'
+    [ "$(/bin/busybox sha256sum "$runtime_var")" = "$runtime_var_hash" ] \
+        || fail 'EFI runtime probe hash changed'
 }
 
 trap cleanup EXIT
@@ -55,24 +55,24 @@ firmware_var=$(/bin/busybox find /sys/firmware/efi/efivars -maxdepth 1 -type f \
 [ -r "$firmware_var" ] || fail 'EFI variable unavailable'
 firmware_var_hash=$(/bin/busybox sha256sum "$firmware_var")
 echo "thin-hv: linux EFI runtime variable=$(/bin/busybox basename "$firmware_var")"
-# Exercise the private Driver#### mapping without adding the slot to DriverOrder.
-private_var_name=DriverFFFF
-private_var="/sys/firmware/efi/efivars/$private_var_name-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+# Exercise a disposable Driver#### variable without adding it to DriverOrder.
+runtime_var_name=DriverFFFF
+runtime_var="/sys/firmware/efi/efivars/$runtime_var_name-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 /bin/kvm-probe
 echo deep >/sys/power/mem_sleep
 for cycle in 1 2 3; do
-    [ ! -e "$private_var" ] || fail 'private EFI probe variable already exists'
-    private_var_payload="thin-hv-s3-profile-private-cycle-$cycle"
-    private_var_owned=1
+    [ ! -e "$runtime_var" ] || fail 'EFI runtime probe variable already exists'
+    runtime_var_payload="thin-hv-s3-runtime-variable-cycle-$cycle"
+    runtime_var_owned=1
     # efivarfs attributes, then an inactive EFI_LOAD_OPTION with an end-only path.
     /bin/busybox printf \
         '\007\000\000\000\000\000\000\000\004\000\000\000\177\377\004\000%s' \
-        "$private_var_payload" >"$private_var" \
-        || fail 'private EFI probe write failed'
-    private_var_hash=$(/bin/busybox sha256sum "$private_var") \
-        || fail 'private EFI probe hash failed'
-    verify_private_var
-    echo "thin-hv: linux S3 private EFI write PASS cycle=$cycle variable=$private_var_name"
+        "$runtime_var_payload" >"$runtime_var" \
+        || fail 'EFI runtime probe write failed'
+    runtime_var_hash=$(/bin/busybox sha256sum "$runtime_var") \
+        || fail 'EFI runtime probe hash failed'
+    verify_runtime_var
+    echo "thin-hv: linux S3 EFI runtime write PASS cycle=$cycle variable=$runtime_var_name"
     echo "thin-hv: linux S3 suspend begin cycle=$cycle"
     /bin/busybox sync
     echo mem >/sys/power/state
@@ -82,12 +82,12 @@ for cycle in 1 2 3; do
     mount -t efivarfs efivarfs /sys/firmware/efi/efivars
     [ "$(/bin/busybox sha256sum "$firmware_var")" = "$firmware_var_hash" ] \
         || fail 'EFI variable changed after resume'
-    verify_private_var
-    echo "thin-hv: linux S3 private EFI resume PASS cycle=$cycle variable=$private_var_name"
-    /bin/busybox rm "$private_var" || fail 'private EFI probe delete failed'
-    [ ! -e "$private_var" ] || fail 'private EFI probe remained after delete'
-    private_var_owned=0
-    echo "thin-hv: linux S3 private EFI delete PASS cycle=$cycle variable=$private_var_name"
+    verify_runtime_var
+    echo "thin-hv: linux S3 EFI runtime resume PASS cycle=$cycle variable=$runtime_var_name"
+    /bin/busybox rm "$runtime_var" || fail 'EFI runtime probe delete failed'
+    [ ! -e "$runtime_var" ] || fail 'EFI runtime probe remained after delete'
+    runtime_var_owned=0
+    echo "thin-hv: linux S3 EFI runtime delete PASS cycle=$cycle variable=$runtime_var_name"
     echo "thin-hv: linux S3 EFI runtime PASS cycle=$cycle"
 done
 echo 'thin-hv: linux S3 nested KVM PASS cycles=3'

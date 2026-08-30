@@ -11,8 +11,9 @@ env \
     LINUX_L1_CMDLINE='console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=2 panic=-1' \
     scripts/x86_64/build-linux-uki.sh "$output"
 env \
-    X86_MONITOR_IMAGE="$repo_root/bin/x86_64/x86-uefi-kvm-monitor.efi" \
+    X86_MONITOR_IMAGE= \
     X86_RETURN_MARKER= \
+    X86_VARIABLE_MARKER= \
     X86_GUEST_MARKER='thin-hv: linux S3 nested KVM PASS cycles=3' \
     X86_UEFI_TIMEOUT_SECONDS=90 \
     X86_UEFI_MEMORY=1G \
