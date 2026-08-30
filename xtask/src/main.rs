@@ -357,6 +357,15 @@ fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<Strin
 }
 
 fn build_x86_uefi(args: &[String]) -> Result<String, String> {
+    if args
+        .iter()
+        .any(|arg| arg == "--all-features" || arg.contains("trusted-outer-kvm"))
+    {
+        return Err(
+            "x86 builds both direct and trusted-outer-KVM artifacts; do not select trusted-outer-kvm explicitly"
+                .to_string(),
+        );
+    }
     let pkg = "x86_uefi_loader";
     let guest_pkg = "x86_guest_uefi_test";
     eprintln!("\n--- Building x86 UEFI package: {} ---", pkg);
@@ -401,6 +410,14 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("bin")
         .join("x86_64")
         .join("x86-uefi-monitor.efi");
+    let trusted_destination = workspace
+        .join("bin")
+        .join("x86_64")
+        .join("x86-uefi-kvm-loader.efi");
+    let trusted_monitor_destination = workspace
+        .join("bin")
+        .join("x86_64")
+        .join("x86-uefi-kvm-monitor.efi");
     let guest_artifact = workspace
         .join("target")
         .join("x86_64-unknown-uefi")
@@ -448,6 +465,57 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             e
         )
     })?;
+
+    eprintln!("\n--- Building trusted-outer-KVM x86 UEFI package ---");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg(pkg)
+        .arg("--target")
+        .arg("x86_64-unknown-uefi")
+        .args(args)
+        .arg("--features")
+        .arg("trusted-outer-kvm")
+        .env("XTASK_BUILD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Failed to build trusted-outer-KVM loader: {}", e))?;
+    if !status.success() {
+        return Err(format!(
+            "trusted-outer-KVM loader build failed with status: {}",
+            status
+        ));
+    }
+    fs::copy(&artifact, &trusted_destination).map_err(|e| {
+        format!(
+            "Failed to copy {} to {}: {}",
+            artifact.display(),
+            trusted_destination.display(),
+            e
+        )
+    })?;
+    fs::copy(&artifact, &trusted_monitor_destination).map_err(|e| {
+        format!(
+            "Failed to copy {} to {}: {}",
+            artifact.display(),
+            trusted_monitor_destination.display(),
+            e
+        )
+    })?;
+    let status = Command::new("objcopy")
+        .arg("--subsystem=efi-rtd")
+        .arg(&trusted_monitor_destination)
+        .status()
+        .map_err(|e| format!("Failed to prepare trusted runtime driver: {}", e))?;
+    if !status.success() {
+        return Err(format!(
+            "objcopy failed for {} with status: {}",
+            trusted_monitor_destination.display(),
+            status
+        ));
+    }
 
     Ok(destination.to_string_lossy().into_owned())
 }
@@ -504,7 +572,7 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn run_x86_uefi(args: &[String]) -> Result<(), String> {
     let binary_path = build_x86_uefi(args)?;
-    eprintln!("\n--- Running x86 UEFI smoke test ---");
+    eprintln!("\n--- Running direct x86 UEFI smoke test ---");
     let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
         .arg(binary_path)
         .stdin(Stdio::inherit())
@@ -513,10 +581,32 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
         .status()
         .map_err(|e| format!("Failed to run x86 UEFI smoke test: {}", e))?;
 
+    if !status.success() {
+        return Err(format!(
+            "direct x86 UEFI smoke test exited with status {}",
+            status
+        ));
+    }
+
+    eprintln!("\n--- Running trusted-outer-KVM x86 UEFI smoke test ---");
+    let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+        .arg("bin/x86_64/x86-uefi-kvm-loader.efi")
+        .env("X86_MONITOR_IMAGE", "bin/x86_64/x86-uefi-kvm-monitor.efi")
+        .env("X86_RETURN_MARKER", "thin-hv: trusted outer KVM guest PASS")
+        .env("X86_UEFI_CPU", "host,+vmx,-hypervisor,kvm=off")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Failed to run trusted-outer-KVM UEFI smoke test: {}", e))?;
+
     if status.success() {
         Ok(())
     } else {
-        Err(format!("x86 UEFI smoke test exited with status {}", status))
+        Err(format!(
+            "trusted-outer-KVM UEFI smoke test exited with status {}",
+            status
+        ))
     }
 }
 

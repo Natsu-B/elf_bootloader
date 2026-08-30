@@ -19,6 +19,8 @@ monitor_esp="$work/monitor-loader-esp"
 hyperv_media="$work/hyperv-media"
 loader="$repo_root/bin/x86_64/x86-uefi-loader.efi"
 runtime_monitor="$repo_root/bin/x86_64/x86-uefi-monitor.efi"
+trusted_kvm_loader="$repo_root/bin/x86_64/x86-uefi-kvm-loader.efi"
+trusted_kvm_monitor="$repo_root/bin/x86_64/x86-uefi-kvm-monitor.efi"
 expected_hash=a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9
 download_url='https://go.microsoft.com/fwlink/?clcid=0x409&country=us&culture=en-us&linkid=2334167'
 wsl_msi_hash=a611ddacee689d2fb1fb5319e58af7f3998864d86cdce632eadd8e61614a0f9d
@@ -99,13 +101,16 @@ prepare_install_media() {
 }
 
 prepare_monitor_media() {
-    [[ -f "$loader" ]] || die "loader not found: $loader; run 'cargo xbuild x86'"
-    [[ -f "$runtime_monitor" ]] || die "runtime monitor not found: $runtime_monitor; run 'cargo xbuild x86'"
+    local boot_loader=${1:-$loader}
+    local monitor_image=${2:-$runtime_monitor}
+
+    [[ -f "$boot_loader" ]] || die "loader not found: $boot_loader; run 'cargo xbuild x86'"
+    [[ -f "$monitor_image" ]] || die "runtime monitor not found: $monitor_image; run 'cargo xbuild x86'"
 
     mkdir -p -- "$monitor_esp/EFI/BOOT"
     rm -f -- "$monitor_esp/EFI/BOOT/GUESTX64.EFI"
-    install -m 0644 -- "$loader" "$monitor_esp/EFI/BOOT/BOOTX64.EFI"
-    install -m 0644 -- "$runtime_monitor" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
+    install -m 0644 -- "$boot_loader" "$monitor_esp/EFI/BOOT/BOOTX64.EFI"
+    install -m 0644 -- "$monitor_image" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
 }
 
 prepare_hyperv_media() {
@@ -245,12 +250,16 @@ run_windows() {
     qemu=$(command -v qemu-system-x86_64)
     swtpm=$(command -v swtpm)
     memory=${WINDOWS_MEMORY:-4G}
-    cpu=${WINDOWS_CPU:-host,+vmx,-hypervisor}
+    if [[ "$mode" == trusted-kvm-hyperv ]]; then
+        cpu=${WINDOWS_CPU:-host,+vmx,-hypervisor,kvm=off}
+    else
+        cpu=${WINDOWS_CPU:-host,+vmx,-hypervisor}
+    fi
     [[ -n "$cpu" ]] || die 'WINDOWS_CPU must not be empty'
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
         smp=1
-    elif [[ "$mode" == hyperv || "$mode" == wsl ]]; then
+    elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == trusted-kvm-hyperv ]]; then
         [[ "$memory" == 4G ]] || die 'Hyper-V control currently requires WINDOWS_MEMORY=4G'
         smp=2
     else
@@ -262,8 +271,11 @@ run_windows() {
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
     mkdir -p -- "$work"
+    need_command flock
+    exec 8>"$work/windows-test.lock"
+    flock -n 8 || die "another Windows test is using $work"
     if [[ -f "$hyperv_disk" && "$mode" != monitor && "$mode" != hyperv && \
-        "$mode" != monitor-hyperv && "$mode" != wsl ]]; then
+        "$mode" != monitor-hyperv && "$mode" != trusted-kvm-hyperv && "$mode" != wsl ]]; then
         # ponytail: keep the raw backing immutable instead of duplicating its
         # allocated blocks; remove all Hyper-V state before changing the base.
         die "Hyper-V overlay exists; remove its disk, vars, TPM, and ready marker together before changing the base"
@@ -362,6 +374,23 @@ run_windows() {
             -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
             -boot "menu=off,strict=on"
         )
+    elif [[ "$mode" == trusted-kvm-hyperv ]]; then
+        need_command qemu-img
+        prepare_hyperv_media
+        [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
+        prepare_monitor_media "$trusted_kvm_loader" "$trusted_kvm_monitor"
+        install -m 0600 -- "$ovmf_vars" "$monitor_vars"
+        timeout_seconds=${WINDOWS_HYPERV_TIMEOUT_SECONDS:-600}
+        active_vars=$monitor_vars
+        disk_image=$hyperv_disk
+        disk_format=qcow2
+        tpm_dir=$hyperv_tpm_dir
+        tpm_instance=hyperv
+        media_args=(
+            -drive "if=none,id=monitor-esp,format=raw,snapshot=on,file=fat:ro:$monitor_esp"
+            -device "ide-hd,bus=ide.1,drive=monitor-esp,bootindex=1"
+            -boot "menu=off,strict=on"
+        )
     else
         [[ -f "$disk" ]] || die "Windows disk not found: $disk"
         [[ -f "$vars" ]] || die "OVMF variables not found: $vars"
@@ -386,7 +415,8 @@ run_windows() {
     if [[ "$mode" == wsl ]]; then
         expected_marker="$wsl_marker stamp=$wsl_media_stamp"
         marker_log=$desktop_serial_log
-    elif [[ "$mode" == hyperv || "$mode" == monitor-hyperv ]]; then
+    elif [[ "$mode" == hyperv || "$mode" == monitor-hyperv || \
+        "$mode" == trusted-kvm-hyperv ]]; then
         expected_marker=$hyperv_marker
         marker_log=$desktop_serial_log
     elif [[ "$mode" == monitor ]]; then
@@ -534,6 +564,14 @@ run_windows() {
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
+    elif [[ "$mode" == trusted-kvm-hyperv ]]; then
+        grep -Fq -- 'thin-hv: trusted outer KVM runtime active' "$serial_log" || \
+            die "trusted outer KVM marker missing from $serial_log"
+        grep -Fq -- 'thin-hv: variable overlay profile=1 ' "$serial_log" || \
+            die "Windows variable-overlay profile marker missing from $serial_log"
+        if grep -Fq -- 'thin-hv: L1 VMLAUNCH direct=' "$serial_log"; then
+            die "direct nested VMX unexpectedly active in $serial_log"
+        fi
     fi
 
     printf 'system_powerdown\n' >&9
@@ -552,7 +590,7 @@ run_windows() {
 }
 
 usage() {
-    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|monitor-hyperv\n' "$0"
+    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|monitor-hyperv|trusted-kvm-hyperv\n' "$0"
 }
 
 case ${1:-} in
@@ -566,6 +604,7 @@ case ${1:-} in
     hyperv) run_windows hyperv ;;
     wsl) run_windows wsl ;;
     monitor-hyperv) run_windows monitor-hyperv ;;
+    trusted-kvm-hyperv) run_windows trusted-kvm-hyperv ;;
     -h | --help | help) usage ;;
     *) usage >&2; exit 2 ;;
 esac

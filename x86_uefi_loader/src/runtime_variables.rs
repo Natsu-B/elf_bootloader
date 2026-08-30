@@ -29,8 +29,10 @@ const ENUM_NAME_CAPACITY: usize = 2048;
 const MEMORY_ATTRIBUTE_PATCH_CAPACITY: usize = 16;
 /// Architectural page size used by UEFI memory descriptors.
 const PAGE_SIZE: u64 = 4096;
+/// Sentinel kept as initialized data so the runtime PE retains its `.data` section.
+const UNINSTALLED_PROFILE: u32 = u32::MAX;
 
-static PROFILE: AtomicU32 = AtomicU32::new(0);
+static PROFILE: AtomicU32 = AtomicU32::new(UNINSTALLED_PROFILE);
 static ORIGINAL_GET_VARIABLE: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_GET_NEXT_VARIABLE_NAME: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_SET_VARIABLE: AtomicUsize = AtomicUsize::new(0);
@@ -481,7 +483,7 @@ fn convert_saved_entry(convert: efi::RuntimeConvertPointer, entry: &AtomicUsize)
 }
 
 fn clear_saved_entries() {
-    PROFILE.store(0, Ordering::Release);
+    PROFILE.store(UNINSTALLED_PROFILE, Ordering::Release);
     ORIGINAL_GET_VARIABLE.store(0, Ordering::Release);
     ORIGINAL_GET_NEXT_VARIABLE_NAME.store(0, Ordering::Release);
     ORIGINAL_SET_VARIABLE.store(0, Ordering::Release);

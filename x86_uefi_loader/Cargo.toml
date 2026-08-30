@@ -7,6 +7,9 @@ edition = "2024"
 name = "x86-uefi-loader"
 path = "src/main.rs"
 
+[features]
+trusted-outer-kvm = []
+
 [dependencies]
 mutex = { path = "../mutex" }
 nested_vmx = { path = "../nested_vmx" }
