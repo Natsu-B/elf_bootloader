@@ -18,6 +18,8 @@ timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 memory=${X86_UEFI_MEMORY:-256M}
 smp=${X86_UEFI_SMP:-1}
 cpu=${X86_UEFI_CPU:-host,+vmx,-hypervisor}
+acpi_s3=${X86_UEFI_ACPI_S3:-0}
+wake_cycles=${X86_UEFI_WAKE_CYCLES:-0}
 
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
@@ -42,6 +44,14 @@ first_file() {
 [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
 [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_SMP must be a positive integer'
 [[ -n "$cpu" ]] || die 'X86_UEFI_CPU must not be empty'
+[[ "$acpi_s3" =~ ^[01]$ ]] || die 'X86_UEFI_ACPI_S3 must be 0 or 1'
+[[ "$wake_cycles" =~ ^[0-9]+$ ]] || die 'X86_UEFI_WAKE_CYCLES must be a non-negative integer'
+((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
+if ((acpi_s3)); then
+    [[ ${loader##*/} == x86-uefi-kvm-loader.efi &&
+        ${monitor##*/} == x86-uefi-kvm-monitor.efi ]] || \
+        die 'X86_UEFI_ACPI_S3 is restricted to trusted outer-KVM artifacts'
+fi
 command -v timeout >/dev/null || die "GNU timeout is required"
 
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
@@ -82,6 +92,10 @@ install -m 0600 -- "$ovmf_vars" "$vars"
 
 qemu_pid=
 monitor_fd_open=0
+sleep_args=(-global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1)
+if ((acpi_s3)); then
+    sleep_args=(-global ICH9-LPC.disable_s3=0 -global ICH9-LPC.disable_s4=1)
+fi
 cleanup() {
     if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
         kill "$qemu_pid" 2>/dev/null || true
@@ -105,8 +119,7 @@ set +e
 timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     "$qemu" \
     -machine q35,accel=kvm \
-    -global ICH9-LPC.disable_s3=0 \
-    -global ICH9-LPC.disable_s4=0 \
+    "${sleep_args[@]}" \
     -cpu "$cpu" \
     -smp "$smp" \
     -m "$memory" \
@@ -124,7 +137,26 @@ timeout --foreground --kill-after=2s "${timeout_seconds}s" \
 qemu_pid=$!
 set -e
 
+wake_cycle=0
+wake_marker_seen=0
+suspended_baseline=0
 for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
+    if ((wake_cycle < wake_cycles)); then
+        wake_marker="thin-hv: linux S3 suspend begin cycle=$((wake_cycle + 1))"
+        if ((wake_marker_seen == 0)) && grep -Fq -- "$wake_marker" "$serial_log"; then
+            suspended_baseline=$(grep -Fc -- 'VM status: paused (suspended)' "$qemu_log" || true)
+            wake_marker_seen=1
+        fi
+        if ((wake_marker_seen)); then
+            printf 'info status\n' >&9
+            suspended_now=$(grep -Fc -- 'VM status: paused (suspended)' "$qemu_log" || true)
+            if ((suspended_now > suspended_baseline)); then
+                printf 'system_wakeup\n' >&9
+                wake_cycle=$((wake_cycle + 1))
+                wake_marker_seen=0
+            fi
+        fi
+    fi
     if grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
         grep -Fq -- "$payload_marker" "$serial_log"; then
@@ -150,6 +182,7 @@ if [[ -n "$return_marker" ]]; then
     grep -Fq -- "$return_marker" "$serial_log" || die "marker '$return_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
 grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
+((wake_cycle == wake_cycles)) || die "observed $wake_cycle of $wake_cycles requested suspend cycles"
 
 ((qemu_status == 0)) || die "QEMU exited with status $qemu_status"
 
