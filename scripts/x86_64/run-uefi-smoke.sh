@@ -8,6 +8,8 @@ monitor=${X86_MONITOR_IMAGE:-"$(dirname -- "$loader")/x86-uefi-monitor.efi"}
 stage="$repo_root/bin/x86_64"
 esp="$stage/esp"
 serial_log="$stage/serial.log"
+qemu_log="$stage/qemu.log"
+monitor_fifo="$stage/qemu-monitor.$$.in"
 vars="$stage/OVMF_VARS.fd"
 marker='thin-hv: uefi entry'
 return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
@@ -76,6 +78,28 @@ install -m 0644 -- "$monitor" "$esp/EFI/BOOT/MONITORX64.EFI"
 install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
 install -m 0600 -- "$ovmf_vars" "$vars"
 : >"$serial_log"
+: >"$qemu_log"
+
+qemu_pid=
+monitor_fd_open=0
+cleanup() {
+    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
+        kill "$qemu_pid" 2>/dev/null || true
+        wait "$qemu_pid" 2>/dev/null || true
+    fi
+    if ((monitor_fd_open)); then
+        exec 9>&- 9<&-
+    fi
+    rm -f -- "$monitor_fifo"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+rm -f -- "$monitor_fifo"
+mkfifo -- "$monitor_fifo"
+exec 9<>"$monitor_fifo"
+monitor_fd_open=1
 
 set +e
 timeout --foreground --kill-after=2s "${timeout_seconds}s" \
@@ -88,27 +112,45 @@ timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     -m "$memory" \
     -nodefaults \
     -display none \
-    -monitor none \
+    -monitor stdio \
     -serial "file:$serial_log" \
     -no-reboot \
     -no-shutdown \
     -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
     -drive "if=pflash,format=raw,file=$vars" \
     -drive "if=none,id=esp,format=raw,file=fat:rw:$esp" \
-    -device virtio-blk-pci,drive=esp
-qemu_status=$?
+    -device virtio-blk-pci,drive=esp \
+    <"$monitor_fifo" >"$qemu_log" 2>&1 &
+qemu_pid=$!
 set -e
 
+for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
+    if grep -Fq -- "$marker" "$serial_log" &&
+        { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
+        grep -Fq -- "$payload_marker" "$serial_log"; then
+        printf 'quit\n' >&9
+        break
+    fi
+    kill -0 "$qemu_pid" 2>/dev/null || break
+    sleep 0.1
+done
+
+set +e
+wait "$qemu_pid"
+qemu_status=$?
+set -e
+qemu_pid=
+
 cat -- "$serial_log"
+if ((qemu_status != 0)); then
+    cat -- "$qemu_log" >&2
+fi
 grep -Fq -- "$marker" "$serial_log" || die "marker '$marker' missing from $serial_log (QEMU status $qemu_status)"
 if [[ -n "$return_marker" ]]; then
     grep -Fq -- "$return_marker" "$serial_log" || die "marker '$return_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
 grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
 
-case $qemu_status in
-    0 | 124) ;;
-    *) die "QEMU exited with status $qemu_status" ;;
-esac
+((qemu_status == 0)) || die "QEMU exited with status $qemu_status"
 
 printf 'x86 UEFI smoke: observed %s\n' "$marker"
