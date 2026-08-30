@@ -14,7 +14,7 @@ Hyper-V PASS marker and its longer run ended in a watchdog bugcheck.
 | Direct-VMCS launch | One vCPU reaches VMX non-root from a runtime EFI driver; Linux crosses `ExitBootServices` while L0 retains its code, data, stack, and `HOST_CR3` pages | Private L0 GDT/IDT/TSS, SMP, and bare-metal lifetime validation |
 | Linux UKI/KVM | Linux 7.1.5 loads `kvm_intel nested=0`, creates `/dev/kvm`, and runs the deterministic real-mode L2 to `KVM_EXIT_IO` | SMP, a normal distribution userspace, and a faulting or long-mode L2 |
 | Direct-VMCS nested VMX | The running monitor handles VMXON, VMCLEAR, VMPTRLD, VMREAD, VMWRITE, INVEPT, INVVPID, VMLAUNCH, and VMRESUME through a direct hardware VMCS; a sparse Windows Hyper-V diagnostic crossed 524,288 balanced direct entries/exits | Non-empty MSR lists, independent CR2/XSAVE state, optional VMX controls, and SMP |
-| Trusted outer KVM | A separate runtime artifact installs profile-1 variable hooks and chainloads Windows without entering project VMX; two-vCPU Hyper-V and WSL2 both passed through host KVM | Physical-machine boot, Sandbox, and VBS/HVCI |
+| Trusted outer KVM | A separate runtime artifact installs profile-1 variable hooks and chainloads without entering project VMX; two-vCPU Hyper-V/WSL2 passed, as did bounded reboot soaks on Linux and Windows | Physical-machine boot, multi-hour operation, Sandbox, and VBS/HVCI |
 | Direct EPT | QEMU-only 8 GiB L0 identity EPT plus a measured L1-supplied EPTP used directly for L2 | Platform-derived RAM/MMIO memory typing and bare-metal use |
 | UEFI variables | In-place Runtime Services overlay for profile-private boot variables; focused OVMF profile-2 round trip, table CRC, Linux virtual-address transition, and a profile-1 Windows desktop boot measured | Cross-reboot/profile-switch persistence, Linux `efibootmgr`, and Windows BCD mutation/isolation |
 | Direct-VMCS Windows | Windows 11 Enterprise Evaluation 25H2 boots and reaches the desktop through the one-vCPU monitor, including after the variable hooks were installed | Direct-monitor SMP, Sandbox, and VBS/HVCI |
@@ -162,7 +162,7 @@ the state and policy pieces:
 * conservative KVM-required allowed-one controls and capability masking;
 * provenance for `effective = l1_requested | l0_required`, so an L0-only exit is not reflected
   merely because L0 forced its control bit;
-* a 30-field direct-VMCS patch manifest: 26 host-state fields plus both address/count pairs for
+* a 29-field direct-VMCS patch manifest: 25 host-state fields plus both address/count pairs for
   the VM-exit MSR store and load lists.
 
 The running one-vCPU monitor applies the conservative `IA32_VMX_*` masks, keeps hardware
@@ -171,6 +171,11 @@ VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE, INVEPT, VMLAUNCH, and VMRESUME. 
 checks virtual CR4.VMXE, CPL, VMX fixed bits, operand encoding, L1 long-mode page translation,
 physical width/alignment, and the hardware revision ID. Nested instructions return architectural
 VMsucceed/VMfail flags, and hardware validates direct VMCS operations.
+
+The runtime discovers and validates the physical-address width once, then retains it instead of
+executing two CPUID leaves on every nested entry. A 65,536-entry counterbalanced A/B reduced the
+direct loop from 8.918 to 8.043 seconds (9.81%); the exact samples and artifact hashes are in the
+[2026-08-30 validation manifest](evidence/x86_64/validation-2026-08-30.md).
 
 Before an L2 entry, L0 saves the direct VMCS host fields and replaces them with VMCS01's L0 CRs,
 segment bases, descriptor-table bases, SYSENTER state, PAT/EFER, RSP/RIP, and supported optional
@@ -599,6 +604,14 @@ contained a direct `VMLAUNCH` marker. `qemu-img check` found no errors afterward
 These results validate the UEFI overlay in front of KVM's ordinary nested virtualization; they do
 not exercise the direct-VMCS monitor below.
 
+A later bounded stability run repeated 256 MiB Windows memory hashing, 128 MiB disk write/read,
+64 MiB TCP loopback, and WSL2 CPU/data hashing before and after a Windows reboot. It completed in
+265.595 seconds with disk persistence, zero bugcheck/WHEA and Hyper-V error events, three trusted
+runtime epochs, clean work/base qcow2 checks, unchanged immutable inputs, and no residual process.
+A separate Linux run completed two boots, 2,000 real KVM L2 creations/runs, CPU/memory, usernet,
+and 128 MiB virtio-blk persistence in 33.576 seconds. These are bounded synthetic soaks, not a
+claim of indefinite daily-use stability.
+
 The exact commands, timestamps, environment, artifact hashes, and coherent Windows log hashes are
 recorded in the [2026-08-30 validation manifest](evidence/x86_64/validation-2026-08-30.md).
 
@@ -746,5 +759,5 @@ committed.
 * Intel, [Intel 64 and IA-32 Architectures Software Developer's Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html), especially Volume 3C/3D VMX operation, VMCS fields, VM-entry checks, exit reasons, EPT, and VMX instruction status.
 * UEFI Forum, [UEFI Specification 2.11, Runtime Services / Variable Services](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#variable-services).
 * BitVisor, [Nested Virtualization, including Unsafe Nested Virtualization](https://github.com/matsu/bitvisor/blob/66559d62e2932a9c416e541a43bf0ccc0557cd06/docs/nested_virtualization.md) and [`vt_shadow_vt.c`](https://github.com/matsu/bitvisor/blob/66559d62e2932a9c416e541a43bf0ccc0557cd06/core/x86/vt_shadow_vt.c).
-* Linux KVM, [`arch/x86/kvm/vmx/nested.c`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/nested.c), [`vmx.c`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/vmx.c), [`vmx.h`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/vmx.h), and [KVM selftests](https://github.com/torvalds/linux/tree/73e3f0710014fe6d4ed98cfc02292f6121db7558/tools/testing/selftests/kvm).
+* Linux KVM, [`arch/x86/kvm/vmx/nested.c`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/nested.c), [`vmx.c`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/vmx.c), [`vmcs_shadow_fields.h`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/vmcs_shadow_fields.h), [nested-guest guidance](https://docs.kernel.org/virt/kvm/x86/running-nested-guests.html), and [KVM selftests](https://github.com/torvalds/linux/tree/73e3f0710014fe6d4ed98cfc02292f6121db7558/tools/testing/selftests/kvm).
 * Microsoft, [Hyper-V TLFS: Nested virtualization](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/nested-virtualization), [Hyper-V feature discovery](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/feature-discovery), and [Hyper-V hardware requirements](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/host-hardware-requirements).

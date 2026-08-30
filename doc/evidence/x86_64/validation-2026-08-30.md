@@ -272,10 +272,126 @@ QEMU wall-time change or regression. The tracked
 [paired samples](trusted-kvm-uefi-startup-2026-08-30.tsv) come from raw tree SHA-256
 `6a6c73506f05843cef294c48ed903b7972ba6e4407faef1171b55ead4466c3db`.
 
+## Direct nested-entry physical-width cache
+
+Commit `260b09d03ee84c3c648c1dfe1c17814965cc172d` retains the validated 12-to-52-bit
+physical-address width in the direct runtime. Before it, every nested VMLAUNCH or VMRESUME address
+validation executed CPUID leaves `0x80000000` and `0x80000008`. KVM v7.1.5 stores `maxphyaddr` in
+host and vCPU state instead of rediscovering it on each nested entry. The project cache therefore
+removes two outer exits from the repeated direct-entry path without changing L1's exposed CPUID.
+The one-vCPU runtime uses an `AtomicU8` zero sentinel; an SMP design with heterogeneous CPUID
+policy would need per-vCPU state.
+
+QEMU 10.0.2 ran four AB/BA-counterbalanced pairs with an identical staged loader, guest UKI,
+OVMF code and variables template. Each sample created one KVM VM/vCPU and completed 65,536 real
+L2 `KVM_RUN`/`KVM_EXIT_IO` cycles. A guest marker immediately before the loop removed firmware and
+Linux boot time from the primary measurement. All eight samples passed their VMX, `/dev/kvm`,
+`kvm_intel`, start, final, exit-reason, port, size, count, and `L2OK` data gates.
+
+| Direct runtime | n | Mean START-to-PASS | L2 entries/s |
+| --- | ---: | ---: | ---: |
+| `63533d5` before cache | 4 | 8.917910 s | 7,349 |
+| `260b09d` after cache | 4 | 8.043292 s | 8,148 |
+
+The paired new-minus-old mean was -0.874619 seconds, or 9.81% less time and 10.87% more entry
+throughput. Every pair improved; deltas ranged from -0.897899 to -0.832568 seconds, and the 95%
+paired t interval was [-0.920617, -0.828621] seconds. The staged inputs were unchanged after all
+runs. Old and new monitor SHA-256 values were
+`592dcfc752e8a8cd21d24a310b95e5e88e6e2620efb3b82f32717a22dadfd505` and
+`6478006bccda5812d8fdcee985767eb6079d02ec78884091186e3632933b581d`; the benchmark UKI hash was
+`ec2deb0a6d90be886e0780d882e5e33e05597f14233bcf807de0798ae5175f84`.
+The tracked [eight samples](direct-cpuid-cache-2026-08-30.tsv) have SHA-256
+`1ec5b3304935b763f3d8a97322cbea6a6a002182f3fdf761e52e72e7467bc8e1`.
+The flake-pinned `cargo fmt --all -- --check`, `cargo xtest -p x86_uefi_loader` (three tests),
+and `cargo xbuild x86 --release` passed. Separate direct and trusted UEFI/KVM smoke boots also
+passed guest CPUID, variable-overlay, and final direct-VMX or trusted-guest markers.
+
+## Nested execution and bounded stability soak
+
+The soak host was an Intel Core Ultra 9 185H running Linux 7.1.5. The Linux soak used QEMU 10.1.5;
+the flake-pinned Windows runner and direct A/B used QEMU 10.0.2. Its
+`kvm_intel` parameters had nested VMX, EPT, EPT A/D, VPID, APICv, shadow VMCS, and unrestricted
+guest enabled; KVM's TDP MMU was also enabled. The v7.1.5 KVM audit covered
+`arch/x86/kvm/vmx/nested.c`, `vmx.c`, and `vmcs_shadow_fields.h`. In particular, the upstream
+shadow-field list already includes common exit state and guest RIP, so the daily-use path keeps
+using host KVM rather than duplicating KVM's VMCS12/VMCS02 machinery in the project TCB.
+
+### Linux trusted outer-KVM bounded soak
+
+One isolated trusted-profile QEMU booted the same Linux L1 twice, with one guest reboot between
+passes. Each L2 probe opened `/dev/kvm`, issued `KVM_CREATE_VM`, registered guest memory, issued
+`KVM_CREATE_VCPU` and `KVM_RUN`, then checked both `KVM_EXIT_IO` and the real-mode guest's
+`L2OK` output. Both boots completed 1,000 probes, for 2,000 actual L2 creations and runs.
+
+| Checkpoint | Boot 1 | Boot 2 |
+| --- | ---: | ---: |
+| trusted runtime active | 0.771 s | 18.306 s |
+| nested ready | 1.314 s | 18.772 s |
+| five usernet pings | 5.346 s | 22.799 s |
+| 128 MiB tmpfs, two workers, 80 SHA-256 rounds | 8.716 s | 26.002 s |
+| 1,000 L2 runs complete | 16.041 s | 33.436 s |
+| 128 MiB virtio-blk hash / reboot persistence | 17.834 s | 33.551 s |
+
+QEMU exited zero by normal S5 poweroff after 33.576 seconds, with no timeout or failure marker.
+The disk payload hash was
+`254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917`. Immutable input hashes
+matched before and after, and no QEMU or swtpm process remained. The temporary result bundle's
+ordered aggregate SHA-256 is
+`f6631bcefd193e8e4ecfe90c70f513cb19a2921ace396522186f934a2fd2f8c0`; its serial and timestamped
+event hashes are `d8ba90916b218cadda70505bad05f4459314741115430de45e728e3e95b105fa` and
+`59fff4078de31dfb23761cfe95fcb1f56b7434acaee2898250e21737b0d17b65` respectively.
+The loader, trusted monitor, and soak UKI hashes are
+`9e6de84ac550188f832ddf46dc5005825a16354c014a44a0acfb5f015b04d496`,
+`4cdbddb8d103f9ad446c99a5a5c095330afdf81752ed9197f2fd5c54c8486f98`, and
+`7a1b2aec81595b52518e456ccd71f7b955155047fe27d52d9e4ae858b9bbea85`.
+
+This is a trusted outer-KVM test, not a direct-VMCS result. The CPU, memory, disk, and network
+loads ran in Linux L1; L2 was a 4 KiB real-mode correctness probe. External networking, a full
+Linux L2 OS, filesystems inside L2, and a long thermal soak remain untested.
+
+### Windows trusted outer-KVM bounded soak
+
+One fresh qcow2 child of the immutable Hyper-V baseline, with independent UEFI variables and TPM
+state, first passed a WSL2 gate in 44.771 seconds. The soak then booted it with two vCPUs and
+`host,+vmx,-hypervisor,kvm=off`. Each of two workload phases checked the enabled Hyper-V feature,
+`HypervisorPresent`, running VMMS, a randomized 256 MiB memory SHA-256, a flushed and reread 128
+MiB disk file, 64 MiB of hash-verified TCP loopback traffic, and four WSL commands. The WSL2
+utility VM returned `uname`, hashed `/proc/cpuinfo`, hashed 64 MiB of generated data, and shut down
+successfully in each phase.
+
+| Check | Phase 1 | Phase 2 after Windows reboot |
+| --- | ---: | ---: |
+| workload duration | 9.941 s | 8.808 s |
+| Windows memory | 256 MiB, SHA-256 PASS | 256 MiB, SHA-256 PASS |
+| Windows disk | 128 MiB, SHA-256 PASS | 128 MiB, SHA-256 PASS |
+| TCP loopback | 64 MiB, SHA-256 PASS | 64 MiB, SHA-256 PASS |
+| WSL2 generated-data hash | 64 MiB PASS | 64 MiB PASS |
+
+The phase-1 disk hash
+`1335c5b16fae304222797d621e3fbab9f09743ab00f38db51741589922dd7901` matched after reboot.
+The bounded event scan found zero bugcheck/WHEA events and zero critical/error events in the
+Hyper-V Hypervisor and VMMS admin logs. Three trusted-runtime profile-1 epochs covered the setup
+and explicit soak reboots; none contained a direct VMLAUNCH marker. The final Hyper-V, WSL2, daily
+soak, disk-persistence, and event markers all passed.
+
+The QEMU harness exited zero after 265.595 seconds. `qemu-img check` found no errors in either the
+work image or immutable baseline. Baseline disk, variable, and TPM hashes and stat metadata were
+unchanged, the release loader/monitor hashes still matched, and no QEMU or swtpm process remained.
+The ordered evidence-list SHA-256 is
+`1ea4816d44df68bdd1b29ab1d9741964b954f3da674cccc53fa40b192a5cc1cc`; COM1 and COM2 log hashes
+are `4581b7d04f6154622c296cfbcc0b759f9d9ff77462d30e9588530f1edb02e195` and
+`4bc1616999bdfa80fb5c8eb2841db18481c7b9bd6de69d06a157d49a7cba93c4`.
+
+This test covers a real WSL2 L2 utility VM but remains a bounded synthetic soak. Its Windows
+network load was loopback only; external network traffic, interactive GUI applications, audio,
+USB, suspend/resume, dedicated WSL event-channel scanning, and multi-hour operation remain
+untested.
+
 ## Limits
 
 Six Windows pairs and six Linux pairs still leave broad end-to-end bounds, and the Linux runner's
 50 ms polling cannot resolve single-digit-millisecond changes. Windows media, qcow2 images, TPM
-state, raw logs, and dumps are not distributable repository fixtures. Physical x86 hardware,
-VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a complete non-interactive cargo xtest remain
-unproven.
+state, raw logs, and dumps are not distributable repository fixtures. The 33.576-second Linux and
+265.595-second Windows soaks demonstrate bounded stability, not that either OS cannot fail during
+indefinite daily use. Physical x86 hardware, VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a
+complete non-interactive cargo xtest remain unproven.
