@@ -24,7 +24,6 @@ fn classification_is_exact_and_keeps_secure_boot_shared() {
     for name in [
         "BootOrder",
         "BootNext",
-        "BootCurrent",
         "Boot0000",
         "Boot0A2F",
         "DriverOrder",
@@ -42,6 +41,7 @@ fn classification_is_exact_and_keeps_secure_boot_shared() {
         "KEK",
         "db",
         "dbx",
+        "BootCurrent",
         "BootOptionSupport",
         "Boot00000",
         "Boot00af",
@@ -58,6 +58,33 @@ fn classification_is_exact_and_keeps_secure_boot_shared() {
     assert_eq!(
         classify(other_guid, &utf16("BootOrder")),
         VariableScope::Shared
+    );
+}
+
+#[test]
+fn boot_current_passes_through_while_boot_selection_state_is_private() {
+    let profile = ProfileId(7);
+
+    for name in ["BootOrder", "BootNext", "Boot0000", "BootFFFF"] {
+        assert!(
+            map_private_variable(profile, EFI_GLOBAL_VARIABLE_GUID, &utf16(name)).is_some(),
+            "{name}"
+        );
+    }
+
+    let boot_current = utf16("BootCurrent");
+    assert_eq!(
+        classify(EFI_GLOBAL_VARIABLE_GUID, &boot_current),
+        VariableScope::Shared
+    );
+    assert!(map_private_variable(profile, EFI_GLOBAL_VARIABLE_GUID, &boot_current).is_none());
+    assert!(
+        unmap_private_variable(
+            profile,
+            MONITOR_VENDOR_GUID,
+            &utf16("P00000007:BootCurrent")
+        )
+        .is_none()
     );
 }
 

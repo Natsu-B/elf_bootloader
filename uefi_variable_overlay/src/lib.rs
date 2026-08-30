@@ -65,14 +65,14 @@ pub enum VariableScope {
 
 /// Classifies one logical variable.
 ///
-/// Only the standardized boot and driver state in the global namespace is
-/// private. In particular, `PK`, `KEK`, `db`, and `dbx` remain shared.
+/// Only persistent boot-selection and driver state in the global namespace is
+/// private. Firmware-owned `BootCurrent`, plus `PK`, `KEK`, `db`, and `dbx`,
+/// remains shared.
 #[must_use]
 pub fn classify(guid: Guid, name: &[u16]) -> VariableScope {
     if guid == EFI_GLOBAL_VARIABLE_GUID
         && (equals_ascii(name, b"BootOrder")
             || equals_ascii(name, b"BootNext")
-            || equals_ascii(name, b"BootCurrent")
             || numbered_name(name, b"Boot")
             || equals_ascii(name, b"DriverOrder")
             || numbered_name(name, b"Driver"))
