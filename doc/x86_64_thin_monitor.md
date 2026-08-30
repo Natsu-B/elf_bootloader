@@ -113,13 +113,15 @@ overlay and directly calls `StartImage`. It executes no project `VMXON` or `VMLA
 L0, Windows/Hyper-V is L1, and KVM handles Hyper-V's nested VMX. The default direct-VMCS artifacts
 remain available for the bare-metal-oriented monitor work.
 
-| Runtime artifact | PE size | `.text` size | Disassembled VMX instructions |
+| Release runtime artifact | PE size | `.text` size | Decoded VMX instruction sites |
 | --- | ---: | ---: | ---: |
-| `x86-uefi-monitor.efi` | 81,920 bytes | 69,817 bytes | 31 |
-| `x86-uefi-kvm-monitor.efi` | 25,088 bytes | 18,953 bytes | 0 |
+| `x86-uefi-monitor.efi` | 81,920 bytes | 69,801 bytes | 303 |
+| `x86-uefi-kvm-monitor.efi` | 24,576 bytes | 18,937 bytes | 0 |
 
-The trusted PE is 69.4% smaller overall and 72.9% smaller in `.text`. These measurements show the
-active implementation reduction; they are not a formal TCB proof.
+These figures come from `cargo xbuild x86 --release`, `stat`, and GNU `objdump` 2.44; the VMX
+count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 70.0% smaller
+overall and 72.9% smaller in `.text`. These measurements show the active implementation
+reduction; they are not a formal TCB proof.
 
 ## Direct EPT and its current ceiling
 
@@ -584,17 +586,21 @@ scripts/x86_64/windows/windows-test.sh trusted-kvm-wsl
 ```
 
 The Hyper-V run emitted `thin-hv: windows hyperv PASS`, selected overlay profile 1, and contained
-no `thin-hv: L1 VMLAUNCH direct=` marker. Its matched PASS-marker time was 28.528 seconds versus
-28.155 seconds for direct KVM: 0.373 seconds, or 1.3%, slower. This single boot-to-marker result is
-a sanity check rather than a steady-state benchmark; structurally, the trusted path has no project
-VM-exit-reflection loop.
+no `thin-hv: L1 VMLAUNCH direct=` marker. A same-baseline A/B pair used independent qcow2
+children and copies of the same starting UEFI-variable and TPM state. The direct QEMU/KVM control
+reached its marker in 33.335 seconds and the trusted path in 34.344 seconds: 1.009 seconds, or
+3.0%, slower. This single boot-to-marker pair is a sanity check rather than a steady-state
+benchmark; structurally, the trusted path has no project VM-exit-reflection loop.
 
 The trusted WSL2 run passed with WSL 2.7.11.0, kernel `6.18.33.2-2`, and both guest processors.
-Including its setup reboot, it reached `thin-hv: windows wsl2 PASS` in 229.306 seconds. COM1 showed
+Including its setup reboot, it reached `thin-hv: windows wsl2 PASS` in 216.732 seconds. COM1 showed
 two boot epochs, each with `thin-hv: trusted outer KVM runtime active` and variable-overlay profile
 1, and neither contained a direct `VMLAUNCH` marker. `qemu-img check` found no errors afterward.
 These results validate the UEFI overlay in front of KVM's ordinary nested virtualization; they do
 not exercise the direct-VMCS monitor below.
+
+The exact commands, timestamps, environment, artifact hashes, and coherent Windows log hashes are
+recorded in the [2026-08-30 validation manifest](evidence/x86_64/validation-2026-08-30.md).
 
 ### Direct-VMCS Hyper-V boundary
 
@@ -638,6 +644,9 @@ slowdown, but does not identify a responsible driver. Post-crash WER data also r
 `LogonUI.exe` / `Windows.UI.Logon.dll` failing with `0xc0000005`, so the later `Please wait` screen
 was a logon failure rather than evidence of normal forward progress. Its temporary dump has
 SHA-256 `5a66631299619ddd5dfd0557278dd993567c425f3c342c0b9a1eab52ce750fd5`.
+
+A mountless independent recheck is tracked in the [forensic transcript](evidence/x86_64/direct-vmx-0x133-forensic.txt).
+Its exact image-specific tool is the [read-only verifier](../scripts/x86_64/windows/direct-vmx-0x133-readonly.py).
 
 Reproduce from a direct-PASS work directory without mutating that control:
 

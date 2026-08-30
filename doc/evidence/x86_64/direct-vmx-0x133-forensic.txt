@@ -1,0 +1,250 @@
+Direct-VMX Windows 0x133 forensic verification (sanitized, read-only)
+===================================================================
+
+Collected: 2026-08-30T17:05:32+09:00
+Repository files edited by this verification: none
+Root/sudo used: no
+Filesystem mount used: no
+Kernel /dev/nbd or loop device used: no
+
+Target
+------
+
+Top image:
+  <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+
+Backing path recorded by qcow2:
+  <direct-pass-workdir>/windows.raw
+
+Resolved backing target:
+  <repo>/bin/x86_64/windows/windows.raw
+
+Preflight and chain inspection
+------------------------------
+
+Commands (all read-only):
+
+  ps -eo pid,lstart,args | rg '[q]emu-system|[q]emu-img|[q]emu-nbd' || true
+  lsof <direct-vmx-evidence-workdir>/windows-hyperv.qcow2 || true
+  stat --format='%n | type=%F | size=%s | inode=%i | mtime=%y' \
+    <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+  readlink -f <direct-pass-workdir>/windows.raw
+  stat -L --format='%n | size=%s | inode=%i | mtime=%y' \
+    <direct-pass-workdir>/windows.raw
+  qemu-img info --backing-chain --output=json \
+    <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+  qemu-img map --output=json \
+    <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+
+Preflight result:
+
+  No process or lsof entry had the target top image open.
+  (A later, unrelated QEMU used a different top qcow2; it was not touched.)
+
+  top stat:
+    size=4760207360
+    inode=18017483
+    mtime=2026-08-30 14:12:32.902053837 +0900
+
+  backing stat (following the symlink):
+    size=85899345920
+    inode=20868167
+    mtime=2026-08-28 06:41:32.608094521 +0900
+
+  chain entry 0:
+    format=qcow2
+    virtual-size=85899345920
+    actual-size=4687081472
+    dirty-flag=false
+    full-backing-filename=<direct-pass-workdir>/windows.raw
+
+  chain entry 1:
+    format=raw
+    virtual-size=85899345920
+    actual-size=14170152960
+    dirty-flag=false
+
+  qemu-img map summary:
+    extents=32579
+    virtual_total=85899345920
+    data_bytes=18200797184
+    zero_bytes=67698548736
+    depth_0_bytes=9351528448
+    depth_1_bytes=76547817472
+
+Controlled before hash:
+
+  $ sha256sum <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+  15ce122b0222f43b6d0e9e3709f03b630669a7ce20938460e0bece9b9f08bbb2
+
+Available extraction/analysis tooling
+-------------------------------------
+
+  Available on PATH:
+    qemu-img 10.1.5, qemu-nbd, qemu-io, ntfsls, ntfscat, ntfsinfo, file
+
+  Available in an existing Nix store path but deliberately not used:
+    nbdfuse, nbdcopy, nbddump, nbdinfo
+
+  Not available on PATH:
+    guestfish, virt-ls, virt-cat, sleuthkit fls/icat, WinDbg/kd/cdb/dumpchk
+
+  An existing Volatility 3 environment was inspected for its local
+  _DUMP_HEADER64 field definitions. Its crash layer supports dump types 1 and
+  5, while this artifact is dump type 6, so it was not used to attribute a
+  driver or analyze a call stack.
+
+Read-only extraction method
+---------------------------
+
+Exact verifier:
+
+  <repo>/scripts/x86_64/windows/direct-vmx-0x133-readonly.py
+  SHA-256:
+    1617fdee5efc71d3239380fc992abc957e6cf044af93b505c5bacd2c5d61ae3d
+
+Invocation:
+
+  python3 <repo>/scripts/x86_64/windows/direct-vmx-0x133-readonly.py \
+    <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+
+The verifier starts exactly this image server:
+
+  qemu-nbd -r -f qcow2 -k <temporary-unix-socket> <top-image>
+
+It negotiates the default NBD export and sends only NBD_CMD_READ requests.
+It does not expose a writable export, mount a filesystem, create an extracted
+dump file, or connect a kernel NBD device. The socket lives in a Python
+TemporaryDirectory. The client socket is closed and qemu-nbd is terminated in
+a finally block.
+
+Partition and NTFS values independently read before extraction:
+
+  MBR signature: 55aa, protective partition type: 0xee
+  GPT signature: EFI PART
+  GPT entry 1: EFI system, LBA 2048..534527
+  GPT entry 2: Microsoft reserved, LBA 534528..567295
+  GPT entry 3: Basic data / Windows NTFS, LBA 567296..166262783
+  GPT entry 4: Windows recovery, LBA 166262784..167768063
+
+  Windows partition byte offset:
+    567296 * 512 = 290455552
+
+  NTFS bytes/sector=512
+  NTFS sectors/cluster=8
+  NTFS cluster size=4096
+  $MFT LCN=786432
+  MFT record size=1024
+  $MFT real size=150470656
+
+  C:\Windows\MEMORY.DMP:
+    MFT record=127224
+    real size=380473258
+    unnamed DATA flags=0 (not compressed/sparse)
+    runlist=(VCN 0, 92889 clusters, LCN 3707751)
+
+  C:\ProgramData\Microsoft\Windows\WER\Temp\
+  WER.a4a110f2-2ed4-4857-a3d5-b34d44d66c7a.tmp.dmp:
+    MFT record=138536
+    real size=197272
+    unnamed DATA flags=0
+    runlist LCNs/clusters:
+      2952174/1, 3601196/6, 3607374/3, 4565575/6,
+      4572153/16, 4590597/16, 4592880/1
+
+Verifier transcript
+-------------------
+
+  NBD export_size=85899345920 server_flags=0x3 transmission_flags=0x40f
+  GPT=b'EFI PART' windows_partition_lba=567296
+    partition_offset=290455552 NTFS=b'NTFS    '
+
+  MEMORY.DMP
+    size=380473258
+    sha256=4be11f89920c0b7dcdfd698a56e115279268725a66aee8dad9ba32f87b8aaa6f
+    signature=PAGEDU64
+    Windows header version=15.26100
+    machine=0x8664 (x86-64)
+    processors=1
+    dump_type=6
+    bugcheck=0x133
+    parameters=(0x1, 0x1e00, 0xfffff806899c43b0, 0x0)
+    system_time_raw=134325673137192768
+    system_time_utc=2026-08-30T12:41:53.719276+00:00
+    system_uptime_raw_100ns=40039377835
+    system_uptime=1:06:43.937784
+
+  WER temporary minidump
+    size=197272
+    sha256=5a66631299619ddd5dfd0557278dd993567c425f3c342c0b9a1eab52ce750fd5
+    signature=MDMP
+    internal timestamp=2026-08-30T13:49:41+00:00
+    module count=79
+    first module=LogonUI.exe
+    exception thread=1032
+    exception code=0xc0000005
+    exception flags=0
+    exception address=0x7fffabb3d259
+    exception parameters=(0x0, 0x70)
+    containing module=Windows.UI.Logon.dll
+    module-relative offset=0xbd259
+
+  cleanup=complete
+
+Chronology cross-check
+----------------------
+
+  The MEMORY.DMP SystemTime FILETIME mechanically decodes to
+  2026-08-30 12:41:53.719276 UTC. QEMU was configured with
+  `-rtc base=localtime`, while the serial artifact mtimes below are host JST;
+  therefore this is a matching guest/host wall-clock sequence, not a claim
+  that the two timestamp domains have the same UTC offset.
+  The subsequent UEFI epoch is visible in the existing serial artifacts:
+
+    monitor-hyperv-desktop-serial.log mtime:
+      2026-08-30 12:42:31.631021047 +0900
+    monitor-hyperv-serial.log mtime:
+      2026-08-30 12:42:32.459035801 +0900
+
+  monitor-hyperv-serial.log contains a new BdsDxe Boot0002 sequence and a new
+  thin-hv UEFI/runtime-monitor epoch after the preceding direct nested-VMX
+  activity. This is distinct from the direct KVM control's earlier 09:55
+  reboot/log files.
+
+Controlled after checks
+-----------------------
+
+Commands:
+
+  sha256sum <direct-vmx-evidence-workdir>/windows-hyperv.qcow2
+  stat --format='%n | type=%F | size=%s | inode=%i | mtime=%y' <top-image>
+  stat -L --format='%n | size=%s | inode=%i | mtime=%y' <backing-path>
+  qemu-img info --backing-chain --output=json <top-image>
+  lsof <top-image> || true
+  pgrep -af '[q]emu-nbd.*thin-hv-windows-efer-long2|[n]bdfuse.*thin-hv' || true
+  find /tmp -maxdepth 1 -type d -name 'thin-hv-nbd-ro-*' -print
+
+Result:
+
+  top sha256 after:
+    15ce122b0222f43b6d0e9e3709f03b630669a7ce20938460e0bece9b9f08bbb2
+
+  The before and after top-image SHA-256 values are identical.
+  Top size, inode, and mtime are identical to preflight.
+  Backing size, inode, and mtime are identical to preflight.
+  qemu-img still reports both chain entries dirty-flag=false.
+  No target lsof entry remained.
+  No matching qemu-nbd or nbdfuse process remained.
+  No thin-hv-nbd-ro-* temporary directory remained.
+
+Forensic conclusion and limit
+-----------------------------
+
+The current qcow2 chain independently confirms the documented MEMORY.DMP hash,
+0x133 code and all four parameters, SystemTime, and uptime. It also independently
+confirms the documented WER minidump hash, LogonUI.exe process identity,
+0xc0000005 exception, and Windows.UI.Logon.dll containing module.
+
+Parameter 1 equal to 1 is consistent with a cumulative watchdog timeout at
+DISPATCH_LEVEL or above. The header and WER minidump do not identify a specific
+driver as the cause, and this transcript makes no such attribution.
