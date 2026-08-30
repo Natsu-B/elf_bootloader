@@ -258,11 +258,7 @@ impl BlockDevice for VirtIoBlk {
     }
 
     fn is_read_only(&self) -> Result<bool, IoError> {
-        if let Some(readonly) = self.is_readonly.get() {
-            Ok(*readonly)
-        } else {
-            Err(IoError::NotReady)
-        }
+        self.is_readonly.get().copied().ok_or(IoError::NotReady)
     }
 
     fn uninstall(&self) {
