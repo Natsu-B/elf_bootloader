@@ -342,9 +342,16 @@ pub(crate) fn run(
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
+    let parent_device = unsafe { (*loaded_image).device_handle };
     if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
+        #[cfg(not(feature = "trusted-outer-kvm"))]
         let _ = writeln!(serial, "thin-hv: loading runtime monitor");
-        return start_runtime_monitor(parent_image, system_table);
+        return start_runtime_monitor(parent_image, parent_device, system_table);
+    }
+    #[cfg(feature = "trusted-outer-kvm")]
+    {
+        serial.init();
+        let _ = writeln!(serial, "thin-hv: uefi entry");
     }
     #[cfg(not(feature = "trusted-outer-kvm"))]
     let _ = writeln!(serial, "thin-hv: runtime monitor active");
@@ -572,10 +579,9 @@ fn run_trusted_outer_kvm(
     let variable_overlay =
         runtime_variables::install(system_table, profile, image_base, image_size)
             .map_err(|status| Error::Firmware("install variable overlay", status.as_usize()))?;
-    let _ = writeln!(serial, "thin-hv: trusted outer KVM runtime active");
     let _ = writeln!(
         serial,
-        "thin-hv: variable overlay profile={} mat_patches={}",
+        "thin-hv: trusted outer KVM runtime active profile={} mat_patches={}",
         profile.0,
         variable_overlay.memory_attribute_patch_count()
     );
@@ -608,17 +614,37 @@ fn run_trusted_outer_kvm(
 /// Starts a runtime-driver copy whose code survives guest ExitBootServices.
 fn start_runtime_monitor(
     parent_image: efi::Handle,
+    parent_device: efi::Handle,
     system_table: *mut efi::SystemTable,
 ) -> Result<(), Error> {
-    let (guest, profile) = match load_image(parent_image, system_table, GUEST_IMAGE_PATH) {
+    let utilities = device_path_utilities_protocol(system_table)?;
+    let (guest, profile) = match load_image_on_device(
+        parent_image,
+        system_table,
+        parent_device,
+        utilities,
+        GUEST_IMAGE_PATH,
+    ) {
         Ok(image) => (image, LINUX_PROFILE),
         Err(error) if error.is_missing_image() => (
-            load_image_from_other_filesystem(parent_image, system_table, WINDOWS_BOOT_IMAGE_PATH)?,
+            load_image_from_other_filesystem(
+                parent_image,
+                parent_device,
+                system_table,
+                utilities,
+                WINDOWS_BOOT_IMAGE_PATH,
+            )?,
             WINDOWS_PROFILE,
         ),
         Err(error) => return Err(error),
     };
-    let monitor = match load_image(parent_image, system_table, MONITOR_IMAGE_PATH) {
+    let monitor = match load_image_on_device(
+        parent_image,
+        system_table,
+        parent_device,
+        utilities,
+        MONITOR_IMAGE_PATH,
+    ) {
         Ok(image) => image,
         Err(error) => {
             let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
@@ -682,26 +708,15 @@ fn runtime_handoff(
     .then_some((handoff.guest, profile))
 }
 
-/// Loads one staged image through its complete filesystem device path.
-fn load_image<const PATH_SIZE: usize>(
-    parent_image: efi::Handle,
-    system_table: *mut efi::SystemTable,
-    image_path: [efi::Char16; PATH_SIZE],
-) -> Result<efi::Handle, Error> {
-    let loaded_image = loaded_image_protocol(parent_image, system_table)?;
-    let device_handle = unsafe { (*loaded_image).device_handle };
-    load_image_on_device(parent_image, system_table, device_handle, image_path)
-}
-
 /// Loads one image from a filesystem other than the monitor's own ESP.
 fn load_image_from_other_filesystem<const PATH_SIZE: usize>(
     parent_image: efi::Handle,
+    parent_device: efi::Handle,
     system_table: *mut efi::SystemTable,
+    utilities: *mut efi::protocols::device_path_utilities::Protocol,
     image_path: [efi::Char16; PATH_SIZE],
 ) -> Result<efi::Handle, Error> {
     let boot_services = unsafe { (*system_table).boot_services };
-    let parent_loaded = loaded_image_protocol(parent_image, system_table)?;
-    let parent_device = unsafe { (*parent_loaded).device_handle };
     let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
     let mut handle_count = 0;
     let mut handles = ptr::null_mut();
@@ -736,7 +751,13 @@ fn load_image_from_other_filesystem<const PATH_SIZE: usize>(
     for index in 0..handle_count {
         let device_handle = unsafe { *handles.add(index) };
         if device_handle != parent_device {
-            match load_image_on_device(parent_image, system_table, device_handle, image_path) {
+            match load_image_on_device(
+                parent_image,
+                system_table,
+                device_handle,
+                utilities,
+                image_path,
+            ) {
                 Ok(image) => {
                     result = Ok(image);
                     break;
@@ -758,6 +779,7 @@ fn load_image_on_device<const PATH_SIZE: usize>(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
     device_handle: efi::Handle,
+    utilities: *mut efi::protocols::device_path_utilities::Protocol,
     image_path: [efi::Char16; PATH_SIZE],
 ) -> Result<efi::Handle, Error> {
     let boot_services = unsafe { (*system_table).boot_services };
@@ -777,23 +799,6 @@ fn load_image_on_device<const PATH_SIZE: usize>(
             status.as_usize(),
         ));
     }
-
-    let mut utilities_guid = efi::protocols::device_path_utilities::PROTOCOL_GUID;
-    let mut utilities_interface = ptr::null_mut();
-    let status = unsafe {
-        ((*boot_services).locate_protocol)(
-            &mut utilities_guid,
-            ptr::null_mut(),
-            &mut utilities_interface,
-        )
-    };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "LocateProtocol(DevicePathUtilities)",
-            status.as_usize(),
-        ));
-    }
-    let utilities = utilities_interface.cast::<efi::protocols::device_path_utilities::Protocol>();
 
     let node_size = PATH_SIZE
         .checked_mul(core::mem::size_of::<efi::Char16>())
@@ -859,6 +864,29 @@ fn load_image_on_device<const PATH_SIZE: usize>(
         return Err(Error::Firmware("LoadImage", status.as_usize()));
     }
     Ok(guest_image)
+}
+
+/// Returns the firmware's shared device-path helper protocol.
+fn device_path_utilities_protocol(
+    system_table: *mut efi::SystemTable,
+) -> Result<*mut efi::protocols::device_path_utilities::Protocol, Error> {
+    let mut guid = efi::protocols::device_path_utilities::PROTOCOL_GUID;
+    let mut interface = ptr::null_mut();
+    let status = unsafe {
+        ((*(*system_table).boot_services).locate_protocol)(
+            &mut guid,
+            ptr::null_mut(),
+            &mut interface,
+        )
+    };
+    if status.is_error() {
+        Err(Error::Firmware(
+            "LocateProtocol(DevicePathUtilities)",
+            status.as_usize(),
+        ))
+    } else {
+        Ok(interface.cast())
+    }
 }
 
 /// Returns the firmware's metadata for one loaded image handle.

@@ -593,16 +593,11 @@ run_windows() {
     elif ((is_trusted)); then
         if ((wsl_monitor_offset >= 0)); then
             tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
-                grep -F -- 'thin-hv: trusted outer KVM runtime active' >/dev/null || \
+                grep -F -- 'thin-hv: trusted outer KVM runtime active profile=1 ' >/dev/null || \
                 die "trusted outer KVM marker missing after WSL reboot in $serial_log"
-            tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
-                grep -F -- 'thin-hv: variable overlay profile=1 ' >/dev/null || \
-                die "Windows variable-overlay profile marker missing after WSL reboot in $serial_log"
         else
-            grep -Fq -- 'thin-hv: trusted outer KVM runtime active' "$serial_log" || \
+            grep -Fq -- 'thin-hv: trusted outer KVM runtime active profile=1 ' "$serial_log" || \
                 die "trusted outer KVM marker missing from $serial_log"
-            grep -Fq -- 'thin-hv: variable overlay profile=1 ' "$serial_log" || \
-                die "Windows variable-overlay profile marker missing from $serial_log"
         fi
         if grep -Fq -- 'thin-hv: L1 VMLAUNCH direct=' "$serial_log"; then
             die "direct nested VMX unexpectedly active in $serial_log"
