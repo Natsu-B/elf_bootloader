@@ -90,9 +90,6 @@ pub(crate) fn run(
         free_pool(unsafe { (*system_table).boot_services }, exit_data.cast());
     }
     let result = start_image_result(status);
-    if result.is_err() {
-        let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest_image) };
-    }
     let status = result?;
     let _ = writeln!(serial, "thin-hv: trusted outer KVM guest PASS");
     Ok(status)

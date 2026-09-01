@@ -298,7 +298,8 @@ run_windows() {
     local expected_marker marker_log media_file wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
     local soak_probe_sent=0 soak_probe_elapsed=-1 soak_phase1_seen=0
-    local soak_started_uptime=-1 soak_elapsed_seconds trusted_boot_count
+    local soak_started_uptime=-1 soak_elapsed_seconds soak_completed_rounds soak_required_rounds
+    local trusted_boot_count
     local marker_seen=0 wsl_failed=0 wsl_monitor_offset=-1 wsl_probe_offset=0
     local s4_probe_elapsed=-1
     local wsl_ready_matches=0
@@ -761,6 +762,14 @@ run_windows() {
         soak_elapsed_seconds=$(($(host_uptime_seconds) - soak_started_uptime))
         ((soak_started_uptime >= 0 && soak_elapsed_seconds >= daily_soak_minutes * 60)) || \
             die "daily-soak PASS arrived after ${soak_elapsed_seconds}s; requested ${daily_soak_minutes}m"
+        soak_completed_rounds=$(tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
+            sed -n 's/^thin-hv: windows daily soak rounds=\([0-9][0-9]*\) target_minutes=[0-9][0-9]* elapsed_ms=[0-9][0-9]*$/\1/p')
+        [[ "$soak_completed_rounds" =~ ^[0-9]+$ ]] || \
+            die "daily-soak actual round count is missing or ambiguous"
+        soak_required_rounds=$daily_soak_rounds
+        ((soak_required_rounds >= 2)) || soak_required_rounds=2
+        ((soak_completed_rounds >= soak_required_rounds)) || \
+            die "daily-soak completed $soak_completed_rounds rounds; required $soak_required_rounds"
         trusted_boot_count=$(tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
             grep -Fc -- "$trusted_marker" || true)
         ((trusted_boot_count == 1)) || \
@@ -836,10 +845,10 @@ run_windows() {
     set -e
     qemu_pid=
     if ((is_daily_soak || is_s4)); then
-        for marker in "$wsl_fail_marker" "$daily_soak_fail_marker" "$s4_fail_marker"; do
-            if grep -Fq -- "$marker" "$marker_log"; then
+        for fail_marker in "$wsl_fail_marker" "$daily_soak_fail_marker" "$s4_fail_marker"; do
+            if grep -Fq -- "$fail_marker" "$marker_log"; then
                 tail -n 80 -- "$marker_log" >&2
-                die "guest reported $marker after PASS; logs: $serial_log $marker_log $qemu_log"
+                die "guest reported $fail_marker after PASS; logs: $serial_log $marker_log $qemu_log"
             fi
         done
         ((qemu_status == 0)) || die "QEMU exited with status $qemu_status after $mode PASS"
@@ -905,10 +914,11 @@ check_wsl_soak() {
         'cargo xbuild x86 --release' \
         'host_uptime_seconds' \
         'trusted_boot_count == 1' \
+        'soak_completed_rounds >= soak_required_rounds' \
         'target_minutes=$daily_soak_minutes target_rounds=$daily_soak_rounds' \
         'grep -Fx -- "$expected_marker"' \
         'during S4 poweroff' \
-        'guest reported $marker after PASS'; do
+        'guest reported $fail_marker after PASS'; do
         grep -Fq -- "$needle" "$0" || die "daily-soak/S4 exit check missing: $needle"
     done
     grep -Fq -- 'daily-soak phase 1 did not start within 180 seconds' "$0" || \
