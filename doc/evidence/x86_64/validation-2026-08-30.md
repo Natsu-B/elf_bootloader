@@ -648,20 +648,25 @@ startup task cannot reconstruct its nonce.
 
 ## Claude Opus daily-use review
 
-Claude Code ran three authenticated `claude-opus-5` reviews at maximum effort. The final review
-used only read/search tools after the user explicitly authorized sending the private source and
-documentation. The account is a USD 20 Claude Pro plan, not an API dollar budget:
+Claude Code returned three authenticated `claude-opus-5` reviews at maximum effort. The third
+completed review used only read/search tools after the user explicitly authorized sending the
+private source and documentation. The account is a USD 20 Claude Pro plan, not an API dollar
+budget:
 
 | Review | Turns | CLI list-price estimate (USD) | Prompt SHA-256 | Result SHA-256 |
 | --- | ---: | ---: | --- | --- |
 | initial | 46 | 5.2573025 | `efae1a8ec70c4c8d912a6758ad638a14fa2a90fb0e1ca9d194ff88d70b3b4821` | `647839a2ccf31daa6163b4008f2d5a264f74e6b2c58472aca65de2f6cf71ad8d` |
 | re-review | 39 | 4.312761 | `a0bae01d4add094e0ada30d55cc284e7593924bd0277ab210e48053885bb4aa1` | `b8e5bf718fdd5af69cb13c11a2263f7f8ad69de01cfb6c99e0d000d8266de767` |
 | final daily-driver review | 37 | 4.528085 | `ec71aba9e582b2999089011354f4091283e7447fc6853cab2104f9ff5baaf3b3` | `a4fb71e5c61e0f5a55623be53acc8c7a588948e16576206d9728d002b935da50` |
+| quota-aborted fourth pass | 39 | 4.610336 | `089efcea280132b960c005e93dc515f562a7fec5a4b5c3a1f1627e98d2cea411` | `11ab80f36e166ab6f2d7884bc26a7af2ec59fcb1782f8bed7e8b0af417f3c6d3` |
 
-The three JSON results total a USD 14.0981485 list-price estimate; that is not charged plan spend or
-remaining capacity. Claude `/usage` reported 6% of the all-model weekly allowance used immediately
-before the final review and 7% afterward, leaving 93%; it resets 2026-09-03 18:59 Asia/Tokyo and
-usage credits were off. The second review correctly required proof that S4 resumed
+The four CLI attempts total a USD 18.7084845 list-price estimate; that is not charged plan spend or
+remaining capacity. The fourth pass produced 50,015 output tokens but hit the current-session limit
+before returning a review: `terminal_reason=api_error`, result `You've hit your session limit`, and
+JSON SHA-256 `715e73b01affdcf26a27d0b843ec375706017714c17bc34132598a2ff753d948`.
+It therefore supplies neither a new finding nor a GO verdict. Refreshed Claude `/usage` reported the
+current session at 100% until 2026-09-02 01:59 Asia/Tokyo and the all-model week at 12% until
+2026-09-03 18:59; usage credits were off. The second review correctly required proof that S4 resumed
 the original process; implementing that check exposed the false positive above. At review time its
 verdict was conditional-GO for trusted Linux and Windows, unmeasured for host suspend, and NO-GO
 for physical/bare-metal and direct-VMCS daily use. The old-hook Windows verdict was superseded by
