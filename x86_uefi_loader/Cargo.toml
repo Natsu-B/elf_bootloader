@@ -13,6 +13,7 @@ direct-vmx = [
     "dep:mutex",
     "dep:nested_vmx",
     "dep:uefi_variable_overlay",
+    "dep:x86_64_hal",
     "x86_64_hal/vmx",
 ]
 trusted-outer-kvm = []
@@ -22,7 +23,7 @@ mutex = { path = "../mutex", optional = true }
 nested_vmx = { path = "../nested_vmx", optional = true }
 r-efi = "=6.0.0"
 uefi_variable_overlay = { path = "../uefi_variable_overlay", optional = true }
-x86_64_hal = { path = "../arch_hal/x86_64_hal", default-features = false }
+x86_64_hal = { path = "../arch_hal/x86_64_hal", default-features = false, optional = true }
 
 [lints]
 workspace = true

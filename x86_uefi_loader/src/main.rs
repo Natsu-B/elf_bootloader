@@ -8,6 +8,7 @@ use core::fmt::Write;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use r_efi::efi;
+#[cfg(feature = "direct-vmx")]
 use x86_64_hal::cpu;
 #[cfg(feature = "direct-vmx")]
 use x86_64_hal::vmx;
@@ -27,6 +28,34 @@ mod vmx_smoke;
 /// Legacy COM1 base I/O port.
 pub(crate) const COM1: u16 = 0x03f8;
 
+/// Writes one byte to an x86 I/O port without pulling the VMX HAL into the trusted loader.
+unsafe fn outb(port: u16, value: u8) {
+    // SAFETY: The caller owns the selected I/O port and runs at CPL0.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Reads one byte from an x86 I/O port without pulling the VMX HAL into the trusted loader.
+unsafe fn inb(port: u16) -> u8 {
+    let value: u8;
+    // SAFETY: The caller owns the selected I/O port and runs at CPL0.
+    unsafe {
+        core::arch::asm!(
+            "in al, dx",
+            in("dx") port,
+            out("al") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
+}
+
 /// Polling serial output used before any monitor runtime exists.
 pub(crate) struct SerialPort;
 
@@ -35,13 +64,13 @@ impl SerialPort {
     pub(crate) fn init(&mut self) {
         // SAFETY: UEFI applications run at CPL0 and this loader exclusively uses COM1.
         unsafe {
-            cpu::outb(COM1 + 1, 0x00);
-            cpu::outb(COM1 + 3, 0x80);
-            cpu::outb(COM1, 0x01);
-            cpu::outb(COM1 + 1, 0x00);
-            cpu::outb(COM1 + 3, 0x03);
-            cpu::outb(COM1 + 2, 0xc7);
-            cpu::outb(COM1 + 4, 0x0b);
+            outb(COM1 + 1, 0x00);
+            outb(COM1 + 3, 0x80);
+            outb(COM1, 0x01);
+            outb(COM1 + 1, 0x00);
+            outb(COM1 + 3, 0x03);
+            outb(COM1 + 2, 0xc7);
+            outb(COM1 + 4, 0x0b);
         }
     }
 
@@ -49,10 +78,10 @@ impl SerialPort {
     pub(crate) fn write_byte(&mut self, byte: u8) {
         // SAFETY: UEFI applications run at CPL0 and this loader exclusively uses COM1.
         unsafe {
-            while cpu::inb(COM1 + 5) & 0x20 == 0 {
+            while inb(COM1 + 5) & 0x20 == 0 {
                 core::hint::spin_loop();
             }
-            cpu::outb(COM1, byte);
+            outb(COM1, byte);
         }
     }
 
