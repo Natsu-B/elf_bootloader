@@ -877,6 +877,7 @@ check_wsl_soak() {
         '$diskHash -eq $expectedDiskHash' \
         "\$mediaRunIdFile = 'D:\\daily-soak-run-id.txt'" \
         'daily soak media run ID is unavailable' \
+        'daily soak media run ID is invalid' \
         '$savedRunId -ne $mediaRunId' \
         'Remove-Item -LiteralPath $phaseFile -Force' \
         '3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351' \

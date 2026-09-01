@@ -428,6 +428,10 @@ try {
             throw 'daily soak media run ID is unavailable'
         }
         $mediaRunId = (Get-Content -LiteralPath $mediaRunIdFile -Raw).Trim()
+        if ($mediaRunId -notmatch `
+                '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') {
+            throw 'daily soak media run ID is invalid'
+        }
         $savedRunId = ''
         try {
             $savedRunId = [string](
@@ -436,9 +440,7 @@ try {
         } catch {
             $savedRunId = ''
         }
-        if ($mediaRunId -notmatch `
-                '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -or `
-                $savedRunId -ne $mediaRunId) {
+        if ($savedRunId -ne $mediaRunId) {
             Remove-Item -LiteralPath $phaseFile -Force
             Remove-Item -LiteralPath `
                 (Join-Path $stateDirectory 'daily-soak-phase1.bin'), `
