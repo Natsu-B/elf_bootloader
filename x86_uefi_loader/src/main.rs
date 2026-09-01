@@ -137,12 +137,14 @@ pub extern "efiapi" fn efi_main(
 
     #[cfg(feature = "trusted-outer-kvm")]
     {
-        if let Err(error) = trusted_outer_kvm::run(image, system_table, &mut serial) {
-            serial.init();
-            let _ = writeln!(serial, "thin-hv: trusted outer KVM FAIL: {error}");
-            return efi::Status::DEVICE_ERROR;
-        }
-        return efi::Status::SUCCESS;
+        return match trusted_outer_kvm::run(image, system_table, &mut serial) {
+            Ok(status) => status,
+            Err(error) => {
+                serial.init();
+                let _ = writeln!(serial, "thin-hv: trusted outer KVM FAIL: {error}");
+                error.status()
+            }
+        };
     }
 
     #[cfg(feature = "direct-vmx")]

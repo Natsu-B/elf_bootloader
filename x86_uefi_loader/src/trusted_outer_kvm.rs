@@ -35,6 +35,13 @@ pub(crate) enum Error {
 }
 
 impl Error {
+    /// Returns the original firmware status for the parent UEFI image.
+    pub(super) fn status(self) -> efi::Status {
+        match self {
+            Self::Firmware(_, value) => efi::Status::from_usize(value),
+        }
+    }
+
     fn is_missing_image(self) -> bool {
         matches!(
             self,
@@ -56,7 +63,7 @@ pub(crate) fn run(
     parent_image: efi::Handle,
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
-) -> Result<(), Error> {
+) -> Result<efi::Status, Error> {
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
     let parent_device = unsafe { (*loaded_image).device_handle };
     serial.init();
@@ -82,14 +89,24 @@ pub(crate) fn run(
     if !exit_data.is_null() {
         free_pool(unsafe { (*system_table).boot_services }, exit_data.cast());
     }
+    let result = start_image_result(status);
+    if result.is_err() {
+        let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest_image) };
+    }
+    let status = result?;
+    let _ = writeln!(serial, "thin-hv: trusted outer KVM guest PASS");
+    Ok(status)
+}
+
+fn start_image_result(status: efi::Status) -> Result<efi::Status, Error> {
     if status.is_error() {
-        return Err(Error::Firmware(
+        Err(Error::Firmware(
             "StartImage(trusted outer KVM guest)",
             status.as_usize(),
-        ));
+        ))
+    } else {
+        Ok(status)
     }
-    let _ = writeln!(serial, "thin-hv: trusted outer KVM guest PASS");
-    Ok(())
 }
 
 /// Selects the staged test/Linux image before an installed Windows loader.
@@ -342,7 +359,22 @@ fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::Error;
+    use super::start_image_result;
     use r_efi::efi;
+
+    #[test]
+    fn start_image_status_is_preserved() {
+        assert_eq!(
+            start_image_result(efi::Status::WARN_RESET_REQUIRED).unwrap(),
+            efi::Status::WARN_RESET_REQUIRED
+        );
+        assert_eq!(
+            start_image_result(efi::Status::SECURITY_VIOLATION)
+                .unwrap_err()
+                .status(),
+            efi::Status::SECURITY_VIOLATION
+        );
+    }
 
     #[test]
     fn only_a_missing_loaded_image_allows_guest_fallback() {
