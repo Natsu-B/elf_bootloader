@@ -625,19 +625,29 @@ fn load_selected_guest(
         utilities,
         GUEST_IMAGE_PATH,
     ) {
-        Ok(image) => Ok((image, LINUX_PROFILE)),
-        Err(error) if error.is_missing_image() => Ok((
-            load_image_from_other_filesystem(
-                parent_image,
-                parent_device,
-                system_table,
-                utilities,
-                WINDOWS_BOOT_IMAGE_PATH,
-            )?,
-            WINDOWS_PROFILE,
-        )),
-        Err(error) => Err(error),
+        Ok(image) => return Ok((image, LINUX_PROFILE)),
+        Err(error) if error.is_missing_image() => {}
+        Err(error) => return Err(error),
     }
+
+    let windows = match load_image_on_device(
+        parent_image,
+        system_table,
+        parent_device,
+        utilities,
+        WINDOWS_BOOT_IMAGE_PATH,
+    ) {
+        Ok(image) => image,
+        Err(error) if error.is_missing_image() => load_image_from_other_filesystem(
+            parent_image,
+            parent_device,
+            system_table,
+            utilities,
+            WINDOWS_BOOT_IMAGE_PATH,
+        )?,
+        Err(error) => return Err(error),
+    };
+    Ok((windows, WINDOWS_PROFILE))
 }
 
 /// Starts a runtime-driver copy whose code survives guest ExitBootServices.

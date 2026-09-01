@@ -15,6 +15,7 @@ marker='thin-hv: uefi entry'
 return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
 payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
 variable_marker=${X86_VARIABLE_MARKER-}
+guest_location=${X86_UEFI_GUEST_LOCATION:-guest}
 trusted_chainload_marker=
 trusted_forbidden_markers=(
     'thin-hv: loading runtime monitor'
@@ -29,9 +30,6 @@ if [[ ! ${X86_VARIABLE_MARKER+x} && ${guest##*/} == x86_guest_uefi_test.efi ]]; 
         variable_marker='thin-hv: uefi variable overlay PASS'
     fi
 fi
-if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
-    trusted_chainload_marker='thin-hv: trusted outer KVM direct chainload profile='
-fi
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 memory=${X86_UEFI_MEMORY:-256M}
 smp=${X86_UEFI_SMP:-1}
@@ -43,6 +41,15 @@ die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
     exit 1
 }
+
+case "$guest_location" in
+    guest | both) trusted_profile=2 ;;
+    windows) trusted_profile=1 ;;
+    *) die "X86_UEFI_GUEST_LOCATION must be guest, windows, or both" ;;
+esac
+if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
+    trusted_chainload_marker="thin-hv: trusted outer KVM direct chainload profile=$trusted_profile resident_runtime=0"
+fi
 
 first_file() {
     local candidate
@@ -106,7 +113,14 @@ if [[ -n "$monitor" ]]; then
 else
     rm -f -- "$esp/EFI/BOOT/MONITORX64.EFI"
 fi
-install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
+rm -f -- "$esp/EFI/BOOT/GUESTX64.EFI" "$esp/EFI/Microsoft/Boot/bootmgfw.efi"
+if [[ "$guest_location" != windows ]]; then
+    install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
+fi
+if [[ "$guest_location" != guest ]]; then
+    mkdir -p -- "$esp/EFI/Microsoft/Boot"
+    install -m 0644 -- "$guest" "$esp/EFI/Microsoft/Boot/bootmgfw.efi"
+fi
 install -m 0600 -- "$ovmf_vars" "$vars"
 : >"$serial_log"
 : >"$qemu_log"
