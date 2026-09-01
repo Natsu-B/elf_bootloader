@@ -614,27 +614,28 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    eprintln!("\n--- Running trusted-outer-KVM x86 UEFI smoke test ---");
-    let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
-        .arg("bin/x86_64/x86-uefi-kvm-loader.efi")
-        .env("X86_MONITOR_IMAGE", "")
-        .env("X86_RETURN_MARKER", "thin-hv: trusted outer KVM guest PASS")
-        .env("X86_VARIABLE_MARKER", "thin-hv: uefi native variables PASS")
-        .env("X86_UEFI_CPU", "host,+vmx,-hypervisor,kvm=off")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| format!("Failed to run trusted-outer-KVM UEFI smoke test: {}", e))?;
+    for guest_location in ["guest", "windows", "both"] {
+        eprintln!("\n--- Running trusted-outer-KVM x86 UEFI smoke test ({guest_location}) ---");
+        let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+            .arg("bin/x86_64/x86-uefi-kvm-loader.efi")
+            .env("X86_MONITOR_IMAGE", "")
+            .env("X86_RETURN_MARKER", "thin-hv: trusted outer KVM guest PASS")
+            .env("X86_VARIABLE_MARKER", "thin-hv: uefi native variables PASS")
+            .env("X86_UEFI_CPU", "host,+vmx,-hypervisor,kvm=off")
+            .env("X86_UEFI_GUEST_LOCATION", guest_location)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to run trusted-outer-KVM UEFI smoke test: {}", e))?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "trusted-outer-KVM UEFI smoke test exited with status {}",
-            status
-        ))
+        if !status.success() {
+            return Err(format!(
+                "trusted-outer-KVM UEFI smoke test ({guest_location}) exited with status {status}"
+            ));
+        }
     }
+    Ok(())
 }
 
 fn run_default(args: &[String]) -> ! {
