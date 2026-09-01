@@ -12,8 +12,8 @@ boot markers. Windows disks, dumps, and raw serial logs are intentionally not co
   (adds curl to the Nix development shell)
 - Trusted startup optimization follow-up: 63c5d2b48fe5a377b02b701a1cf479644f9f95f3
 - 2026-09-01/02 trusted-path follow-up: d4d83832297f6df578f27df96496e5899fe91f5f
-  through e149051 (`same-ESP`, structural TCB split, location coverage, repeatable soaks, and
-  fail-closed shutdown/S4 validation)
+  through b59e2eb (`same-ESP`, structural TCB split, location coverage, repeatable soaks,
+  fail-closed shutdown/S4 validation, and post-Claude false-pass hardening)
 
 The original sections below describe the historical validation baseline. Separately labelled
 follow-ups record later code, artifacts, and validation through 2026-09-02.
@@ -648,10 +648,10 @@ startup task cannot reconstruct its nonce.
 
 ## Claude Opus daily-use review
 
-Claude Code returned three authenticated `claude-opus-5` reviews at maximum effort. The third
-completed review used only read/search tools after the user explicitly authorized sending the
-private source and documentation. The account is a USD 20 Claude Pro plan, not an API dollar
-budget:
+Claude Code returned four authenticated `claude-opus-5` reviews that completed at maximum effort,
+plus one quota-aborted attempt. The third completed review used only read/search tools after the user
+explicitly authorized sending the private source and documentation. The account is a USD 20
+Claude Pro plan, not an API dollar budget:
 
 | Review | Turns | CLI list-price estimate (USD) | Prompt SHA-256 | Result SHA-256 |
 | --- | ---: | ---: | --- | --- |
@@ -659,8 +659,9 @@ budget:
 | re-review | 39 | 4.312761 | `a0bae01d4add094e0ada30d55cc284e7593924bd0277ab210e48053885bb4aa1` | `b8e5bf718fdd5af69cb13c11a2263f7f8ad69de01cfb6c99e0d000d8266de767` |
 | final daily-driver review | 37 | 4.528085 | `ec71aba9e582b2999089011354f4091283e7447fc6853cab2104f9ff5baaf3b3` | `a4fb71e5c61e0f5a55623be53acc8c7a588948e16576206d9728d002b935da50` |
 | quota-aborted fourth pass | 39 | 4.610336 | `089efcea280132b960c005e93dc515f562a7fec5a4b5c3a1f1627e98d2cea411` | `11ab80f36e166ab6f2d7884bc26a7af2ec59fcb1782f8bed7e8b0af417f3c6d3` |
+| post-quota trusted-path review | 58 | 8.145293 | `feeca51489e78c9504a3369fc785e90c5b2bc1256dd5f5b3a57cd7dea1891aaa` | `383c42c867e76fa091d918154a0aeeec09e6da50eb93d0937e45791062bc34bc` |
 
-The four CLI attempts total a USD 18.7084845 list-price estimate; that is not charged plan spend or
+The five CLI attempts total a USD 26.8537775 list-price estimate; that is not charged plan spend or
 remaining capacity. The fourth pass produced 50,015 output tokens but hit the current-session limit
 before returning a review: `terminal_reason=api_error`, result `You've hit your session limit`, and
 JSON SHA-256 `715e73b01affdcf26a27d0b843ec375706017714c17bc34132598a2ff753d948`.
@@ -672,6 +673,14 @@ verdict was conditional-GO for trusted Linux and Windows, unmeasured for host su
 for physical/bare-metal and direct-VMCS daily use. The old-hook Windows verdict was superseded by
 the corrected failure. The final review examined the no-hook direct-chainload configuration and
 gave the same conditional-GO/NO-GO boundary.
+
+After the usage window reset, the post-quota review completed with `terminal_reason=completed`,
+`stop_reason=end_turn`, and `is_error=false`. It used 58 turns, reported 108,280 output tokens, and
+reported result length 21,080. Its JSON SHA-256 is
+`5d798187bc99f13b99efa3e5ffb6397afb374b4e61b8d45769ce0f0ba68fb88c`. The verdict was Linux GO
+and Windows CONDITIONAL-GO solely on medium-severity `SOAK-DUR-001`; it also reported low-severity
+`GATE-VMX-001`. Both findings were fixed in `505e900`. A post-fix Opus rereview is still pending,
+so this review is not itself the final post-fix verdict.
 
 Accepted and implemented findings:
 
@@ -764,6 +773,82 @@ Final-review claims judged invalid or not applicable:
   project VMX layer or resident monitor. The incomplete Hyper-V `TIME-001` proposal, unconditional
   BitLocker recovery, and direct-path crash/overhead conclusions are likewise not evidence against
   the trusted configuration.
+
+## 2026-09-02 post-Claude hardening and current-code validation
+
+The follow-up commits close the review and independent-audit false-pass paths without adding a
+resident monitor:
+
+* `505e900` includes the exact requested minutes and rounds in the guest PASS and host expectation
+  (`SOAK-DUR-001`), rejects the live `thin-hv: L1 ` prefix (`GATE-VMX-001`), and removes two evidence
+  claims that serial output proved an absence of direct VMLAUNCH.
+* `d2ec722` returns the exact UEFI warning or error from `StartImage` and makes `UnloadImage`
+  best-effort only when that loaded child fails to start.
+* `335163a` boots Linux with `panic=0`, rejects panic/Oops/BUG output, and requires exact boot,
+  phase, reboot, PASS, and poweroff counts.
+* `125e062` requires a whole-line Windows PASS, host-monotonic minimum duration, exactly one
+  post-probe trusted reboot, a fresh release loader build, and late FAIL rescans. It compares the
+  intended 128 MiB disk hash with the reread file, resets stale phase state only for a valid new
+  run ID, otherwise fails closed, and excludes the optional runtime URL from the reusable media
+  readiness stamp.
+* `b59e2eb` also rejects a missing or malformed media run ID before stale phase state can be
+  resumed or cleared; only a valid new UUID may replace an interrupted run.
+
+The final strict Linux rerun was:
+
+```sh
+nix develop --accept-flake-config --command env \
+  LINUX_SOAK_HASH_ROUNDS=1 \
+  LINUX_SOAK_L2_PROBES=1 \
+  LINUX_SOAK_TIMEOUT_SECONDS=300 \
+  scripts/x86_64/run-linux-soak-test.sh
+```
+
+It exited zero with exact counts `UEFI=2`, `trusted=2`, `L1 boots=2`, `phase1=1`, `phase2=1`,
+`requested reboot=1`, `PASS=1`, and `poweroff=1`, with no kernel panic, Oops, or BUG marker.
+
+The final exact current-code Windows run reused media stamp
+`d2d2c207b6adf4e3a2b922090a649e2e9d4f7f4a42111958c7130ce27e6e4e61`. Run ID
+`9b17fac5-0d87-4799-8657-d300fcdcb18f` requested 0 minutes and two rounds, completed exactly two
+rounds in 46,680 ms, and reported `reboot=1`, `disk_persist=1`, `bugcheck_whea=0`, and
+`hyperv_errors=0`; the host exited zero. Its desktop, QEMU, and firmware-serial SHA-256 values are
+`b8240e47fea17fb0b87cbec58e26af37479e865263d0cb0e1065d4fe934cbc3f`,
+`3deb51b412edac8b68fc3449f84b8129dc8962897e9d85fa0808244d88c024ed`, and
+`f3dccb6d154720f2581a34539169f3cf61672f9a1cf78668014d396dd8b052f2`.
+
+Immediately before the final S4 run, run ID `e68e7ec0-f600-41a9-aae1-d08305cfc069` used the same
+stamp and completed exactly two rounds for its 0-minute/two-round target in 53,100 ms. Both phases
+fetched `https://raw.githubusercontent.com/torvalds/linux/v7.1/README` with SHA-256
+`2844b0b2cafe22741724c4fdda79b1259de48743f12ad40ce408adb1ef00ceda`; it reported `reboot=1`,
+`disk_persist=1`, and zero for both event counts, and the host exited zero. Its desktop, QEMU, and
+serial SHA-256 values are `3e1eefbd9f999850499cfbca85e43839e57d8a240796f5de1388b768895b97f9`,
+`41efd79124a6ebf03650451171bebff751084f52ebb5bbf6607c8a3d6c42fc11`, and
+`edfac1b1788c1eefe172ed1c9aa2abaf523cbf00cf2763b5ae854ea4c7d686c6`.
+
+Ordinary S4 without an external URL followed immediately and reused that same readiness stamp. The
+request powered off through S4 with status zero; the cold restart restored the original guest
+process in 17.206 seconds. The resumed file retained SHA-256
+`bc933fb25a1fbdab201d1c6c2d9ca9602811ee320eb2e73d945110c40ba98e2b`, firmware reported
+`SecureBoot=00`, WSL2-after and both event scans passed, and the final marker was
+`state=S4 guest_resume=1`. The host exited zero through clean S5, `qemu-img check` passed, and no
+QEMU or `swtpm` remained.
+
+| Final S4 log | Request SHA-256 | Resume SHA-256 |
+| --- | --- | --- |
+| desktop serial | `73a308b3c2b60e69f57e2f65286b42d0e8057efad038702bad49679dd6b15933` | `ecad35c1b0f07fc1f39def8d75b0705c69ad5e58af9324394d00bee2ff80a448` |
+| firmware serial | `27f839a8aba41e97ba8623beb9724e2f476ce6d9545e1e53ca5a725585b30864` | `27f839a8aba41e97ba8623beb9724e2f476ce6d9545e1e53ca5a725585b30864` |
+| QEMU | `d20010d8d296255afd3154674288ed7fd833ffaa873b8f00656fb7535cc64e8a` | `e4125b7c8ea5517dc1d173cd52072ca4770487acbb99231ed0f651795269daf5` |
+
+Before the final refinements, an intentionally interrupted current run was followed by new run ID
+`7f3b8327-8a4f-4713-9623-a002602bae56`; it cleared the stale phase and passed 0 minutes/two rounds.
+A separate current 1-minute/two-round run, ID `94dcf505-70c4-49d7-b7cd-6a15a4d453e3`, completed
+four rounds in 60,435 ms and passed the non-zero host-monotonic duration gate.
+
+`bash -n`, `check-wsl-soak`, PowerShell parser validation, `git diff --check`, and
+`cargo fmt --all -- --check` passed. The x86 unit sets passed 7 `nested_vmx`, 5 overlay, and 12 HAL
+tests; both loader `xtest` variants passed 3 direct and 2 trusted tests; and
+`cargo xrun x86 --release` passed. These remain bounded synthetic QEMU/KVM checks, not multi-hour
+physical-machine or interactive daily-use evidence.
 
 ## Limits
 

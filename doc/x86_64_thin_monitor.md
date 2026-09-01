@@ -42,7 +42,8 @@ trimming), `e36cbe5` and `e2aec2a` (deep-S3 exercise), `93d556e` (`BootCurrent` 
 The final `1ad50dc` change removes the trusted resident runtime and its variable hooks. The
 2026-09-01/02 follow-up adds same-ESP Windows selection (`d4d8383`), structurally isolates and trims
 the trusted chainloader (`976b2e9`, `3fbaa9f`), exercises all three guest locations (`d2ee9c3`),
-and adds repeatable Linux and Windows soak runners (`e40eb29`, `2d3cc3a`).
+and adds repeatable Linux and Windows soak runners (`e40eb29`, `2d3cc3a`). Post-Claude hardening
+through `b59e2eb` closes false-pass paths in the trusted loader and both soak runners.
 
 ## Architecture and late launch
 
@@ -562,6 +563,11 @@ natural QEMU poweroff. Its negative marker test failed in 2.747 seconds, and a s
 positive regression exited zero through the new gate. Exact markers and log hashes are in the
 validation manifest.
 
+Commit `335163a` then changed the soak kernel from crash recovery to `panic=0` and requires exact
+counts for the two UEFI/trusted/L1 boot epochs, both phases, the one requested reboot, final PASS,
+and poweroff while rejecting panic, Oops, and BUG markers. A final one-round/one-probe run passed
+all of those strict gates and exited zero.
+
 ## Windows, Hyper-V, and WSL2 status
 
 The Microsoft-hosted Windows 11 Enterprise Evaluation 25H2 English ISO was downloaded as ignored
@@ -731,6 +737,14 @@ and Hyper-V error events, requests a clean Windows shutdown, requires QEMU exit 
 runs `qemu-img check`. The exact 60-minute 2026-09-01/02 result is in the validation manifest; it
 is not a claim of multi-hour or interactive-use stability.
 
+Commit `125e062` further requires a whole-line PASS containing the exact requested duration and
+round targets, host-monotonic elapsed time, exactly one post-probe trusted reboot, a freshly built
+trusted loader, late FAIL rescans, and an intended-versus-reread disk hash. Persisted phase state
+is bound fail-closed to the current run ID, while the optional runtime URL is intentionally absent
+from the reusable WSL-readiness stamp. Current-code 0-minute/two-round runs passed both without and
+with the external URL, and a separate one-minute/two-round run satisfied the non-zero host clock
+gate. An interrupted current run followed by a new UUID also cleared its stale phase and passed.
+
 ### Windows S4 isolation and trusted direct chainload
 
 The S4 verifier requires an in-memory nonce initialized before `SetSuspendState` to survive in the
@@ -768,6 +782,19 @@ re-hibernate an S4-enabled guest. The final guest therefore requests S5 itself a
 success. It restored the original PowerShell process in 17.371 seconds, retained the disk hash,
 read `SecureBoot=00`, passed WSL2 and event checks, shut down cleanly, and left no QEMU or `swtpm`.
 Exact commands, markers, and hashes are in the validation manifest.
+
+The final current-code sequence ran the optional external probe and then immediately ran ordinary
+S4 without that URL. Both reused the same readiness stamp; S4 powered off cleanly, cold-started,
+restored the original process in 17.206 seconds, passed disk, firmware, WSL2, and event checks, and
+ended through clean S5 with a clean qcow2 and no residual process.
+
+After the Claude usage window reset, a completed maximum-effort Opus review rated the trusted Linux
+path GO and Windows CONDITIONAL-GO solely because its requested soak duration was not yet gated; it
+also found a low-severity impossible negative VMX marker. Commit `505e900` fixed both by echoing and
+gating the exact target and rejecting the live `thin-hv: L1 ` prefix, without claiming that serial
+logs prove an absence of VMLAUNCH. `d2ec722` separately preserves the exact UEFI `StartImage`
+status and unloads only a child that failed to start. The post-fix Opus rereview is pending. These
+results remain bounded synthetic QEMU/KVM evidence, not multi-hour physical daily use.
 
 ### Direct-VMCS Hyper-V boundary
 
