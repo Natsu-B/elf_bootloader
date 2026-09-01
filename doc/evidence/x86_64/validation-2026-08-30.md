@@ -403,13 +403,18 @@ current output or execution dependency.
 
 | Current release artifact | PE bytes | `.text` bytes | GNU objdump 2.44 VMX sites | SHA-256 |
 | --- | ---: | ---: | ---: | --- |
-| trusted `x86-uefi-kvm-loader.efi` | 10,752 | 6,657 | 0 | `68b77e9f4b412c4c5ee6fe0ad745c380c825b3ba4cd911ce407d1e9e12cf0fb8` |
-| direct `x86-uefi-loader.efi` | 80,896 | 69,113 | 303 | `ec4dfd421df923edab35be109cc9c7424659459ddaaea57eb8c51c5323acd384` |
+| trusted `x86-uefi-kvm-loader.efi` | 10,752 | 6,673 | 0 | `2b6d3f49320bf7508350be2075bc3e41ee53b848f3e05209122a6d7ae96a13f7` |
+| direct `x86-uefi-loader.efi` | 80,896 | 69,113 | 303 | `eb56b2dcb31a85e2ee539acef022da19e67fc9376d5a260ba860fdf02bd76e0b` |
 
-The trusted binary is 86.7% smaller overall and 90.4% smaller in `.text`. A string audit found the
+The trusted binary is 86.7% smaller overall and 90.3% smaller in `.text`. A string audit found the
 direct-chainload marker in the trusted binary and no runtime-monitor, variable-overlay,
 install/restore-hook, or VMX markers. The direct binary retained all of those markers. This is an
 active-code measurement, not a formal proof of the complete host KVM/QEMU/OVMF TCB.
+
+Commit `60003ec` makes this an xbuild invariant: `xtask` disassembles the trusted PE before copying
+it to `bin/` and fails the build if GNU objdump decodes any VMX mnemonic, including its
+`vmreadq`/`vmwriteq` spellings. The same build removes the two known obsolete output names instead
+of leaving stale EFI files beside current artifacts.
 
 ### Linux trusted direct-chainload S3
 
@@ -419,6 +424,11 @@ returned on every cycle; the real `/dev/kvm` probe passed before suspend and aft
 Every cycle wrote and read a disposable valid `DriverFFFF` EFI load option through native firmware
 Runtime Services, remounted `efivarfs`, verified it after resume, deleted it, and confirmed absence.
 The run ended with `thin-hv: linux S3 nested KVM PASS cycles=3` and exit status zero.
+
+The post-review rerun of `60003ec` added an exact `/sys/devices/system/cpu/online == 0-1` check
+before suspend and after every resume. The outer harness also required exactly three
+`CPU 1 is now offline` and three `CPU1 is up` records. All three cycles passed those gates, the
+trusted-loader positive/negative marker checks, nested KVM, and native EFI-variable checks.
 
 ### Corrected Windows S4 and root-cause isolation
 
@@ -459,23 +469,35 @@ thin-hv: windows hibernate PASS state=S4 guest_resume=1
 conditional-GO results for the tested QEMU/KVM configuration. The old Windows hook configuration,
 the direct-VMCS backend, physical hardware, and bare-metal suspend remain NO-GO for daily use.
 
+After the trusted `StartImage` lifetime fix in `60003ec`, a fresh child qcow2 and copied OVMF/TPM
+state reran the complete test at `/tmp/thin-hv-windows-s4-lifetime.uwD5rQ`. QEMU again powered off
+for S4 and cold-started. The original PowerShell process resumed in 18.496 seconds; disk persistence
+SHA-256 was `4a8d4e761367309b78d6a1c7bf1369053026430f6ac683f9d29e894a47422366`,
+`SecureBoot=00`, WSL2, zero bugcheck/WHEA and Hyper-V errors, and
+`process_continuation=PASS` all passed. The harness and a separate `qemu-img check` both exited
+zero.
+
 ## Claude Opus daily-use review
 
-Claude Code ran two authenticated `claude-opus-5` reviews at maximum effort under the approved
-USD 20 ceiling:
+Claude Code ran three authenticated `claude-opus-5` reviews at maximum effort. The final review
+used only read/search tools after the user explicitly authorized sending the private source and
+documentation. The account is a USD 20 Claude Pro plan, not an API dollar budget:
 
-| Review | Turns | Cost (USD) | Prompt SHA-256 | Result SHA-256 |
+| Review | Turns | CLI list-price estimate (USD) | Prompt SHA-256 | Result SHA-256 |
 | --- | ---: | ---: | --- | --- |
 | initial | 46 | 5.2573025 | `efae1a8ec70c4c8d912a6758ad638a14fa2a90fb0e1ca9d194ff88d70b3b4821` | `647839a2ccf31daa6163b4008f2d5a264f74e6b2c58472aca65de2f6cf71ad8d` |
 | re-review | 39 | 4.312761 | `a0bae01d4add094e0ada30d55cc284e7593924bd0277ab210e48053885bb4aa1` | `b8e5bf718fdd5af69cb13c11a2263f7f8ad69de01cfb6c99e0d000d8266de767` |
+| final daily-driver review | 37 | 4.528085 | `ec71aba9e582b2999089011354f4091283e7447fc6853cab2104f9ff5baaf3b3` | `a4fb71e5c61e0f5a55623be53acc8c7a588948e16576206d9728d002b935da50` |
 
-Total reported cost was USD 9.5700635. The second review correctly required proof that S4 resumed
+The three JSON results total a USD 14.0981485 list-price estimate; that is not charged plan spend or
+remaining capacity. Claude `/usage` reported 6% of the all-model weekly allowance used immediately
+before the final review and 7% afterward, leaving 93%; it resets 2026-09-03 18:59 Asia/Tokyo and
+usage credits were off. The second review correctly required proof that S4 resumed
 the original process; implementing that check exposed the false positive above. At review time its
 verdict was conditional-GO for trusted Linux and Windows, unmeasured for host suspend, and NO-GO
 for physical/bare-metal and direct-VMCS daily use. The old-hook Windows verdict was superseded by
-the corrected failure. The final no-hook root-cause isolation and direct-chainload PASS happened
-after the re-review, so Claude did not review the final configuration and is not the source of its
-conditional-GO classification.
+the corrected failure. The final review examined the no-hook direct-chainload configuration and
+gave the same conditional-GO/NO-GO boundary.
 
 Accepted and implemented findings:
 
@@ -514,6 +536,59 @@ Findings judged invalid or not applicable to the trusted path:
   power states to QEMU, OVMF, and KVM.
 * Synthesizing `BootCurrent`, and the unconditional BitLocker-recovery claim, were rejected for the
   reasons above.
+
+### Final-review finding disposition
+
+Accepted and implemented in `60003ec`:
+
+* `LIFETIME-001`: a returning UEFI application/OS loader is already unloaded by firmware. The
+  trusted path no longer calls `UnloadImage` on that invalid handle and now frees non-null
+  `ExitData`, as required by [UEFI 2.11](https://uefi.org/specs/UEFI/2.11/04_EFI_System_Table.html).
+* `HARNESS-001/002`: every trusted smoke now requires the direct-chainload marker and rejects
+  direct/runtime/overlay markers. Linux additionally checks the live CPU-online mask after every
+  resume, while the harness counts the kernel's CPU1 offline/up events.
+* The valid part of `TRUST-001`: the final trusted PE already contained zero decoded VMX
+  instructions, but that fact had no automatic regression gate. `xbuild` now enforces it.
+* The valid part of `CI-001`: `x86_64_hal`, `nested_vmx`, `uefi_variable_overlay`, and the trusted
+  loader feature are now host-test plan entries. The five selected x86 entries passed 30 tests in
+  total, and `xtask` passed 17 tests.
+* `DOC-001/002` and the valid part of `ARTIFACT-001`: monitor default staging and current test counts
+  are corrected, and builds prune the two known obsolete EFI output names.
+
+Partially valid items retained as explicit boundaries:
+
+* `BOOT-002`: the tested Windows configuration intentionally uses separate loader and Windows ESPs;
+  same-ESP Windows chainload is now documented as unsupported instead of adding an untested search
+  fallback.
+* `WIN-S3-001`: Windows S3 is explicitly disabled and remains untested; the measured Windows power
+  state is S4 only.
+* `SECBOOT-002`: artifacts are unsigned, Secure Boot and BitLocker remain untested, and recovery
+  risk depends on the active PCR profile. Microsoft documents how to inspect Secure Boot integrity
+  use and when to suspend/reseal protection in the
+  [BitLocker FAQ](https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/faq)
+  and [configuration reference](https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/configure).
+* `TEST-003`: the trusted feature is now compiled by the plan, but tests of path string constants
+  were not added; the live trusted UEFI smoke exercises the actual load/start/error contract.
+
+Final-review claims judged invalid or not applicable:
+
+* `PAYLOAD-001` was rejected. The temporary physical profile-2 key is a negative regression probe:
+  if an overlay hook is accidentally reintroduced, the logical `DriverFFFF` lookup exposes it.
+  The fixture uses fresh VARS and deletes every scratch key.
+* The High-severity/linker-only part of `TRUST-001` was rejected. Normal optimized trusted IR has
+  already eliminated the direct functions before linking; only some direct statics existed before
+  LLVM optimization. The final-PE build gate addresses the real regression risk without a
+  large mechanical source split.
+* `HARNESS-001` overstated the normal fixture gap: it already required the trusted return and native
+  variable markers. Only custom long-running guests lacked the loader-side positive/negative gate.
+* Claude's proposed x86 `uefi` plan row is incompatible with the current `xtask` grammar, whose
+  `uefi` category always builds the AArch64 UEFI integration target. Adding a knowingly invalid row
+  was rejected.
+* Reapplying direct-VMX/EPT/MAT/runtime, per-pCPU direct-state, project ACPI ownership, or
+  monitor-enforced variable-isolation findings to the trusted path was rejected: that path has no
+  project VMX layer or resident monitor. The incomplete Hyper-V `TIME-001` proposal, unconditional
+  BitLocker recovery, and direct-path crash/overhead conclusions are likewise not evidence against
+  the trusted configuration.
 
 ## Limits
 

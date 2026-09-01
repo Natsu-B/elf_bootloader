@@ -315,8 +315,9 @@ cargo test -p uefi_variable_overlay
 cargo fmt --all -- --check
 ```
 
-On the current branch, AArch64 `cargo xbuild`, all 15 `cargo xtest -t std` entries, the unit-test
-plan, the UEFI/QEMU `virtio_blk_modern` test, and the U-Boot/QEMU `stage1_translation` test pass.
+On the current branch, AArch64 `cargo xbuild`, the 16-entry host-test baseline plus four newly
+registered x86 entries (20 current `std` entries total), the unit-test plan, the UEFI/QEMU
+`virtio_blk_modern` test, and the U-Boot/QEMU `stage1_translation` test pass.
 A full `cargo xtest` stopped before executing tests because its `sudo -v` preflight could not
 authenticate in the non-interactive session.
 
@@ -324,10 +325,11 @@ authenticate in the non-interactive session.
 
 `scripts/x86_64/run-uefi-smoke.sh` creates a fresh copy of the OVMF variable template, stages the
 loader as `EFI/BOOT/BOOTX64.EFI`, and stages the payload as `EFI/BOOT/GUESTX64.EFI`.
-`MONITORX64.EFI` is staged only when a runtime image is explicitly supplied; the trusted path
-removes it. S3 and S4 are disabled by default. After the required markers arrive the harness asks
-QEMU to quit, and an outer timeout exit of 124 is a failure rather than a successful smoke result.
-It then runs one vCPU:
+For the direct loader, an unset `X86_MONITOR_IMAGE` stages the sibling `x86-uefi-monitor.efi` as
+`MONITORX64.EFI`; an explicitly empty value suppresses it. Trusted-path callers pass that empty
+value. S3 and S4 are disabled by default. After the required markers arrive the harness asks QEMU
+to quit, and an outer timeout exit of 124 is a failure rather than a successful smoke result. It
+then runs one vCPU:
 
 ```text
 -machine q35,accel=kvm
@@ -535,6 +537,10 @@ complete device path to load `\EFI\Microsoft\Boot\bootmgfw.efi` from the first m
 ESP. This preserves the Windows boot manager's actual device handle and file path. The current
 first-match rule is sufficient for one Windows installation; profile partition-GUID selection is
 needed if multiple Windows ESPs matter.
+
+The supported Windows topology currently uses separate loader and Windows ESPs. If the loader and
+`bootmgfw.efi` share one ESP, the parent device is deliberately skipped during the Windows search,
+so that single-ESP topology is not supported or tested.
 
 The monitor test creates fresh `monitor-vars.fd` from the OVMF template so firmware boot entries
 cannot bypass the loader, then runs q35 with `pci-hole64-size=1G` and OVMF
@@ -787,7 +793,8 @@ configurations.
   runtime-PE solution.
 * The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle and chainloads
   Windows from the first other filesystem containing `bootmgfw.efi`. Multiple Windows installs
-  need profile-owned ESP selection instead of firmware enumeration order.
+  need profile-owned ESP selection instead of firmware enumeration order, and a same-ESP Windows
+  installation is not currently supported.
 * The measured direct nested path handles VMXON, VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE,
   INVEPT, INVVPID, VMLAUNCH, and VMRESUME. Memory-form VMREAD/VMWRITE, VMXOFF, optional VMX
   controls, and VMX in L2 are not supported.
@@ -816,8 +823,11 @@ configurations.
 * Development of the direct backend under host KVM adds the measured
   `host KVM -> this L0 -> L1 hypervisor -> L2` nesting and reflection cost. The trusted path
   deliberately removes this project's L0 layer and accepts the outer KVM/QEMU/OVMF stack as TCB.
-* The bootstrap, direct runtime monitor, and guests are unsigned. Secure Boot was disabled for the QEMU
-  measurements; signing and verification policy must be added before a Secure Boot test.
+* The bootstrap, direct runtime monitor, and guests are unsigned. Secure Boot was disabled for the
+  QEMU measurements; signing and verification policy must be added before a Secure Boot test.
+  BitLocker was not tested. Changing this preboot loader can require recovery depending on the
+  active PCR profile, so preserve the recovery key and inspect `manage-bde -protectors -get C:`;
+  suspend protection before changing the loader and resume/reseal it afterward when required.
 * `cargo xbuild x86` produces the direct loader/runtime pair and the trusted loader under ignored
   `bin/x86_64/`, but none has booted on physical hardware. The direct path's QEMU-specific map and
   descriptor-table lifetime, plus both paths' firmware and device-path assumptions, remain
@@ -825,7 +835,7 @@ configurations.
 * The measured S3 and S4 cycles are QEMU guest power states. Physical-host suspend, bare-metal
   resume, interactive GUI use, audio, USB, external networking, modern standby, multi-hour use,
   and long repeated suspend/hibernate operation remain untested. VBS/HVCI and Windows Sandbox are
-  also untested.
+  also untested. The Windows harness explicitly disables S3; only Windows S4 was validated.
 
 All generated EFI files, ESP directories, OVMF variable stores, serial logs, UKIs, ISO or qcow2
 files, and other large artifacts belong under `bin/` (or another ignored build directory).
@@ -839,3 +849,4 @@ committed.
 * BitVisor, [Nested Virtualization, including Unsafe Nested Virtualization](https://github.com/matsu/bitvisor/blob/66559d62e2932a9c416e541a43bf0ccc0557cd06/docs/nested_virtualization.md) and [`vt_shadow_vt.c`](https://github.com/matsu/bitvisor/blob/66559d62e2932a9c416e541a43bf0ccc0557cd06/core/x86/vt_shadow_vt.c).
 * Linux KVM, [`arch/x86/kvm/vmx/nested.c`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/nested.c), [`vmx.c`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/vmx.c), [`vmcs_shadow_fields.h`](https://github.com/torvalds/linux/blob/73e3f0710014fe6d4ed98cfc02292f6121db7558/arch/x86/kvm/vmx/vmcs_shadow_fields.h), [nested-guest guidance](https://docs.kernel.org/virt/kvm/x86/running-nested-guests.html), and [KVM selftests](https://github.com/torvalds/linux/tree/73e3f0710014fe6d4ed98cfc02292f6121db7558/tools/testing/selftests/kvm).
 * Microsoft, [Hyper-V TLFS: Nested virtualization](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/nested-virtualization), [Hyper-V feature discovery](https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/feature-discovery), and [Hyper-V hardware requirements](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/host-hardware-requirements).
+* Microsoft, [BitLocker FAQ](https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/faq) and [Configure BitLocker](https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/configure).
