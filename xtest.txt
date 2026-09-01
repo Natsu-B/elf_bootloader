@@ -26,7 +26,7 @@ std x86_64_hal
 std nested_vmx
 std uefi_variable_overlay
 std x86_uefi_loader --bin x86-uefi-loader
-std x86_uefi_loader --bin x86-uefi-loader --features trusted-outer-kvm
+std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features trusted-outer-kvm
 # Select host GDB integrations explicitly; the remaining integrations target UEFI.
 unit gdb_remote
 std gdb_remote --test rsp_binary_decode --test rsp_frame_assembler

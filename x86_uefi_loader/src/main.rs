@@ -9,11 +9,19 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use r_efi::efi;
 use x86_64_hal::cpu;
-#[cfg(not(feature = "trusted-outer-kvm"))]
+#[cfg(feature = "direct-vmx")]
 use x86_64_hal::vmx;
 
-#[cfg(not(feature = "trusted-outer-kvm"))]
+#[cfg(all(feature = "direct-vmx", feature = "trusted-outer-kvm"))]
+compile_error!("direct-vmx and trusted-outer-kvm are mutually exclusive");
+#[cfg(not(any(feature = "direct-vmx", feature = "trusted-outer-kvm")))]
+compile_error!("select direct-vmx or trusted-outer-kvm");
+
+#[cfg(feature = "direct-vmx")]
 mod runtime_variables;
+#[cfg(feature = "trusted-outer-kvm")]
+mod trusted_outer_kvm;
+#[cfg(feature = "direct-vmx")]
 mod vmx_smoke;
 
 /// Legacy COM1 base I/O port.
@@ -59,7 +67,7 @@ impl SerialPort {
     }
 
     /// Writes one fixed-width hexadecimal value without `core::fmt`.
-    #[cfg_attr(feature = "trusted-outer-kvm", allow(dead_code))]
+    #[cfg_attr(not(feature = "direct-vmx"), allow(dead_code))]
     pub(crate) fn write_hex(&mut self, value: u64) {
         self.write_bytes(b"0x");
         for digit in (0..16).rev() {
@@ -87,20 +95,20 @@ pub extern "efiapi" fn efi_main(
     system_table: *mut efi::SystemTable,
 ) -> efi::Status {
     let mut serial = SerialPort;
-    #[cfg(not(feature = "trusted-outer-kvm"))]
+    #[cfg(feature = "direct-vmx")]
     {
         serial.init();
         let _ = writeln!(serial, "thin-hv: uefi entry");
     }
-    #[cfg(not(feature = "trusted-outer-kvm"))]
+    #[cfg(feature = "direct-vmx")]
     let vmx_present = cpu::has_vmx();
 
-    #[cfg(not(feature = "trusted-outer-kvm"))]
+    #[cfg(feature = "direct-vmx")]
     let _ = writeln!(serial, "thin-hv: CPUID VMX={}", u8::from(vmx_present));
 
     #[cfg(feature = "trusted-outer-kvm")]
     {
-        if let Err(error) = vmx_smoke::run(image, system_table, &mut serial) {
+        if let Err(error) = trusted_outer_kvm::run(image, system_table, &mut serial) {
             serial.init();
             let _ = writeln!(serial, "thin-hv: trusted outer KVM FAIL: {error}");
             return efi::Status::DEVICE_ERROR;
@@ -108,7 +116,7 @@ pub extern "efiapi" fn efi_main(
         return efi::Status::SUCCESS;
     }
 
-    #[cfg(not(feature = "trusted-outer-kvm"))]
+    #[cfg(feature = "direct-vmx")]
     {
         if !vmx_present {
             let _ = writeln!(serial, "thin-hv: IA32_FEATURE_CONTROL=unavailable");

@@ -8,14 +8,21 @@ name = "x86-uefi-loader"
 path = "src/main.rs"
 
 [features]
+default = ["direct-vmx"]
+direct-vmx = [
+    "dep:mutex",
+    "dep:nested_vmx",
+    "dep:uefi_variable_overlay",
+    "x86_64_hal/vmx",
+]
 trusted-outer-kvm = []
 
 [dependencies]
-mutex = { path = "../mutex" }
-nested_vmx = { path = "../nested_vmx" }
+mutex = { path = "../mutex", optional = true }
+nested_vmx = { path = "../nested_vmx", optional = true }
 r-efi = "=6.0.0"
-uefi_variable_overlay = { path = "../uefi_variable_overlay" }
-x86_64_hal = { path = "../arch_hal/x86_64_hal" }
+uefi_variable_overlay = { path = "../uefi_variable_overlay", optional = true }
+x86_64_hal = { path = "../arch_hal/x86_64_hal", default-features = false }
 
 [lints]
 workspace = true

@@ -3,6 +3,9 @@ name = "x86_64_hal"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["vmx"]
+vmx = []
+
 [lints]
 workspace = true
-

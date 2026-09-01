@@ -1,9 +1,6 @@
 //! One-vCPU VMXON/VMLAUNCH/VMCALL validation.
 
-#![cfg_attr(feature = "trusted-outer-kvm", allow(dead_code, unused_imports))]
-
 use crate::SerialPort;
-#[cfg(not(feature = "trusted-outer-kvm"))]
 use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
@@ -151,7 +148,6 @@ const GUEST_IMAGE_PATH: [efi::Char16; 23] = [
     0,
 ];
 /// Runtime-driver copy of this monitor staged by `run-uefi-smoke.sh`.
-#[cfg(not(feature = "trusted-outer-kvm"))]
 const MONITOR_IMAGE_PATH: [efi::Char16; 25] = [
     b'\\' as u16,
     b'E' as u16,
@@ -229,10 +225,8 @@ static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
-#[cfg(not(feature = "trusted-outer-kvm"))]
 const RUNTIME_MODE: u32 = 0;
 
-#[cfg(not(feature = "trusted-outer-kvm"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RuntimeHandoff {
@@ -306,17 +300,6 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(feature = "trusted-outer-kvm")]
-        {
-            return match *self {
-                Self::Firmware(service, status) => {
-                    write!(formatter, "{service} status={status:#x}")
-                }
-                _ => formatter.write_str("unreachable direct-monitor error"),
-            };
-        }
-
-        #[cfg(not(feature = "trusted-outer-kvm"))]
         match *self {
             Self::Capability(name, value) => write!(formatter, "capability {name}={value:#x}"),
             Self::Allocate(status) => write!(formatter, "AllocatePages status={status:#x}"),
@@ -347,28 +330,17 @@ pub(crate) fn run(
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
     let parent_device = unsafe { (*loaded_image).device_handle };
 
-    #[cfg(feature = "trusted-outer-kvm")]
-    {
-        serial.init();
-        let _ = writeln!(serial, "thin-hv: uefi entry");
-        return start_trusted_outer_kvm(parent_image, parent_device, system_table, serial);
+    if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
+        let _ = writeln!(serial, "thin-hv: loading runtime monitor");
+        return start_runtime_monitor(parent_image, parent_device, system_table);
     }
+    let _ = writeln!(serial, "thin-hv: runtime monitor active");
+    // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
+    // path; use a self-relocated resident core before Windows or bare metal.
 
-    #[cfg(not(feature = "trusted-outer-kvm"))]
-    {
-        if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
-            let _ = writeln!(serial, "thin-hv: loading runtime monitor");
-            return start_runtime_monitor(parent_image, parent_device, system_table);
-        }
-        let _ = writeln!(serial, "thin-hv: runtime monitor active");
-        // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
-        // path; use a self-relocated resident core before Windows or bare metal.
-
-        run_direct_monitor(loaded_image, system_table, serial)
-    }
+    run_direct_monitor(loaded_image, system_table, serial)
 }
 
-#[cfg(not(feature = "trusted-outer-kvm"))]
 fn run_direct_monitor(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
     system_table: *mut efi::SystemTable,
@@ -566,51 +538,6 @@ fn run_direct_monitor(
     }
 }
 
-/// Lets trusted outer KVM run the selected guest as a plain UEFI application.
-///
-/// Firmware-variable isolation belongs to the per-VM OVMF VARS file on this
-/// path, so no resident runtime image or Runtime Services hook is installed.
-#[cfg(feature = "trusted-outer-kvm")]
-fn start_trusted_outer_kvm(
-    parent_image: efi::Handle,
-    parent_device: efi::Handle,
-    system_table: *mut efi::SystemTable,
-    serial: &mut SerialPort,
-) -> Result<(), Error> {
-    let utilities = device_path_utilities_protocol(system_table)?;
-    let (guest_image, profile) =
-        load_selected_guest(parent_image, parent_device, system_table, utilities)?;
-    let _ = writeln!(
-        serial,
-        "thin-hv: trusted outer KVM direct chainload profile={} resident_runtime=0",
-        profile.0
-    );
-
-    let mut exit_data_size = 0;
-    let mut exit_data = ptr::null_mut();
-    let status = unsafe {
-        ((*(*system_table).boot_services).start_image)(
-            guest_image,
-            &mut exit_data_size,
-            &mut exit_data,
-        )
-    };
-    let result = if status.is_error() {
-        Err(Error::Firmware(
-            "StartImage(trusted outer KVM guest)",
-            status.as_usize(),
-        ))
-    } else {
-        Ok(())
-    };
-    if !exit_data.is_null() {
-        free_pool(unsafe { (*system_table).boot_services }, exit_data.cast());
-    }
-    result?;
-    let _ = writeln!(serial, "thin-hv: trusted outer KVM guest PASS");
-    Ok(())
-}
-
 /// Loads the staged test/Linux image, or Windows from another filesystem.
 fn load_selected_guest(
     parent_image: efi::Handle,
@@ -651,7 +578,6 @@ fn load_selected_guest(
 }
 
 /// Starts a runtime-driver copy whose code survives guest ExitBootServices.
-#[cfg(not(feature = "trusted-outer-kvm"))]
 fn start_runtime_monitor(
     parent_image: efi::Handle,
     parent_device: efi::Handle,
@@ -709,7 +635,6 @@ fn start_runtime_monitor(
 }
 
 /// Reads the target handle and profile supplied by the boot application copy.
-#[cfg(not(feature = "trusted-outer-kvm"))]
 fn runtime_handoff(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
 ) -> Option<(efi::Handle, ProfileId)> {

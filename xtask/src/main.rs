@@ -484,6 +484,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .arg("--target")
         .arg("x86_64-unknown-uefi")
         .args(args)
+        .arg("--no-default-features")
         .arg("--features")
         .arg("trusted-outer-kvm")
         .env("XTASK_BUILD", "1")
