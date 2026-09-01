@@ -7,6 +7,7 @@ kernel_override=${2:-${LINUX_KERNEL:-}}
 busybox_override=${3:-${BUSYBOX_STATIC:-}}
 stub_override=${4:-${LINUX_EFI_STUB:-}}
 cmdline=${LINUX_L1_CMDLINE:-'console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=1 panic=-1'}
+read -r -a extra_modules <<<"${LINUX_L1_EXTRA_MODULES:-}"
 
 die() {
     printf 'linux L1 UKI: %s\n' "$*" >&2
@@ -123,18 +124,21 @@ install -m 0755 -- "$init_source" "$root/init"
 [[ "$($file_cmd -Lb -- "$root/bin/kvm-probe")" == *x86-64*static* ]] \
     || die 'KVM probe is not a static x86-64 executable'
 
-while read -r action module_path _; do
-    [[ "$action" == insmod ]] || continue
-    [[ "$module_path" == "$modules_root/"* ]] || die "module outside $modules_root: $module_path"
-    install -Dm 0644 -- "$module_path" "$root/lib/modules/$kernel_release/${module_path#"$modules_root/"}"
-done < <("$modprobe" -d "$modules_prefix" -S "$kernel_release" --show-depends kvm_intel)
+for requested_module in kvm_intel efivarfs "${extra_modules[@]}"; do
+    [[ "$requested_module" =~ ^[a-zA-Z0-9_-]+$ ]] || \
+        die "invalid module name in LINUX_L1_EXTRA_MODULES: $requested_module"
+    module_deps=$("$modprobe" -d "$modules_prefix" -S "$kernel_release" \
+        --show-depends "$requested_module") || die "module not found: $requested_module"
+    while read -r action module_path _; do
+        [[ "$action" == insmod ]] || continue
+        [[ "$module_path" == "$modules_root/"* ]] || \
+            die "module outside $modules_root: $module_path"
+        install -Dm 0644 -- "$module_path" \
+            "$root/lib/modules/$kernel_release/${module_path#"$modules_root/"}"
+    done <<<"$module_deps"
+done
 find "$root/lib/modules/$kernel_release" -name 'kvm-intel.ko*' -print -quit | grep -q . \
     || die "kvm-intel module not found for $kernel_release"
-while read -r action module_path _; do
-    [[ "$action" == insmod ]] || continue
-    [[ "$module_path" == "$modules_root/"* ]] || die "module outside $modules_root: $module_path"
-    install -Dm 0644 -- "$module_path" "$root/lib/modules/$kernel_release/${module_path#"$modules_root/"}"
-done < <("$modprobe" -d "$modules_prefix" -S "$kernel_release" --show-depends efivarfs)
 find "$root/lib/modules/$kernel_release" -name 'efivarfs.ko*' -print -quit | grep -q . \
     || die "efivarfs module not found for $kernel_release"
 install -m 0644 -- "$modules_root"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kernel_release/"

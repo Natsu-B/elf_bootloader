@@ -36,6 +36,9 @@ smp=${X86_UEFI_SMP:-1}
 cpu=${X86_UEFI_CPU:-host,+vmx,-hypervisor}
 acpi_s3=${X86_UEFI_ACPI_S3:-0}
 wake_cycles=${X86_UEFI_WAKE_CYCLES:-0}
+allow_reboot=${X86_UEFI_ALLOW_REBOOT:-0}
+data_disk=${X86_UEFI_DATA_DISK:-}
+usernet=${X86_UEFI_USERNET:-0}
 
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
@@ -71,6 +74,9 @@ first_file() {
 [[ -n "$cpu" ]] || die 'X86_UEFI_CPU must not be empty'
 [[ "$acpi_s3" =~ ^[01]$ ]] || die 'X86_UEFI_ACPI_S3 must be 0 or 1'
 [[ "$wake_cycles" =~ ^[0-9]+$ ]] || die 'X86_UEFI_WAKE_CYCLES must be a non-negative integer'
+[[ "$allow_reboot" =~ ^[01]$ ]] || die 'X86_UEFI_ALLOW_REBOOT must be 0 or 1'
+[[ "$usernet" =~ ^[01]$ ]] || die 'X86_UEFI_USERNET must be 0 or 1'
+[[ -z "$data_disk" || -f "$data_disk" ]] || die "data disk not found: $data_disk"
 ((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
 if ((acpi_s3)); then
     [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]] || \
@@ -131,6 +137,21 @@ sleep_args=(-global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1)
 if ((acpi_s3)); then
     sleep_args=(-global ICH9-LPC.disable_s3=0 -global ICH9-LPC.disable_s4=1)
 fi
+reboot_args=(-no-reboot)
+((allow_reboot)) && reboot_args=()
+extra_device_args=()
+if [[ -n "$data_disk" ]]; then
+    extra_device_args+=(
+        -drive "if=none,id=data,format=raw,file=$data_disk,cache=writeback"
+        -device virtio-blk-pci,drive=data,serial=THINHVDATA
+    )
+fi
+if ((usernet)); then
+    extra_device_args+=(
+        -netdev user,id=net0,restrict=on
+        -device virtio-net-pci,netdev=net0
+    )
+fi
 cleanup() {
     if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
         kill "$qemu_pid" 2>/dev/null || true
@@ -162,12 +183,13 @@ timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     -display none \
     -monitor stdio \
     -serial "file:$serial_log" \
-    -no-reboot \
+    "${reboot_args[@]}" \
     -no-shutdown \
     -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
     -drive "if=pflash,format=raw,file=$vars" \
     -drive "if=none,id=esp,format=raw,file=fat:rw:$esp" \
     -device virtio-blk-pci,drive=esp \
+    "${extra_device_args[@]}" \
     <"$monitor_fifo" >"$qemu_log" 2>&1 &
 qemu_pid=$!
 set -e

@@ -1,0 +1,146 @@
+#!/bin/sh
+set -eu
+
+fail() {
+    echo "thin-hv-soak: FAIL $*"
+    /bin/busybox sync || true
+    /bin/busybox poweroff -f || true
+    exec sh
+}
+
+positive_integer() {
+    case "$1" in
+        '' | 0 | *[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+/bin/busybox mkdir -p /tmp
+mount -t tmpfs -o size=768m tmpfs /tmp
+
+hash_rounds=40
+l2_probes=1000
+for argument in $(/bin/busybox cat /proc/cmdline); do
+    case "$argument" in
+        thin_hv_soak_hash_rounds=*) hash_rounds=${argument#*=} ;;
+        thin_hv_soak_l2_probes=*) l2_probes=${argument#*=} ;;
+    esac
+done
+positive_integer "$hash_rounds" || fail "invalid hash rounds: $hash_rounds"
+positive_integer "$l2_probes" || fail "invalid L2 probe count: $l2_probes"
+
+echo "thin-hv-soak: L1 boot begin uptime=$(/bin/busybox cat /proc/uptime)"
+grep -qw vmx /proc/cpuinfo || fail 'vmx-missing'
+modprobe kvm || fail 'modprobe-kvm'
+modprobe kvm_intel nested=0 || fail 'modprobe-kvm-intel'
+[ -c /dev/kvm ] || fail 'dev-kvm-missing'
+echo 'thin-hv-soak: nested KVM ready'
+
+modprobe virtio_pci || fail 'modprobe-virtio-pci'
+modprobe virtio_blk || fail 'modprobe-virtio-blk'
+modprobe virtio_net || fail 'modprobe-virtio-net'
+
+disk=
+attempt=0
+while [ "$attempt" -lt 50 ] && [ -z "$disk" ]; do
+    for sys_block in /sys/class/block/vd*; do
+        [ -e "$sys_block" ] || continue
+        serial=$(/bin/busybox cat "$sys_block/serial" 2>/dev/null || true)
+        [ "$serial" = THINHVDATA ] || \
+            serial=$(/bin/busybox cat "$sys_block/device/serial" 2>/dev/null || true)
+        if [ "$serial" = THINHVDATA ]; then
+            disk="/dev/${sys_block##*/}"
+            break
+        fi
+    done
+    attempt=$((attempt + 1))
+    [ -n "$disk" ] || /bin/busybox sleep 0.1
+done
+[ -b "$disk" ] || fail 'virtio-disk-missing'
+
+attempt=0
+while [ "$attempt" -lt 50 ] && [ ! -d /sys/class/net/eth0 ]; do
+    attempt=$((attempt + 1))
+    /bin/busybox sleep 0.1
+done
+[ -d /sys/class/net/eth0 ] || fail 'virtio-net-missing'
+/bin/busybox ip link set lo up || fail 'loopback-up'
+/bin/busybox ip link set eth0 up || fail 'eth0-up'
+/bin/busybox ip addr add 10.0.2.15/24 dev eth0 2>/dev/null || true
+/bin/busybox ip route add default via 10.0.2.2 2>/dev/null || true
+/bin/busybox ping -c 5 -W 2 10.0.2.2 >/dev/null || fail 'usernet-ping'
+echo 'thin-hv-soak: usernet PASS packets=5'
+
+marker=$(/bin/busybox dd if="$disk" bs=1 skip=134217728 count=11 2>/dev/null || true)
+if [ "$marker" = THINHVSOAK1 ]; then
+    phase=2
+else
+    phase=1
+fi
+echo "thin-hv-soak: phase=$phase"
+
+/bin/busybox dd if=/dev/zero of=/tmp/memory.bin bs=1M count=128 status=none || \
+    fail 'tmpfs-write'
+stamp=0
+while [ "$stamp" -lt 128 ]; do
+    printf THINHVSOAK | /bin/busybox dd of=/tmp/memory.bin bs=1 \
+        seek=$((stamp * 1048576)) conv=notrunc status=none || fail 'tmpfs-stamp'
+    stamp=$((stamp + 1))
+done
+memory_hash=$(/bin/busybox sha256sum /tmp/memory.bin)
+memory_hash=${memory_hash%% *}
+[ -n "$memory_hash" ] || fail 'tmpfs-hash-empty'
+
+hash_worker() {
+    round=0
+    while [ "$round" -lt "$hash_rounds" ]; do
+        /bin/busybox sha256sum /tmp/memory.bin >/dev/null || return 1
+        round=$((round + 1))
+    done
+}
+hash_worker &
+cpu_a=$!
+hash_worker &
+cpu_b=$!
+wait "$cpu_a" || fail 'cpu-worker-a'
+wait "$cpu_b" || fail 'cpu-worker-b'
+current_hash=$(/bin/busybox sha256sum /tmp/memory.bin)
+[ "${current_hash%% *}" = "$memory_hash" ] || fail 'memory-corruption'
+echo "thin-hv-soak: cpu-memory PASS bytes=134217728 workers=2 hashes=$((hash_rounds * 2)) sha256=$memory_hash"
+
+probe_start=$(/bin/busybox cat /proc/uptime)
+probe=0
+while [ "$probe" -lt "$l2_probes" ]; do
+    /bin/kvm-probe >/dev/null || fail 'kvm-probe'
+    probe=$((probe + 1))
+done
+probe_end=$(/bin/busybox cat /proc/uptime)
+echo "thin-hv-soak: repeated L2 PASS count=$l2_probes start=$probe_start end=$probe_end"
+
+if [ "$phase" -eq 1 ]; then
+    /bin/busybox dd if=/tmp/memory.bin of="$disk" bs=1M count=128 conv=fsync status=none || \
+        fail 'virtio-disk-write'
+    disk_hash=$(/bin/busybox dd if="$disk" bs=1M count=128 status=none | \
+        /bin/busybox sha256sum)
+    [ "${disk_hash%% *}" = "$memory_hash" ] || fail 'virtio-disk-readback'
+    printf THINHVSOAK1 | /bin/busybox dd of="$disk" bs=1 seek=134217728 \
+        conv=notrunc,fsync status=none || fail 'virtio-disk-marker'
+    /bin/busybox sync
+    echo "thin-hv-soak: virtio-blk PASS phase=write bytes=134217728 sha256=$memory_hash"
+    echo 'thin-hv-soak: reboot requested'
+    /bin/busybox reboot -f
+    fail 'reboot-returned'
+fi
+
+disk_hash=$(/bin/busybox dd if="$disk" bs=1M count=128 status=none | \
+    /bin/busybox sha256sum)
+[ "${disk_hash%% *}" = "$memory_hash" ] || fail 'virtio-disk-reboot-persistence'
+echo "thin-hv-soak: virtio-blk PASS phase=reboot-read bytes=134217728 sha256=$memory_hash"
+echo "thin-hv-soak: PASS phase=2 hashes=$((hash_rounds * 2)) l2=$l2_probes uptime=$(/bin/busybox cat /proc/uptime)"
+/bin/busybox sync
+echo 'thin-hv-soak: poweroff requested'
+/bin/busybox poweroff -f
+fail 'poweroff-returned'
