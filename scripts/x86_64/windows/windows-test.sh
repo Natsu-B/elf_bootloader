@@ -531,7 +531,7 @@ run_windows() {
         expected_marker="$wsl_marker stamp=$wsl_media_stamp"
         marker_log=$desktop_serial_log
     elif ((is_daily_soak)); then
-        expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id"
+        expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id target_minutes=$daily_soak_minutes target_rounds=$daily_soak_rounds"
         marker_log=$desktop_serial_log
     elif ((is_wsl)); then
         expected_marker="$wsl_marker stamp=$wsl_media_stamp"
@@ -654,7 +654,7 @@ run_windows() {
             probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
             soak_probe_sent=1
             soak_probe_elapsed=$elapsed
-            expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id"
+            expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id target_minutes=$daily_soak_minutes target_rounds=$daily_soak_rounds"
             marker_seen=0
         fi
         wsl_failed=0
@@ -759,7 +759,7 @@ run_windows() {
             grep -Fq -- "$trusted_marker" "$serial_log" || \
                 die "trusted outer KVM marker missing from $serial_log"
         fi
-        if grep -Fq -- 'thin-hv: L1 VMLAUNCH direct=' "$serial_log"; then
+        if grep -Fq -- 'thin-hv: L1 ' "$serial_log"; then
             die "direct nested VMX unexpectedly active in $serial_log"
         fi
     fi
@@ -837,6 +837,7 @@ check_wsl_soak() {
         'daily soak media stamp changed during resume' \
         'DailySoakRunId' \
         'run_id=' \
+        'daily soak PASS stamp=$Stamp run_id=$RunId target_minutes=$Minutes target_rounds=$Rounds' \
         '3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351' \
         'timeout -s KILL 45' \
         'NoMatchingEventsFound' \

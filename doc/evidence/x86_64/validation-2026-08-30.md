@@ -593,11 +593,11 @@ Both external fetches matched SHA-256
 The host-generated run ID `7f422ef6-50b8-422e-90ac-a185f8ad3831` and media stamp
 `fb89e4d428c24602b1fb89e56686e38ca63fbd04ed681cfbf1a63275a3785168` were present in the staged
 media, persisted phase state, and exact final PASS marker, so a stale marker from another invocation
-could not satisfy the run. COM1 recorded exactly two trusted profile-1 boot epochs and no direct
-`VMLAUNCH`. Windows shut down within the 120-second gate, QEMU and the host harness returned zero,
-and independent `qemu-img check` runs found no errors in either the work image or its immutable
-baseline. The baseline image, OVMF variables, and TPM state retained their pre-run SHA-256 values.
-No Windows QEMU or `swtpm` process remained afterward.
+could not satisfy the run. COM1 recorded exactly two trusted profile-1 boot epochs. Windows shut
+down within the 120-second gate, QEMU and the host harness returned zero, and independent
+`qemu-img check` runs found no errors in either the work image or its immutable baseline. The
+baseline image, OVMF variables, and TPM state retained their pre-run SHA-256 values. No Windows
+QEMU or `swtpm` process remained afterward.
 
 The preserved desktop, firmware-serial, and QEMU logs have SHA-256
 `2314ddad3c89115c70923f33de7f62c0a6ff5c8598c88807b6fa8e9016e1c023`,
@@ -632,9 +632,9 @@ The request-side QEMU powered off through S4 with status zero, and the cold-star
 the original guest PowerShell process and its in-memory nonce in 17.371 seconds. The 16 MiB file
 retained SHA-256 `c99fec6347e6eb302466c991afd4e9f79b3ee14451a662e15cad05e881d00014`;
 `SecureBoot=00`, WSL2 before and after resume, zero bugcheck/WHEA and Hyper-V errors, and
-`process_continuation=PASS` all passed. COM1 contained exactly two trusted profile-1 epochs and no
-direct `VMLAUNCH`. The verifier then requested S5, the resume-side QEMU and host harness exited
-zero, an independent `qemu-img check` found no errors, and no QEMU or `swtpm` remained.
+`process_continuation=PASS` all passed. COM1 contained exactly two trusted profile-1 epochs. The
+verifier then requested S5, the resume-side QEMU and host harness exited zero, an independent
+`qemu-img check` found no errors, and no QEMU or `swtpm` remained.
 
 | S4 log | Request SHA-256 | Resume SHA-256 |
 | --- | --- | --- |

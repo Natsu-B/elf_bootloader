@@ -383,7 +383,7 @@ function Invoke-DailySoak {
         "thin-hv: windows daily soak rounds=$completedRounds target_minutes=$Minutes elapsed_ms=$elapsedMilliseconds",
         'thin-hv: windows daily soak reboot=1 disk_persist=1 bugcheck_whea=0 hyperv_errors=0',
         'thin-hv: windows hyperv PASS',
-        "thin-hv: windows daily soak PASS stamp=$Stamp run_id=$RunId",
+        "thin-hv: windows daily soak PASS stamp=$Stamp run_id=$RunId target_minutes=$Minutes target_rounds=$Rounds",
         "thin-hv: windows wsl2 PASS stamp=$Stamp",
         'thin-hv: windows wsl2 PASS'
     )

@@ -22,7 +22,7 @@ trusted_forbidden_markers=(
     'thin-hv: loading runtime monitor'
     'thin-hv: runtime monitor active'
     'thin-hv: variable overlay profile='
-    'thin-hv: L1 VMLAUNCH direct='
+    'thin-hv: L1 '
 )
 if [[ ! ${X86_VARIABLE_MARKER+x} && ${guest##*/} == x86_guest_uefi_test.efi ]]; then
     if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
