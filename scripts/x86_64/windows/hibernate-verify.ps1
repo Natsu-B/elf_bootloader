@@ -220,6 +220,8 @@ public static class ThinHvNativePower {
     )
     Set-Content -LiteralPath $statusFile -Value $lines -Encoding ASCII
     Write-Com2 -Lines $lines
+    & shutdown.exe /s /t 0 /f
+    Assert-Test ($LASTEXITCODE -eq 0) 'post-resume shutdown request failed'
     exit 0
 } catch {
     $errorText = $_ | Out-String

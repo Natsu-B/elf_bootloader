@@ -787,7 +787,10 @@ run_windows() {
         return
     fi
 
-    printf 'system_powerdown\n' >&9
+    # The S4 verifier requests S5 itself; an ACPI power button can re-hibernate.
+    if ((!is_s4)); then
+        printf 'system_powerdown\n' >&9
+    fi
     for _ in {1..120}; do
         kill -0 "$qemu_pid" 2>/dev/null || break
         sleep 1
@@ -848,7 +851,8 @@ check_wsl_soak() {
         'set -eu; uname -r' \
         'function Get-WinEventsOrEmpty' \
         'NoMatchingEventsFound' \
-        'Level = @(1, 2, 3)'; do
+        'Level = @(1, 2, 3)' \
+        '& shutdown.exe /s /t 0 /f'; do
         grep -Fq -- "$needle" "$hibernate" || die "S4 verifier check missing: $needle"
     done
     for needle in \
