@@ -12,7 +12,7 @@ boot markers. Windows disks, dumps, and raw serial logs are intentionally not co
   (adds curl to the Nix development shell)
 - Trusted startup optimization follow-up: 63c5d2b48fe5a377b02b701a1cf479644f9f95f3
 - 2026-09-01/02 trusted-path follow-up: d4d83832297f6df578f27df96496e5899fe91f5f
-  through b59e2eb (`same-ESP`, structural TCB split, location coverage, repeatable soaks,
+  through fcb15fa (`same-ESP`, structural TCB split, location coverage, repeatable soaks,
   fail-closed shutdown/S4 validation, and post-Claude false-pass hardening)
 
 The original sections below describe the historical validation baseline. Separately labelled
@@ -648,7 +648,7 @@ startup task cannot reconstruct its nonce.
 
 ## Claude Opus daily-use review
 
-Claude Code returned four authenticated `claude-opus-5` reviews that completed at maximum effort,
+Claude Code returned five authenticated `claude-opus-5` reviews that completed at maximum effort,
 plus one quota-aborted attempt. The third completed review used only read/search tools after the user
 explicitly authorized sending the private source and documentation. The account is a USD 20
 Claude Pro plan, not an API dollar budget:
@@ -660,8 +660,9 @@ Claude Pro plan, not an API dollar budget:
 | final daily-driver review | 37 | 4.528085 | `ec71aba9e582b2999089011354f4091283e7447fc6853cab2104f9ff5baaf3b3` | `a4fb71e5c61e0f5a55623be53acc8c7a588948e16576206d9728d002b935da50` |
 | quota-aborted fourth pass | 39 | 4.610336 | `089efcea280132b960c005e93dc515f562a7fec5a4b5c3a1f1627e98d2cea411` | `11ab80f36e166ab6f2d7884bc26a7af2ec59fcb1782f8bed7e8b0af417f3c6d3` |
 | post-quota trusted-path review | 58 | 8.145293 | `feeca51489e78c9504a3369fc785e90c5b2bc1256dd5f5b3a57cd7dea1891aaa` | `383c42c867e76fa091d918154a0aeeec09e6da50eb93d0937e45791062bc34bc` |
+| post-fix closure review | 19 | 2.3635465 | `12c0eb592c30033afdb4f6ef84956214ee57c0bfbc45fac9d371d736dbde9ec7` | `f755030ebeb0cec9bde51db5a00f19433fe60fbf378c35f564a7b74cf58ddca7` |
 
-The five CLI attempts total a USD 26.8537775 list-price estimate; that is not charged plan spend or
+The six CLI attempts total a USD 29.217324 list-price estimate; that is not charged plan spend or
 remaining capacity. The fourth pass produced 50,015 output tokens but hit the current-session limit
 before returning a review: `terminal_reason=api_error`, result `You've hit your session limit`, and
 JSON SHA-256 `715e73b01affdcf26a27d0b843ec375706017714c17bc34132598a2ff753d948`.
@@ -679,8 +680,14 @@ After the usage window reset, the post-quota review completed with `terminal_rea
 reported result length 21,080. Its JSON SHA-256 is
 `5d798187bc99f13b99efa3e5ffb6397afb374b4e61b8d45769ce0f0ba68fb88c`. The verdict was Linux GO
 and Windows CONDITIONAL-GO solely on medium-severity `SOAK-DUR-001`; it also reported low-severity
-`GATE-VMX-001`. Both findings were fixed in `505e900`. A post-fix Opus rereview is still pending,
-so this review is not itself the final post-fix verdict.
+`GATE-VMX-001`. Both findings were fixed in `505e900`.
+
+The post-fix closure review completed with `terminal_reason=completed`, `stop_reason=end_turn`, and
+`is_error=false` after 19 turns. It produced 33,850 output tokens and a 10,566-character result;
+the JSON SHA-256 is `57c42379744d3db6fe03c09623b1e4588a886bc6b7f7feba4f15ede6deecdaa6`.
+It rated both scoped candidates GO and confirmed `SOAK-DUR-001` and `GATE-VMX-001` closed. Its three
+remaining low-severity findings were an ungated actual Windows round count, a redundant
+post-`StartImage` unload, and a latent shell loop-variable clobber. Commit `fcb15fa` fixes all three.
 
 Accepted and implemented findings:
 
@@ -782,8 +789,8 @@ resident monitor:
 * `505e900` includes the exact requested minutes and rounds in the guest PASS and host expectation
   (`SOAK-DUR-001`), rejects the live `thin-hv: L1 ` prefix (`GATE-VMX-001`), and removes two evidence
   claims that serial output proved an absence of direct VMLAUNCH.
-* `d2ec722` returns the exact UEFI warning or error from `StartImage` and makes `UnloadImage`
-  best-effort only when that loaded child fails to start.
+* `d2ec722` returns the exact UEFI warning or error from `StartImage`; `fcb15fa` removes its
+  redundant unload because firmware has already unloaded an application that returned.
 * `335163a` boots Linux with `panic=0`, rejects panic/Oops/BUG output, and requires exact boot,
   phase, reboot, PASS, and poweroff counts.
 * `125e062` requires a whole-line Windows PASS, host-monotonic minimum duration, exactly one
@@ -793,6 +800,8 @@ resident monitor:
   readiness stamp.
 * `b59e2eb` also rejects a missing or malformed media run ID before stale phase state can be
   resumed or cleared; only a valid new UUID may replace an interrupted run.
+* `fcb15fa` parses the unique post-probe round summary and requires at least the requested count,
+  and gives the late FAIL scan a local loop variable.
 
 The final strict Linux rerun was:
 
@@ -849,6 +858,16 @@ four rounds in 60,435 ms and passed the non-zero host-monotonic duration gate.
 tests; both loader `xtest` variants passed 3 direct and 2 trusted tests; and
 `cargo xrun x86 --release` passed. These remain bounded synthetic QEMU/KVM checks, not multi-hour
 physical-machine or interactive daily-use evidence.
+
+After `fcb15fa`, a final 0-minute/two-round trusted Windows run rebuilt the loader, invalidated the
+old readiness stamp, completed setup with stamp
+`a1376ebd9d5ce0ff9c0b9c16239031c78acb699d06a68928b76491bfe33fd792`, and then passed the new
+host-side actual-round gate. Run ID `f0a573bf-f26c-4f6f-8cec-06eadb524bb2` reported exactly two
+rounds in 50,505 ms, one reboot, disk persistence, and zero bugcheck/WHEA or Hyper-V errors. The
+desktop, QEMU, and firmware-serial SHA-256 values are
+`2742a9301617a8624c22720edd7a814130625a36fd9b4f50eb5f13d455fff79a`,
+`3deb51b412edac8b68fc3449f84b8129dc8962897e9d85fa0808244d88c024ed`, and
+`f3dccb6d154720f2581a34539169f3cf61672f9a1cf78668014d396dd8b052f2`.
 
 ## Limits
 

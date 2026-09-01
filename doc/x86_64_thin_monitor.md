@@ -43,7 +43,7 @@ The final `1ad50dc` change removes the trusted resident runtime and its variable
 2026-09-01/02 follow-up adds same-ESP Windows selection (`d4d8383`), structurally isolates and trims
 the trusted chainloader (`976b2e9`, `3fbaa9f`), exercises all three guest locations (`d2ee9c3`),
 and adds repeatable Linux and Windows soak runners (`e40eb29`, `2d3cc3a`). Post-Claude hardening
-through `b59e2eb` closes false-pass paths in the trusted loader and both soak runners.
+through `fcb15fa` closes false-pass paths in the trusted loader and both soak runners.
 
 ## Architecture and late launch
 
@@ -744,6 +744,8 @@ is bound fail-closed to the current run ID, while the optional runtime URL is in
 from the reusable WSL-readiness stamp. Current-code 0-minute/two-round runs passed both without and
 with the external URL, and a separate one-minute/two-round run satisfied the non-zero host clock
 gate. An interrupted current run followed by a new UUID also cleared its stale phase and passed.
+Commit `fcb15fa` additionally requires the unique post-probe actual-round summary to meet the
+requested minimum; a fresh 0-minute/two-round run passed that gate with exactly two rounds.
 
 ### Windows S4 isolation and trusted direct chainload
 
@@ -792,9 +794,11 @@ After the Claude usage window reset, a completed maximum-effort Opus review rate
 path GO and Windows CONDITIONAL-GO solely because its requested soak duration was not yet gated; it
 also found a low-severity impossible negative VMX marker. Commit `505e900` fixed both by echoing and
 gating the exact target and rejecting the live `thin-hv: L1 ` prefix, without claiming that serial
-logs prove an absence of VMLAUNCH. `d2ec722` separately preserves the exact UEFI `StartImage`
-status and unloads only a child that failed to start. The post-fix Opus rereview is pending. These
-results remain bounded synthetic QEMU/KVM evidence, not multi-hour physical daily use.
+logs prove an absence of VMLAUNCH. A focused post-fix maximum-effort Opus review then rated both
+scoped paths GO and confirmed both findings closed. Its three remaining low-severity findings—the
+ungated actual round count, redundant post-`StartImage` unload, and latent shell-variable clobber—are
+all fixed in `fcb15fa`. These results remain bounded synthetic QEMU/KVM evidence, not multi-hour
+physical daily use.
 
 ### Direct-VMCS Hyper-V boundary
 
