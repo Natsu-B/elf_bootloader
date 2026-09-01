@@ -30,6 +30,11 @@ verify_runtime_var() {
         || fail 'EFI runtime probe hash changed'
 }
 
+verify_cpus_online() {
+    cpus_online=$(/bin/busybox cat /sys/devices/system/cpu/online)
+    [ "$cpus_online" = '0-1' ] || fail "expected CPUs 0-1 online, got $cpus_online"
+}
+
 trap cleanup EXIT
 
 state=$(/bin/busybox cat /sys/power/state)
@@ -58,6 +63,8 @@ echo "thin-hv: linux EFI runtime variable=$(/bin/busybox basename "$firmware_var
 # Exercise a disposable Driver#### variable without adding it to DriverOrder.
 runtime_var_name=DriverFFFF
 runtime_var="/sys/firmware/efi/efivars/$runtime_var_name-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+verify_cpus_online
+echo 'thin-hv: linux S3 CPUs online PASS before suspend cycles'
 /bin/kvm-probe
 echo deep >/sys/power/mem_sleep
 for cycle in 1 2 3; do
@@ -77,6 +84,8 @@ for cycle in 1 2 3; do
     /bin/busybox sync
     echo mem >/sys/power/state
     echo "thin-hv: linux S3 resume cycle=$cycle"
+    verify_cpus_online
+    echo "thin-hv: linux S3 CPUs online PASS cycle=$cycle"
     /bin/kvm-probe
     /bin/busybox umount /sys/firmware/efi/efivars
     mount -t efivarfs efivarfs /sys/firmware/efi/efivars

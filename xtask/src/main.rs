@@ -425,6 +425,20 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("x86_guest_uefi_test.efi");
     fs::create_dir_all(destination.parent().expect("destination has a parent"))
         .map_err(|e| format!("Failed to create x86 staging directory: {}", e))?;
+    for obsolete_name in ["x86-uefi-kvm-monitor.efi", "x86-uefi-loader-runtime.efi"] {
+        let obsolete = workspace.join("bin").join("x86_64").join(obsolete_name);
+        match fs::remove_file(&obsolete) {
+            Ok(()) => eprintln!("Removed obsolete x86 artifact {}", obsolete.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove obsolete x86 artifact {}: {}",
+                    obsolete.display(),
+                    error
+                ));
+            }
+        }
+    }
     fs::copy(&artifact, &destination).map_err(|e| {
         format!(
             "Failed to copy {} to {}: {}",
@@ -484,6 +498,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             status
         ));
     }
+    verify_no_decoded_vmx(&artifact)?;
     fs::copy(&artifact, &trusted_destination).map_err(|e| {
         format!(
             "Failed to copy {} to {}: {}",
@@ -493,6 +508,41 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         )
     })?;
     Ok(destination.to_string_lossy().into_owned())
+}
+
+const VMX_MNEMONICS: [&str; 17] = [
+    "vmcall", "vmclear", "vmlaunch", "vmresume", "vmptrld", "vmptrst", "vmread", "vmreadl",
+    "vmreadq", "vmwrite", "vmwritel", "vmwriteq", "vmxoff", "vmxon", "invept", "invvpid", "vmfunc",
+];
+
+fn decoded_vmx_mnemonic(disassembly: &str) -> Option<&str> {
+    disassembly
+        .split_ascii_whitespace()
+        .find(|word| VMX_MNEMONICS.contains(word))
+}
+
+fn verify_no_decoded_vmx(artifact: &Path) -> Result<(), String> {
+    let output = Command::new("objdump")
+        .arg("-d")
+        .arg(artifact)
+        .output()
+        .map_err(|error| format!("Failed to disassemble {}: {}", artifact.display(), error))?;
+    if !output.status.success() {
+        return Err(format!(
+            "objdump failed for {} with status: {}",
+            artifact.display(),
+            output.status
+        ));
+    }
+    let disassembly = String::from_utf8_lossy(&output.stdout);
+    if let Some(mnemonic) = decoded_vmx_mnemonic(&disassembly) {
+        return Err(format!(
+            "trusted outer-KVM artifact {} contains decoded VMX instruction '{}'",
+            artifact.display(),
+            mnemonic
+        ));
+    }
+    Ok(())
 }
 
 fn build_rpi5(args: &[String]) -> Result<String, String> {
@@ -2150,6 +2200,7 @@ mod tests {
     use super::AnsiQueryFilter;
     use super::UbootTargetDir;
     use super::apply_testname_filters;
+    use super::decoded_vmx_mnemonic;
     use super::parse_xtest_cli_args;
     #[cfg(unix)]
     use super::run_guest_test_with_timeout;
@@ -2352,6 +2403,19 @@ mod tests {
         assert!(uboot_unit_tests.is_empty());
         assert_eq!(uefi_tests.len(), 1);
         assert_eq!(uefi_tests[0].1, "uefi_packet_size");
+    }
+
+    #[test]
+    fn detects_only_decoded_vmx_mnemonics() {
+        assert_eq!(
+            decoded_vmx_mnemonic("1000:\t0f 01 c1\tvmcall"),
+            Some("vmcall")
+        );
+        assert_eq!(
+            decoded_vmx_mnemonic("1003:\t0f 78 c1\tvmreadq %rax,%rcx"),
+            Some("vmreadq")
+        );
+        assert_eq!(decoded_vmx_mnemonic("1000 <nested_vmx::vmxon>:"), None);
     }
 
     #[cfg(unix)]

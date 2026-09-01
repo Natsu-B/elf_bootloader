@@ -603,7 +603,9 @@ fn start_trusted_outer_kvm(
     } else {
         Ok(())
     };
-    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest_image) };
+    if !exit_data.is_null() {
+        free_pool(unsafe { (*system_table).boot_services }, exit_data.cast());
+    }
     result?;
     let _ = writeln!(serial, "thin-hv: trusted outer KVM guest PASS");
     Ok(())
@@ -920,7 +922,7 @@ fn loaded_image_protocol(
 }
 
 fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
-    // SAFETY: `buffer` was allocated by this firmware's device-path utilities.
+    // SAFETY: `buffer` was allocated by this firmware or one of its protocols.
     let _ = unsafe { ((*boot_services).free_pool)(buffer) };
 }
 

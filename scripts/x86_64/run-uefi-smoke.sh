@@ -15,12 +15,22 @@ marker='thin-hv: uefi entry'
 return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
 payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
 variable_marker=${X86_VARIABLE_MARKER-}
+trusted_chainload_marker=
+trusted_forbidden_markers=(
+    'thin-hv: loading runtime monitor'
+    'thin-hv: runtime monitor active'
+    'thin-hv: variable overlay profile='
+    'thin-hv: L1 VMLAUNCH direct='
+)
 if [[ ! ${X86_VARIABLE_MARKER+x} && ${guest##*/} == x86_guest_uefi_test.efi ]]; then
     if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
         variable_marker='thin-hv: uefi native variables PASS'
     else
         variable_marker='thin-hv: uefi variable overlay PASS'
     fi
+fi
+if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
+    trusted_chainload_marker='thin-hv: trusted outer KVM direct chainload profile='
 fi
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 memory=${X86_UEFI_MEMORY:-256M}
@@ -171,7 +181,8 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
     if grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
         grep -Fq -- "$payload_marker" "$serial_log" &&
-        { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; }; then
+        { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; } &&
+        { [[ -z "$trusted_chainload_marker" ]] || grep -Fq -- "$trusted_chainload_marker" "$serial_log"; }; then
         printf 'quit\n' >&9
         break
     fi
@@ -197,7 +208,21 @@ grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' mis
 if [[ -n "$variable_marker" ]]; then
     grep -Fq -- "$variable_marker" "$serial_log" || die "marker '$variable_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
+if [[ -n "$trusted_chainload_marker" ]]; then
+    grep -Fq -- "$trusted_chainload_marker" "$serial_log" || \
+        die "marker '$trusted_chainload_marker' missing from $serial_log (QEMU status $qemu_status)"
+    for forbidden_marker in "${trusted_forbidden_markers[@]}"; do
+        ! grep -Fq -- "$forbidden_marker" "$serial_log" || \
+            die "trusted loader emitted forbidden marker '$forbidden_marker'"
+    done
+fi
 ((wake_cycle == wake_cycles)) || die "observed $wake_cycle of $wake_cycles requested suspend cycles"
+if ((wake_cycles)); then
+    offline_count=$(grep -Fc -- 'smpboot: CPU 1 is now offline' "$serial_log" || true)
+    online_count=$(grep -Fc -- 'CPU1 is up' "$serial_log" || true)
+    ((offline_count == wake_cycles)) || die "observed $offline_count of $wake_cycles CPU1 offline events"
+    ((online_count == wake_cycles)) || die "observed $online_count of $wake_cycles CPU1 online events"
+fi
 
 ((qemu_status == 0)) || die "QEMU exited with status $qemu_status"
 
