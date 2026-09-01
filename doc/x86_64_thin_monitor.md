@@ -1,7 +1,7 @@
 # x86_64 thin monitor: architecture and validation status
 
 This document records only implementation and measurements that exist on
-`feat/x86-thin-monitor` through 2026-08-31. The daily-use candidate trusts the upper Linux/KVM,
+`feat/x86-thin-monitor` through 2026-09-02. The daily-use candidate trusts the upper Linux/KVM,
 QEMU, and OVMF stack, directly chainloads the selected guest, and keeps firmware state in a separate
 OVMF variable store for each VM. It installs no resident runtime image or Runtime Services hook.
 Linux deep S3 and Windows S4 results below come from actual resume runs. The one-vCPU direct-VMCS
@@ -39,7 +39,10 @@ Windows CPU-feature A/B selection).
 Later daily-use work includes `b54ff62` (trusted upper KVM), `63c5d2b` and `72df83d` (startup
 trimming), `e36cbe5` and `e2aec2a` (deep-S3 exercise), `93d556e` (`BootCurrent` pass-through),
 `e4886e8` (private-hook liveness after S3), and `0b695c8` (same-process Windows S4 verification).
-The final `1ad50dc` change removes the trusted resident runtime and its variable hooks.
+The final `1ad50dc` change removes the trusted resident runtime and its variable hooks. The
+2026-09-01/02 follow-up adds same-ESP Windows selection (`d4d8383`), structurally isolates and trims
+the trusted chainloader (`976b2e9`, `3fbaa9f`), exercises all three guest locations (`d2ee9c3`),
+and adds repeatable Linux and Windows soak runners (`e40eb29`, `2d3cc3a`).
 
 ## Architecture and late launch
 
@@ -64,7 +67,7 @@ preserves its pages across `ExitBootServices`:
 ```text
 OVMF / physical UEFI
   -> BOOTX64.EFI (ordinary EFI application)
-       1. LoadImage(GUESTX64.EFI), or locate installed bootmgfw.efi on another filesystem
+       1. LoadImage(parent GUESTX64.EFI, parent bootmgfw.efi, then other-filesystem bootmgfw.efi)
        2. LoadImage(MONITORX64.EFI), pass the guest handle in LoadOptions
        3. StartImage(runtime monitor)
   -> MONITORX64.EFI (EFI runtime driver, VMX root)
@@ -121,17 +124,20 @@ The trusted loader executes no project `VMXON` or `VMLAUNCH`, does not load `MON
 leaves no resident project runtime: KVM remains L0, Windows/Hyper-V is L1, and KVM handles Hyper-V's
 nested VMX. The direct-VMCS artifacts remain available for bare-metal-oriented research.
 
-| Release artifact | PE size | `.text` size | Decoded VMX instruction sites |
-| --- | ---: | ---: | ---: |
-| direct `x86-uefi-loader.efi` | 80,896 bytes | 69,113 bytes | 303 |
-| trusted `x86-uefi-kvm-loader.efi` | 10,752 bytes | 6,657 bytes | 0 |
+| Release artifact | PE size | `.text` | `.rdata` | VMX sites | CPUID sites |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| direct `x86-uefi-loader.efi` | 81,920 bytes | 69,977 bytes | 8,757 bytes | 303 | 22 |
+| trusted `x86-uefi-kvm-loader.efi` | 10,752 bytes | 6,945 bytes | 1,073 bytes | 0 | 0 |
 
 These figures come from `cargo xbuild x86 --release`, `stat`, and GNU `objdump` 2.44; the VMX
-count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites. The trusted PE is 86.7% smaller
-overall and 90.4% smaller in `.text`. Its SHA-256 is
-`68b77e9f4b412c4c5ee6fe0ad745c380c825b3ba4cd911ce407d1e9e12cf0fb8`; the direct loader's is
-`ec4dfd421df923edab35be109cc9c7424659459ddaaea57eb8c51c5323acd384`. These measurements show the active implementation
-reduction; they are not a formal TCB proof.
+count includes decoded `VMCALL`, `VMREAD`, and `VMWRITE` sites, while CPUID sites are decoded
+`cpuid` instructions. The trusted normal-dependency graph contains only `x86_uefi_loader` and
+`r-efi`; `x86_64_hal` and the direct VMX policy crates are not normal dependencies of that feature.
+The trusted PE is 86.9% smaller overall and 90.1% smaller in `.text`. Its SHA-256 is
+`530daf8cd72720d6140d518967536c3a295ff153e37b5d4e9b0605e00ff45b6f`; the direct loader's is
+`7590aaf3abbdc0f3d8b8bc99772e4138a5b45210a6a5a7cc076814c50ef1d162`. These measurements and
+dependency audit show the project-owned active-code reduction; they are not a formal proof of the
+complete CPU/Linux/KVM/QEMU/OVMF/selected-guest TCB.
 
 ## Direct EPT and its current ceiling
 
@@ -323,8 +329,10 @@ authenticate in the non-interactive session.
 
 ## QEMU/KVM + OVMF UEFI smoke
 
-`scripts/x86_64/run-uefi-smoke.sh` creates a fresh copy of the OVMF variable template, stages the
-loader as `EFI/BOOT/BOOTX64.EFI`, and stages the payload as `EFI/BOOT/GUESTX64.EFI`.
+`scripts/x86_64/run-uefi-smoke.sh` creates a fresh copy of the OVMF variable template and stages
+the loader as `EFI/BOOT/BOOTX64.EFI`. `X86_UEFI_GUEST_LOCATION=guest` (the default) stages the
+payload as `EFI/BOOT/GUESTX64.EFI`; `windows` stages it as
+`EFI/Microsoft/Boot/bootmgfw.efi`; and `both` stages both paths.
 For the direct loader, an unset `X86_MONITOR_IMAGE` stages the sibling `x86-uefi-monitor.efi` as
 `MONITORX64.EFI`; an explicitly empty value suppresses it. Trusted-path callers pass that empty
 value. S3 and S4 are disabled by default. After the required markers arrive the harness asks QEMU
@@ -373,6 +381,11 @@ env X86_MONITOR_IMAGE= \
 
 This trusted smoke requires `thin-hv: uefi native variables PASS` and the direct-chainload guest
 marker; it does not expect a runtime-monitor or variable-overlay marker.
+
+`cargo xrun x86 --release` runs the direct smoke and then live trusted QEMU/KVM smokes for
+`guest`, `windows`, and `both`. All three trusted locations passed. `guest` selected profile 2,
+`windows` exercised same-ESP `bootmgfw.efi` and selected profile 1, and `both` selected profile 2,
+proving that the explicitly staged `GUESTX64.EFI` retains precedence.
 
 Run through `nix develop`: its pinned OVMF 202505 exercised one Memory Attributes Table edit in
 the direct trace, while QEMU's separately bundled OVMF happened to publish the measured image
@@ -518,6 +531,37 @@ verified the same value, deleted it, and confirmed its absence. The final marker
 no `MONITORX64.EFI` or project variable hook. It proves QEMU guest S3, not physical-host or
 bare-metal suspend.
 
+### Repeatable trusted Linux soak
+
+The repository-owned daily-soak runner rebuilds the release loader and a dedicated Linux UKI,
+creates a fresh 192 MiB data disk, and boots the same two-vCPU L1 twice around a guest reboot:
+
+```sh
+nix develop --accept-flake-config --command scripts/x86_64/run-linux-soak-test.sh
+```
+
+Each boot runs two CPU/memory SHA-256 workers, restricted QEMU usernet, repeated real
+`KVM_CREATE_VM`/`KVM_CREATE_VCPU`/`KVM_RUN` probes, and a 128 MiB virtio-blk write/read check. The
+second boot must read the first boot's non-zero stamped payload before clean S5 poweroff. Defaults
+are 40 hash rounds per worker, 1,000 L2 probes per boot, and a 900-second outer timeout. Longer or
+denser runs use the existing knobs without changing the guest image logic:
+
+```sh
+nix develop --accept-flake-config --command env \
+  LINUX_SOAK_HASH_ROUNDS=12000 \
+  LINUX_SOAK_L2_PROBES=120000 \
+  LINUX_SOAK_TIMEOUT_SECONDS=4800 \
+  scripts/x86_64/run-linux-soak-test.sh
+```
+
+That load completed two trusted boots, 24,000 hashes and 120,000 real KVM probes per boot, and
+128 MiB disk persistence in one QEMU process. Both boots used profile 2 and restricted usernet; the
+second boot reached S5 with the same non-zero disk SHA-256. Commit `e965f0f` then made an explicit
+guest FAIL fatal and required the final `PASS` plus `poweroff requested` markers to end through a
+natural QEMU poweroff. Its negative marker test failed in 2.747 seconds, and a short two-boot
+positive regression exited zero through the new gate. Exact markers and log hashes are in the
+validation manifest.
+
 ## Windows, Hyper-V, and WSL2 status
 
 The Microsoft-hosted Windows 11 Enterprise Evaluation 25H2 English ISO was downloaded as ignored
@@ -531,16 +575,14 @@ after `cargo xbuild x86` with:
 scripts/x86_64/windows/windows-test.sh monitor
 ```
 
-Monitor mode stages only `BOOTX64.EFI` and `MONITORX64.EFI` on its loader ESP. If staged
-`GUESTX64.EFI` is absent, the loader enumerates non-parent `SimpleFileSystem` handles and uses a
-complete device path to load `\EFI\Microsoft\Boot\bootmgfw.efi` from the first matching installed
-ESP. This preserves the Windows boot manager's actual device handle and file path. The current
-first-match rule is sufficient for one Windows installation; profile partition-GUID selection is
-needed if multiple Windows ESPs matter.
-
-The supported Windows topology currently uses separate loader and Windows ESPs. If the loader and
-`bootmgfw.efi` share one ESP, the parent device is deliberately skipped during the Windows search,
-so that single-ESP topology is not supported or tested.
+Monitor mode stages only `BOOTX64.EFI` and `MONITORX64.EFI` on its loader ESP. Guest selection
+first tries `GUESTX64.EFI` on that parent device, then `bootmgfw.efi` on the same device, and only
+then enumerates non-parent `SimpleFileSystem` handles for the first installed Windows boot manager.
+Each load uses a complete device path, preserving the boot manager's actual device handle and file
+path. The `guest`/`windows`/`both` live smokes exercise both same-ESP paths and their precedence;
+the normal Windows harness continues to exercise the separate-ESP fallback. A full installed
+Windows boot with loader and `bootmgfw.efi` on one ESP has not yet been run. Multiple Windows
+installations still need profile-owned partition-GUID selection instead of enumeration order.
 
 The monitor test creates fresh `monitor-vars.fd` from the OVMF template so firmware boot entries
 cannot bypass the loader, then runs q35 with `pci-hole64-size=1G` and OVMF
@@ -664,6 +706,31 @@ claim of indefinite daily-use stability.
 The exact commands, timestamps, environment, artifact hashes, and coherent Windows log hashes are
 recorded in the [2026-08-30 validation manifest](evidence/x86_64/validation-2026-08-30.md).
 
+### Repeatable trusted Windows soak
+
+After preparing the persistent Hyper-V/WSL2 qcow2, OVMF variable store, and TPM state with the
+existing `hyperv` and `trusted-kvm-wsl` modes, run the current daily harness with:
+
+```sh
+nix develop --accept-flake-config --command \
+  scripts/x86_64/windows/windows-test.sh trusted-kvm-wsl-soak
+```
+
+The default target is at least 60 minutes and at least two workload rounds across a forced Windows
+reboot. `WINDOWS_DAILY_SOAK_MINUTES`, `WINDOWS_DAILY_SOAK_ROUNDS`, and
+`WINDOWS_DAILY_SOAK_TIMEOUT_SECONDS` set bounded alternatives. Each round checks Hyper-V/VMMS,
+256 MiB of randomized Windows memory, a flushed and reread 128 MiB file, 64 MiB TCP loopback, and
+WSL2 CPU and 64 MiB memory hashes. `WINDOWS_DAILY_SOAK_EXTERNAL_URL` optionally adds bounded HTTPS
+downloads in both Windows and WSL2 and requires their SHA-256 values to match. The URL must be
+public HTTPS without credentials, query, or fragment.
+
+The host generates a new UUID for every invocation, stages it with the media, and accepts only the
+matching final marker after reboot. The verifier also binds the persisted phase state to that UUID
+and the media stamp, verifies disk persistence and a later Windows boot time, scans bugcheck/WHEA
+and Hyper-V error events, requests a clean Windows shutdown, requires QEMU exit status zero, and
+runs `qemu-img check`. The exact 60-minute 2026-09-01/02 result is in the validation manifest; it
+is not a claim of multi-hour or interactive-use stability.
+
 ### Windows S4 isolation and trusted direct chainload
 
 The S4 verifier requires an in-memory nonce initialized before `SetSuspendState` to survive in the
@@ -692,6 +759,15 @@ upper KVM, using the VM's own OVMF variable store. The retained evidence directo
 `55fb6791b8ff592a00291ec24d865f8029a088bfe67b52d8980a8bf45801aa9a`; `SecureBoot=00`, WSL2,
 bugcheck/WHEA and Hyper-V error counts of zero, and `process_continuation=PASS` were all verified.
 `qemu-img check` found no errors afterward.
+
+The 2026-09-02 rerun hardened the same path further. Event-log access now fails closed, WHEA
+warnings are included, the WSL shell stops on the first failed command, and the host requires the
+resume-side guest to shut down naturally with QEMU status zero and a clean qcow2. Live testing
+exposed and fixed an invalid procfs size check and the fact that an ACPI power button can
+re-hibernate an S4-enabled guest. The final guest therefore requests S5 itself after reporting
+success. It restored the original PowerShell process in 17.371 seconds, retained the disk hash,
+read `SecureBoot=00`, passed WSL2 and event checks, shut down cleanly, and left no QEMU or `swtpm`.
+Exact commands, markers, and hashes are in the validation manifest.
 
 ### Direct-VMCS Hyper-V boundary
 
@@ -791,10 +867,11 @@ configurations.
   runtime allocation regenerates the table. Raw VM-exit logging works across the measured Linux
   relocation and the post-hook Windows boot, but this is not a general bare-metal firmware
   runtime-PE solution.
-* The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle and chainloads
-  Windows from the first other filesystem containing `bootmgfw.efi`. Multiple Windows installs
-  need profile-owned ESP selection instead of firmware enumeration order, and a same-ESP Windows
-  installation is not currently supported.
+* The bootstrap finds `\EFI\BOOT\MONITORX64.EFI` on its own firmware device handle. Guest
+  selection checks parent-device `GUESTX64.EFI`, parent-device `bootmgfw.efi`, then other
+  filesystems in order. The three path-placement smokes pass, but the same-ESP Windows case used
+  the test payload rather than a complete installed Windows image. Multiple Windows installs need
+  profile-owned ESP selection instead of firmware enumeration order.
 * The measured direct nested path handles VMXON, VMCLEAR, VMPTRLD, register-form VMREAD/VMWRITE,
   INVEPT, INVVPID, VMLAUNCH, and VMRESUME. Memory-form VMREAD/VMWRITE, VMXOFF, optional VMX
   controls, and VMX in L2 are not supported.
@@ -833,9 +910,11 @@ configurations.
   descriptor-table lifetime, plus both paths' firmware and device-path assumptions, remain
   unverified there.
 * The measured S3 and S4 cycles are QEMU guest power states. Physical-host suspend, bare-metal
-  resume, interactive GUI use, audio, USB, external networking, modern standby, multi-hour use,
-  and long repeated suspend/hibernate operation remain untested. VBS/HVCI and Windows Sandbox are
-  also untested. The Windows harness explicitly disables S3; only Windows S4 was validated.
+  resume, interactive GUI use, audio, USB, general or sustained external networking, modern
+  standby, multi-hour use, and long repeated suspend/hibernate operation remain untested. One
+  bounded Windows soak compared the same HTTPS payload from Windows and WSL2; Linux exercised only
+  restricted QEMU usernet. VBS/HVCI and Windows Sandbox are also untested. The Windows harness
+  explicitly disables S3; only Windows S4 was validated.
 
 All generated EFI files, ESP directories, OVMF variable stores, serial logs, UKIs, ISO or qcow2
 files, and other large artifacts belong under `bin/` (or another ignored build directory).

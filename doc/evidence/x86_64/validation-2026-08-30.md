@@ -11,9 +11,12 @@ boot markers. Windows disks, dumps, and raw serial logs are intentionally not co
 - Later non-runtime build-input commit: a86492c12221b413b481030ad7b09b060313a273
   (adds curl to the Nix development shell)
 - Trusted startup optimization follow-up: 63c5d2b48fe5a377b02b701a1cf479644f9f95f3
+- 2026-09-01/02 trusted-path follow-up: d4d83832297f6df578f27df96496e5899fe91f5f
+  through e149051 (`same-ESP`, structural TCB split, location coverage, repeatable soaks, and
+  fail-closed shutdown/S4 validation)
 
 The original sections below describe the historical validation baseline. Separately labelled
-follow-ups record later code, artifacts, and validation through 2026-08-31.
+follow-ups record later code, artifacts, and validation through 2026-09-02.
 
 ## Trust boundary
 
@@ -401,20 +404,26 @@ guest, prints `resident_runtime=0`, does not stage `MONITORX64.EFI`, and uses th
 variable store. The previous trusted runtime-driver artifact in the historical table above is not a
 current output or execution dependency.
 
-| Current release artifact | PE bytes | `.text` bytes | GNU objdump 2.44 VMX sites | SHA-256 |
-| --- | ---: | ---: | ---: | --- |
-| trusted `x86-uefi-kvm-loader.efi` | 10,752 | 6,673 | 0 | `2b6d3f49320bf7508350be2075bc3e41ee53b848f3e05209122a6d7ae96a13f7` |
-| direct `x86-uefi-loader.efi` | 80,896 | 69,113 | 303 | `eb56b2dcb31a85e2ee539acef022da19e67fc9376d5a260ba860fdf02bd76e0b` |
+| Current release artifact | PE bytes | `.text` | `.rdata` | VMX sites | CPUID sites | SHA-256 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| trusted `x86-uefi-kvm-loader.efi` | 10,752 | 6,945 | 1,073 | 0 | 0 | `530daf8cd72720d6140d518967536c3a295ff153e37b5d4e9b0605e00ff45b6f` |
+| direct `x86-uefi-loader.efi` | 81,920 | 69,977 | 8,757 | 303 | 22 | `7590aaf3abbdc0f3d8b8bc99772e4138a5b45210a6a5a7cc076814c50ef1d162` |
 
-The trusted binary is 86.7% smaller overall and 90.3% smaller in `.text`. A string audit found the
-direct-chainload marker in the trusted binary and no runtime-monitor, variable-overlay,
-install/restore-hook, or VMX markers. The direct binary retained all of those markers. This is an
-active-code measurement, not a formal proof of the complete host KVM/QEMU/OVMF TCB.
+VMX and CPUID columns count instructions decoded by GNU objdump 2.44. The trusted binary is 86.9%
+smaller overall and 90.1% smaller in `.text`. Its normal-dependency graph contains only
+`x86_uefi_loader` and `r-efi`; `x86_64_hal` and the direct VMX policy crates are absent. A string
+audit found the direct-chainload marker in the trusted binary and no runtime-monitor,
+variable-overlay, install/restore-hook, or VMX markers. The direct binary retained all of those
+markers. This is an active-code and dependency measurement, not a formal proof of the complete CPU,
+host KVM/QEMU/OVMF, firmware, or guest TCB.
 
 Commit `60003ec` makes this an xbuild invariant: `xtask` disassembles the trusted PE before copying
 it to `bin/` and fails the build if GNU objdump decodes any VMX mnemonic, including its
 `vmreadq`/`vmwriteq` spellings. The same build removes the two known obsolete output names instead
-of leaving stale EFI files beside current artifacts.
+of leaving stale EFI files beside current artifacts. Commit `976b2e9` then placed the trusted
+chainloader in its own feature-gated module, and `3fbaa9f` removed `x86_64_hal` from its normal
+dependency graph by keeping the two serial port instructions local. The final-PE disassembly gate
+remains the runnable regression check; the source split and graph reduce what can reach it.
 
 ### Linux trusted direct-chainload S3
 
@@ -476,6 +485,166 @@ SHA-256 was `4a8d4e761367309b78d6a1c7bf1369053026430f6ac683f9d29e894a47422366`,
 `SecureBoot=00`, WSL2, zero bugcheck/WHEA and Hyper-V errors, and
 `process_continuation=PASS` all passed. The harness and a separate `qemu-img check` both exited
 zero.
+
+## 2026-09-01/02 guest-location and repeatable-soak follow-up
+
+### Same-ESP guest selection
+
+Commit `d4d8383` changed the candidate order to parent-device `GUESTX64.EFI`, parent-device
+`bootmgfw.efi`, then `bootmgfw.efi` on other filesystems. The first non-missing load error is still
+fatal. This adds the same-ESP Windows path without weakening error handling or adding a parser.
+
+Commit `d2ee9c3` made `cargo xrun x86 --release` run three live trusted QEMU/KVM smokes after the
+direct smoke. All passed:
+
+| `X86_UEFI_GUEST_LOCATION` | Staged paths | Required profile | Result |
+| --- | --- | ---: | --- |
+| `guest` | `EFI/BOOT/GUESTX64.EFI` | 2 | PASS |
+| `windows` | `EFI/Microsoft/Boot/bootmgfw.efi` on the loader ESP | 1 | PASS |
+| `both` | both parent-device paths | 2 | PASS; `GUESTX64.EFI` precedence |
+
+Each trusted run required `resident_runtime=0`, native-variable and guest PASS markers, and rejected
+runtime-monitor, variable-overlay, and direct `VMLAUNCH` markers. The `windows` fixture uses the
+small UEFI payload at the installed-Windows path; a complete installed Windows same-ESP boot is not
+claimed. The normal Windows harness continues to cover the other-filesystem fallback.
+
+### Repeatable Linux runner
+
+Commit `e40eb29` added an executable repository-owned runner:
+
+```sh
+nix develop --accept-flake-config --command scripts/x86_64/run-linux-soak-test.sh
+```
+
+It builds a dedicated UKI, creates a fresh 192 MiB data disk, and boots the trusted two-vCPU Linux
+L1 twice around a guest reboot. Every boot runs two CPU/memory SHA-256 workers, restricted usernet,
+and repeated real `/dev/kvm` VM/vCPU creation and `KVM_RUN`; the data disk must retain a stamped
+128 MiB payload into phase 2 before clean S5 poweroff. The non-zero stamp prevents a dropped write
+from matching a fresh sparse all-zero disk. Defaults are 40 hash rounds per worker, 1,000 L2 probes
+per boot, and a 900-second timeout. Longer runs set `LINUX_SOAK_HASH_ROUNDS`,
+`LINUX_SOAK_L2_PROBES`, and `LINUX_SOAK_TIMEOUT_SECONDS`.
+
+The 2026-09-01/02 long run used the following exact load:
+
+```sh
+nix develop --accept-flake-config --command env \
+  LINUX_SOAK_HASH_ROUNDS=12000 \
+  LINUX_SOAK_L2_PROBES=120000 \
+  LINUX_SOAK_TIMEOUT_SECONDS=4800 \
+  scripts/x86_64/run-linux-soak-test.sh
+```
+
+One QEMU process covered two trusted profile-2 boot epochs. Each boot completed two workers and
+24,000 hashes, 120,000 real KVM VM/vCPU/run probes, restricted-usernet ping, and the expected phase
+marker. Phase 1 wrote the stamped 128 MiB disk payload and requested reboot; phase 2 reread SHA-256
+`de23f42cf7b86dd9833320e382de3855fb09dfa2be4c1430ee24caab9393f875`. The two L2 loops ended at
+guest uptimes 2,057.06 and 1,912.29 seconds. The final marker, S5 request, kernel `Power down`, and
+host harness all exited successfully; no soak FAIL, kernel panic, Oops, or BUG marker appeared.
+The preserved serial and QEMU logs have SHA-256
+`32d194ad126793010b7688101d72f2906918bc7ca6065194f13814b137b5177a` and
+`ca11776ce2b9fe273db81177eb2451d1d2d6efec1b47f6082568d0dbd99d3a27`.
+
+A fail-closed review then found that the generic smoke runner could send HMP `quit` after the final
+PASS instead of requiring QEMU's natural poweroff, and did not reject an explicit guest FAIL before
+that PASS. Commit `e965f0f` makes both checks opt-in and enables them for this soak. A negative run
+that treated the early `nested KVM ready` marker as failure exited nonzero in 2.747 seconds. A
+post-fix two-boot run with one hash round and one L2 probe per boot reached S5 and exited zero
+naturally; its serial and QEMU log SHA-256 values are
+`3b28f2669304db60372e68d13196130af0ba1bd266eebc096a3f9ad127d9eb9e` and
+`e4125b7c8ea5517dc1d173cd52072ca4770487acbb99231ed0f651795269daf5`.
+
+### Repeatable Windows runner and 60-minute result
+
+Commit `2d3cc3a` added `trusted-kvm-wsl-soak` and its static self-check:
+
+```sh
+nix develop --accept-flake-config --command \
+  scripts/x86_64/windows/windows-test.sh check-wsl-soak
+
+nix develop --accept-flake-config --command env \
+  WINDOWS_TEST_DIR=/tmp/thin-hv-windows-final-soak.DN5iGm \
+  WINDOWS_CPU=host,+vmx,-hypervisor,kvm=off \
+  WINDOWS_MEMORY=4G \
+  WINDOWS_VNC=127.0.0.1:9 \
+  WINDOWS_DAILY_SOAK_MINUTES=60 \
+  WINDOWS_DAILY_SOAK_ROUNDS=2 \
+  WINDOWS_DAILY_SOAK_TIMEOUT_SECONDS=7200 \
+  WINDOWS_DAILY_SOAK_EXTERNAL_URL=https://raw.githubusercontent.com/torvalds/linux/v7.1/README \
+  scripts/x86_64/windows/windows-test.sh trusted-kvm-wsl-soak
+```
+
+`WINDOWS_TEST_DIR` was an ignored private qcow2 child with its own complete OVMF variable store and
+TPM state, prepared from the immutable Hyper-V/WSL2 baseline. The path records this run exactly;
+another machine must point it at an equivalently prepared private directory.
+
+The normal soak defaults are at least 60 minutes and at least two rounds. Each round checks the
+Hyper-V feature, `HypervisorPresent`, VMMS, randomized 256 MiB Windows memory, a flushed and reread
+128 MiB disk file, 64 MiB TCP loopback, WSL2 CPU data, and a 64 MiB WSL2 memory hash. An optional
+`WINDOWS_DAILY_SOAK_EXTERNAL_URL` adds a public HTTPS object fetched independently by Windows and
+WSL2; the verifier rejects credentials, query, and fragment and requires equal SHA-256 values.
+
+The completed run above used a 60-minute target, at least two rounds, and the versioned Linux v7.1
+README as its optional external probe. Phase 1 took 3,887 ms; after the forced Windows reboot,
+phase 2 took 8,351 ms. Work continued until both gates held, completing 459 rounds in 3,606,549 ms.
+Both external fetches matched SHA-256
+`2844b0b2cafe22741724c4fdda79b1259de48743f12ad40ce408adb1ef00ceda`. The final state reported
+`reboot=1`, `disk_persist=1`, `bugcheck_whea=0`, and `hyperv_errors=0`.
+
+The host-generated run ID `7f422ef6-50b8-422e-90ac-a185f8ad3831` and media stamp
+`fb89e4d428c24602b1fb89e56686e38ca63fbd04ed681cfbf1a63275a3785168` were present in the staged
+media, persisted phase state, and exact final PASS marker, so a stale marker from another invocation
+could not satisfy the run. COM1 recorded exactly two trusted profile-1 boot epochs and no direct
+`VMLAUNCH`. Windows shut down within the 120-second gate, QEMU and the host harness returned zero,
+and independent `qemu-img check` runs found no errors in either the work image or its immutable
+baseline. The baseline image, OVMF variables, and TPM state retained their pre-run SHA-256 values.
+No Windows QEMU or `swtpm` process remained afterward.
+
+The preserved desktop, firmware-serial, and QEMU logs have SHA-256
+`2314ddad3c89115c70923f33de7f62c0a6ff5c8598c88807b6fa8e9016e1c023`,
+`edfac1b1788c1eefe172ed1c9aa2abaf523cbf00cf2763b5ae854ea4c7d686c6`, and
+`5ee4dc4923860d8e76e05e8e88f2a046e4df68a6539accf1f50168bb7912b6fb`. This is a repeatable
+one-hour synthetic two-boot soak, not multi-hour, interactive GUI, audio, USB/GPU, passthrough, or
+general network stability evidence.
+
+### Hardened Windows S4 rerun
+
+Commit `f186a8a` made S4 event queries fail closed, included WHEA warnings, made the WSL probe stop
+on its first failing command, delayed the Run-dialog launch, and required clean post-resume
+shutdown, QEMU status zero, and `qemu-img check`. The first live rerun exposed that procfs reports
+`/proc/cpuinfo` size zero even when populated; `b6b16ea` replaced the invalid size test with a
+content grep followed by SHA-256. The next rerun proved the new shutdown gate: an ACPI power button
+can re-hibernate an S4-enabled guest instead of shutting it down. Commit `e149051` therefore has the
+verified guest request S5 after emitting its final markers while the host waits for natural exit.
+
+After revalidating WSL readiness for the staged media, the final command was:
+
+```sh
+nix develop --accept-flake-config --command env \
+  WINDOWS_TEST_DIR=/tmp/thin-hv-windows-final-soak.DN5iGm \
+  WINDOWS_CPU=host,+vmx,-hypervisor,kvm=off \
+  WINDOWS_MEMORY=4G \
+  WINDOWS_VNC=127.0.0.1:9 \
+  WINDOWS_HYPERV_TIMEOUT_SECONDS=1200 \
+  scripts/x86_64/windows/windows-test.sh trusted-kvm-s4
+```
+
+The request-side QEMU powered off through S4 with status zero, and the cold-started QEMU restored
+the original guest PowerShell process and its in-memory nonce in 17.371 seconds. The 16 MiB file
+retained SHA-256 `c99fec6347e6eb302466c991afd4e9f79b3ee14451a662e15cad05e881d00014`;
+`SecureBoot=00`, WSL2 before and after resume, zero bugcheck/WHEA and Hyper-V errors, and
+`process_continuation=PASS` all passed. COM1 contained exactly two trusted profile-1 epochs and no
+direct `VMLAUNCH`. The verifier then requested S5, the resume-side QEMU and host harness exited
+zero, an independent `qemu-img check` found no errors, and no QEMU or `swtpm` remained.
+
+| S4 log | Request SHA-256 | Resume SHA-256 |
+| --- | --- | --- |
+| desktop serial | `f8144a5a3cacc243f68c5096702e019eb31dd7539977f2db40ecc603804e33d7` | `92a1306a91136dce9befeb5373f8dc0127cadd9578e8a262b0355280354006cf` |
+| firmware serial | `27f839a8aba41e97ba8623beb9724e2f476ce6d9545e1e53ca5a725585b30864` | `27f839a8aba41e97ba8623beb9724e2f476ce6d9545e1e53ca5a725585b30864` |
+| QEMU | `d20010d8d296255afd3154674288ed7fd833ffaa873b8f00656fb7535cc64e8a` | `e4125b7c8ea5517dc1d173cd52072ca4770487acbb99231ed0f651795269daf5` |
+
+The request and resume sides are separate QEMU processes/invocations because S4 powers the VM off.
+“Same process” here means the original in-guest PowerShell process resumed; a cold guest boot or
+startup task cannot reconstruct its nonce.
 
 ## Claude Opus daily-use review
 
@@ -554,12 +723,12 @@ Accepted and implemented in `60003ec`:
   total, and `xtask` passed 17 tests.
 * `DOC-001/002` and the valid part of `ARTIFACT-001`: monitor default staging and current test counts
   are corrected, and builds prune the two known obsolete EFI output names.
+* `BOOT-002` was initially retained as a boundary, then superseded by `d4d8383` and `d2ee9c3`:
+  parent-device Windows selection and live `guest`/`windows`/`both` path smokes now pass. Only a
+  complete installed-Windows same-ESP boot remains unmeasured.
 
 Partially valid items retained as explicit boundaries:
 
-* `BOOT-002`: the tested Windows configuration intentionally uses separate loader and Windows ESPs;
-  same-ESP Windows chainload is now documented as unsupported instead of adding an untested search
-  fallback.
 * `WIN-S3-001`: Windows S3 is explicitly disabled and remains untested; the measured Windows power
   state is S4 only.
 * `SECBOOT-002`: artifacts are unsigned, Secure Boot and BitLocker remain untested, and recovery
@@ -578,7 +747,8 @@ Final-review claims judged invalid or not applicable:
 * The High-severity/linker-only part of `TRUST-001` was rejected. Normal optimized trusted IR has
   already eliminated the direct functions before linking; only some direct statics existed before
   LLVM optimization. The final-PE build gate addresses the real regression risk without a
-  large mechanical source split.
+  large mechanical source split. The later `976b2e9` follow-up nevertheless made the separation
+  structural with a small module split and retained the final-PE gate.
 * `HARNESS-001` overstated the normal fixture gap: it already required the trusted return and native
   variable markers. Only custom long-running guests lacked the loader-side positive/negative gate.
 * Claude's proposed x86 `uefi` plan row is incompatible with the current `xtask` grammar, whose
@@ -594,9 +764,11 @@ Final-review claims judged invalid or not applicable:
 
 Six Windows pairs and six Linux pairs still leave broad end-to-end bounds, and the Linux runner's
 50 ms polling cannot resolve single-digit-millisecond changes. Windows media, qcow2 images, TPM
-state, raw logs, and dumps are not distributable repository fixtures. The 33.576-second Linux and
-265.595-second Windows soaks demonstrate bounded stability, not that either OS cannot fail during
-indefinite daily use. Physical x86 hardware, VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a
-complete non-interactive cargo xtest remain unproven. Physical-host suspend, bare-metal resume,
-interactive GUI use, audio, USB, external networking, modern standby, and multi-hour or long
-repeated S3/S4 use are also unproven.
+state, raw logs, and dumps are not distributable repository fixtures. The historical 33.576-second
+Linux and 265.595-second Windows soaks and the repeatable two-boot runners demonstrate bounded
+stability, not that either OS cannot fail during indefinite daily use. Physical x86 hardware,
+VBS/HVCI, Windows Sandbox, SMP direct-VMCS, and a complete non-interactive cargo xtest remain
+unproven. Physical-host suspend, bare-metal resume, interactive GUI use, audio, USB, general or
+sustained external networking, modern standby, and multi-hour or long repeated S3/S4 use are also
+unproven. The 2026-09-01/02 Windows run proves one bounded HTTPS fetch from both Windows and WSL2;
+Linux exercised only restricted QEMU usernet.
