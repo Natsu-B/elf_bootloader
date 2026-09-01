@@ -60,7 +60,7 @@ function Invoke-WslProbe {
 
     $probe = @(
         & wsl.exe --distribution ThinHvTest --user root --cd / --exec `
-            /bin/sh -c 'set -eu; uname -r; test -s /proc/cpuinfo; /bin/busybox sha256sum /proc/cpuinfo; echo thin-hv-hibernate-wsl-ok' `
+            /bin/sh -c 'set -eu; uname -r; /bin/busybox grep -q "^processor" /proc/cpuinfo; /bin/busybox sha256sum /proc/cpuinfo; echo thin-hv-hibernate-wsl-ok' `
             2>&1
     )
     $status = $LASTEXITCODE
