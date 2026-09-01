@@ -30,14 +30,16 @@ truncate -s 192M "$disk"
 
 env \
     X86_MONITOR_IMAGE= \
-    X86_RETURN_MARKER= \
+    X86_RETURN_MARKER='thin-hv-soak: PASS phase=2' \
     X86_VARIABLE_MARKER= \
-    X86_GUEST_MARKER='thin-hv-soak: PASS phase=2' \
+    X86_GUEST_MARKER='thin-hv-soak: poweroff requested' \
+    X86_GUEST_FAILURE_MARKER='thin-hv-soak: FAIL' \
     X86_UEFI_TIMEOUT_SECONDS="$timeout_seconds" \
     X86_UEFI_MEMORY=2G \
     X86_UEFI_SMP=2 \
     X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
     X86_UEFI_ALLOW_REBOOT=1 \
+    X86_UEFI_REQUIRE_POWEROFF=1 \
     X86_UEFI_DATA_DISK="$disk" \
     X86_UEFI_USERNET=1 \
     scripts/x86_64/run-uefi-smoke.sh \

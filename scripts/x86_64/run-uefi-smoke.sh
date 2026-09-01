@@ -14,6 +14,7 @@ vars="$stage/OVMF_VARS.fd"
 marker='thin-hv: uefi entry'
 return_marker=${X86_RETURN_MARKER-'thin-hv: vmx guest PASS'}
 payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
+failure_marker=${X86_GUEST_FAILURE_MARKER-}
 variable_marker=${X86_VARIABLE_MARKER-}
 guest_location=${X86_UEFI_GUEST_LOCATION:-guest}
 trusted_chainload_marker=
@@ -37,6 +38,7 @@ cpu=${X86_UEFI_CPU:-host,+vmx,-hypervisor}
 acpi_s3=${X86_UEFI_ACPI_S3:-0}
 wake_cycles=${X86_UEFI_WAKE_CYCLES:-0}
 allow_reboot=${X86_UEFI_ALLOW_REBOOT:-0}
+require_poweroff=${X86_UEFI_REQUIRE_POWEROFF:-0}
 data_disk=${X86_UEFI_DATA_DISK:-}
 usernet=${X86_UEFI_USERNET:-0}
 
@@ -75,6 +77,7 @@ first_file() {
 [[ "$acpi_s3" =~ ^[01]$ ]] || die 'X86_UEFI_ACPI_S3 must be 0 or 1'
 [[ "$wake_cycles" =~ ^[0-9]+$ ]] || die 'X86_UEFI_WAKE_CYCLES must be a non-negative integer'
 [[ "$allow_reboot" =~ ^[01]$ ]] || die 'X86_UEFI_ALLOW_REBOOT must be 0 or 1'
+[[ "$require_poweroff" =~ ^[01]$ ]] || die 'X86_UEFI_REQUIRE_POWEROFF must be 0 or 1'
 [[ "$usernet" =~ ^[01]$ ]] || die 'X86_UEFI_USERNET must be 0 or 1'
 [[ -z "$data_disk" || -f "$data_disk" ]] || die "data disk not found: $data_disk"
 ((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
@@ -139,6 +142,8 @@ if ((acpi_s3)); then
 fi
 reboot_args=(-no-reboot)
 ((allow_reboot)) && reboot_args=()
+shutdown_args=(-no-shutdown)
+((require_poweroff)) && shutdown_args=()
 extra_device_args=()
 if [[ -n "$data_disk" ]]; then
     extra_device_args+=(
@@ -184,7 +189,7 @@ timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     -monitor stdio \
     -serial "file:$serial_log" \
     "${reboot_args[@]}" \
-    -no-shutdown \
+    "${shutdown_args[@]}" \
     -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
     -drive "if=pflash,format=raw,file=$vars" \
     -drive "if=none,id=esp,format=raw,file=fat:rw:$esp" \
@@ -214,13 +219,19 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
             fi
         fi
     fi
+    if [[ -n "$failure_marker" ]] && grep -Fq -- "$failure_marker" "$serial_log"; then
+        printf 'quit\n' >&9
+        break
+    fi
     if grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
         grep -Fq -- "$payload_marker" "$serial_log" &&
         { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; } &&
         { [[ -z "$trusted_chainload_marker" ]] || grep -Fq -- "$trusted_chainload_marker" "$serial_log"; }; then
-        printf 'quit\n' >&9
-        break
+        if ((!require_poweroff)); then
+            printf 'quit\n' >&9
+            break
+        fi
     fi
     kill -0 "$qemu_pid" 2>/dev/null || break
     sleep 0.1
@@ -235,6 +246,9 @@ qemu_pid=
 cat -- "$serial_log"
 if ((qemu_status != 0)); then
     cat -- "$qemu_log" >&2
+fi
+if [[ -n "$failure_marker" ]] && grep -Fq -- "$failure_marker" "$serial_log"; then
+    die "guest failure marker '$failure_marker' observed in $serial_log"
 fi
 grep -Fq -- "$marker" "$serial_log" || die "marker '$marker' missing from $serial_log (QEMU status $qemu_status)"
 if [[ -n "$return_marker" ]]; then
