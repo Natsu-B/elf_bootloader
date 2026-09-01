@@ -45,6 +45,13 @@ need_command() {
     command -v -- "$1" >/dev/null || die "$1 not found; run through nix develop"
 }
 
+host_uptime_seconds() {
+    local uptime
+
+    read -r uptime _ </proc/uptime
+    printf '%s\n' "${uptime%%.*}"
+}
+
 first_file() {
     local candidate
     for candidate in "$@"; do
@@ -291,6 +298,7 @@ run_windows() {
     local expected_marker marker_log media_file wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
     local soak_probe_sent=0 soak_probe_elapsed=-1 soak_phase1_seen=0
+    local soak_started_uptime=-1 soak_elapsed_seconds trusted_boot_count
     local marker_seen=0 wsl_failed=0 wsl_monitor_offset=-1 wsl_probe_offset=0
     local s4_probe_elapsed=-1
     local wsl_ready_matches=0
@@ -316,6 +324,11 @@ run_windows() {
         disable_s4=0
         [[ "$s4_phase" == request || "$s4_phase" == resume ]] || \
             die "$mode phase must be request or resume"
+    fi
+
+    if ((is_trusted)) && [[ "$s4_phase" != resume ]]; then
+        need_command cargo
+        (cd -- "$repo_root" && cargo xbuild x86 --release)
     fi
 
     need_command qemu-system-x86_64
@@ -420,7 +433,6 @@ run_windows() {
             "$hyperv_media/wsl-verify.ps1" \
             "$hyperv_media/wsl-soak.ps1" \
             "$hyperv_media/hyperv-verify.ps1" \
-            "$hyperv_media/daily-soak-external-url.txt" \
             "$hyperv_media/thin-hv-wsl-rootfs.tar" \
             "$wsl_msi" | cut -d' ' -f1 | sha256sum | cut -d' ' -f1)
         printf '%s\n' "$wsl_media_stamp" >"$hyperv_media/wsl-media-stamp.txt"
@@ -626,16 +638,16 @@ run_windows() {
         if ((is_daily_soak && wsl_ready_matches == 1)); then
             if ((soak_probe_sent)) && \
                 tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
-                    grep -F -- "$expected_marker" >/dev/null; then
+                    grep -Fx -- "$expected_marker" >/dev/null; then
                 marker_seen=1
             fi
         elif ((is_wsl && wsl_ready_matches == 0)); then
             if ((setup_probe_sent)) && \
                 tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
-                    grep -F -- "$expected_marker" >/dev/null; then
+                    grep -Fx -- "$expected_marker" >/dev/null; then
                 marker_seen=1
             fi
-        elif grep -Fq -- "$expected_marker" "$marker_log"; then
+        elif grep -Fxq -- "$expected_marker" "$marker_log"; then
             marker_seen=1
         fi
         if ((is_s4 && marker_seen && !setup_probe_sent)) && \
@@ -650,8 +662,10 @@ run_windows() {
         if ((is_daily_soak && marker_seen && wsl_ready_matches == 0)); then
             printf 'Windows x86 test: observed %s; starting daily soak\n' "$expected_marker"
             wsl_ready_matches=1
+            wsl_monitor_offset=$(stat -c %s -- "$serial_log")
             wsl_probe_offset=$(stat -c %s -- "$marker_log")
             probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
+            soak_started_uptime=$(host_uptime_seconds)
             soak_probe_sent=1
             soak_probe_elapsed=$elapsed
             expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id target_minutes=$daily_soak_minutes target_rounds=$daily_soak_rounds"
@@ -684,6 +698,7 @@ run_windows() {
             wsl_monitor_offset=$(stat -c %s -- "$serial_log")
             wsl_probe_offset=$(stat -c %s -- "$marker_log")
             probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
+            soak_started_uptime=$(host_uptime_seconds)
             soak_probe_sent=1
             soak_probe_elapsed=$elapsed
         fi
@@ -732,6 +747,7 @@ run_windows() {
             wsl_monitor_offset=$(stat -c %s -- "$serial_log")
             wsl_probe_offset=$(stat -c %s -- "$marker_log")
             probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
+            soak_started_uptime=$(host_uptime_seconds)
             soak_probe_sent=1
             soak_probe_elapsed=$elapsed
         fi
@@ -741,6 +757,15 @@ run_windows() {
     done
     ((marker_seen)) || \
         die "marker timeout; logs: $serial_log $marker_log $qemu_log"
+    if ((is_daily_soak)); then
+        soak_elapsed_seconds=$(($(host_uptime_seconds) - soak_started_uptime))
+        ((soak_started_uptime >= 0 && soak_elapsed_seconds >= daily_soak_minutes * 60)) || \
+            die "daily-soak PASS arrived after ${soak_elapsed_seconds}s; requested ${daily_soak_minutes}m"
+        trusted_boot_count=$(tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
+            grep -Fc -- "$trusted_marker" || true)
+        ((trusted_boot_count == 1)) || \
+            die "daily-soak observed $trusted_boot_count trusted reboots; expected exactly 1"
+    fi
     if [[ "$mode" == hyperv ]]; then
         : >"$hyperv_ready"
     elif ((is_wsl)); then
@@ -780,6 +805,10 @@ run_windows() {
         qemu_status=$?
         set -e
         qemu_pid=
+        if grep -Fq -- "$s4_fail_marker" "$marker_log"; then
+            tail -n 80 -- "$marker_log" >&2
+            die "guest reported $s4_fail_marker during S4 poweroff; logs: $serial_log $marker_log $qemu_log"
+        fi
         ((qemu_status == 0)) || die "QEMU S4 exit status $qemu_status; log: $qemu_log"
         printf 'Windows x86 test: S4 powered off cleanly; cold restarting\n'
         cleanup
@@ -807,6 +836,12 @@ run_windows() {
     set -e
     qemu_pid=
     if ((is_daily_soak || is_s4)); then
+        for marker in "$wsl_fail_marker" "$daily_soak_fail_marker" "$s4_fail_marker"; do
+            if grep -Fq -- "$marker" "$marker_log"; then
+                tail -n 80 -- "$marker_log" >&2
+                die "guest reported $marker after PASS; logs: $serial_log $marker_log $qemu_log"
+            fi
+        done
         ((qemu_status == 0)) || die "QEMU exited with status $qemu_status after $mode PASS"
         qemu-img check "$disk_image" >/dev/null || die "$mode disk check failed: $disk_image"
     fi
@@ -838,6 +873,12 @@ check_wsl_soak() {
         'DailySoakRunId' \
         'run_id=' \
         'daily soak PASS stamp=$Stamp run_id=$RunId target_minutes=$Minutes target_rounds=$Rounds' \
+        'IncrementalHash' \
+        '$diskHash -eq $expectedDiskHash' \
+        "\$mediaRunIdFile = 'D:\\daily-soak-run-id.txt'" \
+        'daily soak media run ID is unavailable' \
+        '$savedRunId -ne $mediaRunId' \
+        'Remove-Item -LiteralPath $phaseFile -Force' \
         '3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351' \
         'timeout -s KILL 45' \
         'NoMatchingEventsFound' \
@@ -859,7 +900,14 @@ check_wsl_soak() {
     for needle in \
         'Windows did not shut down within 120 seconds after $mode PASS' \
         'QEMU exited with status $qemu_status after $mode PASS' \
-        'qemu-img check "$disk_image"'; do
+        'qemu-img check "$disk_image"' \
+        'cargo xbuild x86 --release' \
+        'host_uptime_seconds' \
+        'trusted_boot_count == 1' \
+        'target_minutes=$daily_soak_minutes target_rounds=$daily_soak_rounds' \
+        'grep -Fx -- "$expected_marker"' \
+        'during S4 poweroff' \
+        'guest reported $marker after PASS'; do
         grep -Fq -- "$needle" "$0" || die "daily-soak/S4 exit check missing: $needle"
     done
     grep -Fq -- 'daily-soak phase 1 did not start within 180 seconds' "$0" || \

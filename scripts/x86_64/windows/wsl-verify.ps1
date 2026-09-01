@@ -154,17 +154,23 @@ function Invoke-DailyWorkload {
         [System.IO.FileAccess]::Write,
         [System.IO.FileShare]::None
     )
+    $diskHasher = [System.Security.Cryptography.IncrementalHash]::CreateHash(
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256
+    )
+    $expectedDiskHash = ''
     try {
         for ($index = 0; $index -lt 128; $index++) {
             $stream.Write($block, 0, $block.Length)
+            $diskHasher.AppendData($block)
         }
         $stream.Flush($true)
+        $expectedDiskHash = ConvertTo-Hex ($diskHasher.GetHashAndReset())
     } finally {
         $stream.Dispose()
+        $diskHasher.Dispose()
     }
     $diskHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $diskPath).Hash.ToLowerInvariant()
-    $diskHashAgain = (Get-FileHash -Algorithm SHA256 -LiteralPath $diskPath).Hash.ToLowerInvariant()
-    Assert-Soak ($diskHash -eq $diskHashAgain) 'disk write/read hash mismatch'
+    Assert-Soak ($diskHash -eq $expectedDiskHash) 'disk write/read hash mismatch'
     Assert-Soak ((Get-Item -LiteralPath $diskPath).Length -eq 128MB) 'disk file length mismatch'
 
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -412,6 +418,37 @@ $dailySoakRequested = $DailySoakMinutes -gt 0 -or $DailySoakRounds -gt 0 -or `
     (Test-Path -LiteralPath $phaseFile)
 
 try {
+    $mediaRunIdFile = 'D:\daily-soak-run-id.txt'
+    if (Test-Path -LiteralPath $phaseFile) {
+        for ($attempt = 0; $attempt -lt 60 -and `
+                -not (Test-Path -LiteralPath $mediaRunIdFile); $attempt++) {
+            Start-Sleep -Seconds 1
+        }
+        if (-not (Test-Path -LiteralPath $mediaRunIdFile)) {
+            throw 'daily soak media run ID is unavailable'
+        }
+        $mediaRunId = (Get-Content -LiteralPath $mediaRunIdFile -Raw).Trim()
+        $savedRunId = ''
+        try {
+            $savedRunId = [string](
+                (Get-Content -LiteralPath $phaseFile -Raw | ConvertFrom-Json).run_id
+            )
+        } catch {
+            $savedRunId = ''
+        }
+        if ($mediaRunId -notmatch `
+                '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' -or `
+                $savedRunId -ne $mediaRunId) {
+            Remove-Item -LiteralPath $phaseFile -Force
+            Remove-Item -LiteralPath `
+                (Join-Path $stateDirectory 'daily-soak-phase1.bin'), `
+                (Join-Path $stateDirectory 'daily-soak-phase2.bin') `
+                -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $dailySoakRequested = $DailySoakMinutes -gt 0 -or $DailySoakRounds -gt 0 -or `
+        (Test-Path -LiteralPath $phaseFile)
+
     # Preserve the existing Hyper-V marker for later monitor-hyperv runs.
     & (Join-Path $stateDirectory 'hyperv-verify.ps1')
 
