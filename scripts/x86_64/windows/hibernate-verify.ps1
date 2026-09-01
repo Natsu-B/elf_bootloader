@@ -60,7 +60,7 @@ function Invoke-WslProbe {
 
     $probe = @(
         & wsl.exe --distribution ThinHvTest --user root --cd / --exec `
-            /bin/sh -c 'uname -r; test -s /proc/cpuinfo; /bin/busybox sha256sum /proc/cpuinfo; echo thin-hv-hibernate-wsl-ok' `
+            /bin/sh -c 'set -eu; uname -r; test -s /proc/cpuinfo; /bin/busybox sha256sum /proc/cpuinfo; echo thin-hv-hibernate-wsl-ok' `
             2>&1
     )
     $status = $LASTEXITCODE
@@ -69,29 +69,42 @@ function Invoke-WslProbe {
         "WSL2 $Phase probe failed with status $status`: $text"
 }
 
+function Get-WinEventsOrEmpty {
+    param([hashtable]$Filter)
+
+    try {
+        return @(Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop)
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound,*') {
+            return @()
+        }
+        throw
+    }
+}
+
 function Get-ErrorCounts {
     param([DateTime]$Start)
 
-    $bugchecks = @(Get-WinEvent -FilterHashtable @{
+    $bugchecks = @(Get-WinEventsOrEmpty -Filter @{
             LogName = 'System'
             ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'
             Id = 1001
             StartTime = $Start
-        } -ErrorAction SilentlyContinue)
-    $whea = @(Get-WinEvent -FilterHashtable @{
+        })
+    $whea = @(Get-WinEventsOrEmpty -Filter @{
             LogName = 'System'
             ProviderName = 'Microsoft-Windows-WHEA-Logger'
             StartTime = $Start
-            Level = @(1, 2)
-        } -ErrorAction SilentlyContinue)
+            Level = @(1, 2, 3)
+        })
     $hyperv = @()
     foreach ($log in @(
             'Microsoft-Windows-Hyper-V-Hypervisor-Admin',
             'Microsoft-Windows-Hyper-V-VMMS-Admin'
         )) {
-        $hyperv += @(Get-WinEvent -FilterHashtable @{
+        $hyperv += @(Get-WinEventsOrEmpty -Filter @{
                 LogName = $log; StartTime = $Start; Level = @(1, 2)
-            } -ErrorAction SilentlyContinue)
+            })
     }
     return [pscustomobject]@{
         hardware = $bugchecks.Count + $whea.Count

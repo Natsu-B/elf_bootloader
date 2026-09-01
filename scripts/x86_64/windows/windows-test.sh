@@ -273,6 +273,8 @@ probe_wsl_soak() {
 }
 
 probe_s4() {
+    # Let the scheduled verifier's foreground window close before opening Run.
+    sleep 5
     run_dialog_command 'powershell -nop -ep bypass -f d:\hibernate-verify.ps1 -reset' ctrl-shift-ret
     sleep 5
     printf 'sendkey alt-y 20\n' >&9
@@ -791,8 +793,8 @@ run_windows() {
         sleep 1
     done
     if kill -0 "$qemu_pid" 2>/dev/null; then
-        if ((is_daily_soak)); then
-            die "Windows did not shut down within 120 seconds after daily-soak PASS"
+        if ((is_daily_soak || is_s4)); then
+            die "Windows did not shut down within 120 seconds after $mode PASS"
         fi
         printf 'quit\n' >&9
     fi
@@ -801,9 +803,9 @@ run_windows() {
     qemu_status=$?
     set -e
     qemu_pid=
-    if ((is_daily_soak)); then
-        ((qemu_status == 0)) || die "QEMU exited with status $qemu_status after daily-soak PASS"
-        qemu-img check "$disk_image" >/dev/null || die "daily-soak disk check failed: $disk_image"
+    if ((is_daily_soak || is_s4)); then
+        ((qemu_status == 0)) || die "QEMU exited with status $qemu_status after $mode PASS"
+        qemu-img check "$disk_image" >/dev/null || die "$mode disk check failed: $disk_image"
     fi
     tail -n 40 -- "$serial_log"
     cleanup
@@ -820,7 +822,8 @@ run_windows_s4() {
 
 check_wsl_soak() {
     local source="$repo_root/scripts/x86_64/windows"
-    local verifier="$source/wsl-verify.ps1" launcher="$source/wsl-soak.ps1" needle
+    local verifier="$source/wsl-verify.ps1" hibernate="$source/hibernate-verify.ps1"
+    local launcher="$source/wsl-soak.ps1" needle
 
     bash -n "$0"
     for needle in \
@@ -841,13 +844,24 @@ check_wsl_soak() {
         'phaseTwoExternalHash'; do
         grep -Fq -- "$needle" "$verifier" || die "daily-soak verifier check missing: $needle"
     done
-    grep -Fq -- 'Windows did not shut down within 120 seconds after daily-soak PASS' "$0" || \
-        die 'daily-soak shutdown gate is missing'
+    for needle in \
+        'set -eu; uname -r' \
+        'function Get-WinEventsOrEmpty' \
+        'NoMatchingEventsFound' \
+        'Level = @(1, 2, 3)'; do
+        grep -Fq -- "$needle" "$hibernate" || die "S4 verifier check missing: $needle"
+    done
+    for needle in \
+        'Windows did not shut down within 120 seconds after $mode PASS' \
+        'QEMU exited with status $qemu_status after $mode PASS' \
+        'qemu-img check "$disk_image"'; do
+        grep -Fq -- "$needle" "$0" || die "daily-soak/S4 exit check missing: $needle"
+    done
     grep -Fq -- 'daily-soak phase 1 did not start within 180 seconds' "$0" || \
         die 'daily-soak launch gate is missing'
     grep -Fq -- '[int]$Minutes = 60' "$launcher" || die 'daily-soak launcher default is not 60 minutes'
     grep -Fq -- '[int]$Rounds = 2' "$launcher" || die 'daily-soak launcher lacks two-boot rounds'
-    printf 'Windows x86 test: daily-soak static checks PASS\n'
+    printf 'Windows x86 test: daily-soak/S4 static checks PASS\n'
 }
 
 usage() {
