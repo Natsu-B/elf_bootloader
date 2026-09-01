@@ -29,6 +29,8 @@ desktop_marker=thinhvwindowsdesktop
 hyperv_marker='thin-hv: windows hyperv PASS'
 wsl_marker='thin-hv: windows wsl2 PASS'
 wsl_fail_marker='thin-hv: windows wsl2 FAIL'
+daily_soak_marker='thin-hv: windows daily soak PASS'
+daily_soak_fail_marker='thin-hv: windows daily soak FAIL'
 s4_request_marker='thin-hv: windows hibernate request'
 s4_pass_marker='thin-hv: windows hibernate PASS state=S4 guest_resume=1'
 s4_fail_marker='thin-hv: windows hibernate FAIL'
@@ -145,8 +147,10 @@ prepare_hyperv_media() {
 }
 
 prepare_wsl_media() (
+    local daily_soak_run_id=${1:-}
     local source="$repo_root/scripts/x86_64/windows"
     local busybox=${BUSYBOX_STATIC:-} rootfs_work root description applet applets listing
+    local external_url=${WINDOWS_DAILY_SOAK_EXTERNAL_URL:-}
 
     umask 022
     verify_wsl_msi
@@ -160,6 +164,10 @@ prepare_wsl_media() (
     for applet in sh cat uname test; do
         grep -Fxq -- "$applet" <<<"$applets" || \
             die "BUSYBOX_STATIC lacks required applet: $applet"
+    done
+    for applet in dd rm sha256sum timeout wget; do
+        grep -Fxq -- "$applet" <<<"$applets" || \
+            die "BUSYBOX_STATIC lacks daily-soak applet: $applet"
     done
 
     rootfs_work=$(mktemp -d)
@@ -185,7 +193,16 @@ prepare_wsl_media() (
     ln -f -- "$wsl_msi" "$hyperv_media/$(basename -- "$wsl_msi")"
     install -m 0644 -- "$source/wsl-enable.ps1" "$hyperv_media/wsl-enable.ps1"
     install -m 0644 -- "$source/wsl-verify.ps1" "$hyperv_media/wsl-verify.ps1"
+    install -m 0644 -- "$source/wsl-soak.ps1" "$hyperv_media/wsl-soak.ps1"
     install -m 0644 -- "$source/hibernate-verify.ps1" "$hyperv_media/hibernate-verify.ps1"
+    if [[ -n "$external_url" ]]; then
+        [[ "$external_url" =~ ^https://[^[:space:]]+$ && \
+            "$external_url" != *'?'* && "$external_url" != *'#'* && \
+            "$external_url" != *'@'* ]] || \
+            die 'WINDOWS_DAILY_SOAK_EXTERNAL_URL must be a public HTTPS URL without credentials, query, or fragment'
+    fi
+    printf '%s\n' "$external_url" >"$hyperv_media/daily-soak-external-url.txt"
+    printf '%s\n' "$daily_soak_run_id" >"$hyperv_media/daily-soak-run-id.txt"
     sha256sum -- "$hyperv_media/thin-hv-wsl-rootfs.tar"
 )
 
@@ -244,6 +261,17 @@ probe_wsl_enable() {
     printf 'sendkey alt-y 20\n' >&9
 }
 
+probe_wsl_soak() {
+    local minutes=$1 rounds=$2
+
+    # The scheduled verifier emits its marker just before exiting. Let its
+    # foreground PowerShell window close before opening the Run dialog.
+    sleep 5
+    run_dialog_command "powershell -nop -ep bypass -f d:\\wsl-soak.ps1 -minutes $minutes -rounds $rounds" ctrl-shift-ret
+    sleep 5
+    printf 'sendkey alt-y 20\n' >&9
+}
+
 probe_s4() {
     run_dialog_command 'powershell -nop -ep bypass -f d:\hibernate-verify.ps1 -reset' ctrl-shift-ret
     sleep 5
@@ -254,24 +282,32 @@ run_windows() {
     local mode=$1
     local s4_phase=${2:-}
     local timeout_seconds memory smp cpu disk_size ovmf_code ovmf_vars active_vars disable_s4=1
+    local daily_soak_minutes=0 daily_soak_rounds=0 daily_soak_timeout daily_soak_run_id=''
     local disk_image=$disk disk_format=raw disk_snapshot=off
     local tpm_dir=$base_tpm_dir tpm_instance=base
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
     local expected_marker marker_log media_file wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
+    local soak_probe_sent=0 soak_probe_elapsed=-1 soak_phase1_seen=0
     local marker_seen=0 wsl_failed=0 wsl_monitor_offset=-1 wsl_probe_offset=0
     local s4_probe_elapsed=-1
     local wsl_ready_matches=0
-    local is_trusted=0 is_wsl=0 is_s4=0
+    local is_trusted=0 is_wsl=0 is_s4=0 is_daily_soak=0
     local -a media_args
 
     if [[ "$mode" == trusted-kvm-hyperv || "$mode" == trusted-kvm-wsl || \
-        "$mode" == trusted-kvm-s4 ]]; then
+        "$mode" == trusted-kvm-wsl-soak || "$mode" == trusted-kvm-s4 ]]; then
         is_trusted=1
     fi
     if [[ "$mode" == wsl || "$mode" == wsl-s4 || "$mode" == trusted-kvm-wsl || \
-        "$mode" == trusted-kvm-s4 ]]; then
+        "$mode" == trusted-kvm-wsl-soak || "$mode" == trusted-kvm-s4 ]]; then
         is_wsl=1
+    fi
+    if [[ "$mode" == trusted-kvm-wsl-soak ]]; then
+        is_daily_soak=1
+        daily_soak_run_id=$(< /proc/sys/kernel/random/uuid)
+        [[ "$daily_soak_run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || \
+            die 'failed to generate daily-soak run ID'
     fi
     if [[ "$mode" == wsl-s4 || "$mode" == trusted-kvm-s4 ]]; then
         is_s4=1
@@ -296,7 +332,8 @@ run_windows() {
         smp=1
     elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == wsl-s4 || \
         "$mode" == trusted-kvm-hyperv || \
-        "$mode" == trusted-kvm-wsl || "$mode" == trusted-kvm-s4 ]]; then
+        "$mode" == trusted-kvm-wsl || "$mode" == trusted-kvm-wsl-soak || \
+        "$mode" == trusted-kvm-s4 ]]; then
         [[ "$memory" == 4G ]] || die 'Hyper-V control currently requires WINDOWS_MEMORY=4G'
         smp=2
     else
@@ -313,7 +350,8 @@ run_windows() {
     flock -n 8 || die "another Windows test is using $work"
     if [[ -f "$hyperv_disk" && "$mode" != monitor && "$mode" != hyperv && \
         "$mode" != monitor-hyperv && "$mode" != trusted-kvm-hyperv && \
-        "$mode" != trusted-kvm-wsl && "$mode" != trusted-kvm-s4 && \
+        "$mode" != trusted-kvm-wsl && "$mode" != trusted-kvm-wsl-soak && \
+        "$mode" != trusted-kvm-s4 && \
         "$mode" != wsl && "$mode" != wsl-s4 ]]; then
         # ponytail: keep the raw backing immutable instead of duplicating its
         # allocated blocks; remove all Hyper-V state before changing the base.
@@ -374,11 +412,13 @@ run_windows() {
         need_command qemu-img
         prepare_hyperv_media
         [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
-        prepare_wsl_media
+        prepare_wsl_media "$daily_soak_run_id"
         wsl_media_stamp=$(sha256sum \
             "$hyperv_media/wsl-enable.ps1" \
             "$hyperv_media/wsl-verify.ps1" \
+            "$hyperv_media/wsl-soak.ps1" \
             "$hyperv_media/hyperv-verify.ps1" \
+            "$hyperv_media/daily-soak-external-url.txt" \
             "$hyperv_media/thin-hv-wsl-rootfs.tar" \
             "$wsl_msi" | cut -d' ' -f1 | sha256sum | cut -d' ' -f1)
         printf '%s\n' "$wsl_media_stamp" >"$hyperv_media/wsl-media-stamp.txt"
@@ -391,7 +431,20 @@ run_windows() {
             fi
             die "WSL2 PASS missing for this media; run '$0 wsl' first"
         fi
-        timeout_seconds=${WINDOWS_WSL_TIMEOUT_SECONDS:-1800}
+        if ((is_daily_soak)); then
+            daily_soak_minutes=${WINDOWS_DAILY_SOAK_MINUTES:-60}
+            daily_soak_rounds=${WINDOWS_DAILY_SOAK_ROUNDS:-2}
+            [[ "$daily_soak_minutes" =~ ^[0-9]+$ && \
+                "$daily_soak_rounds" =~ ^[0-9]+$ ]] || \
+                die 'daily-soak minutes and rounds must be non-negative integers'
+            ((daily_soak_minutes <= 10080 && daily_soak_rounds <= 10000 && \
+                (daily_soak_minutes > 0 || daily_soak_rounds > 0))) || \
+                die 'daily-soak target must be positive and within 10080 minutes/10000 rounds'
+            daily_soak_timeout=$((daily_soak_minutes * 60 + daily_soak_rounds * 300 + 1800))
+            timeout_seconds=${WINDOWS_DAILY_SOAK_TIMEOUT_SECONDS:-$daily_soak_timeout}
+        else
+            timeout_seconds=${WINDOWS_WSL_TIMEOUT_SECONDS:-1800}
+        fi
         active_vars=$hyperv_vars
         disk_image=$hyperv_disk
         disk_format=qcow2
@@ -471,6 +524,12 @@ run_windows() {
     : >"$qemu_log"
     if ((is_s4)) && [[ "$s4_phase" == resume ]]; then
         expected_marker=$s4_pass_marker
+        marker_log=$desktop_serial_log
+    elif ((is_daily_soak && wsl_ready_matches == 0)); then
+        expected_marker="$wsl_marker stamp=$wsl_media_stamp"
+        marker_log=$desktop_serial_log
+    elif ((is_daily_soak)); then
+        expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id"
         marker_log=$desktop_serial_log
     elif ((is_wsl)); then
         expected_marker="$wsl_marker stamp=$wsl_media_stamp"
@@ -562,7 +621,13 @@ run_windows() {
 
     while ((elapsed < timeout_seconds)); do
         marker_seen=0
-        if ((is_wsl && wsl_ready_matches == 0)); then
+        if ((is_daily_soak && wsl_ready_matches == 1)); then
+            if ((soak_probe_sent)) && \
+                tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
+                    grep -F -- "$expected_marker" >/dev/null; then
+                marker_seen=1
+            fi
+        elif ((is_wsl && wsl_ready_matches == 0)); then
             if ((setup_probe_sent)) && \
                 tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
                     grep -F -- "$expected_marker" >/dev/null; then
@@ -580,9 +645,15 @@ run_windows() {
             expected_marker=$s4_request_marker
             marker_seen=0
         fi
-        if ((marker_seen)); then
-            printf 'Windows x86 test: observed %s\n' "$expected_marker"
-            break
+        if ((is_daily_soak && marker_seen && wsl_ready_matches == 0)); then
+            printf 'Windows x86 test: observed %s; starting daily soak\n' "$expected_marker"
+            wsl_ready_matches=1
+            wsl_probe_offset=$(stat -c %s -- "$marker_log")
+            probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
+            soak_probe_sent=1
+            soak_probe_elapsed=$elapsed
+            expected_marker="$daily_soak_marker stamp=$wsl_media_stamp run_id=$daily_soak_run_id"
+            marker_seen=0
         fi
         wsl_failed=0
         if ((is_wsl && wsl_ready_matches == 1)) && \
@@ -604,6 +675,27 @@ run_windows() {
         if ((wsl_failed)); then
             tail -n 80 -- "$marker_log" >&2
             die "guest reported $wsl_fail_marker; logs: $serial_log $marker_log $qemu_log"
+        fi
+        if ((is_daily_soak && wsl_ready_matches == 1 && !soak_probe_sent)) && \
+            grep -Fq -- "$wsl_marker stamp=$wsl_media_stamp" "$marker_log"; then
+            printf 'Windows x86 test: current WSL media is ready; starting daily soak\n'
+            wsl_monitor_offset=$(stat -c %s -- "$serial_log")
+            wsl_probe_offset=$(stat -c %s -- "$marker_log")
+            probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
+            soak_probe_sent=1
+            soak_probe_elapsed=$elapsed
+        fi
+        if ((is_daily_soak && soak_probe_sent && !soak_phase1_seen)); then
+            if tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
+                grep -F -- 'thin-hv: windows daily soak phase=1 PASS' >/dev/null; then
+                soak_phase1_seen=1
+            elif ((elapsed >= soak_probe_elapsed + 180)); then
+                die "daily-soak phase 1 did not start within 180 seconds; logs: $serial_log $marker_log $qemu_log"
+            fi
+        fi
+        if ((marker_seen)); then
+            printf 'Windows x86 test: observed %s\n' "$expected_marker"
+            break
         fi
         if ((is_s4 && setup_probe_sent && s4_probe_elapsed >= 0 && \
             elapsed >= s4_probe_elapsed + 120)) && [[ "$s4_phase" == request ]]; then
@@ -632,6 +724,14 @@ run_windows() {
             wsl_probe_offset=$(stat -c %s -- "$marker_log")
             probe_wsl_enable
             setup_probe_sent=1
+        fi
+        if ((is_daily_soak && wsl_ready_matches == 1 && elapsed >= 150 && \
+            !soak_probe_sent)); then
+            wsl_monitor_offset=$(stat -c %s -- "$serial_log")
+            wsl_probe_offset=$(stat -c %s -- "$marker_log")
+            probe_wsl_soak "$daily_soak_minutes" "$daily_soak_rounds"
+            soak_probe_sent=1
+            soak_probe_elapsed=$elapsed
         fi
         if ((elapsed % 30 == 0)); then
             printf 'Windows x86 test: waiting for marker (%ss/%ss)\n' "$elapsed" "$timeout_seconds"
@@ -691,10 +791,20 @@ run_windows() {
         sleep 1
     done
     if kill -0 "$qemu_pid" 2>/dev/null; then
+        if ((is_daily_soak)); then
+            die "Windows did not shut down within 120 seconds after daily-soak PASS"
+        fi
         printf 'quit\n' >&9
     fi
-    wait "$qemu_pid" || true
+    set +e
+    wait "$qemu_pid"
+    qemu_status=$?
+    set -e
     qemu_pid=
+    if ((is_daily_soak)); then
+        ((qemu_status == 0)) || die "QEMU exited with status $qemu_status after daily-soak PASS"
+        qemu-img check "$disk_image" >/dev/null || die "daily-soak disk check failed: $disk_image"
+    fi
     tail -n 40 -- "$serial_log"
     cleanup
     trap - EXIT INT TERM
@@ -708,8 +818,40 @@ run_windows_s4() {
     run_windows "$mode" resume
 }
 
+check_wsl_soak() {
+    local source="$repo_root/scripts/x86_64/windows"
+    local verifier="$source/wsl-verify.ps1" launcher="$source/wsl-soak.ps1" needle
+
+    bash -n "$0"
+    for needle in \
+        '[int]$DailySoakMinutes = 0' \
+        '[int]$DailySoakRounds = 0' \
+        'Restart-Computer -Force' \
+        'phase-1 disk hash did not survive reboot' \
+        'daily soak media stamp changed during resume' \
+        'DailySoakRunId' \
+        'run_id=' \
+        '3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351' \
+        'timeout -s KILL 45' \
+        'NoMatchingEventsFound' \
+        'Microsoft-Windows-WHEA-Logger' \
+        'Microsoft-Windows-Hyper-V-Hypervisor-Admin' \
+        'memory_sha256' 'disk_sha256' 'tcp_bytes' \
+        'wsl_cpu_sha256' 'wsl_memory_sha256' 'external_sha256' \
+        'phaseTwoExternalHash'; do
+        grep -Fq -- "$needle" "$verifier" || die "daily-soak verifier check missing: $needle"
+    done
+    grep -Fq -- 'Windows did not shut down within 120 seconds after daily-soak PASS' "$0" || \
+        die 'daily-soak shutdown gate is missing'
+    grep -Fq -- 'daily-soak phase 1 did not start within 180 seconds' "$0" || \
+        die 'daily-soak launch gate is missing'
+    grep -Fq -- '[int]$Minutes = 60' "$launcher" || die 'daily-soak launcher default is not 60 minutes'
+    grep -Fq -- '[int]$Rounds = 2' "$launcher" || die 'daily-soak launcher lacks two-boot rounds'
+    printf 'Windows x86 test: daily-soak static checks PASS\n'
+}
+
 usage() {
-    printf 'usage: %s download|verify|download-wsl|verify-wsl|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-s4\n' "$0"
+    printf 'usage: %s download|verify|download-wsl|verify-wsl|check-wsl-soak|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-wsl-soak|trusted-kvm-s4\n' "$0"
 }
 
 case ${1:-} in
@@ -717,6 +859,7 @@ case ${1:-} in
     verify) verify_iso ;;
     download-wsl) download_wsl_msi ;;
     verify-wsl) verify_wsl_msi ;;
+    check-wsl-soak) check_wsl_soak ;;
     install) run_windows install ;;
     boot) run_windows boot ;;
     monitor) run_windows monitor ;;
@@ -726,6 +869,7 @@ case ${1:-} in
     monitor-hyperv) run_windows monitor-hyperv ;;
     trusted-kvm-hyperv) run_windows trusted-kvm-hyperv ;;
     trusted-kvm-wsl) run_windows trusted-kvm-wsl ;;
+    trusted-kvm-wsl-soak) run_windows trusted-kvm-wsl-soak ;;
     trusted-kvm-s4) run_windows_s4 trusted-kvm-s4 ;;
     -h | --help | help) usage ;;
     *) usage >&2; exit 2 ;;
