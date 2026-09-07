@@ -801,7 +801,7 @@ resident monitor:
 * `b59e2eb` also rejects a missing or malformed media run ID before stale phase state can be
   resumed or cleared; only a valid new UUID may replace an interrupted run.
 * `fcb15fa` parses the unique post-probe round summary and requires at least the requested count,
-  and gives the late FAIL scan a local loop variable.
+  and gives the late FAIL scan a separate loop variable.
 
 The final strict Linux rerun was:
 
@@ -868,6 +868,68 @@ desktop, QEMU, and firmware-serial SHA-256 values are
 `2742a9301617a8624c22720edd7a814130625a36fd9b4f50eb5f13d455fff79a`,
 `3deb51b412edac8b68fc3449f84b8129dc8962897e9d85fa0808244d88c024ed`, and
 `f3dccb6d154720f2581a34539169f3cf61672f9a1cf78668014d396dd8b052f2`.
+
+## 2026-09-07 focused follow-up
+
+At the start of this follow-up, the worktree at `1945057b52680ffb74ed7dbb0d08b4adafcfc887` was
+clean. No runtime or harness code changed; the September 2 Linux/Windows results above were not
+rerun.
+
+### Rejected finding: unbounded poweroff wait
+
+The earlier claim that `run-uefi-smoke.sh` waits indefinitely when a guest does not power off is
+not applicable to this code. QEMU already runs under `timeout --foreground --kill-after=2s`
+(line 180), the runner waits for that wrapper (line 241), and rejects nonzero status (line 277).
+`X86_UEFI_REQUIRE_POWEROFF=1` disables marker-driven `quit`, not the timeout. The Linux soak caller
+enables that mode at `run-linux-soak-test.sh:51`.
+
+A real QEMU/KVM negative check used the trusted UEFI payload, which returned to OVMF without
+powering off:
+
+```sh
+nix develop --accept-flake-config --command env \
+  X86_MONITOR_IMAGE= \
+  X86_RETURN_MARKER='thin-hv: trusted outer KVM guest PASS' \
+  X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
+  X86_UEFI_TIMEOUT_SECONDS=10 X86_UEFI_REQUIRE_POWEROFF=1 \
+  scripts/x86_64/run-uefi-smoke.sh \
+  bin/x86_64/x86-uefi-kvm-loader.efi bin/x86_64/x86_guest_uefi_test.efi
+```
+
+With GNU coreutils 9.7 and QEMU 10.0.2, the runner exited **1 after 10.151 seconds** (excluding
+Nix setup), reporting QEMU status **124**. All six expected payload/trusted markers were present;
+QEMU received SIGTERM from `timeout`, and no QEMU processes remained. The two-second SIGKILL
+fallback was not exercised. No additional timeout implementation is warranted by this finding.
+
+Raw logs are in `/tmp/x86-uefi-poweroff-negative.iWxzrI/` (temporary, not repository fixtures):
+
+| Log | SHA-256 |
+| --- | --- |
+| timing.log | `bc8692ee2a03efa5a6daff5ed67dd6d30876f59e5e9a3dac8d7504a6eb077cf8` |
+| serial.log | `d1bb7f9e694e29c87fcacbe0bfc9d4021ddc323b78cde350e398a12db847adae` |
+| qemu.log | `b524a8e0840aab3e4cadbbaae4da71f163530a36f210d851f4730b37f1f9f818` |
+| stderr.log | `d3e724a02f49df5688bfea3c606303a0e913e4e4a33f79bbacdf83aa3bef21c2` |
+
+### Claude review attempt and subsequent waiver
+
+A focused Opus/high-effort request attempted to verify the three `fcb15fa` fixes (actual-round
+gate, returned-image lifetime, and marker-variable clobbering), plus the timeout allegation.
+It used read-only tools and a $1.50 CLI list-price estimate cap, not a $20 prepaid API balance.
+Claude Code returned HTTP 403 before inference: the organization has disabled Claude subscription
+access for Claude Code. The JSON reports `is_error=true`, `terminal_reason=api_error`, zero tokens,
+and `total_cost_usd=0`; its misleading `subtype=success` is not a completed review.
+
+The `/usage` endpoint was rate limited on both attempts. Current quota is therefore unknown, not
+proven exhausted. No API-key billing fallback was used. This attempt adds no Claude verdict and
+does not independently close the three fixes with Claude. The user subsequently waived further
+Claude use; local review and validation can continue without restoring that access. The previous
+bounded QEMU/KVM GO remains historical evidence, not proof of physical-machine or interactive
+daily-use safety.
+
+The attempted prompt `/tmp/claude-x86-closure-20260907.txt` has SHA-256
+`07c3c4a493146493e8ce6c3d7054bcafcef430f2161da975c7b1096a673ba003`; the error JSON
+`/tmp/claude-x86-closure-20260907.json` has SHA-256
+`5b0806d72f19f490aacd54ed625a433ffcee2ee27c36c770fa529970ad80bf7d`.
 
 ## Limits
 
