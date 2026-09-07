@@ -357,12 +357,15 @@ fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<Strin
 }
 
 fn build_x86_uefi(args: &[String]) -> Result<String, String> {
-    if args
-        .iter()
-        .any(|arg| arg == "--all-features" || arg.contains("trusted-outer-kvm"))
-    {
+    if args.iter().any(|arg| {
+        arg == "--all-features"
+            || arg.contains("trusted-outer-kvm")
+            || arg.contains("physical-chainload")
+            || arg.contains("physical-preflight")
+            || arg.contains("physical-policy")
+    }) {
         return Err(
-            "x86 builds both direct and trusted-outer-KVM artifacts; do not select trusted-outer-kvm explicitly"
+            "x86 builds all backend artifacts; do not select an alternate backend feature explicitly"
                 .to_string(),
         );
     }
@@ -410,10 +413,6 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("bin")
         .join("x86_64")
         .join("x86-uefi-monitor.efi");
-    let trusted_destination = workspace
-        .join("bin")
-        .join("x86_64")
-        .join("x86-uefi-kvm-loader.efi");
     let guest_artifact = workspace
         .join("target")
         .join("x86_64-unknown-uefi")
@@ -476,38 +475,91 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         )
     })?;
 
-    eprintln!("\n--- Building trusted-outer-KVM x86 UEFI package ---");
-    let status = Command::new("cargo")
-        .arg("build")
-        .arg("-p")
-        .arg(pkg)
-        .arg("--target")
-        .arg("x86_64-unknown-uefi")
-        .args(args)
-        .arg("--no-default-features")
-        .arg("--features")
-        .arg("trusted-outer-kvm")
-        .env("XTASK_BUILD", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| format!("Failed to build trusted-outer-KVM loader: {}", e))?;
-    if !status.success() {
-        return Err(format!(
-            "trusted-outer-KVM loader build failed with status: {}",
-            status
-        ));
+    for (feature, filename) in [
+        ("trusted-outer-kvm", "x86-uefi-kvm-loader.efi"),
+        ("physical-chainload", "x86-uefi-physical-loader.efi"),
+        ("physical-preflight", "x86-uefi-preflight.efi"),
+    ] {
+        eprintln!("\n--- Building non-VMX x86 UEFI backend: {feature} ---");
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("-p")
+            .arg(pkg)
+            .arg("--target")
+            .arg("x86_64-unknown-uefi")
+            .args(args)
+            .arg("--no-default-features")
+            .arg("--features")
+            .arg(feature)
+            .env("XTASK_BUILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to build {feature} loader: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "{feature} loader build failed with status: {status}"
+            ));
+        }
+        verify_no_decoded_vmx(&artifact)?;
+        let backend_destination = workspace.join("bin").join("x86_64").join(filename);
+        fs::copy(&artifact, &backend_destination).map_err(|e| {
+            format!(
+                "Failed to copy {} to {}: {}",
+                artifact.display(),
+                backend_destination.display(),
+                e
+            )
+        })?;
     }
-    verify_no_decoded_vmx(&artifact)?;
-    fs::copy(&artifact, &trusted_destination).map_err(|e| {
-        format!(
-            "Failed to copy {} to {}: {}",
-            artifact.display(),
-            trusted_destination.display(),
-            e
-        )
-    })?;
+    let policy_artifact = workspace
+        .join("target/x86_64-unknown-uefi")
+        .join(resolve_profile(args))
+        .join("x86-uefi-physical-policy.efi");
+    for (feature, filename) in [
+        (
+            "physical-policy-driver",
+            "x86-uefi-physical-policy-driver.efi",
+        ),
+        (
+            "physical-policy-payload",
+            "x86-uefi-physical-policy-payload.efi",
+        ),
+    ] {
+        eprintln!("\n--- Building non-VMX QEMU-only fixture: {feature} ---");
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                guest_pkg,
+                "--bin",
+                "x86-uefi-physical-policy",
+            ])
+            .args(["--target", "x86_64-unknown-uefi"])
+            .args(args)
+            .args(["--no-default-features", "--features", feature])
+            .env("XTASK_BUILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| format!("Failed to build {feature} fixture: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "{feature} fixture build failed with status: {status}"
+            ));
+        }
+        verify_no_decoded_vmx(&policy_artifact)?;
+        let policy_destination = workspace.join("bin/x86_64").join(filename);
+        fs::copy(&policy_artifact, &policy_destination).map_err(|error| {
+            format!(
+                "Failed to copy {} to {}: {error}",
+                policy_artifact.display(),
+                policy_destination.display()
+            )
+        })?;
+    }
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -538,7 +590,7 @@ fn verify_no_decoded_vmx(artifact: &Path) -> Result<(), String> {
     let disassembly = String::from_utf8_lossy(&output.stdout);
     if let Some(mnemonic) = decoded_vmx_mnemonic(&disassembly) {
         return Err(format!(
-            "trusted outer-KVM artifact {} contains decoded VMX instruction '{}'",
+            "non-VMX artifact {} contains decoded VMX instruction '{}'",
             artifact.display(),
             mnemonic
         ));
@@ -598,9 +650,12 @@ fn run(args: &[String]) -> Result<(), String> {
 
 fn run_x86_uefi(args: &[String]) -> Result<(), String> {
     let binary_path = build_x86_uefi(args)?;
-    eprintln!("\n--- Running direct x86 UEFI smoke test ---");
+    eprintln!("\n--- Running QEMU/KVM direct-vmx / project L0 smoke test ---");
     let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
         .arg(binary_path)
+        .env("X86_UEFI_BACKEND", "direct-vmx")
+        .env("X86_UEFI_PHYSICAL_POLICY", "0")
+        .env("X86_UEFI_ACCEL", "kvm")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -615,9 +670,12 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
     }
 
     for guest_location in ["guest", "windows", "both"] {
-        eprintln!("\n--- Running trusted-outer-KVM x86 UEFI smoke test ({guest_location}) ---");
+        eprintln!("\n--- Running QEMU/KVM outer-kvm / reference smoke test ({guest_location}) ---");
         let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
             .arg("bin/x86_64/x86-uefi-kvm-loader.efi")
+            .env("X86_UEFI_BACKEND", "outer-kvm")
+            .env("X86_UEFI_PHYSICAL_POLICY", "0")
+            .env("X86_UEFI_ACCEL", "kvm")
             .env("X86_MONITOR_IMAGE", "")
             .env("X86_RETURN_MARKER", "thin-hv: trusted outer KVM guest PASS")
             .env("X86_VARIABLE_MARKER", "thin-hv: uefi native variables PASS")
@@ -634,6 +692,83 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
                 "trusted-outer-KVM UEFI smoke test ({guest_location}) exited with status {status}"
             ));
         }
+    }
+    for (backend, filename, accel, cpu) in [
+        (
+            "physical-chainload",
+            "x86-uefi-physical-loader.efi",
+            "kvm",
+            // Match the reference fixture: the shared payload checks both the
+            // hypervisor bit and the synthetic KVM CPUID signature leaf.
+            "host,+vmx,-hypervisor,kvm=off",
+        ),
+        (
+            "physical-preflight",
+            "x86-uefi-preflight.efi",
+            "kvm",
+            "host,+vmx,-hypervisor",
+        ),
+        (
+            "physical-preflight",
+            "x86-uefi-preflight.efi",
+            "tcg",
+            "qemu64",
+        ),
+    ] {
+        eprintln!("\n--- Running QEMU/{accel} {backend} regression (not physical hardware) ---");
+        let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+            .arg(Path::new("bin/x86_64").join(filename))
+            .env("X86_UEFI_BACKEND", backend)
+            .env("X86_UEFI_PHYSICAL_POLICY", "0")
+            .env("X86_UEFI_ACCEL", accel)
+            .env("X86_UEFI_CPU", cpu)
+            .env(
+                "X86_UEFI_TIMEOUT_SECONDS",
+                if accel == "tcg" { "60" } else { "30" },
+            )
+            .env_remove("X86_MONITOR_IMAGE")
+            .env_remove("X86_RETURN_MARKER")
+            .env_remove("X86_VARIABLE_MARKER")
+            .env_remove("X86_GUEST_MARKER")
+            .env_remove("X86_UEFI_GUEST_LOCATION")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("Failed to run {backend} QEMU/{accel} regression: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "{backend} QEMU/{accel} regression exited with status {status}"
+            ));
+        }
+    }
+    eprintln!(
+        "\n--- Running physical-chainload policy fixture (QEMU/TCG, not physical hardware) ---"
+    );
+    let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+        .arg("bin/x86_64/x86-uefi-physical-policy-driver.efi")
+        .arg("bin/x86_64/x86-uefi-physical-policy-payload.efi")
+        .env("X86_UEFI_BACKEND", "physical-chainload")
+        .env("X86_UEFI_PHYSICAL_POLICY", "1")
+        .env("X86_UEFI_ACCEL", "tcg")
+        .env("X86_UEFI_CPU", "qemu64")
+        .env("X86_UEFI_TIMEOUT_SECONDS", "60")
+        .env("X86_UEFI_MEMORY", "256M")
+        .env("X86_UEFI_SMP", "1")
+        .env_remove("X86_MONITOR_IMAGE")
+        .env_remove("X86_RETURN_MARKER")
+        .env_remove("X86_VARIABLE_MARKER")
+        .env_remove("X86_GUEST_MARKER")
+        .env_remove("X86_UEFI_GUEST_LOCATION")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("Failed to run physical policy QEMU/TCG fixture: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "physical policy QEMU/TCG fixture exited with status {status}"
+        ));
     }
     Ok(())
 }
@@ -2418,6 +2553,415 @@ mod tests {
             Some("vmreadq")
         );
         assert_eq!(decoded_vmx_mnemonic("1000 <nested_vmx::vmxon>:"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn x86_backend_gate_rejects_missing_mixed_or_resident_provenance() {
+        use std::io::Write;
+
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |backend: &str, log: &str| {
+            let mut child = Command::new("bash")
+                .arg(&runner)
+                .args(["--check-backend-log", backend, "/dev/stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let written = child.stdin.take().unwrap().write_all(log.as_bytes());
+            let output = child.wait_with_output().unwrap();
+            if !output.status.success() {
+                eprintln!("backend gate: {}", String::from_utf8_lossy(&output.stderr));
+            }
+            written.is_ok() && output.status.success()
+        };
+        let markers = [
+            ("direct-vmx", "thin-hv: backend=direct-vmx role=project-l0"),
+            ("outer-kvm", "thin-hv: backend=outer-kvm role=reference"),
+            (
+                "physical-chainload",
+                "thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0",
+            ),
+            (
+                "physical-preflight",
+                "thin-hv: backend=physical-preflight project_vmx=0",
+            ),
+        ];
+        for (backend, marker) in markers {
+            assert!(
+                check(backend, marker),
+                "unterminated final marker: {backend}"
+            );
+            assert!(check(backend, &format!("{marker}\r\n{marker}\r\n")));
+            assert!(!check(backend, "thin-hv: uefi entry\n"));
+            assert!(!check(backend, &format!("{marker} truncated\n")));
+            for (other, other_marker) in markers {
+                if backend != other {
+                    assert!(!check(backend, &format!("{other_marker}\n")));
+                    assert!(!check(backend, &format!("{marker}\n{other_marker}\n")));
+                }
+            }
+            if backend != "direct-vmx" {
+                for forbidden in [
+                    "thin-hv: runtime monitor active",
+                    "thin-hv: loading runtime monitor",
+                    "thin-hv: variable overlay profile=1",
+                    "thin-hv: uefi variable overlay PASS",
+                    "thin-hv: L1 VMLAUNCH",
+                    "thin-hv: vmx guest PASS",
+                ] {
+                    assert!(!check(backend, &format!("{marker}\n{forbidden}\n")));
+                }
+            }
+        }
+        assert!(!check("unknown", markers[0].1));
+        assert!(!check(
+            "physical-preflight",
+            &format!("{}\nthin-hv: guest uefi payload\n", markers[3].1)
+        ));
+        let direct_boot = format!("{0}\n{0}\nthin-hv: runtime monitor active\n", markers[0].1);
+        let guest_success =
+            "thin-hv: windows desktop\nthin-hv: windows hyperv PASS\nthin-hv: vmx guest PASS\n";
+        assert!(check(
+            "direct-vmx",
+            &format!("{direct_boot}{guest_success}")
+        ));
+        for failure in [
+            "thin-hv: vmx smoke FAIL: FeatureControlLocked",
+            "thin-hv: vmx guest FAIL marker=0x0",
+            "thin-hv: vmx guest FAIL: unsupported exit",
+            "thin-hv: VMRESUME FAIL status=FailValid",
+            "thin-hv: VMXOFF status=Success",
+            "thin-hv: panic",
+            "thin-hv: CPUID VMX=0",
+            "thin-hv: IA32_FEATURE_CONTROL=unavailable",
+            "thin-hv: IA32_VMX_BASIC=unavailable",
+        ] {
+            // Firmware may boot the OS after an unsuccessful monitor returns.
+            assert!(!check(
+                "direct-vmx",
+                &format!("{direct_boot}{failure}\n{guest_success}")
+            ));
+            assert!(!check(
+                "direct-vmx",
+                &format!("{direct_boot}{guest_success}{failure}")
+            ));
+            assert!(!check(
+                "direct-vmx",
+                &format!("{failure}\r\n{direct_boot}{guest_success}")
+            ));
+        }
+        // Architectural VMfailValid results and physical fixture negatives are
+        // not terminal project-monitor failures and must not be over-matched.
+        assert!(check(
+            "direct-vmx",
+            &format!("{direct_boot}thin-hv: L1 VMCLEAR status=FailValid\n{guest_success}")
+        ));
+        assert!(check(
+            "physical-chainload",
+            &format!(
+                "{}\nthin-hv: physical chainload FAIL: LoadImage status=0x800000000000000e\n",
+                markers[2].1
+            )
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vmx_diagnostics_decoder_rejects_malformed_abi_and_provenance() {
+        let decoder = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/decode-vmx-diagnostics.py");
+        let output = Command::new("python3")
+            .arg(decoder)
+            .arg("--self-test")
+            .output()
+            .expect("run the pure VMX diagnostics decoder tests");
+        assert!(
+            output.status.success(),
+            "decoder host tests failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_serial_marker_accepts_only_exact_lf_or_crlf_records() {
+        use std::io::Write;
+
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/windows/windows-test.sh");
+        let check = |transcript: &[u8]| {
+            let mut child = Command::new("bash")
+                .arg(&runner)
+                .args(["check-serial-marker", "thinhvwindowsdesktop"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("run the read-only Windows serial marker gate");
+            child
+                .stdin
+                .take()
+                .expect("serial transcript pipe")
+                .write_all(transcript)
+                .expect("the marker gate must drain its input even after a match");
+            child.wait().expect("wait for serial marker gate").success()
+        };
+        assert!(check(b"thinhvwindowsdesktop\n"));
+        assert!(check(b"thinhvwindowsdesktop\r\n"));
+        for transcript in [
+            b"".as_slice(),
+            b"thin\rhvwindowsdesktop\n",
+            b"thinhvwindowsdesktop\r\r\n",
+            b"prefix thinhvwindowsdesktop\n",
+            b"thinhvwindowsdesktop suffix\n",
+            b"thinhvwindowsdesktop\r suffix\n",
+            b"thinhvwindowsdesktop\0\n",
+        ] {
+            assert!(
+                !check(transcript),
+                "accepted malformed record: {transcript:?}"
+            );
+        }
+        // The production offset path is a pipeline under pipefail. A match
+        // must not close the reader before a large prefix/suffix drains.
+        let mut large = "unrelated-prefix\n".repeat(8192).into_bytes();
+        large.extend_from_slice(b"thinhvwindowsdesktop\r\n");
+        large.extend_from_slice("unrelated-suffix\n".repeat(8192).as_bytes());
+        assert!(check(&large));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_physical_self_test_bootstrap_selects_one_volume_and_never_collects() {
+        use std::io::Write;
+
+        let directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/x86_64/windows");
+        let output = Command::new("bash")
+            .arg(directory.join("windows-test.sh"))
+            .arg("physical-test-command")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let command = String::from_utf8(output.stdout).unwrap();
+        let encoded = command
+            .strip_prefix("powershell -nop -ep bypass -encodedcommand ")
+            .unwrap();
+        assert!(
+            encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        );
+        let mut decoder = Command::new("base64")
+            .arg("--decode")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        decoder
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(encoded.as_bytes())
+            .unwrap();
+        let decoded = decoder.wait_with_output().unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len() % 2, 0);
+        let units: Vec<_> = decoded
+            .stdout
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let bootstrap = String::from_utf16(&units).unwrap();
+        assert!(bootstrap.contains("Get-PSDrive -PSProvider FileSystem"));
+        assert!(bootstrap.contains("thin-hv-physical-status-test.ps1"));
+        assert!(bootstrap.contains("if($p.Count -ne 1){exit 1}"));
+        assert!(bootstrap.ends_with(";& $p[0]"));
+        assert!(!bootstrap.to_ascii_lowercase().contains("d:"));
+        let wrapper = fs::read_to_string(directory.join("physical-status-test.ps1")).unwrap();
+        assert!(wrapper.contains("-File $source -SelfTest"));
+        assert!(wrapper.contains("$LASTEXITCODE -ne 0"));
+        assert!(wrapper.contains("$output.Count -ne 1"));
+        assert!(wrapper.contains("[string]$output[0] -cne $expected"));
+        assert!(wrapper.contains("\"hardware_queries\":0"));
+        assert!(!wrapper.contains("-BootLabel"));
+        assert!(!wrapper.contains("Get-CimInstance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_kvm_lifecycle_gate_requires_exact_order_backend_and_clean_shutdown() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-kvm-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-linux-kvm-test.sh");
+        let check = |backend: &str, count: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-log", backend, count])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
+            let cycle = |number| {
+                format!(
+                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK process_exit=0\n"
+                )
+            };
+            let valid = format!(
+                "thin-hv: backend={backend} role={role}\n\
+                 thin-hv: linux L2 lifecycle begin backend={backend} cycles=2 l1_cpus=1\n\
+                 {}{}\
+                 thin-hv: linux L2 lifecycle PASS backend={backend} cycles=2\n\
+                 thin-hv: linux L2 lifecycle poweroff requested\n",
+                cycle(1),
+                cycle(2)
+            );
+            assert!(check(backend, "2", &valid));
+            assert!(check(backend, "2", &valid.replace('\n', "\r\n")));
+            assert!(!check(backend, "3", &valid));
+            assert!(!check(backend, "02", &valid));
+            assert!(!check("unknown", "2", &valid));
+            assert!(!check(backend, "2", &valid.replace(&cycle(1), "")));
+            assert!(!check(backend, "2", &valid.replace(&cycle(2), &cycle(1))));
+            assert!(!check(
+                backend,
+                "2",
+                &valid.replace(&cycle(1), &(cycle(2) + &cycle(1)))
+            ));
+            assert!(!check(
+                backend,
+                "2",
+                &valid.replace("process_exit=0", "process_exit=1")
+            ));
+            assert!(!check(
+                backend,
+                "2",
+                &valid.replace("thin-hv: linux L2 lifecycle poweroff requested\n", "")
+            ));
+            for failure in [
+                "thin-hv: linux L2 lifecycle FAIL",
+                "thin-hv: linux L1 L2 KVM FAIL",
+                "Kernel panic",
+                "Oops:",
+                "BUG:",
+                "thin-hv: backend=physical-preflight project_vmx=0",
+            ] {
+                assert!(!check(backend, "2", &format!("{valid}{failure}\n")));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_policy_gate_requires_same_esp_and_scoped_expected_failures() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-physical-policy-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .arg("--check-physical-policy-log")
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let backend = "thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0\n";
+        let payload = "thin-hv: physical policy payload path=windows current_esp=1 PASS\n";
+        let failure = "thin-hv: physical chainload FAIL: expected negative fixture";
+        let precondition = "thin-hv: physical policy secondary_esp_visible=1 targets=windows,linux,other-only PASS\n";
+        let mut valid = precondition.to_owned();
+        for (name, path, status) in [
+            ("default-windows", "windows", "0x0"),
+            ("explicit-linux", "linux", "0x0"),
+            ("other-esp-only", "", "0x800000000000000e"),
+            ("malformed-options", "", "0x8000000000000002"),
+            ("self-path", "", "0x800000000000000f"),
+        ] {
+            valid.push_str(&format!(
+                "thin-hv: physical policy case={name} begin\nthin-hv: uefi entry\n{backend}"
+            ));
+            if path.is_empty() {
+                valid.push_str(&format!("{failure} status={status}\n"));
+            } else {
+                valid.push_str(&format!("thin-hv: physical policy payload path={path} current_esp=1 PASS\nthin-hv: physical chainload PASS\n"));
+            }
+            valid.push_str(&format!(
+                "thin-hv: physical policy case={name} PASS status={status}\n"
+            ));
+        }
+        valid.push_str("thin-hv: physical policy harness PASS\n");
+        assert!(check(&valid));
+        assert!(check(&valid.replace('\n', "\r\n")));
+        assert!(!check(&valid.replace(precondition, "")));
+        assert!(!check(&format!("{precondition}{valid}")));
+        assert!(!check(&format!(
+            "{}{precondition}",
+            valid.replace(precondition, "")
+        )));
+        assert!(!check(&valid.replace("current_esp=1", "current_esp=0")));
+        assert!(!check(&valid.replace("path=linux", "path=windows")));
+        assert!(!check(&valid.replace("0x800000000000000e", "0x0")));
+        assert!(!check(&valid.replace(payload, "")));
+        assert!(!check(
+            &valid.replace(backend, &(backend.to_owned() + backend))
+        ));
+        assert!(!check(
+            &valid.replace(failure, &(payload.to_owned() + failure))
+        ));
+        assert!(!check(
+            &valid.replace("thin-hv: physical policy harness PASS\n", "")
+        ));
+        assert!(!check(&valid.replace(
+            "thin-hv: physical policy case=explicit-linux begin",
+            "thin-hv: physical policy case=default-windows begin"
+        )));
+        assert!(!check(
+            &valid.replace("thin-hv: physical chainload PASS\n", failure)
+        ));
+        for forbidden in [
+            failure,
+            "thin-hv: physical policy harness FAIL\n",
+            "thin-hv: backend=outer-kvm role=reference\n",
+            "thin-hv: runtime monitor active\n",
+            "thin-hv: variable overlay profile=1\n",
+            "thin-hv: L1 VMLAUNCH\n",
+        ] {
+            assert!(!check(&format!("{valid}{forbidden}")));
+        }
     }
 
     #[cfg(unix)]

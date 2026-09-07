@@ -3,6 +3,16 @@ name = "x86_guest_uefi_test"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+physical-policy = []
+physical-policy-driver = ["physical-policy"]
+physical-policy-payload = ["physical-policy"]
+
+[[bin]]
+name = "x86-uefi-physical-policy"
+path = "src/physical_policy.rs"
+required-features = ["physical-policy"]
+
 [dependencies]
 r-efi = "=6.0.0"
 x86_64_hal = { path = "../arch_hal/x86_64_hal" }

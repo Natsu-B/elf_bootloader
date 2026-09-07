@@ -13,10 +13,40 @@ use x86_64_hal::cpu;
 #[cfg(feature = "direct-vmx")]
 use x86_64_hal::vmx;
 
-#[cfg(all(feature = "direct-vmx", feature = "trusted-outer-kvm"))]
-compile_error!("direct-vmx and trusted-outer-kvm are mutually exclusive");
-#[cfg(not(any(feature = "direct-vmx", feature = "trusted-outer-kvm")))]
-compile_error!("select direct-vmx or trusted-outer-kvm");
+#[cfg(any(
+    all(
+        feature = "direct-vmx",
+        any(
+            feature = "trusted-outer-kvm",
+            feature = "physical-chainload",
+            feature = "physical-preflight"
+        )
+    ),
+    all(
+        feature = "trusted-outer-kvm",
+        any(feature = "physical-chainload", feature = "physical-preflight")
+    ),
+    all(feature = "physical-chainload", feature = "physical-preflight")
+))]
+compile_error!("x86 UEFI backends are mutually exclusive");
+#[cfg(not(any(
+    feature = "direct-vmx",
+    feature = "trusted-outer-kvm",
+    feature = "physical-chainload",
+    feature = "physical-preflight"
+)))]
+compile_error!("select one x86 UEFI backend");
+
+#[cfg(any(
+    feature = "trusted-outer-kvm",
+    feature = "physical-chainload",
+    feature = "physical-preflight"
+))]
+mod chainload;
+#[cfg(feature = "physical-chainload")]
+mod physical_chainload;
+#[cfg(feature = "physical-preflight")]
+mod physical_preflight;
 
 #[cfg(feature = "direct-vmx")]
 mod runtime_variables;
@@ -27,6 +57,23 @@ mod vmx_smoke;
 
 /// Legacy COM1 base I/O port.
 pub(crate) const COM1: u16 = 0x03f8;
+/// Finite poll budget: an absent or wedged UART must not prevent firmware boot.
+const SERIAL_POLL_LIMIT: usize = 65_536;
+
+/// Checks a bounded sequence of UART status reads without assuming a working COM1.
+fn wait_for_transmitter(mut status: impl FnMut() -> u8) -> bool {
+    for _ in 0..SERIAL_POLL_LIMIT {
+        let value = status();
+        if value == u8::MAX {
+            return false;
+        }
+        if value & 0x20 != 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
 
 /// Writes one byte to an x86 I/O port without pulling the VMX HAL into the trusted loader.
 unsafe fn outb(port: u16, value: u8) {
@@ -74,29 +121,42 @@ impl SerialPort {
         }
     }
 
-    /// Waits for the transmitter and writes one byte.
+    /// Attempts one byte without letting unavailable diagnostics block the guest.
     pub(crate) fn write_byte(&mut self, byte: u8) {
-        // SAFETY: UEFI applications run at CPL0 and this loader exclusively uses COM1.
-        unsafe {
-            while inb(COM1 + 5) & 0x20 == 0 {
-                core::hint::spin_loop();
-            }
-            outb(COM1, byte);
+        let _ = self.try_write_byte(byte);
+    }
+
+    /// Reports a missing or unresponsive UART to callers that check logging errors.
+    fn try_write_byte(&mut self, byte: u8) -> fmt::Result {
+        if !wait_for_transmitter(|| {
+            // SAFETY: UEFI and the monitor run at CPL0 and own the COM1 register ports.
+            unsafe { inb(COM1 + 5) }
+        }) {
+            return Err(fmt::Error);
         }
+        // SAFETY: COM1 was ready within the bounded poll and this code owns its data port.
+        unsafe { outb(COM1, byte) };
+        Ok(())
     }
 
     /// Writes bytes without constructing formatting state.
     pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+        let _ = self.try_write_bytes(bytes);
+    }
+
+    /// Stops the current message at the first unavailable-UART error.
+    fn try_write_bytes(&mut self, bytes: &[u8]) -> fmt::Result {
         for &byte in bytes {
             if byte == b'\n' {
-                self.write_byte(b'\r');
+                self.try_write_byte(b'\r')?;
             }
-            self.write_byte(byte);
+            self.try_write_byte(byte)?;
         }
+        Ok(())
     }
 
     /// Writes one fixed-width hexadecimal value without `core::fmt`.
-    #[cfg_attr(not(feature = "direct-vmx"), allow(dead_code))]
+    #[cfg(feature = "direct-vmx")]
     pub(crate) fn write_hex(&mut self, value: u64) {
         self.write_bytes(b"0x");
         for digit in (0..16).rev() {
@@ -112,8 +172,7 @@ impl SerialPort {
 
 impl fmt::Write for SerialPort {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        self.write_bytes(text.as_bytes());
-        Ok(())
+        self.try_write_bytes(text.as_bytes())
     }
 }
 
@@ -128,12 +187,33 @@ pub extern "efiapi" fn efi_main(
     {
         serial.init();
         let _ = writeln!(serial, "thin-hv: uefi entry");
+        let _ = writeln!(serial, "thin-hv: backend=direct-vmx role=project-l0");
     }
     #[cfg(feature = "direct-vmx")]
     let vmx_present = cpu::has_vmx();
 
     #[cfg(feature = "direct-vmx")]
     let _ = writeln!(serial, "thin-hv: CPUID VMX={}", u8::from(vmx_present));
+
+    #[cfg(feature = "physical-chainload")]
+    {
+        return match physical_chainload::run(image, system_table, &mut serial) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = writeln!(serial, "thin-hv: physical chainload FAIL: {error}");
+                error.status()
+            }
+        };
+    }
+    #[cfg(feature = "physical-preflight")]
+    {
+        serial.init();
+        let _ = writeln!(serial, "thin-hv: uefi entry");
+        return match physical_preflight::run(image, system_table, &mut serial) {
+            Ok(status) => status,
+            Err(error) => error.status(),
+        };
+    }
 
     #[cfg(feature = "trusted-outer-kvm")]
     {
@@ -194,5 +274,33 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     serial.write_bytes(b"thin-hv: panic\n");
     loop {
         core::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod serial_tests {
+    use super::SERIAL_POLL_LIMIT;
+    use super::wait_for_transmitter;
+
+    #[test]
+    fn absent_and_wedged_serial_ports_have_bounded_waits() {
+        let mut reads = 0;
+        assert!(!wait_for_transmitter(|| {
+            reads += 1;
+            0
+        }));
+        assert_eq!(reads, SERIAL_POLL_LIMIT);
+        reads = 0;
+        assert!(!wait_for_transmitter(|| {
+            reads += 1;
+            0xff
+        }));
+        assert_eq!(reads, 1);
+        reads = 0;
+        assert!(wait_for_transmitter(|| {
+            reads += 1;
+            if reads == 3 { 0x20 } else { 0 }
+        }));
+        assert_eq!(reads, 3);
     }
 }

@@ -11,6 +11,7 @@ use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
 use mutex::SpinLock;
 use nested_vmx::DIRECT_VMCS_PATCH_MANIFEST;
 use nested_vmx::EXIT_ACKNOWLEDGE_INTERRUPT;
@@ -203,7 +204,9 @@ static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
 /// Physical-address width exposed unchanged to the current one-vCPU L1.
 static MAX_PHYSICAL_ADDRESS_BITS: AtomicU8 = AtomicU8::new(0);
-static CPUID_EXIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// BSP-only diagnostics in the runtime PE, not a shared-state solution for SMP.
+/// Move this record into the owning pCPU state before enabling additional CPUs.
+static EXIT_DIAGNOSTICS: SpinLock<ExitDiagnostics> = SpinLock::new(ExitDiagnostics::new());
 /// Nested VMX state for the current single-vCPU smoke run.
 // ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
 static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
@@ -221,6 +224,258 @@ static DIRECT_ENTRY_POLICY: SpinLock<Option<(VmcsPhys, u64)>> = SpinLock::new(No
 // ponytail: one global direct run is sufficient for the current one-pCPU
 // probe; move this into per-pCPU storage before enabling SMP.
 static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
+
+/// Little-endian snapshot signature; only this 144-byte record may be captured.
+const DIAGNOSTIC_MAGIC: u64 = u64::from_le_bytes(*b"THVSTAT1");
+/// Fixed snapshot ABI, independent of the Rust lock's private layout.
+const DIAGNOSTIC_VERSION: u64 = 1;
+/// Scope value 1 means the current BSP-only QEMU Direct-VMX prototype.
+const DIAGNOSTIC_BSP_SCOPE: u64 = 1;
+
+/// Memory-only progress events; values contain no guest registers or MSR data.
+#[derive(Clone, Copy)]
+enum DiagnosticEvent {
+    L1Exit(u64),
+    L0Handled { reason: u64, action: u64 },
+    NestedExit(u64),
+    Reflected(u64),
+    EntryFailure(u64),
+    GuestReturned,
+}
+
+/// Movable value state for eventual per-pCPU ownership; all counters saturate.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExitCounterValues {
+    l1_exits: u64,
+    direct_entry_attempts: u64,
+    observed_l2_entries: u64,
+    reflected_l2_exits: u64,
+    l0_only_handled_exits: u64,
+    external_interrupt_exits: u64,
+    interrupt_window_exits: u64,
+    invept: u64,
+    invvpid: u64,
+    nested_entry_failures: u64,
+    cpuid_exits: u64,
+    /// 0 initial, 1 L1 exit, 2 L0 handled, 3 direct entry, 4 L2 exit,
+    /// 5 reflection complete, 6 immediate entry failure, 7 bounded guest return.
+    last_phase: u64,
+    /// Raw VM-exit reason, or u64::MAX when unavailable; never a guest payload.
+    last_reason: u64,
+}
+
+impl ExitCounterValues {
+    const fn new() -> Self {
+        Self {
+            l1_exits: 0,
+            direct_entry_attempts: 0,
+            observed_l2_entries: 0,
+            reflected_l2_exits: 0,
+            l0_only_handled_exits: 0,
+            external_interrupt_exits: 0,
+            interrupt_window_exits: 0,
+            invept: 0,
+            invvpid: 0,
+            nested_entry_failures: 0,
+            cpuid_exits: 0,
+            last_phase: 0,
+            last_reason: u64::MAX,
+        }
+    }
+
+    /// Counts reasons only for actual non-entry-failure hardware exits.
+    fn count_reason(&mut self, reason: u64, l1: bool) {
+        if reason == u64::MAX || reason & (1 << 31) != 0 {
+            return;
+        }
+        match reason & 0xffff {
+            EXIT_REASON_EXTERNAL_INTERRUPT => {
+                diagnostic_increment(&mut self.external_interrupt_exits)
+            }
+            EXIT_REASON_INTERRUPT_WINDOW => diagnostic_increment(&mut self.interrupt_window_exits),
+            EXIT_REASON_INVEPT if l1 => diagnostic_increment(&mut self.invept),
+            EXIT_REASON_INVVPID if l1 => diagnostic_increment(&mut self.invvpid),
+            EXIT_REASON_CPUID if l1 => diagnostic_increment(&mut self.cpuid_exits),
+            _ => {}
+        }
+    }
+
+    /// Updates scalar cells only, avoiding a bulk copy in the unsaved-XSAVE path.
+    fn record(&mut self, event: DiagnosticEvent) {
+        let (phase, reason) = match event {
+            DiagnosticEvent::L1Exit(reason) => {
+                diagnostic_increment(&mut self.l1_exits);
+                self.count_reason(reason, true);
+                (1, reason)
+            }
+            DiagnosticEvent::L0Handled { reason, action } => {
+                diagnostic_increment(&mut self.l0_only_handled_exits);
+                if matches!(action, VMEXIT_ACTION_VMLAUNCH | VMEXIT_ACTION_VMRESUME) {
+                    diagnostic_increment(&mut self.direct_entry_attempts);
+                    (3, reason)
+                } else {
+                    (2, reason)
+                }
+            }
+            DiagnosticEvent::NestedExit(reason) => {
+                if reason != u64::MAX {
+                    if reason & (1 << 31) == 0 {
+                        diagnostic_increment(&mut self.observed_l2_entries);
+                    } else {
+                        diagnostic_increment(&mut self.nested_entry_failures);
+                    }
+                }
+                self.count_reason(reason, false);
+                (4, reason)
+            }
+            DiagnosticEvent::Reflected(reason) => {
+                // Includes a VM-entry-failure exit successfully reflected to L1;
+                // observed_l2_entries excludes such entries that never ran L2.
+                diagnostic_increment(&mut self.reflected_l2_exits);
+                (5, reason)
+            }
+            DiagnosticEvent::EntryFailure(reason) => {
+                diagnostic_increment(&mut self.nested_entry_failures);
+                (6, reason)
+            }
+            DiagnosticEvent::GuestReturned => (7, EXIT_REASON_VMCALL),
+        };
+        diagnostic_store(&mut self.last_phase, phase);
+        diagnostic_store(&mut self.last_reason, reason);
+    }
+}
+
+/// Stores scalar telemetry observably for an external stopped-VM reader.
+fn diagnostic_store(destination: &mut u64, value: u64) {
+    // SAFETY: destination is an aligned, initialized, exclusively borrowed scalar
+    // in the guarded record (or a host test). Volatile preserves external capture
+    // visibility without exposing any guest-memory pointer or adding synchronization.
+    unsafe { ptr::write_volatile(destination, value) };
+}
+
+fn diagnostic_increment(destination: &mut u64) {
+    let next = destination.saturating_add(1);
+    diagnostic_store(destination, next);
+}
+
+/// Odd means in progress; exhaustion remains permanently odd, never wraps/ABAs.
+fn diagnostic_next_sequence(previous: u64) -> Option<(u64, u64)> {
+    if previous & 1 != 0 {
+        return None;
+    }
+    Some((previous.checked_add(1)?, previous.checked_add(2)?))
+}
+
+/// Exactly 18 little-endian u64 words; sequence is word 3, counters start at 5.
+/// Readers require magic/version/size/scope and a stable even sequence. Stop all
+/// QEMU vCPUs before copying this record; an odd/exhausted snapshot is not valid.
+#[repr(C)]
+struct ExitDiagnostics {
+    magic: u64,
+    version: u64,
+    size: u64,
+    sequence: AtomicU64,
+    scope: u64,
+    values: ExitCounterValues,
+}
+
+impl ExitDiagnostics {
+    const fn new() -> Self {
+        Self {
+            magic: DIAGNOSTIC_MAGIC,
+            version: DIAGNOSTIC_VERSION,
+            size: core::mem::size_of::<Self>() as u64,
+            sequence: AtomicU64::new(0),
+            scope: DIAGNOSTIC_BSP_SCOPE,
+            values: ExitCounterValues::new(),
+        }
+    }
+
+    fn record(&mut self, event: DiagnosticEvent) {
+        let sequence = diagnostic_next_sequence(self.sequence.load(Ordering::Relaxed));
+        self.sequence
+            .store(sequence.map_or(u64::MAX, |(odd, _)| odd), Ordering::Relaxed);
+        // x86 preserves store order; this compiler fence also prevents moving any
+        // scalar store before the observable odd marker or after the even commit.
+        compiler_fence(Ordering::SeqCst);
+        self.values.record(event);
+        compiler_fence(Ordering::Release);
+        if let Some((_, even)) = sequence {
+            self.sequence.store(even, Ordering::Release);
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 144);
+
+/// No serial or allocation is permitted here: this is the bounded hot-path hook.
+fn record_diagnostic(event: DiagnosticEvent) {
+    EXIT_DIAGNOSTICS.lock().record(event);
+}
+
+/// Preserves existing cold diagnostic fields with a saturating counter.
+fn cpuid_exit_count() -> u64 {
+    EXIT_DIAGNOSTICS.lock().values.cpuid_exits
+}
+
+/// Publishes only storage proven to belong to this runtime PE, before VMX entry.
+fn publish_diagnostics(
+    image_base: u64,
+    image_end: u64,
+    serial: &mut SerialPort,
+) -> Result<(), Error> {
+    let mut diagnostics = EXIT_DIAGNOSTICS.lock();
+    *diagnostics = ExitDiagnostics::new();
+    let address = ptr::from_ref(&*diagnostics) as usize as u64;
+    let size = core::mem::size_of::<ExitDiagnostics>() as u64;
+    let end = address
+        .checked_add(size)
+        .ok_or(Error::OutsideIdentityMap(address))?;
+    if address < image_base || end > image_end || end > IDENTITY_MAP_LIMIT {
+        return Err(Error::OutsideIdentityMap(end));
+    }
+    drop(diagnostics);
+    let _ = writeln!(
+        serial,
+        "thin-hv: vmx diagnostics address={address:#018x} size={size} version=1 scope=bsp-only environment=qemu-prototype"
+    );
+    Ok(())
+}
+
+/// Emits a bounded summary only after the existing returning guest leaves VMX.
+fn log_diagnostic_summary(serial: &mut SerialPort) {
+    let diagnostics = EXIT_DIAGNOSTICS.lock();
+    let values = diagnostics.values;
+    let sequence = diagnostics.sequence.load(Ordering::Acquire);
+    drop(diagnostics);
+    serial.write_bytes(b"thin-hv: vmx diagnostics summary scope=bsp-only");
+    for (name, value) in [
+        (&b"sequence"[..], sequence),
+        (&b"l1_exits"[..], values.l1_exits),
+        (&b"direct_entry_attempts"[..], values.direct_entry_attempts),
+        (&b"observed_l2_entries"[..], values.observed_l2_entries),
+        (&b"reflected_l2_exits"[..], values.reflected_l2_exits),
+        (&b"l0_only_handled_exits"[..], values.l0_only_handled_exits),
+        (
+            &b"external_interrupt_exits"[..],
+            values.external_interrupt_exits,
+        ),
+        (
+            &b"interrupt_window_exits"[..],
+            values.interrupt_window_exits,
+        ),
+        (&b"invept"[..], values.invept),
+        (&b"invvpid"[..], values.invvpid),
+        (&b"nested_entry_failures"[..], values.nested_entry_failures),
+        (&b"cpuid_exits"[..], values.cpuid_exits),
+        (&b"last_phase"[..], values.last_phase),
+        (&b"last_reason"[..], values.last_reason),
+    ] {
+        write_raw_field(serial, name, value);
+    }
+    write_raw_newline(serial);
+}
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == MONITOR_PAGES as u64);
 
@@ -387,6 +642,15 @@ fn run_direct_monitor(
     if image_base >= IDENTITY_MAP_LIMIT || image_end > IDENTITY_MAP_LIMIT {
         return Err(Error::OutsideIdentityMap(image_end));
     }
+    // SAFETY: run() selected this live runtime LoadedImage interface, and firmware
+    // keeps its code/data types valid throughout this pre-launch check.
+    if unsafe { (*loaded_image).image_data_type } != efi::RUNTIME_SERVICES_DATA {
+        return Err(Error::Firmware(
+            "diagnostics require runtime image data",
+            efi::Status::UNSUPPORTED.as_usize(),
+        ));
+    }
+    publish_diagnostics(image_base, image_end, serial)?;
 
     let feature_control = unsafe { cpu::rdmsr(cpu::IA32_FEATURE_CONTROL) };
     if feature_control & 1 == 0 {
@@ -1023,7 +1287,6 @@ fn configure_and_launch(
 
     GUEST_RAN.store(0, Ordering::Release);
     GUEST_STATUS.store(usize::MAX, Ordering::Release);
-    CPUID_EXIT_COUNT.store(0, Ordering::Relaxed);
     *L1_VCPU_STATE.lock() = VcpuState::new();
     *CARRIER_PATCH_VALUES.lock() = None;
     *DIRECT_PATCH_VALUES.lock() = None;
@@ -1467,11 +1730,25 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     let registers = unsafe { &mut *registers };
     let nested_run = NESTED_RUN.lock().take();
     if let Some(run) = nested_run {
+        // SAFETY: a hardware exit entered L0 with the direct VMCS current; this
+        // read-only telemetry access neither changes fields nor emulation policy.
+        let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+        record_diagnostic(DiagnosticEvent::NestedExit(reason));
         reflect_l2_vmexit(&run, registers);
+        record_diagnostic(DiagnosticEvent::Reflected(reason));
         return VMEXIT_ACTION_RESUME;
     }
 
+    // SAFETY: the hardware exit selected the live carrier VMCS for this BSP.
     let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    record_diagnostic(DiagnosticEvent::L1Exit(reason));
+    let action = dispatch_l1_exit(registers, reason);
+    record_diagnostic(DiagnosticEvent::L0Handled { reason, action });
+    action
+}
+
+/// Existing L1 emulation, separated only to count successfully handled exits.
+fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
     let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
     let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
@@ -1541,7 +1818,6 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_CPUID {
-        CPUID_EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
         let leaf = registers.rax as u32;
         let subleaf = registers.rcx as u32;
         let mut result = if (0x4000_0000..=0x4fff_ffff).contains(&leaf) {
@@ -1587,7 +1863,6 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_RDMSR {
         let msr = registers.rcx as u32;
         if VMX_CAPABILITY_MSR_RANGE.contains(&msr) {
-            log_l1_vmxon(b"capability_msr", u64::from(msr));
             let Some(value) = l1_vmx_capability(msr) else {
                 inject_general_protection(
                     reason,
@@ -1626,7 +1901,6 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         };
         let fixed = (value | CR4_VMX_ENABLE | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
             & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
-        log_l1_vmxon(b"cr4_write", value);
         for (field, field_value) in [(vmcs::GUEST_CR4, fixed), (vmcs::CR4_READ_SHADOW, value)] {
             let status = unsafe { vmx::vmwrite(field, field_value) };
             if status != VmxStatus::Success {
@@ -1712,6 +1986,10 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
+        record_diagnostic(DiagnosticEvent::L0Handled {
+            reason,
+            action: VMEXIT_ACTION_RESUME,
+        });
         log_vmexit(reason, qualification, guest_rip, instruction_len);
         finish_vmcall(reason);
     }
@@ -1807,7 +2085,6 @@ fn handle_l1_vmxon(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    log_l1_vmxon(b"entry", reason);
     let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -1837,7 +2114,6 @@ fn handle_l1_vmxon(
 
     let region_address =
         read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
-    log_l1_vmxon(b"region", region_address);
 
     let result = validate_l1_vmxon_region(region_address).map_or(
         VmInstructionResult::VmfailInvalid,
@@ -1928,7 +2204,6 @@ fn handle_l1_vmclear(
     }
 
     let address = read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
-    log_l1_vmx(b"VMCLEAR", b"region", address);
     let Some(region) = validate_l1_vmcs_address(address) else {
         complete_vmx_instruction(
             l1_vmx_failure(&state, VMXERR_VMCLEAR_INVALID_ADDRESS),
@@ -2737,6 +3012,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
     let Some(run) = NESTED_RUN.lock().take() else {
         stop_unexpected_exit(b"missing failed VMLAUNCH state", 20, 0, 0, 0, registers);
     };
+    record_diagnostic(DiagnosticEvent::EntryFailure(run.outer_reason));
     let result = if rflags & 1 != 0 {
         VmInstructionResult::VmfailInvalid
     } else if rflags & (1 << 6) != 0 {
@@ -3263,25 +3539,6 @@ fn l1_vmx_failure(state: &VcpuState, error: u32) -> VmInstructionResult {
     }
 }
 
-/// Logs one cold-path VMXON decode value.
-fn log_l1_vmxon(name: &[u8], value: u64) {
-    log_l1_vmx(b"VMXON", name, value);
-}
-
-/// Logs one cold-path nested-VMX decode value without runtime formatting.
-fn log_l1_vmx(instruction: &[u8], name: &[u8], value: u64) {
-    let mut serial = SerialPort;
-    serial.init();
-    serial.write_bytes(b"thin-hv: L1 ");
-    serial.write_bytes(instruction);
-    serial.write_byte(b' ');
-    serial.write_bytes(name);
-    serial.write_byte(b'=');
-    serial.write_hex(value);
-    serial.write_byte(b'\r');
-    serial.write_byte(b'\n');
-}
-
 /// Decodes and reads one nested-VMX m64 pointer operand.
 fn read_l1_vmx_pointer(
     reason: u64,
@@ -3605,7 +3862,7 @@ fn advance_guest_rip(
 /// Logs the common architectural VM-exit state.
 fn log_vmexit(reason: u64, qualification: u64, guest_rip: u64, instruction_len: u64) {
     let cpu_id = (cpu::cpuid(1, 0).ebx >> 24) & 0xff;
-    let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
+    let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;
     serial.init();
     serial.write_bytes(b"thin-hv: VMEXIT");
@@ -3615,17 +3872,19 @@ fn log_vmexit(reason: u64, qualification: u64, guest_rip: u64, instruction_len: 
     write_raw_field(&mut serial, b"qualification", qualification);
     write_raw_field(&mut serial, b"guest_rip", guest_rip);
     write_raw_field(&mut serial, b"instruction_len", instruction_len);
-    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits as u64);
+    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits);
     write_raw_newline(&mut serial);
 }
 
 /// Completes the bounded smoke test after the guest's VMCALL.
 fn finish_vmcall(reason: u64) -> ! {
+    record_diagnostic(DiagnosticEvent::GuestReturned);
     let marker = GUEST_RAN.load(Ordering::Acquire);
     let guest_status = GUEST_STATUS.load(Ordering::Acquire);
     let vmxoff = leave_vmx();
     let mut serial = SerialPort;
     serial.init();
+    log_diagnostic_summary(&mut serial);
     if reason & 0xffff == EXIT_REASON_VMCALL
         && marker == GUEST_MARKER
         && guest_status == efi::Status::SUCCESS.as_usize()
@@ -3657,7 +3916,7 @@ fn stop_unexpected_exit(
 ) -> ! {
     let vm_error = vm_instruction_error();
     let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }.unwrap_or(u64::MAX);
-    let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
+    let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;
     serial.init();
     serial.write_bytes(b"thin-hv: vmx guest FAIL: ");
@@ -3668,7 +3927,7 @@ fn stop_unexpected_exit(
     write_raw_field(&mut serial, b"guest_rip", guest_rip);
     write_raw_field(&mut serial, b"instruction_len", instruction_len);
     write_raw_field(&mut serial, b"vm_instruction_error", vm_error);
-    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits as u64);
+    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits);
     write_raw_field(&mut serial, b"rax", registers.rax);
     write_raw_field(&mut serial, b"rbx", registers.rbx);
     write_raw_field(&mut serial, b"rcx", registers.rcx);
@@ -3703,7 +3962,7 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
     let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
     let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
-    let cpuid_exits = CPUID_EXIT_COUNT.load(Ordering::Relaxed);
+    let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;
     serial.init();
     serial.write_bytes(b"thin-hv: VMRESUME FAIL status=");
@@ -3714,7 +3973,7 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
     write_raw_field(&mut serial, b"qualification", qualification);
     write_raw_field(&mut serial, b"guest_rip", guest_rip);
     write_raw_field(&mut serial, b"instruction_len", instruction_len);
-    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits as u64);
+    write_raw_field(&mut serial, b"cpuid_exits", cpuid_exits);
     write_raw_field(&mut serial, b"rax", registers.rax);
     write_raw_field(&mut serial, b"rbx", registers.rbx);
     write_raw_field(&mut serial, b"rcx", registers.rcx);
@@ -3764,6 +4023,9 @@ fn leave_vmx() -> VmxStatus {
 #[cfg(test)]
 mod tests {
     use super::DIRECT_VMCS_PATCH_MANIFEST;
+    use super::DiagnosticEvent;
+    use super::ExitCounterValues;
+    use super::ExitDiagnostics;
     use super::INJECT_EXTERNAL_INTERRUPT;
     use super::MAX_PHYSICAL_ADDRESS_BITS;
     use super::VmcsField;
@@ -3772,6 +4034,136 @@ mod tests {
     use super::read_direct_patch_field;
     use super::write_direct_patch_field;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn diagnostics_classify_l1_l2_and_failed_entries_without_reflection_confusion() {
+        let mut diagnostics = ExitDiagnostics::new();
+        for reason in [
+            super::EXIT_REASON_CPUID,
+            super::EXIT_REASON_INVEPT,
+            super::EXIT_REASON_INVVPID,
+        ] {
+            diagnostics.record(DiagnosticEvent::L1Exit(reason));
+            diagnostics.record(DiagnosticEvent::L0Handled {
+                reason,
+                action: super::VMEXIT_ACTION_RESUME,
+            });
+        }
+        diagnostics.record(DiagnosticEvent::L1Exit(
+            super::EXIT_REASON_EXTERNAL_INTERRUPT,
+        ));
+        diagnostics.record(DiagnosticEvent::L0Handled {
+            reason: super::EXIT_REASON_VMLAUNCH,
+            action: super::VMEXIT_ACTION_VMLAUNCH,
+        });
+        diagnostics.record(DiagnosticEvent::NestedExit(
+            super::EXIT_REASON_EXTERNAL_INTERRUPT,
+        ));
+        diagnostics.record(DiagnosticEvent::Reflected(
+            super::EXIT_REASON_EXTERNAL_INTERRUPT,
+        ));
+        let failed_entry = (1 << 31) | super::EXIT_REASON_INTERRUPT_WINDOW;
+        diagnostics.record(DiagnosticEvent::NestedExit(failed_entry));
+        diagnostics.record(DiagnosticEvent::Reflected(failed_entry));
+        diagnostics.record(DiagnosticEvent::EntryFailure(super::EXIT_REASON_VMRESUME));
+        diagnostics.record(DiagnosticEvent::NestedExit(u64::MAX));
+        let values = diagnostics.values;
+        assert_eq!(values.l1_exits, 4);
+        assert_eq!(values.l0_only_handled_exits, 4);
+        assert_eq!(values.direct_entry_attempts, 1);
+        assert_eq!(values.observed_l2_entries, 1);
+        assert_eq!(values.reflected_l2_exits, 2);
+        assert_eq!(values.external_interrupt_exits, 2);
+        assert_eq!(values.interrupt_window_exits, 0);
+        assert_eq!(values.nested_entry_failures, 2);
+        assert_eq!(
+            (values.cpuid_exits, values.invept, values.invvpid),
+            (1, 1, 1)
+        );
+        assert_eq!(values.last_reason, u64::MAX);
+        assert_eq!(values.last_phase, 4);
+        assert_eq!(diagnostics.sequence.load(Ordering::Relaxed) & 1, 0);
+        diagnostics.record(DiagnosticEvent::NestedExit(super::EXIT_REASON_INVEPT));
+        assert_eq!(
+            diagnostics.values.invept, 1,
+            "L2-reflected instruction is not L0's INVEPT"
+        );
+        diagnostics.record(DiagnosticEvent::GuestReturned);
+        assert_eq!(diagnostics.values.last_phase, 7);
+    }
+
+    #[test]
+    fn diagnostics_all_counters_saturate_without_wrapping() {
+        let almost = u64::MAX - 1;
+        let mut values = ExitCounterValues {
+            l1_exits: almost,
+            direct_entry_attempts: almost,
+            observed_l2_entries: almost,
+            reflected_l2_exits: almost,
+            l0_only_handled_exits: almost,
+            external_interrupt_exits: almost,
+            interrupt_window_exits: almost,
+            invept: almost,
+            invvpid: almost,
+            nested_entry_failures: almost,
+            cpuid_exits: almost,
+            last_phase: 0,
+            last_reason: u64::MAX,
+        };
+        for _ in 0..3 {
+            for reason in [
+                super::EXIT_REASON_CPUID,
+                super::EXIT_REASON_INVEPT,
+                super::EXIT_REASON_INVVPID,
+                super::EXIT_REASON_EXTERNAL_INTERRUPT,
+                super::EXIT_REASON_INTERRUPT_WINDOW,
+            ] {
+                values.record(DiagnosticEvent::L1Exit(reason));
+            }
+            values.record(DiagnosticEvent::L0Handled {
+                reason: super::EXIT_REASON_VMRESUME,
+                action: super::VMEXIT_ACTION_VMRESUME,
+            });
+            values.record(DiagnosticEvent::NestedExit(super::EXIT_REASON_CPUID));
+            values.record(DiagnosticEvent::Reflected(super::EXIT_REASON_CPUID));
+            values.record(DiagnosticEvent::EntryFailure(super::EXIT_REASON_VMLAUNCH));
+        }
+        for counter in [
+            values.l1_exits,
+            values.direct_entry_attempts,
+            values.observed_l2_entries,
+            values.reflected_l2_exits,
+            values.l0_only_handled_exits,
+            values.external_interrupt_exits,
+            values.interrupt_window_exits,
+            values.invept,
+            values.invvpid,
+            values.nested_entry_failures,
+            values.cpuid_exits,
+        ] {
+            assert_eq!(counter, u64::MAX);
+        }
+    }
+
+    #[test]
+    fn diagnostics_snapshot_layout_and_sequence_exhaustion_are_fail_closed() {
+        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 144);
+        assert_eq!(core::mem::offset_of!(ExitDiagnostics, sequence), 24);
+        assert_eq!(core::mem::offset_of!(ExitDiagnostics, values), 40);
+        assert_eq!(super::DIAGNOSTIC_MAGIC.to_le_bytes(), *b"THVSTAT1");
+        assert_eq!(super::diagnostic_next_sequence(0), Some((1, 2)));
+        assert_eq!(super::diagnostic_next_sequence(1), None);
+        assert_eq!(super::diagnostic_next_sequence(u64::MAX - 1), None);
+        let mut diagnostics = ExitDiagnostics::new();
+        diagnostics.sequence.store(u64::MAX - 3, Ordering::Relaxed);
+        diagnostics.record(DiagnosticEvent::L1Exit(super::EXIT_REASON_CPUID));
+        assert_eq!(diagnostics.sequence.load(Ordering::Relaxed), u64::MAX - 1);
+        diagnostics.record(DiagnosticEvent::L1Exit(super::EXIT_REASON_CPUID));
+        assert_eq!(diagnostics.sequence.load(Ordering::Relaxed), u64::MAX);
+        diagnostics.record(DiagnosticEvent::L1Exit(super::EXIT_REASON_CPUID));
+        assert_eq!(diagnostics.sequence.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(diagnostics.values.l1_exits, 3);
+    }
 
     #[test]
     fn acknowledged_external_interrupt_requires_a_plain_external_vector() {

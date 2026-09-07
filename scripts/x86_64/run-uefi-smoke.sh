@@ -1,12 +1,156 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+die() {
+    printf 'x86 UEFI smoke: %s\n' "$*" >&2
+    exit 1
+}
+
+# This same gate is exercised without QEMU by the xtask host tests.
+check_backend_log() {
+    local backend=$1 log=$2 expected line seen=0
+    case "$backend" in
+        direct-vmx) expected='thin-hv: backend=direct-vmx role=project-l0' ;;
+        outer-kvm) expected='thin-hv: backend=outer-kvm role=reference' ;;
+        physical-chainload) expected='thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0' ;;
+        physical-preflight) expected='thin-hv: backend=physical-preflight project_vmx=0' ;;
+        *) return 1 ;;
+    esac
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" == 'thin-hv: backend='* ]]; then
+            [[ "$line" == "$expected" ]] || return 1
+            seen=1
+        fi
+        if [[ "$backend" == direct-vmx ]]; then
+            # Runtime entry is logged before VMX setup. Firmware may continue
+            # booting Windows after setup returns an error; that is not L0 PASS.
+            # VMXOFF status is emitted only by the terminal failure handlers.
+            case "$line" in
+                *'thin-hv: vmx smoke FAIL'* | *'thin-hv: vmx guest FAIL'* | \
+                *'thin-hv: VMRESUME FAIL'* | *'thin-hv: VMXOFF status='* | \
+                *'thin-hv: panic'* | *'thin-hv: CPUID VMX=0'* | \
+                *'thin-hv: IA32_FEATURE_CONTROL=unavailable'* | \
+                *'thin-hv: IA32_VMX_BASIC=unavailable'*) return 1 ;;
+            esac
+        fi
+        if [[ "$backend" != direct-vmx ]]; then
+            case "$line" in
+                *'thin-hv: loading runtime monitor'* | *'thin-hv: runtime monitor active'* | \
+                *'thin-hv: variable overlay profile='* | *'thin-hv: uefi variable overlay PASS'* | \
+                *'thin-hv: L1 '* | *'thin-hv: vmx '*) return 1 ;;
+            esac
+        fi
+        if [[ "$backend" != outer-kvm && "$line" == *'thin-hv: trusted outer KVM'* ]]; then
+            return 1
+        fi
+        if [[ "$backend" == physical-preflight && "$line" == *'thin-hv: guest uefi payload'* ]]; then
+            return 1
+        fi
+    done <"$log"
+    ((seen))
+}
+
+# Validate the complete ordered transcript, not just the final fixture marker.
+# Expected loader errors are accepted only within their own negative test case.
+check_physical_policy_log() {
+    local log=$1 line index=0 active=0 complete=0 secondary=0
+    local entries=0 backends=0 payloads=0 returns=0 failures=0
+    local names=(default-windows explicit-linux other-esp-only malformed-options self-path)
+    local statuses=(0x0 0x0 0x800000000000000e 0x8000000000000002 0x800000000000000f)
+    local paths=(windows linux)
+    check_backend_log physical-chainload "$log" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        case "$line" in
+            'thin-hv: physical policy secondary_esp_visible=1 targets=windows,linux,other-only PASS')
+                ((secondary == 0 && active == 0 && index == 0 && complete == 0)) || return 1
+                secondary=1
+                ;;
+            'thin-hv: physical policy case='*' begin')
+                ((secondary == 1 && active == 0 && complete == 0 && index < ${#names[@]})) || return 1
+                [[ "$line" == "thin-hv: physical policy case=${names[index]} begin" ]] || return 1
+                active=1 entries=0 backends=0 payloads=0 returns=0 failures=0
+                ;;
+            'thin-hv: uefi entry')
+                ((active == 1 && entries == 0 && backends == 0)) || return 1
+                entries=1
+                ;;
+            'thin-hv: backend='*)
+                ((active == 1 && entries == 1 && backends == 0)) || return 1
+                backends=1
+                ;;
+            'thin-hv: physical policy payload '*)
+                ((active == 1 && backends == 1 && index < 2 && payloads == 0 && returns == 0)) || return 1
+                [[ "$line" == "thin-hv: physical policy payload path=${paths[index]} current_esp=1 PASS" ]] || return 1
+                payloads=1
+                ;;
+            'thin-hv: physical chainload PASS')
+                ((active == 1 && index < 2 && payloads == 1 && returns == 0)) || return 1
+                returns=1
+                ;;
+            'thin-hv: physical chainload FAIL: '*)
+                ((active == 1 && backends == 1 && index >= 2 && failures == 0)) || return 1
+                [[ "$line" == *" status=${statuses[index]}" ]] || return 1
+                failures=1
+                ;;
+            'thin-hv: physical policy case='*' PASS status='*)
+                ((active == 1 && entries == 1 && backends == 1)) || return 1
+                [[ "$line" == "thin-hv: physical policy case=${names[index]} PASS status=${statuses[index]}" ]] || return 1
+                if ((index < 2)); then
+                    ((payloads == 1 && returns == 1 && failures == 0)) || return 1
+                else
+                    ((payloads == 0 && returns == 0 && failures == 1)) || return 1
+                fi
+                active=0
+                index=$((index + 1))
+                ;;
+            'thin-hv: physical policy harness PASS')
+                ((active == 0 && complete == 0 && index == ${#names[@]})) || return 1
+                complete=1
+                ;;
+            *'thin-hv:'*'FAIL'* | *'thin-hv:'*'panic'* | \
+            *'thin-hv: guest uefi payload'* | *'thin-hv: uefi native variables'* | \
+            'thin-hv: physical policy '*) return 1 ;;
+            'thin-hv: physical chainload scope='*)
+                ((active == 1 && backends == 1 && index < 3 && payloads == 0 && returns == 0 && failures == 0)) || return 1
+                if ((index == 0)); then
+                    [[ "$line" == 'thin-hv: physical chainload scope=current-esp explicit_path=0' ]] || return 1
+                else
+                    [[ "$line" == 'thin-hv: physical chainload scope=current-esp explicit_path=1' ]] || return 1
+                fi
+                ;;
+            'thin-hv: physical chainload '*) return 1 ;;
+        esac
+    done <"$log"
+    ((secondary == 1 && complete == 1 && active == 0 && index == ${#names[@]}))
+}
+
+if [[ ${1:-} == --check-backend-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-backend-log BACKEND LOG'
+    check_backend_log "$2" "$3" || die "backend provenance check failed for $2"
+    exit 0
+fi
+if [[ ${1:-} == --check-physical-policy-log ]]; then
+    [[ $# == 2 ]] || die 'usage: --check-physical-policy-log LOG'
+    check_physical_policy_log "$2" || die 'physical-chainload policy transcript check failed'
+    exit 0
+fi
+
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
-monitor=${X86_MONITOR_IMAGE-"$(dirname -- "$loader")/x86-uefi-monitor.efi"}
+backend=${X86_UEFI_BACKEND:-direct-vmx}
+physical_policy=${X86_UEFI_PHYSICAL_POLICY:-0}
+[[ "$physical_policy" =~ ^[01]$ ]] || die 'X86_UEFI_PHYSICAL_POLICY must be 0 or 1'
+if ((physical_policy)); then
+    [[ "$backend" == physical-chainload ]] || die 'physical policy fixtures require the explicit physical-chainload backend'
+fi
+monitor=${X86_MONITOR_IMAGE-}
+if [[ "$backend" == direct-vmx ]]; then
+    monitor=${X86_MONITOR_IMAGE-"$(dirname -- "$loader")/x86-uefi-monitor.efi"}
+fi
 stage="$repo_root/bin/x86_64"
-esp="$stage/esp"
 serial_log="$stage/serial.log"
 qemu_log="$stage/qemu.log"
 monitor_fifo="$stage/qemu-monitor.$$.in"
@@ -18,23 +162,43 @@ failure_marker=${X86_GUEST_FAILURE_MARKER-}
 variable_marker=${X86_VARIABLE_MARKER-}
 guest_location=${X86_UEFI_GUEST_LOCATION:-guest}
 trusted_chainload_marker=
-trusted_forbidden_markers=(
-    'thin-hv: loading runtime monitor'
-    'thin-hv: runtime monitor active'
-    'thin-hv: variable overlay profile='
-    'thin-hv: L1 '
-)
+case "$backend" in
+    direct-vmx) ;;
+    outer-kvm) return_marker=${X86_RETURN_MARKER-'thin-hv: trusted outer KVM guest PASS'} ;;
+    physical-chainload)
+        guest_location=${X86_UEFI_GUEST_LOCATION:-windows}
+        return_marker='thin-hv: physical chainload PASS'
+        ;;
+    physical-preflight)
+        guest_location=none
+        return_marker='thin-hv: physical preflight PASS'
+        payload_marker=
+        variable_marker=
+        ;;
+    *) die 'X86_UEFI_BACKEND must be direct-vmx, outer-kvm, physical-chainload, or physical-preflight' ;;
+esac
+if [[ "$backend" != direct-vmx && -n "$monitor" ]]; then
+    die "$backend must not stage a project runtime monitor"
+fi
 if [[ ! ${X86_VARIABLE_MARKER+x} && ${guest##*/} == x86_guest_uefi_test.efi ]]; then
-    if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
+    if [[ "$backend" == outer-kvm || "$backend" == physical-chainload ]]; then
         variable_marker='thin-hv: uefi native variables PASS'
-    else
+    elif [[ "$backend" == direct-vmx ]]; then
         variable_marker='thin-hv: uefi variable overlay PASS'
     fi
+fi
+if ((physical_policy)); then
+    marker='thin-hv: physical policy case=default-windows begin'
+    return_marker='thin-hv: physical policy harness PASS'
+    payload_marker=
+    variable_marker=
+    failure_marker='thin-hv: physical policy harness FAIL'
 fi
 timeout_seconds=${X86_UEFI_TIMEOUT_SECONDS:-10}
 memory=${X86_UEFI_MEMORY:-256M}
 smp=${X86_UEFI_SMP:-1}
 cpu=${X86_UEFI_CPU:-host,+vmx,-hypervisor}
+accel=${X86_UEFI_ACCEL:-kvm}
 acpi_s3=${X86_UEFI_ACPI_S3:-0}
 wake_cycles=${X86_UEFI_WAKE_CYCLES:-0}
 allow_reboot=${X86_UEFI_ALLOW_REBOOT:-0}
@@ -42,17 +206,16 @@ require_poweroff=${X86_UEFI_REQUIRE_POWEROFF:-0}
 data_disk=${X86_UEFI_DATA_DISK:-}
 usernet=${X86_UEFI_USERNET:-0}
 
-die() {
-    printf 'x86 UEFI smoke: %s\n' "$*" >&2
-    exit 1
-}
-
 case "$guest_location" in
     guest | both) trusted_profile=2 ;;
     windows) trusted_profile=1 ;;
+    none) [[ "$backend" == physical-preflight ]] || die 'only preflight may omit the guest' ;;
     *) die "X86_UEFI_GUEST_LOCATION must be guest, windows, or both" ;;
 esac
-if [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]]; then
+if [[ "$backend" == physical-chainload && "$guest_location" != windows ]]; then
+    die 'physical-chainload smoke requires the Windows test payload on its parent ESP'
+fi
+if [[ "$backend" == outer-kvm ]]; then
     trusted_chainload_marker="thin-hv: trusted outer KVM direct chainload profile=$trusted_profile resident_runtime=0"
 fi
 
@@ -69,11 +232,16 @@ first_file() {
 
 [[ -f "$loader" ]] || die "loader not found: $loader"
 [[ -z "$monitor" || -f "$monitor" ]] || die "runtime monitor not found: $monitor"
-[[ -f "$guest" ]] || die "guest payload not found: $guest"
+[[ "$guest_location" == none || -f "$guest" ]] || die "guest payload not found: $guest"
+policy_loader="$stage/x86-uefi-physical-loader.efi"
+if ((physical_policy)); then
+    [[ -f "$policy_loader" ]] || die "physical policy project loader not found: $policy_loader"
+fi
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
 [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
 [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_SMP must be a positive integer'
 [[ -n "$cpu" ]] || die 'X86_UEFI_CPU must not be empty'
+[[ "$accel" == kvm || "$accel" == tcg ]] || die 'X86_UEFI_ACCEL must be kvm or tcg'
 [[ "$acpi_s3" =~ ^[01]$ ]] || die 'X86_UEFI_ACPI_S3 must be 0 or 1'
 [[ "$wake_cycles" =~ ^[0-9]+$ ]] || die 'X86_UEFI_WAKE_CYCLES must be a non-negative integer'
 [[ "$allow_reboot" =~ ^[01]$ ]] || die 'X86_UEFI_ALLOW_REBOOT must be 0 or 1'
@@ -82,8 +250,14 @@ first_file() {
 [[ -z "$data_disk" || -f "$data_disk" ]] || die "data disk not found: $data_disk"
 ((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
 if ((acpi_s3)); then
-    [[ ${loader##*/} == x86-uefi-kvm-loader.efi ]] || \
+    [[ "$backend" == outer-kvm ]] || \
         die 'X86_UEFI_ACPI_S3 is restricted to trusted outer-KVM artifacts'
+fi
+if ((physical_policy)); then
+    [[ "$smp" == 1 && "$acpi_s3" == 0 && "$wake_cycles" == 0 && \
+        "$allow_reboot" == 0 && "$require_poweroff" == 0 && \
+        "$usernet" == 0 && -z "$data_disk" ]] || \
+        die 'physical policy fixtures require one CPU, no extra devices, and no suspend/reboot/poweroff mode'
 fi
 command -v timeout >/dev/null || die "GNU timeout is required"
 
@@ -115,6 +289,26 @@ ovmf_vars=$(first_file \
     /usr/share/OVMF/OVMF_VARS_4M.fd \
     /usr/share/edk2/x64/OVMF_VARS.fd) || die "OVMF variable template not found; set OVMF_VARS"
 
+esp=
+policy_esp=
+cleanup_esps() {
+    local directory
+    for directory in "$esp" "$policy_esp"; do
+        [[ -n "$directory" ]] || continue
+        # Only files placed in this invocation's mktemp directories are removed.
+        rm -f -- "$directory/EFI/BOOT/BOOTX64.EFI" "$directory/EFI/BOOT/MONITORX64.EFI" \
+            "$directory/EFI/BOOT/GUESTX64.EFI" "$directory/EFI/Microsoft/Boot/bootmgfw.efi" \
+            "$directory/EFI/ubuntu/shimx64.efi" "$directory/EFI/Test/PHYSICAL.EFI" \
+            "$directory/EFI/Test/OTHERONLY.EFI"
+        rmdir -- "$directory/EFI/Microsoft/Boot" "$directory/EFI/Microsoft" \
+            "$directory/EFI/ubuntu" "$directory/EFI/Test" "$directory/EFI/BOOT" \
+            "$directory/EFI" "$directory" 2>/dev/null || true
+    done
+}
+trap cleanup_esps EXIT
+mkdir -p -- "$stage"
+# All payloads, including the fake bootmgfw.efi, live only on this test ESP.
+esp=$(mktemp -d "$stage/esp.XXXXXX")
 mkdir -p -- "$esp/EFI/BOOT"
 install -m 0644 -- "$loader" "$esp/EFI/BOOT/BOOTX64.EFI"
 if [[ -n "$monitor" ]]; then
@@ -123,12 +317,34 @@ else
     rm -f -- "$esp/EFI/BOOT/MONITORX64.EFI"
 fi
 rm -f -- "$esp/EFI/BOOT/GUESTX64.EFI" "$esp/EFI/Microsoft/Boot/bootmgfw.efi"
-if [[ "$guest_location" != windows ]]; then
+if [[ "$guest_location" == guest || "$guest_location" == both ]]; then
     install -m 0644 -- "$guest" "$esp/EFI/BOOT/GUESTX64.EFI"
 fi
-if [[ "$guest_location" != guest ]]; then
+if [[ "$guest_location" == windows || "$guest_location" == both ]]; then
     mkdir -p -- "$esp/EFI/Microsoft/Boot"
     install -m 0644 -- "$guest" "$esp/EFI/Microsoft/Boot/bootmgfw.efi"
+fi
+esp_args=(
+    -drive "if=none,id=esp,format=raw,file=fat:rw:$esp"
+    -device virtio-blk-pci,drive=esp
+)
+if ((physical_policy)); then
+    mkdir -p -- "$esp/EFI/Test" "$esp/EFI/ubuntu"
+    install -m 0644 -- "$policy_loader" "$esp/EFI/Test/PHYSICAL.EFI"
+    install -m 0644 -- "$guest" "$esp/EFI/ubuntu/shimx64.efi"
+    policy_esp=$(mktemp -d "$stage/esp-policy-other.XXXXXX")
+    mkdir -p -- "$policy_esp/EFI/Microsoft/Boot" "$policy_esp/EFI/ubuntu" "$policy_esp/EFI/Test"
+    install -m 0644 -- "$guest" "$policy_esp/EFI/Microsoft/Boot/bootmgfw.efi"
+    install -m 0644 -- "$guest" "$policy_esp/EFI/ubuntu/shimx64.efi"
+    install -m 0644 -- "$guest" "$policy_esp/EFI/Test/OTHERONLY.EFI"
+    # Present duplicate targets first, but boot only the driver on the primary
+    # ESP. Both disks are immutable fixtures, never an installed Windows ESP.
+    esp_args=(
+        -drive "if=none,id=policy-other,format=raw,readonly=on,file=fat:ro:$policy_esp"
+        -device virtio-blk-pci,drive=policy-other
+        -drive "if=none,id=esp,format=raw,readonly=on,file=fat:ro:$esp"
+        -device virtio-blk-pci,drive=esp,bootindex=1
+    )
 fi
 install -m 0600 -- "$ovmf_vars" "$vars"
 : >"$serial_log"
@@ -166,6 +382,7 @@ cleanup() {
         exec 9>&- 9<&-
     fi
     rm -f -- "$monitor_fifo"
+    cleanup_esps
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -179,7 +396,7 @@ monitor_fd_open=1
 set +e
 timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     "$qemu" \
-    -machine q35,accel=kvm \
+    -machine "q35,accel=$accel" \
     "${sleep_args[@]}" \
     -cpu "$cpu" \
     -smp "$smp" \
@@ -192,8 +409,7 @@ timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     "${shutdown_args[@]}" \
     -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
     -drive "if=pflash,format=raw,file=$vars" \
-    -drive "if=none,id=esp,format=raw,file=fat:rw:$esp" \
-    -device virtio-blk-pci,drive=esp \
+    "${esp_args[@]}" \
     "${extra_device_args[@]}" \
     <"$monitor_fifo" >"$qemu_log" 2>&1 &
 qemu_pid=$!
@@ -225,7 +441,7 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
     fi
     if grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
-        grep -Fq -- "$payload_marker" "$serial_log" &&
+        { [[ -z "$payload_marker" ]] || grep -Fq -- "$payload_marker" "$serial_log"; } &&
         { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; } &&
         { [[ -z "$trusted_chainload_marker" ]] || grep -Fq -- "$trusted_chainload_marker" "$serial_log"; }; then
         if ((!require_poweroff)); then
@@ -254,17 +470,19 @@ grep -Fq -- "$marker" "$serial_log" || die "marker '$marker' missing from $seria
 if [[ -n "$return_marker" ]]; then
     grep -Fq -- "$return_marker" "$serial_log" || die "marker '$return_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
-grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
+if [[ -n "$payload_marker" ]]; then
+    grep -Fq -- "$payload_marker" "$serial_log" || die "marker '$payload_marker' missing from $serial_log (QEMU status $qemu_status)"
+fi
 if [[ -n "$variable_marker" ]]; then
     grep -Fq -- "$variable_marker" "$serial_log" || die "marker '$variable_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
 if [[ -n "$trusted_chainload_marker" ]]; then
     grep -Fq -- "$trusted_chainload_marker" "$serial_log" || \
         die "marker '$trusted_chainload_marker' missing from $serial_log (QEMU status $qemu_status)"
-    for forbidden_marker in "${trusted_forbidden_markers[@]}"; do
-        ! grep -Fq -- "$forbidden_marker" "$serial_log" || \
-            die "trusted loader emitted forbidden marker '$forbidden_marker'"
-    done
+fi
+check_backend_log "$backend" "$serial_log" || die "backend provenance check failed for $backend in $serial_log"
+if ((physical_policy)); then
+    check_physical_policy_log "$serial_log" || die 'physical-chainload policy transcript check failed'
 fi
 ((wake_cycle == wake_cycles)) || die "observed $wake_cycle of $wake_cycles requested suspend cycles"
 if ((wake_cycles)); then
@@ -276,4 +494,4 @@ fi
 
 ((qemu_status == 0)) || die "QEMU exited with status $qemu_status"
 
-printf 'x86 UEFI smoke: observed %s\n' "$marker"
+printf 'x86 UEFI smoke: PASS backend=%s environment=QEMU/%s (not physical hardware)\n' "$backend" "$accel"

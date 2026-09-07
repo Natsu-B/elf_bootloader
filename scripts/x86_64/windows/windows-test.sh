@@ -35,6 +35,9 @@ s4_request_marker='thin-hv: windows hibernate request'
 s4_pass_marker='thin-hv: windows hibernate PASS state=S4 guest_resume=1'
 s4_fail_marker='thin-hv: windows hibernate FAIL'
 trusted_marker='thin-hv: trusted outer KVM direct chainload profile=1 resident_runtime=0'
+physical_test_marker='thin-hv: windows physical-status self-test PASS exit=0'
+physical_test_failure='thin-hv: windows physical-status self-test FAIL'
+physical_test_json='{"schema":"thin-hv.physical-status.self-test.v1","result":"PASS","hardware_queries":0}'
 
 die() {
     printf 'Windows x86 test: %s\n' "$*" >&2
@@ -50,6 +53,17 @@ host_uptime_seconds() {
 
     read -r uptime _ </proc/uptime
     printf '%s\n' "${uptime%%.*}"
+}
+
+serial_has_exact_marker() {
+    local expected=$1
+    shift
+
+    [[ -n "$expected" && "$expected" != *$'\r'* && "$expected" != *$'\n'* ]] || return 2
+    # cmd.exe emits CRLF, while SerialPort.WriteLine emits LF. Accept exactly
+    # those records, without deleting embedded CR or permitting extra text.
+    # Do not use -q: offset-pipeline producers must drain under pipefail.
+    LC_ALL=C grep -aFx -e "$expected" -e "$expected"$'\r' -- "$@" >/dev/null
 }
 
 first_file() {
@@ -225,14 +239,20 @@ stop_pid_file() {
 }
 
 run_dialog_command() {
-    local command=$1 submit_key=${2:-ret} index key
+    local command=$1 submit_key=${2:-ret} destination=${3:-dialog} index key
 
-    printf 'sendkey esc 20\n' >&9
-    sleep 0.1
-    printf 'sendkey esc 20\n' >&9
-    sleep 1
-    printf 'sendkey meta_l-r 20\n' >&9
-    sleep 3
+    case "$destination" in
+        dialog)
+            printf 'sendkey esc 20\n' >&9
+            sleep 0.1
+            printf 'sendkey esc 20\n' >&9
+            sleep 1
+            printf 'sendkey meta_l-r 20\n' >&9
+            sleep 3
+            ;;
+        console) ;;
+        *) die 'keyboard destination must be dialog or console' ;;
+    esac
     for ((index = 0; index < ${#command}; index++)); do
         key=${command:index:1}
         case $key in
@@ -243,6 +263,9 @@ run_dialog_command() {
             .) key='dot' ;;
             -) key=minus ;;
             '>') key=shift-dot ;;
+            '+') key=shift-equal ;;
+            '=') key=equal ;;
+            [A-Z]) key="shift-${key,,}" ;;
         esac
         printf 'sendkey %s 20\n' "$key" >&9
         sleep 0.1
@@ -254,6 +277,26 @@ probe_windows_desktop() {
     # ponytail: the Run dialog is the desktop-ready probe; use a guest agent
     # only if later tests need general command execution inside Windows.
     run_dialog_command "cmd /c echo $desktop_marker>com2"
+}
+
+physical_test_command() {
+    local bootstrap encoded
+
+    # Select exactly one mounted test volume; never assume a drive letter.
+    bootstrap='$p=@(Get-PSDrive -PSProvider FileSystem|ForEach-Object {Join-Path $_.Root "thin-hv-physical-status-test.ps1"}|Where-Object {Test-Path -LiteralPath $_ -PathType Leaf});if($p.Count -ne 1){exit 1};& $p[0]'
+    encoded=$(printf '%s' "$bootstrap" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+    [[ "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || die 'invalid encoded physical-status test command'
+    printf 'powershell -nop -ep bypass -encodedcommand %s' "$encoded"
+}
+
+capture_physical_test_screen() {
+    local screen=$1
+
+    # QEMU monitor paths are quoted separately from the shell's path handling.
+    screen=${screen//\\/\\\\}
+    screen=${screen//\"/\\\"}
+    printf 'screendump "%s"\n' "$screen" >&9
+    sleep 0.5
 }
 
 probe_hyperv_enable() {
@@ -304,7 +347,13 @@ run_windows() {
     local s4_probe_elapsed=-1
     local wsl_ready_matches=0
     local is_trusted=0 is_wsl=0 is_s4=0 is_daily_soak=0
-    local -a media_args
+    local backend_label='outer-kvm / reference'
+    local is_physical_test=0 physical_state='' physical_started=0 physical_probe_started=-1
+    local physical_desktop_probe_sent=0
+    local is_direct=0 diagnostics_failure_captured=0
+    local -a media_args network_args=(-netdev user,id=net0)
+
+    [[ "$mode" == check-physical-status ]] && is_physical_test=1
 
     if [[ "$mode" == trusted-kvm-hyperv || "$mode" == trusted-kvm-wsl || \
         "$mode" == trusted-kvm-wsl-soak || "$mode" == trusted-kvm-s4 ]]; then
@@ -344,6 +393,8 @@ run_windows() {
     fi
     [[ -n "$cpu" ]] || die 'WINDOWS_CPU must not be empty'
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
+        is_direct=1
+        backend_label='direct-vmx / project L0'
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
         smp=1
     elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == wsl-s4 || \
@@ -357,6 +408,8 @@ run_windows() {
     fi
     [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'WINDOWS_MEMORY must be a QEMU size such as 4G'
     [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'WINDOWS_SMP must be a positive integer'
+    printf 'Windows x86 test: backend=%s mode=%s environment=QEMU/KVM (not physical hardware)\n' \
+        "$backend_label" "$mode"
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
@@ -368,13 +421,40 @@ run_windows() {
         "$mode" != monitor-hyperv && "$mode" != trusted-kvm-hyperv && \
         "$mode" != trusted-kvm-wsl && "$mode" != trusted-kvm-wsl-soak && \
         "$mode" != trusted-kvm-s4 && \
-        "$mode" != wsl && "$mode" != wsl-s4 ]]; then
+        "$mode" != wsl && "$mode" != wsl-s4 && "$mode" != check-physical-status ]]; then
         # ponytail: keep the raw backing immutable instead of duplicating its
         # allocated blocks; remove all Hyper-V state before changing the base.
         die "Hyper-V overlay exists; remove its disk, vars, TPM, and ready marker together before changing the base"
     fi
 
-    if [[ "$mode" == install ]]; then
+    if ((is_physical_test)); then
+        need_command iconv
+        need_command base64
+        [[ -f "$disk" && -f "$vars" && -d "$base_tpm_dir" ]] || \
+            die 'physical-status self-test requires the existing QEMU evaluation disk, vars, and TPM'
+        timeout_seconds=${WINDOWS_PHYSICAL_TEST_TIMEOUT_SECONDS:-600}
+        disk_snapshot=on
+        network_args=(-netdev user,id=net0,restrict=on)
+        rm -f -- "$work/check-physical-status-command.ppm" "$work/check-physical-status-failure.ppm"
+        physical_state=$(mktemp -d "$work/physical-status.XXXXXX")
+        # This early trap also covers failures while preparing private test state.
+        trap 'rm -rf -- "$physical_state"' EXIT
+        mkdir -p -- "$physical_state/media" "$physical_state/tpm"
+        install -m 0600 -- "$vars" "$physical_state/vars.fd"
+        cp -a -- "$base_tpm_dir/." "$physical_state/tpm/"
+        install -m 0644 -- "$repo_root/scripts/x86_64/windows/physical-status.ps1" \
+            "$physical_state/media/physical-status.ps1"
+        install -m 0644 -- "$repo_root/scripts/x86_64/windows/physical-status-test.ps1" \
+            "$physical_state/media/thin-hv-physical-status-test.ps1"
+        active_vars="$physical_state/vars.fd"
+        tpm_dir="$physical_state/tpm"
+        tpm_instance=physical-status
+        media_args=(
+            -drive "if=none,id=status-media,format=raw,readonly=on,file=fat:ro:$physical_state/media"
+            -device "usb-storage,bus=xhci.0,drive=status-media,removable=on"
+            -boot "menu=off"
+        )
+    elif [[ "$mode" == install ]]; then
         need_command qemu-img
         disk_size=${WINDOWS_DISK_SIZE:-80G}
         [[ "$disk_size" =~ ^[1-9][0-9]*[KMG]$ ]] || \
@@ -427,7 +507,7 @@ run_windows() {
     elif ((is_wsl)); then
         need_command qemu-img
         prepare_hyperv_media
-        [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
+        [[ -f "$hyperv_ready" ]] || die "outer-kvm/reference Hyper-V PASS missing; run '$0 hyperv' first"
         prepare_wsl_media "$daily_soak_run_id"
         wsl_media_stamp=$(sha256sum \
             "$hyperv_media/wsl-enable.ps1" \
@@ -486,7 +566,7 @@ run_windows() {
     elif [[ "$mode" == monitor-hyperv ]]; then
         need_command qemu-img
         prepare_hyperv_media
-        [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
+        [[ -f "$hyperv_ready" ]] || die "outer-kvm/reference Hyper-V PASS missing; run '$0 hyperv' first"
         prepare_monitor_media
         install -m 0600 -- "$ovmf_vars" "$monitor_vars"
         timeout_seconds=${WINDOWS_HYPERV_TIMEOUT_SECONDS:-600}
@@ -503,7 +583,7 @@ run_windows() {
     elif [[ "$mode" == trusted-kvm-hyperv ]]; then
         need_command qemu-img
         prepare_hyperv_media
-        [[ -f "$hyperv_ready" ]] || die "direct Hyper-V PASS missing; run '$0 hyperv' first"
+        [[ -f "$hyperv_ready" ]] || die "outer-kvm/reference Hyper-V PASS missing; run '$0 hyperv' first"
         prepare_monitor_media "$trusted_kvm_loader" ''
         timeout_seconds=${WINDOWS_HYPERV_TIMEOUT_SECONDS:-600}
         active_vars=$hyperv_vars
@@ -537,7 +617,10 @@ run_windows() {
     : >"$serial_log"
     : >"$desktop_serial_log"
     : >"$qemu_log"
-    if ((is_s4)) && [[ "$s4_phase" == resume ]]; then
+    if ((is_physical_test)); then
+        expected_marker=$physical_test_marker
+        marker_log=$desktop_serial_log
+    elif ((is_s4)) && [[ "$s4_phase" == resume ]]; then
         expected_marker=$s4_pass_marker
         marker_log=$desktop_serial_log
     elif ((is_daily_soak && wsl_ready_matches == 0)); then
@@ -561,9 +644,123 @@ run_windows() {
         marker_log=$serial_log
     fi
 
+    qemu_is_owned() {
+        [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null || return 1
+        if ((is_physical_test || is_direct)); then
+            # Bind cleanup to this invocation's QEMU serial argument, not a reused PID.
+            [[ -r "/proc/$qemu_pid/cmdline" ]] || return 1
+            tr '\0' '\n' <"/proc/$qemu_pid/cmdline" | \
+                grep -Fx -- "file:$serial_log" >/dev/null || return 1
+        fi
+    }
+
+    direct_monitor_state() {
+        local offset state attempt
+
+        qemu_is_owned && ((monitor_fd_open)) || return 1
+        offset=$(stat -c %s -- "$qemu_log") || return 1
+        [[ "$offset" =~ ^[0-9]+$ ]] || return 1
+        printf 'info status\n' >&9 || return 1
+        for ((attempt = 0; attempt < 50; attempt++)); do
+            qemu_is_owned || return 1
+            state=$(tail -c "+$((offset + 1))" -- "$qemu_log" | tr -d '\r' | \
+                sed -n 's/.*VM status: \(running\|paused\)$/\1/p') || return 1
+            if [[ "$state" == running || "$state" == paused ]]; then
+                printf '%s\n' "$state"
+                return 0
+            fi
+            [[ -z "$state" ]] || return 1
+            sleep 0.1
+        done
+        return 1
+    }
+
+    capture_direct_diagnostics() {
+        local reason=$1 resume=$2 directory screen record json_file quoted_record
+        local decoder="$repo_root/scripts/x86_64/decode-vmx-diagnostics.py"
+        local initial_state='' stopped=0 must_resume=0 address='' result=1
+
+        ((is_direct && monitor_fd_open)) && qemu_is_owned || return 1
+        [[ "$reason" == failure || "$reason" == pre-success ]] || return 1
+        [[ "$resume" == 0 || "$resume" == 1 ]] || return 1
+        # Never allow a host path to add a second HMP command.
+        [[ "$work" != *$'\n'* && "$work" != *$'\r'* ]] || return 1
+        directory=$(mktemp -d "$work/$mode-$reason-diagnostics.XXXXXX") || return 1
+        screen="$directory/screen.ppm"
+        record="$directory/counters.bin"
+        json_file="$directory/counters.json"
+        initial_state=$(direct_monitor_state) || initial_state=
+        if [[ "$initial_state" == running ]]; then
+            must_resume=$resume
+            if printf 'stop\n' >&9 && [[ $(direct_monitor_state) == paused ]]; then
+                stopped=1
+            fi
+        elif [[ "$initial_state" == paused ]]; then
+            stopped=1
+        fi
+
+        # The screen remains useful when the monitor never reached publication.
+        capture_physical_test_screen "$screen" || true
+        if [[ -s "$screen" ]]; then
+            printf 'Windows x86 test: direct diagnostics screen=%s reason=%s\n' "$screen" "$reason"
+        fi
+        if ((stopped)) && command -v python3 >/dev/null && [[ -f "$decoder" ]]; then
+            address=$(python3 "$decoder" address "$serial_log") || address=
+            if [[ "$address" =~ ^0x[0-9a-f]{16}$ ]]; then
+                quoted_record=${record//\\/\\\\}
+                quoted_record=${quoted_record//\"/\\\"}
+                # The decoder validated this unique monitor-owned publication.
+                # The VM is stopped, and the fixed byte count is never log input.
+                if printf 'pmemsave %s 144 "%s"\n' "$address" "$quoted_record" >&9 && \
+                    [[ $(direct_monitor_state) == paused ]] && \
+                    python3 "$decoder" decode "$serial_log" "$record" >"$json_file"; then
+                    printf 'Windows x86 test: direct diagnostics counters=%s reason=%s\n' "$json_file" "$reason"
+                    cat -- "$json_file"
+                    result=0
+                else
+                    rm -f -- "$json_file"
+                fi
+            fi
+        fi
+        # Keep only validated bounded JSON and the requested screen, not a dump.
+        rm -f -- "$record"
+        if ((must_resume)); then
+            if ! printf 'cont\n' >&9 || [[ $(direct_monitor_state) != running ]]; then
+                printf 'Windows x86 test: direct diagnostics could not resume QEMU\n' >&2
+                return 2
+            fi
+        fi
+        if ((resume)) && [[ "$initial_state" != running ]]; then
+            # Preserve an existing pause, but never turn it into functional PASS.
+            printf 'Windows x86 test: QEMU was not running at direct pre-success capture\n' >&2
+            return 2
+        fi
+        if ((result)); then
+            printf 'Windows x86 test: direct diagnostics counters unavailable reason=%s\n' "$reason" >&2
+        fi
+        return "$result"
+    }
+
     cleanup() {
-        if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-            kill "$qemu_pid" 2>/dev/null || true
+        if qemu_is_owned; then
+            if ((is_direct && monitor_fd_open && !diagnostics_failure_captured)); then
+                diagnostics_failure_captured=1
+                capture_direct_diagnostics failure 0 || true
+            fi
+            if ((is_physical_test && monitor_fd_open)); then
+                capture_physical_test_screen "$work/check-physical-status-failure.ppm" || true
+            fi
+            # Capture may take several seconds; do not act on its old PID check.
+            if qemu_is_owned; then
+                kill "$qemu_pid" 2>/dev/null || true
+                if ((is_physical_test || is_direct)); then
+                    for _ in {1..20}; do
+                        qemu_is_owned || break
+                        sleep 0.1
+                    done
+                    qemu_is_owned && kill -KILL "$qemu_pid" 2>/dev/null || true
+                fi
+            fi
             wait "$qemu_pid" 2>/dev/null || true
         fi
         stop_pid_file "$tpm_pid_file"
@@ -571,6 +768,7 @@ run_windows() {
             exec 9>&- 9<&-
         fi
         rm -f -- "$tpm_socket" "$tpm_pid_file" "$monitor_fifo"
+        [[ -z "$physical_state" ]] || rm -rf -- "$physical_state"
     }
     trap cleanup EXIT
     trap 'exit 130' INT
@@ -619,11 +817,12 @@ run_windows() {
         -device usb-tablet,bus=xhci.0 \
         -drive "if=none,id=windisk,format=$disk_format,file=$disk_image,snapshot=$disk_snapshot,cache=writeback,discard=unmap,detect-zeroes=unmap" \
         -device ide-hd,bus=ide.0,drive=windisk,bootindex=2 \
-        -netdev user,id=net0 \
+        "${network_args[@]}" \
         -device e1000e,netdev=net0 \
         "${media_args[@]}" \
         <"$monitor_fifo" >"$qemu_log" 2>&1 &
     qemu_pid=$!
+    ((is_physical_test)) && physical_started=$(host_uptime_seconds)
     printf 'Windows x86 test: %s running as PID %s; VNC %s\n' \
         "$mode" "$qemu_pid" "${WINDOWS_VNC:-127.0.0.1:1}"
     if [[ "$mode" == install ]]; then
@@ -635,20 +834,45 @@ run_windows() {
     fi
 
     while ((elapsed < timeout_seconds)); do
+        if ((is_physical_test)); then
+            (($(host_uptime_seconds) - physical_started < timeout_seconds)) || break
+            if grep -Fq -- "$physical_test_failure" "$marker_log"; then
+                die 'physical-status self-test failed in disposable Windows'
+            fi
+            if ((physical_probe_started < 0 && elapsed >= 150)) && serial_has_exact_marker "$marker" "$serial_log"; then
+                if ((physical_desktop_probe_sent == 0)); then
+                    probe_windows_desktop
+                    physical_desktop_probe_sent=1
+                elif serial_has_exact_marker "$desktop_marker" "$marker_log"; then
+                    physical_probe_started=$(host_uptime_seconds)
+                    # A previous screenshot showed only the desktop, not a
+                    # parser error. Keep a console open to expose the failing
+                    # launch phase without changing the encoded test command.
+                    run_dialog_command cmd
+                    sleep 3
+                    run_dialog_command "$(physical_test_command)" ret console
+                    sleep 3
+                    capture_physical_test_screen "$work/check-physical-status-command.ppm"
+                fi
+            elif ((physical_probe_started >= 0 && $(host_uptime_seconds) - physical_probe_started >= 180)); then
+                serial_has_exact_marker "$expected_marker" "$marker_log" || \
+                    die 'physical-status self-test did not complete within 180 seconds'
+            fi
+        fi
         marker_seen=0
         if ((is_daily_soak && wsl_ready_matches == 1)); then
             if ((soak_probe_sent)) && \
                 tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
-                    grep -Fx -- "$expected_marker" >/dev/null; then
+                    serial_has_exact_marker "$expected_marker"; then
                 marker_seen=1
             fi
         elif ((is_wsl && wsl_ready_matches == 0)); then
             if ((setup_probe_sent)) && \
                 tail -c "+$((wsl_probe_offset + 1))" -- "$marker_log" | \
-                    grep -Fx -- "$expected_marker" >/dev/null; then
+                    serial_has_exact_marker "$expected_marker"; then
                 marker_seen=1
             fi
-        elif grep -Fxq -- "$expected_marker" "$marker_log"; then
+        elif serial_has_exact_marker "$expected_marker" "$marker_log"; then
             marker_seen=1
         fi
         if ((is_s4 && marker_seen && !setup_probe_sent)) && \
@@ -712,7 +936,8 @@ run_windows() {
             fi
         fi
         if ((marker_seen)); then
-            printf 'Windows x86 test: observed %s\n' "$expected_marker"
+            printf 'Windows x86 test: backend=%s environment=QEMU/KVM observed %s\n' \
+                "$backend_label" "$expected_marker"
             break
         fi
         if ((is_s4 && setup_probe_sent && s4_probe_elapsed >= 0 && \
@@ -758,6 +983,9 @@ run_windows() {
     done
     ((marker_seen)) || \
         die "marker timeout; logs: $serial_log $marker_log $qemu_log"
+    if ((is_physical_test)); then
+        serial_has_exact_marker "$physical_test_json" "$marker_log" || die 'physical-status exact JSON missing'
+    fi
     if ((is_daily_soak)); then
         soak_elapsed_seconds=$(($(host_uptime_seconds) - soak_started_uptime))
         ((soak_started_uptime >= 0 && soak_elapsed_seconds >= daily_soak_minutes * 60)) || \
@@ -782,8 +1010,17 @@ run_windows() {
     fi
 
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
+        bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
+            --check-backend-log direct-vmx "$serial_log" || die 'Direct-VMX backend provenance failed'
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
+        [[ $(direct_monitor_state) == running ]] || die 'QEMU is not running before direct success validation'
+        if capture_direct_diagnostics pre-success 1; then
+            :
+        else
+            local diagnostics_status=$?
+            ((diagnostics_status != 2)) || die 'QEMU was not running or did not resume during direct diagnostics capture'
+        fi
     elif ((is_trusted)); then
         if ((wsl_monitor_offset >= 0)); then
             tail -c "+$((wsl_monitor_offset + 1))" -- "$serial_log" | \
@@ -825,8 +1062,8 @@ run_windows() {
         return
     fi
 
-    # The S4 verifier requests S5 itself; an ACPI power button can re-hibernate.
-    if ((!is_s4)); then
+    # These verifiers request S5 themselves; an ACPI button can re-hibernate.
+    if ((!is_s4 && !is_physical_test && !is_daily_soak)); then
         printf 'system_powerdown\n' >&9
     fi
     for _ in {1..120}; do
@@ -834,7 +1071,7 @@ run_windows() {
         sleep 1
     done
     if kill -0 "$qemu_pid" 2>/dev/null; then
-        if ((is_daily_soak || is_s4)); then
+        if ((is_daily_soak || is_s4 || is_physical_test)); then
             die "Windows did not shut down within 120 seconds after $mode PASS"
         fi
         printf 'quit\n' >&9
@@ -844,6 +1081,14 @@ run_windows() {
     qemu_status=$?
     set -e
     qemu_pid=
+    if ((is_direct)); then
+        ((qemu_status == 0)) || die "Direct-VMX QEMU exit status $qemu_status after guest marker"
+    fi
+    if ((is_physical_test)); then
+        ! grep -Fq -- "$physical_test_failure" "$marker_log" || die 'physical-status late failure'
+        ((qemu_status == 0)) || die "physical-status QEMU exit status $qemu_status"
+        printf 'Windows x86 test: physical-status SelfTest PASS environment=QEMU/KVM hardware_queries=0\n'
+    fi
     if ((is_daily_soak || is_s4)); then
         for fail_marker in "$wsl_fail_marker" "$daily_soak_fail_marker" "$s4_fail_marker"; do
             if grep -Fq -- "$fail_marker" "$marker_log"; then
@@ -880,6 +1125,8 @@ check_wsl_soak() {
         'phase-1 disk hash did not survive reboot' \
         'daily soak media stamp changed during resume' \
         'DailySoakRunId' \
+        '& shutdown.exe /s /t 0 /f' \
+        'daily soak shutdown request failed' \
         'run_id=' \
         'daily soak PASS stamp=$Stamp run_id=$RunId target_minutes=$Minutes target_rounds=$Rounds' \
         'IncrementalHash' \
@@ -916,13 +1163,15 @@ check_wsl_soak() {
         'trusted_boot_count == 1' \
         'soak_completed_rounds >= soak_required_rounds' \
         'target_minutes=$daily_soak_minutes target_rounds=$daily_soak_rounds' \
-        'grep -Fx -- "$expected_marker"' \
+        'serial_has_exact_marker "$expected_marker"' \
         'during S4 poweroff' \
         'guest reported $fail_marker after PASS'; do
         grep -Fq -- "$needle" "$0" || die "daily-soak/S4 exit check missing: $needle"
     done
     grep -Fq -- 'daily-soak phase 1 did not start within 180 seconds' "$0" || \
         die 'daily-soak launch gate is missing'
+    grep -Fxq -- '    if ((!is_s4 && !is_physical_test && !is_daily_soak)); then' "$0" || \
+        die 'daily-soak must not receive an additional ACPI power-button request'
     grep -Fq -- '[int]$Minutes = 60' "$launcher" || die 'daily-soak launcher default is not 60 minutes'
     grep -Fq -- '[int]$Rounds = 2' "$launcher" || die 'daily-soak launcher lacks two-boot rounds'
     printf 'Windows x86 test: daily-soak/S4 static checks PASS\n'
@@ -930,6 +1179,7 @@ check_wsl_soak() {
 
 usage() {
     printf 'usage: %s download|verify|download-wsl|verify-wsl|check-wsl-soak|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-wsl-soak|trusted-kvm-s4\n' "$0"
+    printf '       %s check-physical-status (disposable QEMU eval SelfTest only)\n' "$0"
 }
 
 case ${1:-} in
@@ -938,6 +1188,13 @@ case ${1:-} in
     download-wsl) download_wsl_msi ;;
     verify-wsl) verify_wsl_msi ;;
     check-wsl-soak) check_wsl_soak ;;
+    check-physical-status) run_windows check-physical-status ;;
+    physical-test-command) physical_test_command ;;
+    check-serial-marker)
+        (($# == 2 || $# == 3)) || die 'check-serial-marker requires MARKER and optional LOG'
+        shift
+        serial_has_exact_marker "$@"
+        ;;
     install) run_windows install ;;
     boot) run_windows boot ;;
     monitor) run_windows monitor ;;

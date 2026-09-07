@@ -11,6 +11,7 @@ env \
     LINUX_L1_CMDLINE='console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=2 panic=-1' \
     scripts/x86_64/build-linux-uki.sh "$output"
 env \
+    X86_UEFI_BACKEND=outer-kvm \
     X86_MONITOR_IMAGE= \
     X86_RETURN_MARKER= \
     X86_VARIABLE_MARKER= \

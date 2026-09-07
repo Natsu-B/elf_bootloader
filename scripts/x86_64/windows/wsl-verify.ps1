@@ -406,6 +406,9 @@ function Invoke-DailySoak {
         (Join-Path $stateDirectory 'daily-soak-phase2.bin') -Force
     Set-Content -LiteralPath $statusFile -Value $lines -Encoding ASCII
     Write-Com2 -Lines $lines
+    # Evaluation-QEMU completion must not depend on the power-button policy.
+    & shutdown.exe /s /t 0 /f
+    Assert-Soak ($LASTEXITCODE -eq 0) 'daily soak shutdown request failed'
     exit 0
 }
 

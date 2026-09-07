@@ -5,28 +5,95 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
+fail_lifecycle() {
+    echo "thin-hv: linux L2 lifecycle FAIL $*"
+    # The host runner detects this marker and terminates this disposable VM.
+    while :; do /bin/busybox sleep 1; done
+}
+
+# Interactive boot remains the default. Automated lifetime testing is explicit
+# and uses a fresh probe process (and therefore fresh VM/vCPU descriptors) per run.
+cycles=
+lifecycle_backend=
+read -r boot_arguments </proc/cmdline
+set -f
+for argument in $boot_arguments; do
+    case "$argument" in
+        thin_hv_kvm_cycles=*)
+            [ -z "$cycles" ] || fail_lifecycle duplicate-cycle-argument
+            cycles=${argument#*=}
+            case "$cycles" in ''|0*|*[!0-9]*) fail_lifecycle invalid-cycle-count ;; esac
+            [ "${#cycles}" -le 4 ] && [ "$cycles" -le 4096 ] \
+                || fail_lifecycle cycle-count-out-of-range
+            ;;
+        thin_hv_kvm_backend=*)
+            [ -z "$lifecycle_backend" ] || fail_lifecycle duplicate-backend-argument
+            lifecycle_backend=${argument#*=}
+            case "$lifecycle_backend" in
+                direct-vmx|outer-kvm) ;;
+                *) fail_lifecycle invalid-backend ;;
+            esac
+            ;;
+    esac
+done
+set +f
+if [ -n "$cycles$lifecycle_backend" ]; then
+    [ -n "$cycles" ] && [ -n "$lifecycle_backend" ] \
+        || fail_lifecycle incomplete-lifecycle-arguments
+    read -r online_cpus </sys/devices/system/cpu/online
+    [ "$online_cpus" = 0 ] || fail_lifecycle requires-one-L1-cpu
+fi
+
+kvm_ready=1
 if grep -qw vmx /proc/cpuinfo; then
     echo 'thin-hv: linux L1 /proc/cpuinfo vmx=1'
 else
     echo 'thin-hv: linux L1 /proc/cpuinfo vmx=0'
+    kvm_ready=0
 fi
 echo 'thin-hv: linux L1 modprobe kvm begin'
 if modprobe kvm; then
     echo 'thin-hv: linux L1 modprobe kvm end rc=0'
 else
     echo 'thin-hv: linux L1 modprobe kvm end rc=1'
+    kvm_ready=0
 fi
 echo 'thin-hv: linux L1 modprobe kvm_intel begin'
 if modprobe kvm_intel nested=0 && [ -d /sys/module/kvm_intel ]; then
     echo 'thin-hv: linux L1 kvm_intel=1'
 else
     echo 'thin-hv: linux L1 kvm_intel=0'
+    kvm_ready=0
 fi
 if [ -c /dev/kvm ]; then
     echo 'thin-hv: linux L1 /dev/kvm=1'
-    /bin/kvm-probe || true
+    if [ -z "$cycles" ]; then
+        /bin/kvm-probe || true
+    else
+        [ "$kvm_ready" = 1 ] || fail_lifecycle KVM-unavailable
+        echo "thin-hv: linux L2 lifecycle begin backend=$lifecycle_backend cycles=$cycles l1_cpus=1"
+        completed=0
+        while [ "$completed" -lt "$cycles" ]; do
+            # A successful wait requires exit_group(0), after the kernel tears
+            # down this process's KVM VM/vCPU fds and shared kvm_run mapping.
+            if probe_output=$(/bin/kvm-probe); then
+                [ "$probe_output" = 'thin-hv: linux L1 L2 KVM PASS' ] \
+                    || fail_lifecycle probe-success-marker-mismatch
+            else
+                echo "$probe_output"
+                fail_lifecycle "probe-process-exit cycle=$((completed + 1))"
+            fi
+            completed=$((completed + 1))
+            echo "thin-hv: linux L2 lifecycle cycle=$completed KVM_RUN=IO port=0xe9 data=L2OK process_exit=0"
+        done
+        echo "thin-hv: linux L2 lifecycle PASS backend=$lifecycle_backend cycles=$completed"
+        echo 'thin-hv: linux L2 lifecycle poweroff requested'
+        /bin/busybox poweroff -f || fail_lifecycle poweroff-failed
+        fail_lifecycle poweroff-returned
+    fi
 else
     echo 'thin-hv: linux L1 /dev/kvm=0'
+    [ -z "$cycles" ] || fail_lifecycle missing-KVM-device
 fi
 echo 'thin-hv: linux L1 shell'
 exec setsid cttyhack sh

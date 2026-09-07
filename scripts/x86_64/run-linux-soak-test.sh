@@ -38,6 +38,7 @@ trap 'rm -f -- "$disk"' EXIT
 truncate -s 192M "$disk"
 
 env \
+    X86_UEFI_BACKEND=outer-kvm \
     X86_MONITOR_IMAGE= \
     X86_RETURN_MARKER='thin-hv-soak: PASS phase=2' \
     X86_VARIABLE_MARKER= \

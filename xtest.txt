@@ -27,6 +27,10 @@ std nested_vmx
 std uefi_variable_overlay
 std x86_uefi_loader --bin x86-uefi-loader
 std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features trusted-outer-kvm
+std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features physical-chainload
+std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features physical-preflight
+std x86_guest_uefi_test --bin x86-uefi-physical-policy --no-default-features --features physical-policy-driver
+std x86_guest_uefi_test --bin x86-uefi-physical-policy --no-default-features --features physical-policy-payload
 # Select host GDB integrations explicitly; the remaining integrations target UEFI.
 unit gdb_remote
 std gdb_remote --test rsp_binary_decode --test rsp_frame_assembler
