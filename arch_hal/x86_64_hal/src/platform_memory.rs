@@ -591,7 +591,7 @@ impl<'a> PlatformMap<'a> {
         }
         for ranges in [private, mmio] {
             for (index, range) in ranges.iter().enumerate() {
-                if range.end > mtrrs.width.limit() || range.end > (1 << 48) {
+                if range.end > mtrrs.width.limit() {
                     return Err(Error::EptAddressWidth);
                 }
                 if ranges[..index].iter().any(|other| range.overlaps(*other)) {
@@ -600,6 +600,9 @@ impl<'a> PlatformMap<'a> {
             }
         }
         for range in mmio {
+            if range.end > (1 << 48) {
+                return Err(Error::EptAddressWidth);
+            }
             for descriptor in descriptors {
                 if range.overlaps(descriptor.range(mtrrs.width)?)
                     && !matches!(descriptor.memory_type, 0 | 11)
@@ -628,6 +631,23 @@ impl<'a> PlatformMap<'a> {
             cursor: 0,
             failed: false,
         }
+    }
+
+    /// Physical paging-structure addresses use MAXPHYADDR, not the GPA walk width.
+    pub(crate) const fn physical_width(&self) -> PhysicalWidth {
+        self.mtrrs.width
+    }
+
+    /// Requires explicit ownership of every byte, including adjacent reservations.
+    pub(crate) fn owns_private_range(&self, range: PhysicalRange) -> bool {
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let Some(owner) = self.private.iter().find(|owner| owner.contains(cursor)) else {
+                return false;
+            };
+            cursor = owner.end;
+        }
+        true
     }
 
     /// Returns the next mapped interval start, skipping absent and unowned ranges.
