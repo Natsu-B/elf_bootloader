@@ -1083,6 +1083,8 @@ run_windows() {
     qemu_pid=
     if ((is_direct)); then
         ((qemu_status == 0)) || die "Direct-VMX QEMU exit status $qemu_status after guest marker"
+        bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
+            --check-backend-log direct-vmx "$serial_log" || die 'Direct-VMX backend/fatal gate failed after QEMU exit'
     fi
     if ((is_physical_test)); then
         ! grep -Fq -- "$physical_test_failure" "$marker_log" || die 'physical-status late failure'
