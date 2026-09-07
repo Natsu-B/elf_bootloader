@@ -1,5 +1,10 @@
 # x86_64 thin monitor: architecture and validation status
 
+The deployment direction changed on 2026-09-07: see
+[physical x86 L0 milestones](x86_64_physical_l0.md). Outer KVM is now a reference/CI backend,
+not the production architecture. The dated results below are historical QEMU evidence;
+they do not establish physical Direct-VMX, Windows activation, or bare-metal daily-use safety.
+
 This document records only implementation and measurements that exist on
 `feat/x86-thin-monitor` through 2026-09-02. The daily-use candidate trusts the upper Linux/KVM,
 QEMU, and OVMF stack, directly chainloads the selected guest, and keeps firmware state in a separate
@@ -66,7 +71,7 @@ the same PE image and changes its subsystem to EFI runtime driver with
 preserves its pages across `ExitBootServices`:
 
 ```text
-OVMF / physical UEFI
+QEMU / OVMF (prototype; not physical validation)
   -> BOOTX64.EFI (ordinary EFI application)
        1. LoadImage(parent GUESTX64.EFI, parent bootmgfw.efi, then other-filesystem bootmgfw.efi)
        2. LoadImage(MONITORX64.EFI), pass the guest handle in LoadOptions
