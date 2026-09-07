@@ -29,6 +29,7 @@ check_backend_log() {
             case "$line" in
                 *'thin-hv: vmx smoke FAIL'* | *'thin-hv: vmx guest FAIL'* | \
                 *'thin-hv: VMRESUME FAIL'* | *'thin-hv: VMXOFF status='* | \
+                *'thin-hv: host exception '* | \
                 *'thin-hv: panic'* | *'thin-hv: CPUID VMX=0'* | \
                 *'thin-hv: IA32_FEATURE_CONTROL=unavailable'* | \
                 *'thin-hv: IA32_VMX_BASIC=unavailable'*) return 1 ;;
@@ -37,6 +38,7 @@ check_backend_log() {
         if [[ "$backend" != direct-vmx ]]; then
             case "$line" in
                 *'thin-hv: loading runtime monitor'* | *'thin-hv: runtime monitor active'* | \
+                *'thin-hv: private host state'* | *'thin-hv: host exception '* | \
                 *'thin-hv: variable overlay profile='* | *'thin-hv: uefi variable overlay PASS'* | \
                 *'thin-hv: L1 '* | *'thin-hv: vmx '*) return 1 ;;
             esac
@@ -49,6 +51,123 @@ check_backend_log() {
         fi
     done <"$log"
     ((seen))
+}
+
+# This is a separate negative fixture, never a relaxed ordinary backend gate.
+# Only the deliberate root exception may fail, and QEMU must stop by timeout.
+check_host_exception_log() {
+    local status=$1 log=$2 line transcript bytes phase=0 backends=0 payload=0 variables=0
+    [[ "$status" == 124 ]] || return 1
+    [[ -f "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+    ((bytes > 0 && bytes <= 262144)) || return 1
+    # Bash normally discards NUL bytes in read. Using NUL as the delimiter first
+    # rejects them instead of accepting a corrupted marker with bytes removed.
+    if IFS= read -r -d '' transcript <"$log"; then
+        return 1
+    fi
+    ((${#transcript} <= 262144)) || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        case "$line" in
+            'thin-hv: backend=direct-vmx role=project-l0')
+                ((phase == 0 && backends < 2)) || return 1
+                backends=$((backends + 1))
+                ;;
+            'thin-hv: runtime monitor active')
+                ((phase == 0 && backends == 2)) || return 1
+                phase=1
+                ;;
+            'thin-hv: private host state PASS')
+                ((phase == 1)) || return 1
+                phase=2
+                ;;
+            'thin-hv: guest uefi payload')
+                ((phase == 2 && payload == 0 && variables == 0)) || return 1
+                payload=1
+                ;;
+            'thin-hv: uefi variable overlay PASS')
+                ((phase == 2 && payload == 1 && variables == 0)) || return 1
+                variables=1
+                ;;
+            'thin-hv: host exception test guest returned')
+                ((phase == 2 && payload == 1 && variables == 1)) || return 1
+                phase=3
+                ;;
+            'thin-hv: host exception test armed')
+                ((phase == 3)) || return 1
+                phase=4
+                ;;
+            'thin-hv: host exception FAIL: stopped')
+                ((phase == 4)) || return 1
+                phase=5
+                ;;
+            *'FAIL'* | *'panic'* | *'thin-hv: VMXOFF status='* | \
+            *'thin-hv: CPUID VMX=0'* | *'thin-hv: trusted outer KVM'* | \
+            'thin-hv: backend='* | 'thin-hv: runtime monitor active'* | \
+            'thin-hv: private host state'* | 'thin-hv: host exception '* | \
+            'thin-hv: vmx guest PASS'* | 'thin-hv: guest uefi payload'* | \
+            'thin-hv: uefi variable overlay'* | 'thin-hv: uefi native variables'*) return 1 ;;
+        esac
+    done <<<"$transcript"
+    ((phase == 5 && backends == 2 && payload == 1 && variables == 1))
+}
+
+# Fixed QEMU fixtures distinguish a real EPT construction from a capability skip.
+# The application may legitimately skip elsewhere; that is not this KVM test's PASS.
+check_preflight_ept_log() {
+    local accel=$1 log=$2 line transcript bytes passes=0 skips=0 vmx_markers=0 tables leaves
+    local pass_pattern='^thin-hv: preflight EPT audit PASS scope=uefi-memory-map tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=288 mmio_complete=0 direct_vmx_ready=0$'
+    [[ "$accel" == kvm || "$accel" == tcg ]] || return 1
+    [[ -f "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+    ((bytes > 0 && bytes <= 262144)) || return 1
+    if IFS= read -r -d '' transcript <"$log"; then
+        return 1
+    fi
+    ((${#transcript} <= 262144)) || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" =~ $pass_pattern ]]; then
+            [[ "$accel" == kvm ]] || return 1
+            ((passes == 0 && skips == 0)) || return 1
+            tables=${BASH_REMATCH[1]}
+            leaves=${BASH_REMATCH[2]}
+            ((tables <= 256)) || return 1
+            # Validate u64 without Bash signed arithmetic wrapping large counts.
+            if ((${#leaves} == 20)) && [[ "$leaves" > 18446744073709551615 ]]; then
+                return 1
+            fi
+            passes=1
+            continue
+        fi
+        case "$line" in
+            'thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0')
+                [[ "$accel" == tcg ]] || return 1
+                ((skips == 0 && passes == 0)) || return 1
+                skips=1
+                ;;
+            'thin-hv: preflight VMX=0 direct_vmx_ready=0')
+                [[ "$accel" == tcg ]] || return 1
+                ((vmx_markers == 0)) || return 1
+                vmx_markers=1
+                ;;
+            'thin-hv: preflight VMX=1 direct_vmx_ready=0')
+                [[ "$accel" == kvm ]] || return 1
+                ((vmx_markers == 0)) || return 1
+                vmx_markers=1
+                ;;
+            *'FAIL'* | *'panic'* | 'thin-hv: preflight EPT audit'* | \
+            'thin-hv: preflight VMX='*) return 1 ;;
+        esac
+    done <<<"$transcript"
+    if [[ "$accel" == kvm ]]; then
+        ((passes == 1 && skips == 0))
+    else
+        ((passes == 0 && skips == 1 && vmx_markers == 1))
+    fi
 }
 
 # Validate the complete ordered transcript, not just the final fixture marker.
@@ -136,13 +255,29 @@ if [[ ${1:-} == --check-physical-policy-log ]]; then
     check_physical_policy_log "$2" || die 'physical-chainload policy transcript check failed'
     exit 0
 fi
+if [[ ${1:-} == --check-host-exception-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-host-exception-log QEMU_STATUS LOG'
+    check_host_exception_log "$2" "$3" || die 'root host-exception fixture transcript/status check failed'
+    exit 0
+fi
+if [[ ${1:-} == --check-preflight-ept-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-preflight-ept-log ACCEL LOG'
+    check_preflight_ept_log "$2" "$3" || die 'preflight EPT construction transcript check failed'
+    exit 0
+fi
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
 physical_policy=${X86_UEFI_PHYSICAL_POLICY:-0}
+host_exception_test=${X86_UEFI_HOST_EXCEPTION_TEST:-0}
 [[ "$physical_policy" =~ ^[01]$ ]] || die 'X86_UEFI_PHYSICAL_POLICY must be 0 or 1'
+[[ "$host_exception_test" =~ ^[01]$ ]] || die 'X86_UEFI_HOST_EXCEPTION_TEST must be 0 or 1'
+if ((host_exception_test)); then
+    [[ "$backend" == direct-vmx && "$physical_policy" == 0 ]] || \
+        die 'host-exception fixtures require the explicit direct-vmx backend and no physical policy fixture'
+fi
 if ((physical_policy)); then
     [[ "$backend" == physical-chainload ]] || die 'physical policy fixtures require the explicit physical-chainload backend'
 fi
@@ -258,6 +393,22 @@ if ((physical_policy)); then
         "$allow_reboot" == 0 && "$require_poweroff" == 0 && \
         "$usernet" == 0 && -z "$data_disk" ]] || \
         die 'physical policy fixtures require one CPU, no extra devices, and no suspend/reboot/poweroff mode'
+fi
+if ((host_exception_test)); then
+    [[ "$accel" == kvm && "$smp" == 1 && "$memory" == 256M && \
+        "$acpi_s3" == 0 && "$wake_cycles" == 0 && "$allow_reboot" == 0 && \
+        "$require_poweroff" == 0 && "$usernet" == 0 && -z "$data_disk" && \
+        "$guest_location" == guest && -z "$failure_marker" ]] || \
+        die 'host-exception fixtures require QEMU/KVM, one CPU, 256M, the native guest, and no extra modes/devices'
+    [[ "$timeout_seconds" =~ ^([1-9]|[1-5][0-9]|60)$ ]] || \
+        die 'host-exception timeout must be bounded to 1..60 seconds'
+    [[ ${loader##*/} == x86-uefi-host-exception-loader.efi && \
+        ${monitor##*/} == x86-uefi-host-exception-monitor.efi && \
+        ${guest##*/} == x86_guest_uefi_test.efi ]] || \
+        die 'host-exception fixtures require their separate test-only loader/runtime artifacts and native guest'
+elif [[ ${loader##*/} == x86-uefi-host-exception-loader.efi || \
+        ${monitor##*/} == x86-uefi-host-exception-monitor.efi ]]; then
+    die 'test-only host-exception artifacts must not run as an ordinary smoke backend'
 fi
 command -v timeout >/dev/null || die "GNU timeout is required"
 
@@ -439,7 +590,7 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
         printf 'quit\n' >&9
         break
     fi
-    if grep -Fq -- "$marker" "$serial_log" &&
+    if ((!host_exception_test)) && grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
         { [[ -z "$payload_marker" ]] || grep -Fq -- "$payload_marker" "$serial_log"; } &&
         { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; } &&
@@ -463,6 +614,12 @@ cat -- "$serial_log"
 if ((qemu_status != 0)); then
     cat -- "$qemu_log" >&2
 fi
+if ((host_exception_test)); then
+    check_host_exception_log "$qemu_status" "$serial_log" || \
+        die 'root host-exception fixture transcript/status check failed'
+    printf 'x86 UEFI host-exception fixture: PASS backend=direct-vmx environment=QEMU/KVM expected_stop=124 (not physical hardware)\n'
+    exit 0
+fi
 if [[ -n "$failure_marker" ]] && grep -Fq -- "$failure_marker" "$serial_log"; then
     die "guest failure marker '$failure_marker' observed in $serial_log"
 fi
@@ -481,6 +638,9 @@ if [[ -n "$trusted_chainload_marker" ]]; then
         die "marker '$trusted_chainload_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
 check_backend_log "$backend" "$serial_log" || die "backend provenance check failed for $backend in $serial_log"
+if [[ "$backend" == physical-preflight ]]; then
+    check_preflight_ept_log "$accel" "$serial_log" || die 'preflight EPT construction transcript check failed'
+fi
 if ((physical_policy)); then
     check_physical_policy_log "$serial_log" || die 'physical-chainload policy transcript check failed'
 fi

@@ -11,6 +11,8 @@ pub mod cpu;
 #[cfg(feature = "vmx")]
 pub mod ept;
 #[cfg(feature = "vmx")]
+pub mod host_state;
+#[cfg(feature = "vmx")]
 pub mod paging;
 #[cfg(feature = "vmx")]
 pub mod platform_memory;

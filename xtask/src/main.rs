@@ -37,10 +37,16 @@ fn main() {
             print_xtask_usage();
         }
         Some("build") => {
-            let _ = build(&remaining_args).unwrap();
+            if let Err(error) = build(&remaining_args) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
         }
         Some("run") => {
-            run(&remaining_args).unwrap();
+            if let Err(error) = run(&remaining_args) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
         }
         Some("test") => test(&remaining_args),
         Some(cmd) => {
@@ -363,6 +369,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("physical-chainload")
             || arg.contains("physical-preflight")
             || arg.contains("physical-policy")
+            || arg.contains("host-exception-test")
     }) {
         return Err(
             "x86 builds all backend artifacts; do not select an alternate backend feature explicitly"
@@ -560,7 +567,57 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             )
         })?;
     }
+    build_x86_host_exception_fixture(args, &workspace, &artifact)?;
     Ok(destination.to_string_lossy().into_owned())
+}
+
+/// Builds a deliberately faulting QEMU-only fixture without replacing normal images.
+fn build_x86_host_exception_fixture(
+    args: &[String],
+    workspace: &Path,
+    artifact: &Path,
+) -> Result<(), String> {
+    eprintln!("\n--- Building test-only Direct-VMX root-exception fixture ---");
+    let status = Command::new("cargo")
+        .args(["build", "-p", "x86_uefi_loader", "--bin", "x86-uefi-loader"])
+        .args(["--target", "x86_64-unknown-uefi"])
+        .args(args)
+        .args(["--no-default-features", "--features", "host-exception-test"])
+        .env("XTASK_BUILD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("Failed to build host-exception fixture: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "host-exception fixture build failed with status: {status}"
+        ));
+    }
+    let stage = workspace.join("bin/x86_64");
+    let monitor = stage.join("x86-uefi-host-exception-monitor.efi");
+    for destination in [
+        stage.join("x86-uefi-host-exception-loader.efi"),
+        monitor.clone(),
+    ] {
+        fs::copy(artifact, &destination).map_err(|error| {
+            format!(
+                "Failed to copy host-exception fixture to {}: {error}",
+                destination.display()
+            )
+        })?;
+    }
+    let status = Command::new("objcopy")
+        .arg("--subsystem=efi-rtd")
+        .arg(&monitor)
+        .status()
+        .map_err(|error| format!("Failed to convert host-exception runtime image: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "host-exception runtime conversion failed with status: {status}"
+        ));
+    }
+    Ok(())
 }
 
 const VMX_MNEMONICS: [&str; 17] = [
@@ -655,6 +712,7 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
         .arg(binary_path)
         .env("X86_UEFI_BACKEND", "direct-vmx")
         .env("X86_UEFI_PHYSICAL_POLICY", "0")
+        .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
         .env("X86_UEFI_ACCEL", "kvm")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -669,12 +727,53 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    eprintln!(
+        "\n--- Running expected root exception fixture (QEMU/KVM, not physical hardware) ---"
+    );
+    let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+        .arg("bin/x86_64/x86-uefi-host-exception-loader.efi")
+        .arg("bin/x86_64/x86_guest_uefi_test.efi")
+        .env(
+            "X86_MONITOR_IMAGE",
+            "bin/x86_64/x86-uefi-host-exception-monitor.efi",
+        )
+        .env("X86_UEFI_BACKEND", "direct-vmx")
+        .env("X86_UEFI_PHYSICAL_POLICY", "0")
+        .env("X86_UEFI_HOST_EXCEPTION_TEST", "1")
+        .env("X86_UEFI_ACCEL", "kvm")
+        .env("X86_UEFI_CPU", "host,+vmx,-hypervisor")
+        .env("X86_UEFI_MEMORY", "256M")
+        .env("X86_UEFI_SMP", "1")
+        .env("X86_UEFI_TIMEOUT_SECONDS", "30")
+        .env("X86_UEFI_GUEST_LOCATION", "guest")
+        .env("X86_UEFI_ACPI_S3", "0")
+        .env("X86_UEFI_WAKE_CYCLES", "0")
+        .env("X86_UEFI_ALLOW_REBOOT", "0")
+        .env("X86_UEFI_REQUIRE_POWEROFF", "0")
+        .env("X86_UEFI_USERNET", "0")
+        .env_remove("X86_UEFI_DATA_DISK")
+        .env_remove("X86_RETURN_MARKER")
+        .env_remove("X86_VARIABLE_MARKER")
+        .env_remove("X86_GUEST_MARKER")
+        .env_remove("X86_GUEST_FAILURE_MARKER")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("Failed to run root-exception fixture: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "root-exception fixture failed with status: {status}"
+        ));
+    }
+
     for guest_location in ["guest", "windows", "both"] {
         eprintln!("\n--- Running QEMU/KVM outer-kvm / reference smoke test ({guest_location}) ---");
         let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
             .arg("bin/x86_64/x86-uefi-kvm-loader.efi")
             .env("X86_UEFI_BACKEND", "outer-kvm")
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
+            .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
             .env("X86_UEFI_ACCEL", "kvm")
             .env("X86_MONITOR_IMAGE", "")
             .env("X86_RETURN_MARKER", "thin-hv: trusted outer KVM guest PASS")
@@ -720,6 +819,7 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
             .arg(Path::new("bin/x86_64").join(filename))
             .env("X86_UEFI_BACKEND", backend)
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
+            .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
             .env("X86_UEFI_ACCEL", accel)
             .env("X86_UEFI_CPU", cpu)
             .env(
@@ -750,6 +850,7 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
         .arg("bin/x86_64/x86-uefi-physical-policy-payload.efi")
         .env("X86_UEFI_BACKEND", "physical-chainload")
         .env("X86_UEFI_PHYSICAL_POLICY", "1")
+        .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
         .env("X86_UEFI_ACCEL", "tcg")
         .env("X86_UEFI_CPU", "qemu64")
         .env("X86_UEFI_TIMEOUT_SECONDS", "60")
@@ -2667,6 +2768,221 @@ mod tests {
                 markers[2].1
             )
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_exception_gate_requires_only_the_ordered_expected_root_fault() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-host-exception-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |status: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-host-exception-log", status])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let backend = "thin-hv: backend=direct-vmx role=project-l0\n";
+        let required = [
+            "thin-hv: runtime monitor active\n",
+            "thin-hv: private host state PASS\n",
+            "thin-hv: guest uefi payload\n",
+            "thin-hv: uefi variable overlay PASS\n",
+            "thin-hv: host exception test guest returned\n",
+            "thin-hv: host exception test armed\n",
+            "thin-hv: host exception FAIL: stopped\n",
+        ];
+        let valid = format!("{backend}{backend}{}", required.concat());
+        assert!(check("124", &valid));
+        assert!(check("124", &valid.replace('\n', "\r\n")));
+        assert!(check("124", valid.trim_end_matches('\n')));
+        for status in ["0", "1", "137", "143", "0124", ""] {
+            assert!(!check(status, &valid), "accepted QEMU status {status}");
+        }
+        assert!(!check("124", ""));
+        assert!(!check("124", &valid.replacen(backend, "", 1)));
+        assert!(!check("124", &format!("{backend}{valid}")));
+        assert!(!check(
+            "124",
+            &valid.replace(backend, "thin-hv: backend=outer-kvm role=reference\n")
+        ));
+        for required_line in required {
+            assert!(!check("124", &valid.replace(required_line, "")));
+            assert!(!check(
+                "124",
+                &valid.replace(required_line, &format!("{required_line}{required_line}"))
+            ));
+            assert!(!check(
+                "124",
+                &valid.replace(required_line, &format!("prefix {required_line}"))
+            ));
+            assert!(!check(
+                "124",
+                &valid.replace(required_line, &required_line.replace('\n', " suffix\n"))
+            ));
+        }
+        assert!(!check(
+            "124",
+            &valid.replace(
+                "thin-hv: host exception test guest returned\nthin-hv: host exception test armed\n",
+                "thin-hv: host exception test armed\nthin-hv: host exception test guest returned\n"
+            )
+        ));
+        assert!(!check(
+            "124",
+            &valid.replace("exception test armed", "exception\0 test armed")
+        ));
+        assert!(!check("124", &valid.replace("stopped\n", "stopped\r\r\n")));
+        assert!(!check(
+            "124",
+            &format!("{}{valid}", "unrelated\n".repeat(32768))
+        ));
+        for forbidden in [
+            "thin-hv: vmx smoke FAIL: test\n",
+            "thin-hv: vmx guest FAIL\n",
+            "thin-hv: VMRESUME FAIL\n",
+            "thin-hv: VMXOFF status=Success\n",
+            "thin-hv: panic\n",
+            "thin-hv: vmx guest PASS start_image_status=0x0000000000000000\n",
+            "thin-hv: backend=physical-preflight project_vmx=0\n",
+            "thin-hv: uefi native variables PASS\n",
+        ] {
+            assert!(!check("124", &format!("{valid}{forbidden}")));
+            assert!(!check("124", &format!("{forbidden}{valid}")));
+        }
+        fs::write(&log.0, &valid).unwrap();
+        let ordinary = Command::new("bash")
+            .arg(&runner)
+            .args(["--check-backend-log", "direct-vmx"])
+            .arg(&log.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !ordinary.success(),
+            "ordinary Direct-VMX must reject the expected-fault transcript"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_ept_gate_distinguishes_construction_from_capability_skip() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-preflight-ept-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |accel: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-preflight-ept-log", accel])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let vmx_absent = "thin-hv: preflight VMX=0 direct_vmx_ready=0\n";
+        let vmx_present = "thin-hv: preflight VMX=1 direct_vmx_ready=0\n";
+        let skip =
+            "thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0\n";
+        let pass = |tables: &str, leaves: &str| {
+            format!(
+                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
+            )
+        };
+        let kvm = format!("{vmx_present}{}", pass("12", "3456"));
+        let tcg = format!("{vmx_absent}{skip}");
+        assert!(check("kvm", &kvm));
+        assert!(check("tcg", &tcg));
+        assert!(check("kvm", &pass("1", "1")));
+        assert!(check("kvm", &pass("256", "18446744073709551615")));
+        assert!(check("kvm", &kvm.replace('\n', "\r\n")));
+        assert!(check("tcg", &tcg.replace('\n', "\r\n")));
+        assert!(check("kvm", kvm.trim_end_matches('\n')));
+        assert!(!check("tcg", skip));
+        assert!(!check("kvm", &tcg));
+        assert!(!check("tcg", &kvm));
+        for accel in ["", "unknown", "KVM", "kvm "] {
+            assert!(!check(accel, &kvm));
+        }
+        for tables in ["0", "01", "-1", "257", "9999", "18446744073709551616"] {
+            assert!(!check("kvm", &pass(tables, "1")));
+        }
+        for leaves in [
+            "0",
+            "01",
+            "-1",
+            "1x",
+            "18446744073709551616",
+            "999999999999999999999",
+        ] {
+            assert!(!check("kvm", &pass("1", leaves)));
+        }
+        for (accel, valid) in [("kvm", &kvm), ("tcg", &tcg)] {
+            assert!(!check(accel, ""));
+            assert!(!check(accel, &format!("{valid}{valid}")));
+            assert!(!check(
+                accel,
+                &format!("{valid}thin-hv: physical preflight FAIL\n")
+            ));
+            assert!(!check(
+                accel,
+                &format!("{valid}thin-hv: preflight EPT audit FAIL\n")
+            ));
+            assert!(!check(
+                accel,
+                &format!("{valid}thin-hv: preflight EPT audit malformed\n")
+            ));
+            assert!(!check(accel, &valid.replace("EPT audit", "EPT\0 audit")));
+            assert!(!check(
+                accel,
+                &valid.replace("direct_vmx_ready=0", "direct_vmx_ready=1")
+            ));
+        }
+        for (from, to) in [
+            ("private_pages=288", "private_pages=287"),
+            ("mmio_complete=0", "mmio_complete=1"),
+            ("scope=uefi-memory-map", "scope=qemu-fallback"),
+            ("leaves=3456", "leaves=3456 extra=1"),
+        ] {
+            assert!(!check("kvm", &kvm.replace(from, to)));
+        }
+        assert!(!check(
+            "tcg",
+            &tcg.replace("reason=no-ept-capability", "reason=unknown")
+        ));
+        assert!(!check("kvm", &format!("{kvm}{skip}")));
+        assert!(!check("tcg", &format!("{tcg}{}", pass("1", "1"))));
     }
 
     #[cfg(unix)]
