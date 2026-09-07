@@ -13,6 +13,8 @@ pub mod ept;
 #[cfg(feature = "vmx")]
 pub mod paging;
 #[cfg(feature = "vmx")]
+pub mod platform_memory;
+#[cfg(feature = "vmx")]
 pub mod vmcs;
 #[cfg(feature = "vmx")]
 pub mod vmx;
