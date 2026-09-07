@@ -124,7 +124,7 @@ or successful compilation alone does not establish a passed policy boot test.
 capability MSRs, FEATURE_CONTROL, PAT/MTRR state, and a validated UEFI memory-map snapshot.
 It records ACPI/SMBIOS table presence/addresses and MSDM header presence only. It never reads the
 MSDM key payload, dumps SMBIOS identifiers, or changes firmware identity. Temporary Boot Services
-pool allocation is released; there is no VMXON, WRMSR, ExitBootServices, child launch, or persistent
+pool and EPT-audit page allocations are released; there is no VMXON, WRMSR, ExitBootServices, child launch, or persistent
 firmware-variable mutation.
 
 Map sizes, descriptor version/stride/counts, physical-width limits, overlaps, arithmetic and
@@ -140,6 +140,7 @@ thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0
 thin-hv: physical chainload PASS
 thin-hv: backend=physical-preflight project_vmx=0
 thin-hv: preflight VMX=0 direct_vmx_ready=0
+thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0
 thin-hv: physical preflight PASS
 ```
 
@@ -150,8 +151,8 @@ unfinished physical monitor. Missing VMX is tested under TCG without probing uns
 
 | Stage | Current implementation boundary / remaining work |
 | --- | --- |
-| 3: platform EPT | The safe, heap-free HAL platform_memory planner validates UEFI/MTRR ranges, excludes private pages and splits compatible leaves. It is not connected to an EPT materializer. The active vmx_smoke carrier still uses ept::build_identity_8g and fixed WB/UC QEMU buckets. No physical EPT is installed. |
-| 4: private L0 state | Private HOST_CR3/stack exist, but the map is fixed 8 GiB and write_host_state still depends on firmware GDT/IDT/TSS, selectors and other state. Private exception tables/stacks and a safe handoff trampoline are required. |
+| 3: platform EPT | The heap-free HAL planner now feeds a checked 4-level EPT materializer, including 4 KiB/2 MiB/1 GiB leaves and explicit arena ownership. Physical preflight builds and discards tables from the actual UEFI/MTRR snapshot. This is map-only coverage, not complete APIC/PCI MMIO discovery. The active vmx_smoke carrier still uses ept::build_identity_8g and fixed WB/UC QEMU buckets. No physical EPT is installed. |
+| 4: private L0 state | Carrier and direct-L2 VM-exit host fields now use private GDT/IDT/TSS, selectors, FS/GS/SYSENTER targets, an ordinary host stack and four separate IST stacks. Every root exception stops visibly; NMI forwarding is not implemented. HOST_CR3 is still a fixed 8 GiB identity map. A separate L1 bootstrap and platform host map remain required before physical deployment. |
 | 5: pCPU ownership | VMXON/carrier and L1_VCPU_STATE, CARRIER_PATCH_VALUES, DIRECT_PATCH_VALUES, DIRECT_ENTRY_POLICY, NESTED_RUN remain single-CPU. No AP bringup, VMCS migration or normal Windows SMP claim. |
 | 6: identity | New baseline/preflight leave system tables, real TPM, Secure Boot data and storage untouched. Physical Direct-VMX reservations/identity preservation have not been established. |
 | 7: Linux nested KVM | Direct-VMX Linux and 64 repeated real KVM lifecycles pass in single-vCPU QEMU/KVM. Synthesized VMfailValid error exposure and operand exception delivery still need correction; this is not a physical Linux/SMP result, and reference soaks are not Direct-VMX evidence. |
@@ -180,7 +181,8 @@ nix develop --accept-flake-config --command cargo xrun x86
 nix develop --accept-flake-config --command cargo xrun x86 --release
 ```
 
-The xrun matrix distinguishes Direct-VMX, outer-KVM/reference, physical-chainload under KVM,
+The nine-case xrun matrix distinguishes Direct-VMX, its separate expected-root-exception fixture,
+outer-KVM/reference, physical-chainload under KVM,
 preflight under both KVM and TCG, and the new physical policy fixture under TCG.
 `X86_UEFI_BACKEND` specifies the expected backend before launch;
 a mismatching/missing backend marker or forbidden runtime/overlay marker fails the run. It is not
@@ -190,7 +192,97 @@ variable store, so run them serially. Concurrent Windows jobs require separate w
 overlays, matching variable stores/TPM state, work-directory locks and VNC endpoints. Their
 shared backing images must remain immutable.
 
-### Recorded results, 2026-09-08
+### Platform EPT / private host-state increment, 2026-09-08
+
+This increment started on `feat/x86-thin-monitor` at `2ba44e4`, with only the user's existing
+AGENTS.md edit. Branch/status and the latest twenty commits were inspected before editing;
+the branch was not switched. Implementation commits are `298f096` (HAL materializer) and
+`193e6e0` (private VM-exit host state, connected preflight audit and test gates).
+
+The concrete architectural changes are:
+
+* `ept::{required_platform_pages,build_platform_identity,PlatformEpt}` exhaust the validated
+  platform plan before publishing a usable result. Sizing counts table intervals rather than
+  walking every 4 KiB leaf, so enormous unsupported layouts fail capacity checks promptly.
+  The contiguous arena must be explicitly private, including its unused tail. Errors clear
+  its root. All leaf types retain guest PAT participation. GPA walk width and paging-structure
+  physical width are checked separately. There is no heap or QEMU fallback in this builder.
+* `platform_snapshot::with_snapshot` captures only the CPU/MTRR state currently consumed by
+  inventory and construction, without repeated MSR reads. `platform_ept_audit::with_storage`
+  reserves 256 table pages plus a 32-page descriptor scratch area before GetMemoryMap, checks
+  captured physical/canonical bounds before accessing those pages, builds the actual map with
+  all 288 pages excluded, and releases all temporary storage. EPTP is never installed.
+  This is UEFI-map coverage only: PCI root windows, BAR relocation space and all APIC/device
+  apertures still need platform discovery. `mmio_complete=0 direct_vmx_ready=0` is mandatory.
+* `host_state::{HostStack,HostEnvironment}` initializes one private GDT/TSS page, one IDT page
+  and four independent 8 KiB IST stacks. The existing 16 KiB host stack is retained. All 256
+  IDT gates terminate through an assembly-only bounded COM1/CLI/HLT handler; root NMI handling
+  deliberately stops rather than silently claiming forwarding. The new storage adds 40 KiB
+  to the single-CPU monitor block (101 pages total). It is runtime-reserved but is **not yet
+  excluded from the active QEMU carrier EPT**. No guard-page or physical SMP claim is made.
+* `run_direct_monitor` validates allocations and conditional VMX-MSR presence before access,
+  rejects unsupported CET/LA57 host state, and prepares private host fields before VMXON.
+  `write_host_state` no longer copies firmware descriptor tables, selectors, FS/GS or SYSENTER
+  targets. The cross-crate manifest test requires all sixteen initialized host fields to have
+  exactly one Direct-VMCS `HostState` patch. Immediate VMfail does not install these descriptors;
+  post-entry terminal paths retain storage and never return to firmware. Pre-entry failures
+  free the block only after successful VMXOFF if VMX was enabled; failed VMXOFF stops with storage retained.
+* `host-exception-test` builds separately named loader/runtime images for QEMU only. After a
+  successful native guest return it raises #UD in VMX root. Its strict gate requires the ordered
+  private-host/guest/armed/exception records and timeout status 124; ordinary Direct-VMX rejects
+  those markers. Do not deploy these test artifacts. Preflight gates likewise distinguish an
+  actual KVM EPT-build PASS from TCG's explicit no-VMX SKIP. Expected build/run errors now return
+  xtask status 1 instead of aborting with a core dump.
+
+| Evidence class | Check | Result for this increment |
+| --- | --- | --- |
+| Host unit tests | All five affected packages / feature rows | PASS: 116 Rust test executions: HAL 39, loader 39 (direct 8, fault fixture 8, reference 5, chainload 7, preflight 11), nested 7, xtask 25, physical-policy driver/payload 4+2. |
+| Build/format | `cargo fmt --check`, x86 debug/release builds | PASS; no new external crate, root dependency change or AArch64 production-source change. The shared xtask change is error reporting only; AArch64 hardware was not tested. |
+| QEMU/KVM + TCG | Debug and release nine-case xrun matrices | PASS, 18 cases total: seven KVM and two TCG cases per profile. The root #UD fixture is an expected-stop test, not a successful OS boot. |
+| QEMU/KVM, preflight | Actual UEFI/MTRR EPT construction | PASS in both profiles: 17 table pages, 6,385 leaves, all 288 temporary pages excluded. No VMX enabled and no physical EPT installed. |
+| QEMU/KVM, Direct-VMX | Real Linux KVM L2 lifecycle | PASS: 64 ordered create/run/destroy cycles and clean poweroff with private carrier/direct-L2 host fields. One vCPU only. |
+| QEMU/KVM, reference | Same Linux lifecycle control | PASS: 64 cycles and clean poweroff; not project-L0 evidence. |
+| QEMU/KVM, Direct-VMX | Ordinary Windows desktop | PASS: fresh release run, exact desktop response, validated pre-success counters and runner exit zero. Screen shows the desktop and PowerShell. No L2 entry was recorded; this is not Hyper-V, SMP, S5 or daily-use proof. |
+| QEMU/KVM, reference | Windows Hyper-V control | PASS: fresh overlay, expected Hyper-V marker and runner exit zero. |
+| QEMU/KVM, Direct-VMX | Windows Hyper-V | FAIL: 1200-second marker deadline and runner exit 1. Both mid-run and final screens show “Please wait”, not a BSOD. The private host-state change does not establish Hyper-V usability. |
+| Host negative integration | Unavailable QEMU executable | PASS: expected status 1, no VM started and no xtask panic/core dump. |
+| Physical hardware | Original Windows/Linux and firmware identity | UNVERIFIED. No physical PC was booted or modified in this increment. |
+
+Logs are `/tmp/x86-platform-{complete-validation,matrix-retest,final-host,committed-validation}-20260908.log`,
+`/tmp/x86-private-host-linux-lifecycles-20260908.log`,
+`/tmp/x86-private-host-windows-{normal,reference,hyperv-final}-20260908.log`, and
+`/tmp/x86-xtask-run-error-check-20260908.log`. The first full matrix failed because the new
+fault-arming records contained CRCRLF (SerialPort already expands LF); the output was corrected
+and both complete matrices passed without weakening the gate. Two Hyper-V fixture setup attempts
+failed before QEMU launch because copied base vars/TPM prerequisites were missing; neither is an
+OS boot result. The successful desktop and Hyper-V/reference jobs use separate writable QEMU
+state, immutable backing images and independent VNC endpoints.
+
+The failed Direct Hyper-V run has two validated 144-byte diagnostic snapshots. The mid-run
+capture briefly stopped and explicitly resumed the owned QEMU, using the existing runner's
+ownership/status helpers; this is diagnostic evidence, not an uninstrumented performance run.
+Only bounded decoded JSON was retained, not the raw record. The snapshots are in
+`/tmp/thin-hv-hyperv-midrun-counter.EDS27j/counters.json` and
+`/tmp/thin-hv-windows-private-host-hyperv.Un5FVd/monitor-hyperv-failure-diagnostics.8AUOPs/counters.json`.
+
+| Counter | Mid-run | Timeout | Change |
+| --- | ---: | ---: | ---: |
+| L1 exits | 57,024,008 | 84,983,611 | 27,959,603 |
+| Observed L2 entries | 6,570,335 | 9,838,744 | 3,268,409 |
+| Reflected L2 exits | 6,570,334 | 9,838,744 | 3,268,410 |
+| External-interrupt exits | 746,945 | 1,067,637 | 320,692 |
+| Interrupt-window exits | 499,215 | 713,554 | 214,339 |
+| INVEPT / INVVPID | 6,773 / 6,154 | 6,773 / 6,154 | 0 / 0 |
+| Recorded nested entry failures | 0 | 0 | 0 |
+
+Mid-run capture occurred during an L2 RDMSR exit before its reflection completed; the one-count
+entry/reflection difference is consistent with that phase boundary. Timeout capture occurred at
+an L1 VMREAD exit. These changing counters rule out the entire monitor having stopped between
+the snapshots, but do not establish forward progress in Windows initialization, correct interrupt
+delivery, preservation of MSR/XSAVE state, or the root cause of the failure. There is no new
+DPC_WATCHDOG_VIOLATION observation and no justified physical-daily-use claim.
+
+### Earlier foundation results, 2026-09-08 (before the increment above)
 
 PASS means the named runner's observed gate, not completion of an architectural stage. Logs
 listed here are local, untracked `/tmp` evidence; no disk images, variable stores, TPM state,
@@ -355,6 +447,11 @@ protection, clear the TPM, or modify protectors to make a test pass. A recovery 
 condition: return through the known-good firmware path and follow the existing recovery process,
 not an automated hypervisor repair step. Keep an operator-controlled way to select that bypass
 even when the project image cannot start.
+
+Secure Boot must accept the project EFI image through an already authorized signing/trust path.
+The build does not enroll keys or bypass firmware verification. If that trust path is unavailable,
+stop and resolve it with the machine's operator; do not disable Secure Boot or change its databases
+as an implicit test step. Never replace the original Windows Boot Manager with a project artifact.
 
 1. Boot the original installation directly through firmware. Record activation status only and
    verify normal physical devices and reboot.
