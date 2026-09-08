@@ -30,6 +30,7 @@ check_log() {
     awk -v backend="$backend" -v cycles="$cycles" '
         {
             sub(/\r$/, "")
+            sub(/^\[[ ]*[0-9]+\.[0-9]+\] /, "")
             if ($0 ~ /Kernel panic|Oops:|BUG:|thin-hv: linux L1 L2 KVM FAIL|thin-hv: linux L2 lifecycle FAIL/) bad=1
             if (index($0, "thin-hv: linux L2 lifecycle ") != 1) next
             if ($0 == "thin-hv: linux L2 lifecycle begin backend=" backend " cycles=" cycles " l1_cpus=1") {

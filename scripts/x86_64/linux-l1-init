@@ -5,8 +5,14 @@ mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
+# Serialize test records with kernel printk (including delayed TSC calibration).
+# A tty write can otherwise be split by an unrelated kernel console message.
+log_lifecycle() {
+    printf '<5>thin-hv: linux L2 lifecycle %s\n' "$*" >/dev/kmsg
+}
+
 fail_lifecycle() {
-    echo "thin-hv: linux L2 lifecycle FAIL $*"
+    log_lifecycle "FAIL $*"
     # The host runner detects this marker and terminates this disposable VM.
     while :; do /bin/busybox sleep 1; done
 }
@@ -71,7 +77,7 @@ if [ -c /dev/kvm ]; then
         /bin/kvm-probe || true
     else
         [ "$kvm_ready" = 1 ] || fail_lifecycle KVM-unavailable
-        echo "thin-hv: linux L2 lifecycle begin backend=$lifecycle_backend cycles=$cycles l1_cpus=1"
+        log_lifecycle "begin backend=$lifecycle_backend cycles=$cycles l1_cpus=1"
         completed=0
         while [ "$completed" -lt "$cycles" ]; do
             # PASS follows checked IO completion, state/memslot checks, and
@@ -84,10 +90,10 @@ if [ -c /dev/kvm ]; then
                 fail_lifecycle "probe-process-exit cycle=$((completed + 1))"
             fi
             completed=$((completed + 1))
-            echo "thin-hv: linux L2 lifecycle cycle=$completed KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=96 halt=32 remaps=14 state_checks=16 sse_checks=16 long64_rounds=16 paging_checks=64 invlpg=16 cr3_writes=48 xmm16_checks=16 msr_checks=16 debug_checks=16 tsc_checks=16 teardown=explicit process_exit=0"
+            log_lifecycle "cycle=$completed KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=96 halt=32 remaps=14 state_checks=16 sse_checks=16 long64_rounds=16 paging_checks=64 invlpg=16 cr3_writes=48 xmm16_checks=16 msr_checks=16 debug_checks=16 tsc_checks=16 teardown=explicit process_exit=0"
         done
-        echo "thin-hv: linux L2 lifecycle PASS backend=$lifecycle_backend cycles=$completed"
-        echo 'thin-hv: linux L2 lifecycle poweroff requested'
+        log_lifecycle "PASS backend=$lifecycle_backend cycles=$completed"
+        log_lifecycle 'poweroff requested'
         /bin/busybox poweroff -f || fail_lifecycle poweroff-failed
         fail_lifecycle poweroff-returned
     fi

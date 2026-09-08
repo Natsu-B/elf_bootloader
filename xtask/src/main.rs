@@ -3438,6 +3438,25 @@ mod tests {
             );
             assert!(check(backend, "2", &valid));
             assert!(check(backend, "2", &valid.replace('\n', "\r\n")));
+            let kernel_records = valid
+                .lines()
+                .map(|line| {
+                    if line.starts_with("thin-hv: linux") {
+                        format!("[    1.234567] {line}\n")
+                    } else {
+                        format!("{line}\n")
+                    }
+                })
+                .collect::<String>();
+            assert!(check(backend, "2", &kernel_records));
+            assert!(!check(
+                backend,
+                "2",
+                &kernel_records.replace(
+                    "process_exit=0\n",
+                    "process_exit=0[    1.260008] tsc: calibration\n"
+                )
+            ));
             assert!(!check(backend, "3", &valid));
             assert!(!check(backend, "2", &(valid.clone() + "\0")));
             assert!(!check(backend, "2", &"x".repeat(2_097_153)));
