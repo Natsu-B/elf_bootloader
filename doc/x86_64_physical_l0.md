@@ -169,6 +169,10 @@ non-root guest_entry trampoline; blindly unmapping it breaks the present handoff
 
 ### QEMU-first nested gate (2026-09-08)
 
+Latest expanded coverage, reproduced failures and exact commands are recorded in
+[the QEMU nested validation report](evidence/x86_64/validation-2026-09-08-nested.md).
+The older result tables below describe their own increments, not the latest matrix.
+
 The target is to finish architectural development and reproducible nested regressions in QEMU
 before exposing an original physical Windows installation to L0. Real-machine testing must still
 validate firmware, actual MMIO/DMA/device behavior, microcode/CPU differences, Secure Boot, TPM,
@@ -196,11 +200,13 @@ backends. Two Linux cases run the real KVM probe with the requested cycle count 
 range 1..4096). Linux UKIs and monitors are built in release by its existing runner; use the
 explicit `--release` command above for a uniform release suite.
 
-The instruction fixture allocates only three disposable BootServices pages, validates their
-layout/ownership, executes no VMLAUNCH/VMRESUME and writes no firmware variable or identity data.
+The instruction fixture allocates four disposable BootServices pages, validates their
+layout/ownership, and writes no firmware variable or identity data. VMLAUNCH/VMRESUME cases
+are guaranteed entry failures, not successful L2 execution.
 It checks VMXON/OFF, VMPTRST, VMCLEAR/VMPTRLD, VMREAD/VMWRITE, two-VMCS state/error persistence
-over eight switches, exact CF/ZF and errors 2/3/9/10/12/13/15/28, including wide field encodings,
-misaligned physical operands and capability-gated invalid INVEPT/INVVPID. All VMCS pages are
+over eight switches, exact CF/ZF and errors 2/3/5/7/9/10/11/12/13/15/28, including wide fields,
+misaligned operands, invalid revisions, shadow-header capability masking and all advertised
+INVEPT/INVVPID types plus malformed descriptors. All VMCS pages are
 cleared and VMXOFF, exact control restoration and FreePages must succeed before its PASS.
 The existing Linux probe separately provides actual L2 VMLAUNCH/VMRESUME/exit evidence.
 
@@ -209,22 +215,23 @@ OUT→IN→OUT→HLT rounds. It verifies all GPRs, selected flags/segments and C
 IO before inspecting state, deletes/recreates the data slot at the same GPA with alternating
 backing pages, and checks both active and retired backing data. PASS requires successful explicit
 `munmap`/`close` of both VM/vCPU contexts and `/dev/kvm`; process exit remains a cleanup backstop,
-not a substitute for the gate. Per process: 64 `KVM_RUN` calls, 16 completed HLT/state checks,
-14 remaps. Each VM initializes distinct XMM0–7/MXCSR sentinels once using actual guest
+not a substitute for the gate. The original real-mode phase uses 64 `KVM_RUN` calls,
+16 completed HLT/state checks and 14 remaps. Each VM initializes XMM0–7/MXCSR sentinels using guest
 `MOVDQU`/`LDMXCSR`, then executes SSE2 `PXOR` and `MOVDQU` stores each round. Every completed
 HLT checks `KVM_GET_FPU` against all eight expected XMM values and independently checks the
 vector actually stored by L2; guest `STMXCSR` stores verify MXCSR each round. Initializing in
 the guest avoids assumptions about the legacy FPU ioctl: the
 [Linux v7.1.5 implementation](https://raw.githubusercontent.com/gregkh/linux/v7.1.5/arch/x86/kvm/x86.c)
 does not transfer its structure's MXCSR member or mark the XSAVE SSE component active when
-copying XMM bytes. Real-mode instructions do not initialize XMM8–15, so those registers are
-explicitly outside this probe's coverage.
+copying XMM bytes. The new long-mode phase initializes and checks all XMM0–15 separately.
 FPU state is not reset between rounds; this is not a cached SET/GET-only test. The cycle
-transcript requires `sse_checks=16`. At 256 cycles this is 512 created VMs, 16,384 KVM_RUN
-calls, 3,584 remaps and 4,096 SSE-state checks **per backend**.
-Two VMs on one L1 CPU are not L2 SMP; real-mode memslot checks do not establish guest-paging
-TLB semantics, concurrent invalidation, VPID generation correctness, full XSAVE/AVX or device interrupt
-delivery. Those need additional QEMU gates before a daily-use claim.
+transcript requires `sse_checks=16`. The same two VMs then execute 16 long-mode checkpoints
+with two four-level roots, 4 KiB leaves, PTE replacement/INVLPG, CR3 reload/root switching,
+XMM0–15/MXCSR, EFER/PAT, disabled-debug DR0 sentinels and nondecreasing guest TSC.
+Total per process: 144 KVM_RUN, 32 HLT, 64 paging checks, 16 INVLPG, 48 CR3 writes and
+14 memslot remaps. The strict transcript requires each coverage counter and successful cleanup.
+Two VMs on one L1 CPU are not L2 SMP. These checks do not establish concurrent invalidation,
+VPID generations, full XSAVE/AVX, live-L2 suspend, or TSC accuracy/performance.
 
 The native fixture first reproduced an actual Direct-VMX defect on the prior `7373d97` EFI:
 `VMCLEAR(VMXON pointer)` returned ZF=1 but VMREAD(error) still returned 12 rather than 3. The
