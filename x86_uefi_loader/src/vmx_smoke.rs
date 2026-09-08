@@ -22,6 +22,7 @@ use nested_vmx::VMXERR_INVALID_INVEPT_INVVPID_OPERAND;
 use nested_vmx::VMXERR_UNSUPPORTED_VMCS_COMPONENT;
 use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMCLEAR_VMXON_POINTER;
+use nested_vmx::VMXERR_VMPTRLD_INCORRECT_REVISION;
 use nested_vmx::VMXERR_VMPTRLD_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMPTRLD_VMXON_POINTER;
 use nested_vmx::VMXERR_VMWRITE_READ_ONLY_COMPONENT;
@@ -31,6 +32,7 @@ use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
 use nested_vmx::restrict_vmx_capability;
+use nested_vmx::vmcs_revision_is_supported;
 use r_efi::efi;
 use uefi_variable_overlay::ProfileId;
 use x86_64_hal::addr::EptPhys;
@@ -42,12 +44,14 @@ use x86_64_hal::host_state;
 use x86_64_hal::host_state::HostEnvironment;
 use x86_64_hal::host_state::HostStack;
 use x86_64_hal::paging;
+use x86_64_hal::platform_memory;
+use x86_64_hal::platform_memory::FirmwareDescriptor;
 use x86_64_hal::vmcs;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 91 + host_state::HOST_ENVIRONMENT_PAGES;
+const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES;
 /// First of eight page directories mapping the low eight gibibytes.
 const EPT_PD_FIRST_PAGE: u64 = 4;
 /// L1 MSR bitmap, including conservative VMX capability interception.
@@ -66,6 +70,9 @@ const HOST_PDPT_PAGE: u64 = 82;
 const HOST_PD_FIRST_PAGE: u64 = 83;
 /// Private GDT/TSS, IDT and four independent IST stacks, after the host tables.
 const HOST_ENVIRONMENT_FIRST_PAGE: u64 = 91;
+/// Inactive, deliberately invalid-revision page used only to record VMX error 11.
+const ERROR_REVISION_PAGE: u64 =
+    HOST_ENVIRONMENT_FIRST_PAGE + host_state::HOST_ENVIRONMENT_PAGES as u64;
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
 /// Upper bound of the smoke monitor's identity-mapped physical space.
@@ -488,9 +495,7 @@ fn log_diagnostic_summary(serial: &mut SerialPort) {
 }
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == HOST_ENVIRONMENT_FIRST_PAGE);
-const _: () = assert!(
-    HOST_ENVIRONMENT_FIRST_PAGE as usize + host_state::HOST_ENVIRONMENT_PAGES == MONITOR_PAGES
-);
+const _: () = assert!(ERROR_REVISION_PAGE as usize + 1 == MONITOR_PAGES);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
 const RUNTIME_MODE: u32 = 0;
@@ -746,6 +751,14 @@ fn run_direct_monitor(
         if block_end > IDENTITY_MAP_LIMIT {
             return Err(Error::OutsideIdentityMap(block_end));
         }
+        let physical_bits = max_physical_address_bits()
+            .ok_or(Error::Capability("monitor physical-address width", 0))?;
+        if block_end > 1_u64 << physical_bits
+            || (basic.physical_address_width_32 && block_end > 1_u64 << 32)
+        {
+            return Err(Error::OutsideIdentityMap(block_end));
+        }
+        validate_monitor_allocation(system_table, block)?;
         // Resolve fallible typed addresses before changing CR0/CR4. Any rejection
         // therefore returns through allocation cleanup without a CPU-state restore.
         let vmxon = VmxonPhys::new(block).ok_or(Error::Firmware(
@@ -773,12 +786,17 @@ fn run_direct_monitor(
         // SAFETY: AllocatePages returned this exclusive runtime allocation; its
         // nonzero base, page alignment and complete byte range were checked above.
         unsafe { ptr::write_bytes(block as *mut u8, 0, MONITOR_PAGES * PAGE_SIZE as usize) };
-        // SAFETY: the checked allocation contains disjoint VMXON, VMCS and MSR
-        // bitmap pages. No CPU uses them yet; revision words and bitmap bytes are
-        // initialized only inside their respective allocated page boundaries.
+        // SAFETY: the checked allocation contains disjoint VMXON, VMCS, invalid
+        // revision and MSR-bitmap pages. No CPU uses them yet; all writes remain
+        // inside their pages. The extra page's low revision bit is inverted, so
+        // it can never become a current hardware VMCS, even with shadowing.
         unsafe {
             ptr::write_volatile(block as *mut u32, basic.revision_id);
             ptr::write_volatile((block + PAGE_SIZE) as *mut u32, basic.revision_id);
+            ptr::write_volatile(
+                (block + ERROR_REVISION_PAGE * PAGE_SIZE) as *mut u32,
+                basic.revision_id ^ 1,
+            );
             initialize_l1_msr_bitmap(block + MSR_BITMAP_PAGE * PAGE_SIZE);
         }
 
@@ -822,7 +840,8 @@ fn run_direct_monitor(
         }
         let host_stack = HostStack::new(block + HOST_STACK_PAGE * PAGE_SIZE, 4 * PAGE_SIZE)
             .map_err(Error::HostState)?;
-        // SAFETY: these are the final exclusive pages of the checked runtime block.
+        // SAFETY: these exclusive host-environment pages lie inside the checked
+        // runtime block, before the disjoint invalid-revision page.
         // The ordinary host stack is disjoint and also runtime-owned. HOST_CR3 maps
         // the entire block supervisor-writable and the retained PE executable. No
         // CPU/VMCS uses this storage yet; CR4.CET/LA57 were rejected above. After a
@@ -1275,6 +1294,101 @@ fn loaded_image_protocol(
 fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
     // SAFETY: `buffer` was allocated by this firmware or one of its protocols.
     let _ = unsafe { ((*boot_services).free_pool)(buffer) };
+}
+
+/// Checks the live runtime allocation against a bounded firmware memory map.
+fn validate_monitor_allocation(
+    system_table: *mut efi::SystemTable,
+    base: u64,
+) -> Result<(), Error> {
+    let mut storage = [0_u64; 1024];
+    let mut length = core::mem::size_of_val(&storage);
+    let mut key = 0;
+    let mut stride = 0;
+    let mut version = 0;
+    // SAFETY: launch holds the live firmware system table before ExitBootServices.
+    // The aligned, initialized stack buffer and every scalar output remain valid
+    // for the synchronous service call; no firmware state is changed.
+    let status = unsafe {
+        ((*(*system_table).boot_services).get_memory_map)(
+            &mut length,
+            storage.as_mut_ptr().cast(),
+            &mut key,
+            &mut stride,
+            &mut version,
+        )
+    };
+    if status.is_error() {
+        return Err(Error::Firmware("monitor GetMemoryMap", status.as_usize()));
+    }
+    if length > core::mem::size_of_val(&storage) {
+        return Err(Error::Firmware(
+            "monitor memory-map size",
+            efi::Status::COMPROMISED_DATA.as_usize(),
+        ));
+    }
+    // SAFETY: the bounded length is inside the initialized storage array; the
+    // byte slice is consumed locally and never survives this stack allocation.
+    let bytes = unsafe { core::slice::from_raw_parts(storage.as_ptr().cast(), length) };
+    let mut regions = [FirmwareDescriptor::default(); 205];
+    let count =
+        platform_memory::decode_uefi_map(bytes, stride, version, &mut regions).map_err(|_| {
+            Error::Firmware(
+                "monitor memory-map layout",
+                efi::Status::COMPROMISED_DATA.as_usize(),
+            )
+        })?;
+    if !monitor_allocation_is_wb(&regions[..count], base) {
+        return Err(Error::Firmware(
+            "monitor allocation requires unique writable WB runtime RAM",
+            efi::Status::UNSUPPORTED.as_usize(),
+        ));
+    }
+    Ok(())
+}
+
+/// Requires unique runtime RAM coverage inside the QEMU backend's WB buckets.
+///
+/// This is deliberately a smoke-backend check, not a physical MTRR/EPT policy.
+fn monitor_allocation_is_wb(regions: &[FirmwareDescriptor], base: u64) -> bool {
+    let Some(end) = base.checked_add(MONITOR_PAGES as u64 * PAGE_SIZE) else {
+        return false;
+    };
+    if base == 0
+        || !base.is_multiple_of(PAGE_SIZE)
+        || !((base < 1 << 31 && end <= 1 << 31) || (base >= 1 << 32 && end <= 6 << 30))
+    {
+        return false;
+    }
+    let mut covered = [0_u8; MONITOR_PAGES];
+    for region in regions {
+        let Some(region_end) = region
+            .number_of_pages
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| region.physical_start.checked_add(bytes))
+        else {
+            return false;
+        };
+        if !region.physical_start.is_multiple_of(PAGE_SIZE) || region.number_of_pages == 0 {
+            return false;
+        }
+        if region.physical_start >= end || region_end <= base {
+            continue;
+        }
+        if region.memory_type != efi::RUNTIME_SERVICES_DATA
+            || region.attributes & efi::MEMORY_WB == 0
+            || region.attributes & (efi::MEMORY_RP | efi::MEMORY_WP | efi::MEMORY_RO) != 0
+        {
+            return false;
+        }
+        for (index, count) in covered.iter_mut().enumerate() {
+            let page = base + index as u64 * PAGE_SIZE;
+            if region.physical_start <= page && page < region_end {
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    covered.iter().all(|&count| count == 1)
 }
 
 /// Builds the L0-owned page tables used after firmware memory is reclaimed.
@@ -2455,7 +2569,12 @@ fn handle_l1_vmptrld(
     }
 
     let address = read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
-    let Some(region) = validate_l1_vmcs_address(address) else {
+    // SAFETY: this CPL0 VM-exit handler runs after successful hardware VMXON;
+    // the VMX_BASIC MSR is present and its physical-address restriction is stable.
+    let basic = vmx::VmxBasic::from_msr(unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) });
+    let Some(region) = validate_l1_vmcs_address(address)
+        .filter(|_| !basic.physical_address_width_32 || address < 1_u64 << 32)
+    else {
         complete_vmx_instruction(
             l1_vmx_failure(&state, VMXERR_VMPTRLD_INVALID_ADDRESS),
             reason,
@@ -2491,6 +2610,40 @@ fn handle_l1_vmptrld(
             instruction_len,
             registers,
         );
+    }
+    // SAFETY: trusted L1 supplies WB VMCS RAM, not MMIO, as required by VMX.
+    // The aligned operand's entire page fits the identity map and physical width;
+    // reading its architectural header does not access the opaque VMCS body.
+    // The monitor's secondary-control capability gate establishes this MSR,
+    // and the VM-exit handler runs at CPL0.
+    let (revision, secondary_capability) = unsafe {
+        (
+            ptr::read_volatile(region.get() as *const u32),
+            cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2),
+        )
+    };
+    let Some(l1_secondary_capability) =
+        restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, secondary_capability)
+    else {
+        stop_unexpected_exit(
+            b"VMPTRLD secondary capability changed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    if !vmcs_revision_is_supported(revision, basic.revision_id, l1_secondary_capability) {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_VMPTRLD_INCORRECT_REVISION),
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
     }
     let old_current = state.current_vmcs().map(|current| current.address());
     if old_current != Some(region) && !materialize_direct_patch(None) {
@@ -3724,6 +3877,11 @@ fn publish_l1_instruction_error(error: u32) -> Option<()> {
     // same live runtime allocation. Per-pCPU bring-up must retain this ownership
     // relationship or pass the owning CPU's VMXON address explicitly.
     let vmxon = VmxonPhys::new(carrier.get().checked_sub(PAGE_SIZE)?)?;
+    let invalid_revision = validate_l1_vmcs_address(
+        vmxon
+            .get()
+            .checked_add(ERROR_REVISION_PAGE.checked_mul(PAGE_SIZE)?)?,
+    )?;
     with_l1_current_vmcs(Some(current), || {
         // SAFETY: the helper selected L1's valid hardware VMCS; VMREAD does not
         // modify the opaque error field on success.
@@ -3744,7 +3902,12 @@ fn publish_l1_instruction_error(error: u32) -> Option<()> {
             // vmxon is its active page by the allocation invariant above.
             // INVVPID support is required by Direct-VMX capabilities; physical
             // VMX_MISC[29] was clear, so the error-13 instruction cannot succeed.
-            (unsafe { vmx::record_failure(failure, vmxon) }) == VmxStatus::FailValid
+            // The disjoint runtime-owned invalid_revision page was initialized
+            // with BASIC.revision_id XOR 1 before VMXON and is never activated,
+            // rewritten, or freed while the monitor runs. Its complete address
+            // range and the required WB memory type were checked at allocation.
+            (unsafe { vmx::record_failure(failure, vmxon, invalid_revision) })
+                == VmxStatus::FailValid
         };
         if !recorded {
             return None;
@@ -4280,6 +4443,46 @@ fn leave_vmx() -> VmxStatus {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn monitor_error_page_requires_disjoint_complete_writable_runtime_ram() {
+        use super::FirmwareDescriptor;
+        use r_efi::efi;
+
+        let base = 0x10_0000;
+        let mut region = FirmwareDescriptor {
+            memory_type: efi::RUNTIME_SERVICES_DATA,
+            physical_start: base,
+            number_of_pages: super::MONITOR_PAGES as u64,
+            attributes: efi::MEMORY_WB,
+        };
+        assert!(super::monitor_allocation_is_wb(&[region], base));
+        assert!(!super::monitor_allocation_is_wb(&[region, region], base));
+        region.number_of_pages -= 1;
+        assert!(!super::monitor_allocation_is_wb(&[region], base));
+        region.number_of_pages += 1;
+        for attributes in [
+            0,
+            efi::MEMORY_WB | efi::MEMORY_RO,
+            efi::MEMORY_WB | efi::MEMORY_RP,
+            efi::MEMORY_WB | efi::MEMORY_WP,
+        ] {
+            region.attributes = attributes;
+            assert!(!super::monitor_allocation_is_wb(&[region], base));
+        }
+        region.attributes = efi::MEMORY_WB;
+        region.memory_type = efi::BOOT_SERVICES_DATA;
+        assert!(!super::monitor_allocation_is_wb(&[region], base));
+        region.memory_type = efi::RUNTIME_SERVICES_DATA;
+        for base in [0, 1, 1 << 31, 6 << 30, u64::MAX - 4095] {
+            region.physical_start = base;
+            assert!(!super::monitor_allocation_is_wb(&[region], base));
+        }
+        region.physical_start = 1 << 32;
+        assert!(super::monitor_allocation_is_wb(&[region], 1 << 32));
+        assert!(super::ERROR_REVISION_PAGE > 1);
+        assert_eq!(super::ERROR_REVISION_PAGE + 1, super::MONITOR_PAGES as u64);
+    }
+
+    #[test]
     fn vmx_failure_requires_l1_current_vmcs_not_the_hardware_carrier() {
         use nested_vmx::VcpuState;
         use nested_vmx::VmInstructionResult;
@@ -4289,14 +4492,14 @@ mod tests {
         let mut state = VcpuState::new();
         let vmcs = VmcsPhys::new(0x2000).unwrap();
         state.record_vmxon_success(VmxonPhys::new(0x1000).unwrap());
-        for error in [2, 3, 9, 10, 12, 13, 15, 28] {
+        for error in [2, 3, 9, 10, 11, 12, 13, 15, 28] {
             assert_eq!(
                 super::l1_vmx_failure(&state, error),
                 VmInstructionResult::VmfailInvalid
             );
         }
         state.record_vmptrld_success(vmcs);
-        for error in [2, 3, 9, 10, 12, 13, 15, 28] {
+        for error in [2, 3, 9, 10, 11, 12, 13, 15, 28] {
             assert_eq!(
                 super::l1_vmx_failure(&state, error),
                 VmInstructionResult::VmfailValid(error)

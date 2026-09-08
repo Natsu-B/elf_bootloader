@@ -316,6 +316,8 @@ pub enum RecordedFailure {
     VmptrldInvalidAddress = 9,
     /// VMPTRLD targeting the active hardware VMXON region.
     VmptrldVmxonPointer = 10,
+    /// VMPTRLD targeting an inactive page with an incorrect revision identifier.
+    VmptrldIncorrectRevision = 11,
     /// VMREAD with an encoding containing reserved bits.
     UnsupportedComponent = 12,
     /// VMWRITE to a read-only field on a CPU without writable exit information.
@@ -335,6 +337,7 @@ impl RecordedFailure {
             3 => Some(Self::VmclearVmxonPointer),
             9 => Some(Self::VmptrldInvalidAddress),
             10 => Some(Self::VmptrldVmxonPointer),
+            11 => Some(Self::VmptrldIncorrectRevision),
             12 => Some(Self::UnsupportedComponent),
             13 => Some(Self::ReadOnlyComponent),
             15 => Some(Self::VmxonInRoot),
@@ -357,7 +360,15 @@ impl RecordedFailure {
 /// not a nested guest's VMXON pointer. INVVPID must be supported for error 28.
 /// For error 13, physical IA32_VMX_MISC[29] must be clear (VM-exit information
 /// fields must actually be read-only on this CPU).
-pub unsafe fn record_failure(failure: RecordedFailure, vmxon_region: VmxonPhys) -> VmxStatus {
+/// `invalid_revision_region` must be a live, exclusively monitor-owned, inactive
+/// VMCS-sized page, mapped with the VMX-required memory type and within the VMX
+/// physical-address width. Its header bits 30:0 must differ from VMX_BASIC's
+/// revision identifier. It must not alias VMXON, any active VMCS, or guest data.
+pub unsafe fn record_failure(
+    failure: RecordedFailure,
+    vmxon_region: VmxonPhys,
+    invalid_revision_region: VmcsPhys,
+) -> VmxStatus {
     if failure == RecordedFailure::UnsupportedComponent {
         // SAFETY: the caller supplies a valid current VMCS. Bit 15 is reserved
         // in VMCS field encodings, so this register-form access must fail.
@@ -383,13 +394,16 @@ pub unsafe fn record_failure(failure: RecordedFailure, vmxon_region: VmxonPhys) 
     }
     let physical = match failure {
         RecordedFailure::VmclearInvalidAddress | RecordedFailure::VmptrldInvalidAddress => 1_u64,
+        RecordedFailure::VmptrldIncorrectRevision => invalid_revision_region.get(),
         _ => vmxon_region.get(),
     };
     let carry: u8;
     let zero: u8;
     // SAFETY: the memory operand itself is a readable local u64. Its value is
-    // either deliberately misaligned or the active VMXON pointer: both are
-    // rejected before a VMCS is accessed, cleared, or made current. The caller
+    // either deliberately misaligned, the active VMXON pointer, or an exclusively
+    // owned inactive page with a mismatched revision. The first two fail before
+    // any page access; the third reads only its valid page's header and fails
+    // before making it current. None clears or changes an active VMCS. The caller
     // supplies the root-mode/current-VMCS prerequisites for VMfailValid.
     unsafe {
         if matches!(
@@ -654,7 +668,7 @@ mod tests {
 
     #[test]
     fn recorded_failures_accept_only_guaranteed_instruction_errors() {
-        let supported = [2, 3, 9, 10, 12, 13, 15, 28];
+        let supported = [2, 3, 9, 10, 11, 12, 13, 15, 28];
         for error in 0..=64 {
             assert_eq!(
                 RecordedFailure::from_error(error).map(|failure| failure as u32),

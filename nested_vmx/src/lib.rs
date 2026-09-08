@@ -36,6 +36,8 @@ pub const VMXERR_VMCLEAR_VMXON_POINTER: u32 = 3;
 pub const VMXERR_VMPTRLD_INVALID_ADDRESS: u32 = 9;
 /// `VM_INSTRUCTION_ERROR` for VMPTRLD targeting the active VMXON region.
 pub const VMXERR_VMPTRLD_VMXON_POINTER: u32 = 10;
+/// `VM_INSTRUCTION_ERROR` for an incompatible VMCS revision or shadow indicator.
+pub const VMXERR_VMPTRLD_INCORRECT_REVISION: u32 = 11;
 /// `VM_INSTRUCTION_ERROR` for an unsupported VMCS field encoding.
 pub const VMXERR_UNSUPPORTED_VMCS_COMPONENT: u32 = 12;
 /// `VM_INSTRUCTION_ERROR` for writing a read-only VMCS field.
@@ -403,6 +405,21 @@ pub const TRUSTED_VMFUNC_CAPABILITIES: u64 = 0;
 const TRUSTED_BASIC_MASK: u64 = 0x00bc_1fff_7fff_ffff;
 /// `IA32_VMX_MISC` features implemented by the direct trusted path.
 const TRUSTED_MISC_MASK: u64 = 0x160;
+
+/// Checks a VMCS header against the revision and shadowing capability seen by L1.
+///
+/// Intel SDM's VMPTRLD operation checks bit 31 against the processor's ability
+/// to set secondary control 14, not the current VMCS's execution controls.
+#[must_use]
+pub const fn vmcs_revision_is_supported(
+    header: u32,
+    revision_id: u32,
+    secondary_capability: u64,
+) -> bool {
+    header & 0x7fff_ffff == revision_id
+        && (header & (1 << 31) == 0
+            || (secondary_capability >> 32) as u32 & SECONDARY_VMCS_SHADOWING != 0)
+}
 
 /// Restricts one VMX capability MSR to the trusted direct-VMCS contract.
 ///
@@ -778,6 +795,37 @@ pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 29] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmcs_revision_and_shadow_indicator_follow_l1_capability() {
+        let physical = u64::from(u32::MAX) << 32;
+        let masked = restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, physical)
+            .expect("complete hardware capability supports the conservative policy");
+        for revision in [0, 1, 0x1234, 0x7fff_ffff] {
+            assert!(vmcs_revision_is_supported(revision, revision, masked));
+            assert!(!vmcs_revision_is_supported(revision ^ 1, revision, masked));
+            assert!(!vmcs_revision_is_supported(
+                revision | (1 << 31),
+                revision,
+                masked
+            ));
+            assert!(vmcs_revision_is_supported(
+                revision | (1 << 31),
+                revision,
+                physical
+            ));
+            assert!(!vmcs_revision_is_supported(
+                (revision ^ 1) | (1 << 31),
+                revision,
+                physical
+            ));
+            assert!(!vmcs_revision_is_supported(
+                revision | (1 << 31),
+                revision,
+                u64::from(SECONDARY_VMCS_SHADOWING)
+            ));
+        }
+    }
 
     #[test]
     fn vmx_results_replace_only_the_six_status_flags() {
