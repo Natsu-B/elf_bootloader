@@ -7,6 +7,12 @@ edition = "2024"
 physical-policy = []
 physical-policy-driver = ["physical-policy"]
 physical-policy-payload = ["physical-policy"]
+nested-contract = []
+
+[[bin]]
+name = "x86-uefi-nested-contract"
+path = "src/nested_contract.rs"
+required-features = ["nested-contract"]
 
 [[bin]]
 name = "x86-uefi-physical-policy"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Finite single-vCPU KVM VM/vCPU lifetime regression using the existing UKI runner.
+# Finite two-VM KVM context/memslot regression on one L1 CPU, not L2 SMP.
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -14,10 +14,18 @@ validate_cycles() {
 }
 
 check_log() {
-    local backend=$1 cycles=$2 log=$3
+    local backend=$1 cycles=$2 log=$3 bytes transcript LC_ALL=C
     case "$backend" in direct-vmx|outer-kvm) ;; *) return 1 ;; esac
     validate_cycles "$cycles" || return 1
-    [[ -r "$log" ]] || return 1
+    [[ -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+    ((bytes > 0 && bytes <= 2097152)) || return 1
+    # As in the UEFI fixture gates, reject NUL instead of silently discarding it.
+    # The extra-byte cap also rejects a log that grows beyond the checked size.
+    if IFS= read -r -d '' -n 2097153 transcript <"$log"; then
+        return 1
+    fi
     bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" --check-backend-log "$backend" "$log" || return 1
     awk -v backend="$backend" -v cycles="$cycles" '
         {
@@ -30,7 +38,7 @@ check_log() {
             } else if (index($0, "thin-hv: linux L2 lifecycle cycle=") == 1) {
                 count++
                 if (begin != 1 || done || poweroff || count > cycles ||
-                    $0 != "thin-hv: linux L2 lifecycle cycle=" count " KVM_RUN=IO port=0xe9 data=L2OK process_exit=0") bad=1
+                    $0 != "thin-hv: linux L2 lifecycle cycle=" count " KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 teardown=explicit process_exit=0") bad=1
             } else if ($0 == "thin-hv: linux L2 lifecycle PASS backend=" backend " cycles=" cycles) {
                 if (begin != 1 || count != cycles || done || poweroff) bad=1
                 done++

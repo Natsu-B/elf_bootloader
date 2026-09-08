@@ -53,6 +53,65 @@ check_backend_log() {
     ((seen))
 }
 
+# Hardware-backed instruction assertions must precede a successful guest return.
+# Optional capability checks remain explicit in the evidence, never implied PASS.
+check_nested_contract_log() {
+    local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 expected_backends
+    local valid invept invvpid readonly LC_ALL=C
+    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=1 vmfail_valid=(9|1[0-2]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2$'
+    case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
+    case "$cpu_profile" in native|readonly-vmcs) ;; *) return 1 ;; esac
+    [[ -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 262144)) || return 1
+    if IFS= read -r -d '' -n 262145 transcript <"$log"; then
+        return 1
+    fi
+    ((${#transcript} <= 262144)) || return 1
+    check_backend_log "$backend" "$log" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" =~ $pass_pattern ]]; then
+            ((phase == 1)) || return 1
+            valid=${BASH_REMATCH[1]}
+            invept=${BASH_REMATCH[2]}
+            invvpid=${BASH_REMATCH[3]}
+            readonly=${BASH_REMATCH[4]}
+            ((valid == 9 + invept + invvpid + readonly)) || return 1
+            [[ "$cpu_profile" != readonly-vmcs || "$readonly" == 1 ]] || return 1
+            phase=2
+            continue
+        fi
+        case "$line" in
+            'thin-hv: backend='*)
+                ((phase == 0 && backends < expected_backends)) || return 1
+                backends=$((backends + 1))
+                ;;
+            'thin-hv: private host state PASS')
+                [[ "$backend" == direct-vmx ]] && ((phase == 0 && private == 0)) || return 1
+                private=1
+                ;;
+            'thin-hv: nested contract START')
+                ((phase == 0 && backends == expected_backends)) || return 1
+                [[ "$backend" != direct-vmx || "$private" == 1 ]] || return 1
+                phase=1
+                ;;
+            'thin-hv: vmx guest PASS start_image_status=0x0000000000000000')
+                [[ "$backend" == direct-vmx ]] && ((phase == 2)) || return 1
+                phase=3
+                ;;
+            'thin-hv: trusted outer KVM guest PASS')
+                [[ "$backend" == outer-kvm ]] && ((phase == 2)) || return 1
+                phase=3
+                ;;
+            *'FAIL'* | *'panic'* | 'thin-hv: nested contract '* | \
+            'thin-hv: private host state'* | 'thin-hv: vmx guest PASS'* | \
+            'thin-hv: trusted outer KVM guest PASS'*) return 1 ;;
+        esac
+    done <<<"$transcript"
+    ((phase == 3 && backends == expected_backends))
+}
+
 # This is a separate negative fixture, never a relaxed ordinary backend gate.
 # Only the deliberate root exception may fail, and QEMU must stop by timeout.
 check_host_exception_log() {
@@ -248,6 +307,11 @@ check_physical_policy_log() {
 if [[ ${1:-} == --check-backend-log ]]; then
     [[ $# == 3 ]] || die 'usage: --check-backend-log BACKEND LOG'
     check_backend_log "$2" "$3" || die "backend provenance check failed for $2"
+    exit 0
+fi
+if [[ ${1:-} == --check-nested-contract-log ]]; then
+    [[ $# == 4 ]] || die 'usage: --check-nested-contract-log BACKEND CPU_PROFILE LOG'
+    check_nested_contract_log "$2" "$3" "$4" || die 'nested VMX contract transcript check failed'
     exit 0
 fi
 if [[ ${1:-} == --check-physical-policy-log ]]; then

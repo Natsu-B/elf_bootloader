@@ -1,0 +1,715 @@
+//! Bounded, disposable QEMU/KVM nested-VMX instruction contract.
+//!
+//! Run the identical image below the project Direct-VMCS monitor and the
+//! outer-KVM reference. This image does not launch an L2; the Linux KVM probe
+//! tests real entry/exit separately. No variable, disk, or firmware identity
+//! service is written. All VMX regions belong to this application until cleared
+//! and VMXOFF succeeds; no test state survives a successful return.
+//!
+//! Intel SDM Volume 3C, sections 32.2--32.4 specify the flag/error contracts:
+//! <https://cdrdv2-public.intel.com/868136/252046-081-sdm-change-document.pdf>.
+
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), no_std)]
+
+use core::arch::asm;
+use core::fmt;
+use core::fmt::Write;
+use core::ptr;
+use r_efi::efi;
+use x86_64_hal::addr::VmcsPhys;
+use x86_64_hal::addr::VmxonPhys;
+use x86_64_hal::cpu;
+use x86_64_hal::platform_memory;
+use x86_64_hal::platform_memory::FirmwareDescriptor;
+use x86_64_hal::vmcs;
+use x86_64_hal::vmx;
+use x86_64_hal::vmx::VmxStatus;
+
+const PAGE: usize = 4096;
+const PAGES: usize = 3;
+const CYCLES: u64 = 8;
+/// Reserved encoding bit 12 guarantees this is not a supported VMCS field.
+const UNSUPPORTED_FIELD: u64 = 0x1000;
+const SENTINEL: u64 = 0x1234_5678_9abc_def0;
+/// CF in bit zero, ZF in bit one; the forbidden 1/1 result stays distinguishable.
+const FAIL_INVALID: u64 = 1;
+const FAIL_VALID: u64 = 2;
+
+/// A bounded diagnostic with no firmware payload or identity contents.
+#[derive(Debug)]
+struct Failure {
+    stage: &'static str,
+    actual: u64,
+    expected: u64,
+}
+
+type Result<T> = core::result::Result<T, Failure>;
+
+fn equal(stage: &'static str, actual: u64, expected: u64) -> Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(Failure {
+            stage,
+            actual,
+            expected,
+        })
+    }
+}
+
+fn success(stage: &'static str, status: VmxStatus) -> Result<()> {
+    equal(
+        stage,
+        match status {
+            VmxStatus::Success => 0,
+            VmxStatus::FailInvalid => FAIL_INVALID,
+            VmxStatus::FailValid => FAIL_VALID,
+        },
+        0,
+    )
+}
+
+/// COM1 is owned by the disposable VM; absent/broken UART waits are finite.
+struct Serial;
+
+impl Serial {
+    fn initialize(&mut self) {
+        // SAFETY: the x86 UEFI fixture runs at CPL0 and owns QEMU's COM1 ports.
+        unsafe {
+            cpu::outb(0x3f9, 0);
+            cpu::outb(0x3fb, 0x80);
+            cpu::outb(0x3f8, 1);
+            cpu::outb(0x3f9, 0);
+            cpu::outb(0x3fb, 3);
+            cpu::outb(0x3fa, 0xc7);
+            cpu::outb(0x3fc, 0x0b);
+        }
+    }
+
+    fn byte(&mut self, byte: u8) -> fmt::Result {
+        for _ in 0..65_536 {
+            // SAFETY: the fixture owns COM1 and runs at CPL0.
+            let ready = unsafe { cpu::inb(0x3fd) };
+            if ready == 0xff {
+                return Err(fmt::Error);
+            }
+            if ready & 0x20 != 0 {
+                // SAFETY: the owned UART reported an available transmitter.
+                unsafe { cpu::outb(0x3f8, byte) };
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(fmt::Error)
+    }
+
+    fn failure(&mut self, error: &Failure) {
+        let _ = writeln!(
+            self,
+            "thin-hv: nested contract FAIL stage={} actual={:#x} expected={:#x}",
+            error.stage, error.actual, error.expected
+        );
+    }
+}
+
+impl Write for Serial {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for byte in text.bytes() {
+            if byte == b'\n' {
+                self.byte(b'\r')?;
+            }
+            self.byte(byte)?;
+        }
+        Ok(())
+    }
+}
+
+/// Captured prerequisites; original execution mode must remain unchanged.
+struct Prerequisites {
+    revision: u32,
+    cr0: u64,
+    cr4: u64,
+    invept: bool,
+    invvpid: bool,
+    readonly: bool,
+}
+
+fn prerequisites() -> Result<Prerequisites> {
+    equal("cpuid-vmx", u64::from(cpu::has_vmx()), 1)?;
+    equal(
+        "cpuid-msr",
+        u64::from(cpu::cpuid(1, 0).edx & (1 << 5) != 0),
+        1,
+    )?;
+    let extended = cpu::cpuid(0x8000_0000, 0).eax;
+    equal("cpuid-address-leaf", u64::from(extended >= 0x8000_0008), 1)?;
+    let width = cpu::cpuid(0x8000_0008, 0).eax & 0xff;
+    equal("physical-width", u64::from((32..=52).contains(&width)), 1)?;
+    // SAFETY: CPUID.VMX and MSR were checked; these are mandatory VMX capability
+    // MSRs, read at CPL0. No FEATURE_CONTROL or other firmware MSR is written.
+    let (feature, basic, cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1) = unsafe {
+        (
+            cpu::rdmsr(cpu::IA32_FEATURE_CONTROL),
+            vmx::VmxBasic::from_msr(cpu::rdmsr(vmx::IA32_VMX_BASIC)),
+            cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0),
+            cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1),
+            cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0),
+            cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1),
+        )
+    };
+    equal("feature-control", feature & 5, 5)?;
+    equal(
+        "vmcs-size",
+        u64::from((1..=4096).contains(&basic.region_size)),
+        1,
+    )?;
+    equal("vmcs-memory-type", u64::from(basic.memory_type), 6)?;
+    let cr0 = cpu::read_cr0();
+    let cr4 = cpu::read_cr4();
+    equal("firmware-vmxe-clear", cr4 & (1 << 13), 0)?;
+    equal("firmware-cache-enabled", cr0 & ((1 << 29) | (1 << 30)), 0)?;
+    // Refuse mode-changing normalization. Only CR4.VMXE is added; arbitrary
+    // firmware state is never repaired by this diagnostic fixture.
+    equal("cr0-fixed", (cr0 | cr0_fixed0) & cr0_fixed1, cr0)?;
+    let enabled_cr4 = cr4 | (1 << 13);
+    equal(
+        "cr4-fixed",
+        (enabled_cr4 | cr4_fixed0) & cr4_fixed1,
+        enabled_cr4,
+    )?;
+    // SAFETY: CPUID.VMX establishes legacy controls; BASIC gates TRUE controls.
+    let primary = unsafe {
+        cpu::rdmsr(if basic.true_controls {
+            vmx::IA32_VMX_TRUE_PROCBASED_CTLS
+        } else {
+            vmx::IA32_VMX_PROCBASED_CTLS
+        })
+    };
+    let mut secondary = 0;
+    if primary & (1 << 63) != 0 {
+        // SAFETY: allowed-one activate-secondary-controls establishes this MSR.
+        secondary = unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) };
+    }
+    let mut translation_caps = 0;
+    if secondary & ((1 << 33) | (1 << 37)) != 0 {
+        // SAFETY: secondary EPT or VPID support establishes EPT_VPID_CAP.
+        translation_caps = unsafe { cpu::rdmsr(vmx::IA32_VMX_EPT_VPID_CAP) };
+    }
+    // SAFETY: CPUID.VMX establishes the mandatory VMX_MISC capability MSR.
+    let misc = unsafe { cpu::rdmsr(vmx::IA32_VMX_MISC) };
+    Ok(Prerequisites {
+        revision: basic.revision_id,
+        cr0,
+        cr4,
+        invept: secondary & (1 << 33) != 0 && translation_caps & (1 << 20) != 0,
+        invvpid: secondary & (1 << 37) != 0 && translation_caps & (1 << 32) != 0,
+        readonly: misc & (1 << 29) == 0,
+    })
+}
+
+/// Confirms the bounded low-memory allocation belongs to WB-capable firmware RAM.
+fn allocation_map(boot: *mut efi::BootServices, base: u64) -> Result<()> {
+    let mut storage = [0_u64; 1024];
+    let mut length = core::mem::size_of_val(&storage);
+    let mut key = 0;
+    let mut stride = 0;
+    let mut version = 0;
+    // SAFETY: boot is live, the eight-byte-aligned stack buffer covers `length`
+    // bytes, and all output slots remain valid for this synchronous call.
+    let status = unsafe {
+        ((*boot).get_memory_map)(
+            &mut length,
+            storage.as_mut_ptr().cast(),
+            &mut key,
+            &mut stride,
+            &mut version,
+        )
+    };
+    equal("memory-map-status", status.as_usize() as u64, 0)?;
+    equal(
+        "memory-map-size",
+        u64::from(length <= core::mem::size_of_val(&storage)),
+        1,
+    )?;
+    // SAFETY: the initialized stack array is byte-readable and the returned size
+    // was checked against its complete allocation; the slice stays in this call.
+    let bytes = unsafe { core::slice::from_raw_parts(storage.as_ptr().cast(), length) };
+    let mut regions = [FirmwareDescriptor::default(); 205];
+    let count =
+        platform_memory::decode_uefi_map(bytes, stride, version, &mut regions).map_err(|_| {
+            Failure {
+                stage: "memory-map-layout",
+                actual: 1,
+                expected: 0,
+            }
+        })?;
+    allocation_covered(&regions[..count], base)
+}
+
+fn allocation_covered(regions: &[FirmwareDescriptor], base: u64) -> Result<()> {
+    let end = base
+        .checked_add((PAGES * PAGE) as u64)
+        .filter(|&end| base != 0 && base % PAGE as u64 == 0 && end <= 1 << 32)
+        .ok_or(Failure {
+            stage: "allocation-range",
+            actual: base,
+            expected: 0,
+        })?;
+    let mut covered = [0_u8; PAGES];
+    for region in regions {
+        let region_end = region
+            .number_of_pages
+            .checked_mul(PAGE as u64)
+            .and_then(|bytes| region.physical_start.checked_add(bytes))
+            .filter(|_| region.physical_start % PAGE as u64 == 0 && region.number_of_pages != 0)
+            .ok_or(Failure {
+                stage: "descriptor-range",
+                actual: region.physical_start,
+                expected: 0,
+            })?;
+        if region.physical_start >= end || region_end <= base {
+            continue;
+        }
+        equal(
+            "allocation-memory-type",
+            u64::from(region.memory_type),
+            u64::from(efi::BOOT_SERVICES_DATA),
+        )?;
+        equal(
+            "allocation-wb",
+            region.attributes & efi::MEMORY_WB,
+            efi::MEMORY_WB,
+        )?;
+        equal(
+            "allocation-protected",
+            region.attributes & (efi::MEMORY_RP | efi::MEMORY_WP | efi::MEMORY_RO),
+            0,
+        )?;
+        for (index, coverage) in covered.iter_mut().enumerate() {
+            let page = base + (index * PAGE) as u64;
+            if region.physical_start <= page && page < region_end {
+                *coverage = coverage.saturating_add(1);
+            }
+        }
+    }
+    for count in covered {
+        equal("allocation-page-coverage", u64::from(count), 1)?;
+    }
+    Ok(())
+}
+
+/// Executes only architecturally failing VMREAD forms, preserving raw CF/ZF.
+///
+/// # Safety
+/// The caller must be in VMX root operation. `field` is either reserved, or
+/// there is no current VMCS. Neither case can read or modify VMCS payload data.
+unsafe fn rejected_read(field: u64) -> (u64, u64) {
+    let mut value = SENTINEL;
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: the caller established VMX root operation and the intentional
+    // invalid case. Register operands cannot fault on guest memory. The HAL's
+    // valid-VMCS/field contract deliberately is not invoked for this probe.
+    unsafe {
+        asm!("vmread {value}, {field}", "setc {carry}", "setz {zero}",
+        field = in(reg) field, value = inout(reg) value,
+        carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+        options(nostack));
+    }
+    (u64::from(carry) | (u64::from(zero) << 1), value)
+}
+
+/// Executes an unsupported/read-only VMWRITE without claiming the HAL contract.
+///
+/// # Safety
+/// The caller must be in VMX root operation with a current, exclusively owned
+/// VMCS. The field must be reserved, or read-only with VMX_MISC[29] clear.
+unsafe fn rejected_write(field: u64) -> u64 {
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: VMX root/current VMCS and the architecturally failing field are
+    // caller invariants. No memory operand exists; the error field alone changes.
+    unsafe {
+        asm!("vmwrite {field}, {value}", "setc {carry}", "setz {zero}",
+        field = in(reg) field, value = in(reg) SENTINEL,
+        carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+        options(nostack));
+    }
+    u64::from(carry) | (u64::from(zero) << 1)
+}
+
+/// Tests rejected physical pointers without dereferencing malformed addresses.
+///
+/// # Safety
+/// VMX root operation must be active. `physical` must be this CPU's current
+/// VMXON pointer, or 1 with operation 1 (VMCLEAR) or 2 (VMPTRLD). The current
+/// VMCS must be test-owned. Each case must reject without changing ownership.
+unsafe fn rejected_pointer(physical: u64, operation: u8) -> u64 {
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: the memory operand is the readable live stack slot, not `physical`.
+    // VMXON in root and VMCLEAR/VMPTRLD with the VMXON pointer are defined VMfail
+    // cases. For physical value 1, VMCLEAR/VMPTRLD reject alignment before any
+    // access to a VMCS region; no CPU dereference of address 1 is performed.
+    unsafe {
+        match operation {
+            0 => asm!("vmxon [{pointer}]", "setc {carry}", "setz {zero}",
+                pointer = in(reg) &physical, carry = lateout(reg_byte) carry,
+                zero = lateout(reg_byte) zero, options(nostack)),
+            1 => asm!("vmclear [{pointer}]", "setc {carry}", "setz {zero}",
+                pointer = in(reg) &physical, carry = lateout(reg_byte) carry,
+                zero = lateout(reg_byte) zero, options(nostack)),
+            _ => asm!("vmptrld [{pointer}]", "setc {carry}", "setz {zero}",
+                pointer = in(reg) &physical, carry = lateout(reg_byte) carry,
+                zero = lateout(reg_byte) zero, options(nostack)),
+        }
+    }
+    u64::from(carry) | (u64::from(zero) << 1)
+}
+
+/// Uses a reserved invalidation type with a valid, zero-filled m128 descriptor.
+///
+/// # Safety
+/// VMX root and a current VMCS are required; CPUID and VMX capability MSRs must
+/// establish availability of the selected instruction, avoiding #UD.
+unsafe fn rejected_invalidation(vpid: bool) -> u64 {
+    let descriptor = vmx::InveptDescriptor::default();
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: the advertised instruction sees a readable aligned m128 operand;
+    // type u64::MAX is unsupported and must report error 28 without invalidation.
+    // Deliberately do not call the HAL wrapper requiring a supported type.
+    unsafe {
+        if vpid {
+            asm!("invvpid {kind}, [{descriptor}]", "setc {carry}", "setz {zero}",
+                kind = in(reg) u64::MAX, descriptor = in(reg) &descriptor,
+                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+                options(nostack));
+        } else {
+            asm!("invept {kind}, [{descriptor}]", "setc {carry}", "setz {zero}",
+                kind = in(reg) u64::MAX, descriptor = in(reg) &descriptor,
+                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+                options(nostack));
+        }
+    }
+    u64::from(carry) | (u64::from(zero) << 1)
+}
+
+/// The current VMCS is exclusively test-owned throughout each successful call.
+unsafe fn field_equal(stage: &'static str, field: u32, expected: u64) -> Result<()> {
+    // SAFETY: callers have successfully loaded their owned VMCS; they pass only
+    // mandatory GUEST_RIP/GUEST_RSP/VM_INSTRUCTION_ERROR encodings.
+    match unsafe { vmx::vmread(field) } {
+        Ok(actual) => equal(stage, actual, expected),
+        Err(status) => success(stage, status),
+    }
+}
+
+unsafe fn pointer_equal(stage: &'static str, expected: u64) -> Result<()> {
+    let mut physical = 0;
+    // SAFETY: callers are in VMX root and this output slot is writable for 8 bytes.
+    success(stage, unsafe { vmx::vmptrst(&mut physical) })?;
+    equal(stage, physical, expected)
+}
+
+/// No guest entries occur, so field contents are independent of launch validity.
+unsafe fn instructions(
+    vmxon: VmxonPhys,
+    first: VmcsPhys,
+    second: VmcsPhys,
+    capabilities: &Prerequisites,
+) -> Result<()> {
+    // SAFETY: VMXON succeeded and no VMPTRLD has executed in this session.
+    unsafe {
+        pointer_equal("initial-pointer", u64::MAX)?;
+        let (flags, value) = rejected_read(u64::from(vmcs::GUEST_RIP));
+        equal("read-no-current-flags", flags, FAIL_INVALID)?;
+        equal("read-no-current-destination", value, SENTINEL)?;
+    }
+    // SAFETY: both aligned, initialized WB VMCS pages are exclusively test-owned.
+    unsafe {
+        success("clear-first", vmx::vmclear(first))?;
+        success("clear-second", vmx::vmclear(second))?;
+        success("load-first", vmx::vmptrld(first))?;
+        success("write-first-rip", vmx::vmwrite(vmcs::GUEST_RIP, 0x1000))?;
+        success("write-first-rsp", vmx::vmwrite(vmcs::GUEST_RSP, 0x8000))?;
+    }
+    // SAFETY: first is current and owned; the reserved/read-only fields and
+    // VMXON pointer exercise defined VMfailValid paths. Physical value 1 is held
+    // in a readable operand and rejected for alignment before VMCS memory access.
+    unsafe {
+        let (flags, value) = rejected_read(UNSUPPORTED_FIELD);
+        equal("unsupported-read-flags", flags, FAIL_VALID)?;
+        equal("unsupported-read-destination", value, SENTINEL)?;
+        field_equal("unsupported-read-error", vmcs::VM_INSTRUCTION_ERROR, 12)?;
+        let wide_field = (1 << 32) | u64::from(vmcs::GUEST_RIP);
+        let (flags, value) = rejected_read(wide_field);
+        equal("wide-read-flags", flags, FAIL_VALID)?;
+        equal("wide-read-destination", value, SENTINEL)?;
+        field_equal("wide-read-error", vmcs::VM_INSTRUCTION_ERROR, 12)?;
+        equal("wide-write-flags", rejected_write(wide_field), FAIL_VALID)?;
+        field_equal("wide-write-error", vmcs::VM_INSTRUCTION_ERROR, 12)?;
+        if capabilities.readonly {
+            equal(
+                "readonly-write-flags",
+                rejected_write(u64::from(vmcs::VM_INSTRUCTION_ERROR)),
+                FAIL_VALID,
+            )?;
+            field_equal("readonly-write-error", vmcs::VM_INSTRUCTION_ERROR, 13)?;
+        }
+        equal(
+            "clear-vmxon-flags",
+            rejected_pointer(vmxon.get(), 1),
+            FAIL_VALID,
+        )?;
+        field_equal("clear-vmxon-error", vmcs::VM_INSTRUCTION_ERROR, 3)?;
+        equal("clear-misaligned-flags", rejected_pointer(1, 1), FAIL_VALID)?;
+        field_equal("clear-misaligned-error", vmcs::VM_INSTRUCTION_ERROR, 2)?;
+        equal(
+            "repeat-vmxon-flags",
+            rejected_pointer(vmxon.get(), 0),
+            FAIL_VALID,
+        )?;
+        field_equal("repeat-vmxon-error", vmcs::VM_INSTRUCTION_ERROR, 15)?;
+    }
+    // SAFETY: second is an initialized, exclusively owned VMCS; after VMPTRLD
+    // succeeds only mandatory natural-width guest fields are written. The invalid
+    // field, physical value 1, and VMXON pointer are defined rejection probes;
+    // the operand slot is valid and address 1 is never dereferenced by VMPTRLD.
+    unsafe {
+        success("load-second", vmx::vmptrld(second))?;
+        success("write-second-rip", vmx::vmwrite(vmcs::GUEST_RIP, 0x2000))?;
+        success("write-second-rsp", vmx::vmwrite(vmcs::GUEST_RSP, 0x9000))?;
+        equal(
+            "unsupported-write-flags",
+            rejected_write(UNSUPPORTED_FIELD),
+            FAIL_VALID,
+        )?;
+        field_equal("unsupported-write-error", vmcs::VM_INSTRUCTION_ERROR, 12)?;
+        equal("load-misaligned-flags", rejected_pointer(1, 2), FAIL_VALID)?;
+        field_equal("load-misaligned-error", vmcs::VM_INSTRUCTION_ERROR, 9)?;
+        equal(
+            "load-vmxon-flags",
+            rejected_pointer(vmxon.get(), 2),
+            FAIL_VALID,
+        )?;
+        field_equal("load-vmxon-error", vmcs::VM_INSTRUCTION_ERROR, 10)?;
+    }
+    for cycle in 0..CYCLES {
+        // SAFETY: the two owned VMCSs remain active only on this CPU. Successful
+        // VMX operations must preserve each VMCS's distinct error field; these
+        // guest RIP/RSP values are never consumed by a hardware VM entry.
+        unsafe {
+            success("switch-first", vmx::vmptrld(first))?;
+            pointer_equal("first-pointer", first.get())?;
+            field_equal("first-rip", vmcs::GUEST_RIP, 0x1000 + cycle)?;
+            field_equal("first-rsp", vmcs::GUEST_RSP, 0x8000 + cycle)?;
+            field_equal("first-error", vmcs::VM_INSTRUCTION_ERROR, 15)?;
+            success(
+                "update-first-rip",
+                vmx::vmwrite(vmcs::GUEST_RIP, 0x1001 + cycle),
+            )?;
+            success(
+                "update-first-rsp",
+                vmx::vmwrite(vmcs::GUEST_RSP, 0x8001 + cycle),
+            )?;
+            success("switch-second", vmx::vmptrld(second))?;
+            pointer_equal("second-pointer", second.get())?;
+            field_equal("second-rip", vmcs::GUEST_RIP, 0x2000 + cycle)?;
+            field_equal("second-rsp", vmcs::GUEST_RSP, 0x9000 + cycle)?;
+            field_equal("second-error", vmcs::VM_INSTRUCTION_ERROR, 10)?;
+            success(
+                "update-second-rip",
+                vmx::vmwrite(vmcs::GUEST_RIP, 0x2001 + cycle),
+            )?;
+            success(
+                "update-second-rsp",
+                vmx::vmwrite(vmcs::GUEST_RSP, 0x9001 + cycle),
+            )?;
+        }
+    }
+    if capabilities.invept {
+        // SAFETY: capability MSRs advertised INVEPT and second remains current.
+        unsafe {
+            equal("invept-flags", rejected_invalidation(false), FAIL_VALID)?;
+            field_equal("invept-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
+        }
+    }
+    if capabilities.invvpid {
+        // SAFETY: capability MSRs advertised INVVPID and second remains current.
+        unsafe {
+            equal("invvpid-flags", rejected_invalidation(true), FAIL_VALID)?;
+            field_equal("invvpid-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
+        }
+    }
+    Ok(())
+}
+
+/// Halts only after one bounded diagnostic; runner owns the finite test deadline.
+fn fatal(serial: &mut Serial, error: Failure) -> ! {
+    serial.failure(&error);
+    loop {
+        // SAFETY: a cleanup/panic failure cannot safely return or release VMX
+        // storage. This dedicated VM is stopped at CPL0 until the runner kills it.
+        unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+    }
+}
+
+fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<(bool, bool, bool)> {
+    equal("system-table", u64::from(!table.is_null()), 1)?;
+    // SAFETY: UEFI supplies this live SystemTable; this fixture never calls EBS.
+    let boot = unsafe { (*table).boot_services };
+    equal("boot-services", u64::from(!boot.is_null()), 1)?;
+    let capabilities = prerequisites()?;
+    let mut base = u64::from(u32::MAX);
+    // SAFETY: boot is live and base is a writable output slot. A low allocation
+    // satisfies BASIC's optional 32-bit operand limit and UEFI identity mapping.
+    let allocation = unsafe {
+        ((*boot).allocate_pages)(
+            efi::ALLOCATE_MAX_ADDRESS,
+            efi::BOOT_SERVICES_DATA,
+            PAGES,
+            &mut base,
+        )
+    };
+    equal("allocate-pages", allocation.as_usize() as u64, 0)?;
+    let result = (|| {
+        allocation_map(boot, base)?;
+        let vmxon = VmxonPhys::new(base).ok_or(Failure {
+            stage: "vmxon-alignment",
+            actual: base,
+            expected: 0,
+        })?;
+        let first = VmcsPhys::new(base + PAGE as u64).ok_or(Failure {
+            stage: "first-alignment",
+            actual: base,
+            expected: 0,
+        })?;
+        let second = VmcsPhys::new(base + (2 * PAGE) as u64).ok_or(Failure {
+            stage: "second-alignment",
+            actual: base,
+            expected: 0,
+        })?;
+        // SAFETY: the entire exclusive three-page low-memory allocation was
+        // checked against the current UEFI map before any pointer dereference.
+        // OVMF supplies WB RAM; CR0 caching is enabled and BASIC requires WB.
+        unsafe {
+            ptr::write_bytes(base as *mut u8, 0, PAGES * PAGE);
+            for index in 0..PAGES {
+                ptr::write_volatile(
+                    (base + (index * PAGE) as u64) as *mut u32,
+                    capabilities.revision,
+                );
+            }
+            cpu::write_cr4(capabilities.cr4 | (1 << 13));
+        }
+        // SAFETY: FEATURE_CONTROL, fixed CR bits, cacheability, revision and
+        // exclusive VMXON storage were checked. No VMX session was active at entry.
+        let entered = unsafe { vmx::vmxon(vmxon) };
+        let result = if entered == VmxStatus::Success {
+            // SAFETY: this CPU owns the newly entered session and both initialized
+            // VMCS pages. The finite contract never enters a guest or migrates.
+            let result = unsafe { instructions(vmxon, first, second, &capabilities) };
+            // SAFETY: these are our initialized VMCS pages even after a failed
+            // assertion. Clear both to evict cached VMCS state before VMXOFF.
+            let (clear_first, clear_second, left) =
+                unsafe { (vmx::vmclear(first), vmx::vmclear(second), vmx::vmxoff()) };
+            if let Err(error) = success("cleanup-vmxoff-retaining-pages", left) {
+                fatal(serial, error);
+            }
+            if let Err(error) = success("cleanup-clear-first-retaining-pages", clear_first)
+                .and_then(|()| success("cleanup-clear-second-retaining-pages", clear_second))
+            {
+                fatal(serial, error);
+            }
+            result
+        } else {
+            success("vmxon", entered)
+        };
+        // SAFETY: VMXON failed without entering, or cleanup VMXOFF succeeded.
+        // Restore the exact captured controls before calling firmware or freeing.
+        unsafe {
+            cpu::write_cr4(capabilities.cr4);
+            cpu::write_cr0(capabilities.cr0);
+        }
+        if let Err(error) = equal("restored-cr0", cpu::read_cr0(), capabilities.cr0)
+            .and_then(|()| equal("restored-cr4", cpu::read_cr4(), capabilities.cr4))
+        {
+            fatal(serial, error);
+        }
+        result?;
+        Ok((
+            capabilities.invept,
+            capabilities.invvpid,
+            capabilities.readonly,
+        ))
+    })();
+    // SAFETY: the closure returns only before VMXON, after its failure, or after
+    // both VMCLEARs and VMXOFF succeeded. No active VMCS or references survive.
+    // Fatal cleanup failures retain this allocation and never reach FreePages.
+    let release = unsafe { ((*boot).free_pages)(base, PAGES) };
+    equal("free-pages", release.as_usize() as u64, 0)?;
+    result
+}
+
+/// UEFI entry point; PASS is emitted only after all architectural cleanup.
+#[unsafe(no_mangle)]
+pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTable) -> efi::Status {
+    let mut serial = Serial;
+    serial.initialize();
+    if writeln!(serial, "thin-hv: nested contract START").is_err() {
+        return efi::Status::DEVICE_ERROR;
+    }
+    match run(table, &mut serial) {
+        Ok((invept, invvpid, readonly)) => {
+            if writeln!(serial,
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=1 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2",
+                9 + u8::from(invept) + u8::from(invvpid) + u8::from(readonly),
+                u8::from(invept), u8::from(invvpid), u8::from(readonly)).is_ok() {
+                efi::Status::SUCCESS
+            } else { efi::Status::DEVICE_ERROR }
+        }
+        Err(error) => { serial.failure(&error); efi::Status::DEVICE_ERROR }
+    }
+}
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    fatal(
+        &mut Serial,
+        Failure {
+            stage: "panic-retaining-pages",
+            actual: 1,
+            expected: 0,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_requires_complete_unique_writable_wb_pages() {
+        let mut region = FirmwareDescriptor {
+            memory_type: efi::BOOT_SERVICES_DATA,
+            physical_start: 0x1000,
+            number_of_pages: PAGES as u64,
+            attributes: efi::MEMORY_WB,
+        };
+        assert!(allocation_covered(&[region], 0x1000).is_ok());
+        assert!(allocation_covered(&[region, region], 0x1000).is_err());
+        assert!(allocation_covered(&[region], 0).is_err());
+        assert!(allocation_covered(&[region], u64::MAX).is_err());
+        assert!(allocation_covered(&[region], (1 << 32) - PAGE as u64).is_err());
+        region.attributes |= efi::MEMORY_RO;
+        assert!(allocation_covered(&[region], 0x1000).is_err());
+        region.attributes = 0;
+        assert!(allocation_covered(&[region], 0x1000).is_err());
+        region.attributes = efi::MEMORY_WB;
+        region.number_of_pages -= 1;
+        assert!(allocation_covered(&[region], 0x1000).is_err());
+    }
+}

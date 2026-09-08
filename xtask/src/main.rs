@@ -68,6 +68,9 @@ fn print_xtask_usage() {
     println!("Commands:");
     println!("  build [x86|rpi5|rpi4|rpi4_net|example] [args...]");
     println!("  run [x86|rpi4|rpi5|net] [args...]");
+    println!(
+        "  run x86 --nested [--release]    QEMU/KVM nested contract and Linux state/lifetime A/B tests"
+    );
     println!("  test [xtest args...]");
     println!();
     println!("Options:");
@@ -370,6 +373,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("physical-preflight")
             || arg.contains("physical-policy")
             || arg.contains("host-exception-test")
+            || arg.contains("nested-contract")
     }) {
         return Err(
             "x86 builds all backend artifacts; do not select an alternate backend feature explicitly"
@@ -568,6 +572,37 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         })?;
     }
     build_x86_host_exception_fixture(args, &workspace, &artifact)?;
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            guest_pkg,
+            "--bin",
+            "x86-uefi-nested-contract",
+        ])
+        .args(["--target", "x86_64-unknown-uefi"])
+        .args(args)
+        .args(["--no-default-features", "--features", "nested-contract"])
+        .env("XTASK_BUILD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("Failed to build nested VMX contract fixture: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "nested VMX contract fixture build failed: {status}"
+        ));
+    }
+    let contract_artifact = workspace
+        .join("target/x86_64-unknown-uefi")
+        .join(resolve_profile(args))
+        .join("x86-uefi-nested-contract.efi");
+    fs::copy(
+        &contract_artifact,
+        workspace.join("bin/x86_64/x86-uefi-nested-contract.efi"),
+    )
+    .map_err(|error| format!("Failed to stage nested VMX contract fixture: {error}"))?;
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -705,7 +740,140 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Runs every bounded nested case even when another backend or case fails.
+/// The shared UEFI staging directory requires serial execution of these VMs.
+fn run_x86_nested() -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (backend, cpu_profile) in [
+        ("outer-kvm", "native"),
+        ("direct-vmx", "native"),
+        ("outer-kvm", "readonly-vmcs"),
+        ("direct-vmx", "readonly-vmcs"),
+    ] {
+        match fs::remove_file("bin/x86_64/serial.log") {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failures.push(format!("Cannot clear prior contract evidence: {error}"));
+                continue;
+            }
+        }
+        let (loader, monitor) = if backend == "direct-vmx" {
+            ("x86-uefi-loader.efi", "bin/x86_64/x86-uefi-monitor.efi")
+        } else {
+            ("x86-uefi-kvm-loader.efi", "")
+        };
+        eprintln!(
+            "\n--- Nested VMX instruction contract backend={backend} cpu_profile={cpu_profile} environment=QEMU/kvm ---"
+        );
+        let result = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+            .arg(Path::new("bin/x86_64").join(loader))
+            .arg("bin/x86_64/x86-uefi-nested-contract.efi")
+            .env("X86_UEFI_BACKEND", backend)
+            .env("X86_MONITOR_IMAGE", monitor)
+            .env("X86_UEFI_PHYSICAL_POLICY", "0")
+            .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
+            .env("X86_UEFI_ACCEL", "kvm")
+            .env(
+                "X86_UEFI_CPU",
+                if cpu_profile == "readonly-vmcs" {
+                    "host,+vmx,-hypervisor,kvm=off,vmx-vmwrite-vmexit-fields=off"
+                } else {
+                    "host,+vmx,-hypervisor,kvm=off"
+                },
+            )
+            .env("X86_UEFI_MEMORY", "256M")
+            .env("X86_UEFI_SMP", "1")
+            .env("X86_UEFI_TIMEOUT_SECONDS", "30")
+            .env("X86_UEFI_GUEST_LOCATION", "guest")
+            .env("X86_UEFI_ACPI_S3", "0")
+            .env("X86_UEFI_WAKE_CYCLES", "0")
+            .env("X86_UEFI_ALLOW_REBOOT", "0")
+            .env("X86_UEFI_REQUIRE_POWEROFF", "0")
+            .env("X86_UEFI_USERNET", "0")
+            .env_remove("X86_UEFI_DATA_DISK")
+            .env_remove("X86_RETURN_MARKER")
+            .env("X86_VARIABLE_MARKER", "")
+            .env("X86_GUEST_MARKER", "thin-hv: nested contract PASS")
+            .env("X86_GUEST_FAILURE_MARKER", "thin-hv: nested contract FAIL")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        let result = match result {
+            Ok(status) if status.success() => Command::new("bash")
+                .arg("./scripts/x86_64/run-uefi-smoke.sh")
+                .args([
+                    "--check-nested-contract-log",
+                    backend,
+                    cpu_profile,
+                    "bin/x86_64/serial.log",
+                ])
+                .status()
+                .map_err(|error| error.to_string()),
+            Ok(status) => Ok(status),
+            Err(error) => Err(error.to_string()),
+        };
+        match result {
+            Ok(status) if status.success() => {
+                eprintln!("nested contract: PASS backend={backend} cpu_profile={cpu_profile}")
+            }
+            other => failures.push(format!(
+                "nested contract backend={backend} cpu_profile={cpu_profile}: {other:?}"
+            )),
+        }
+        let evidence = format!("bin/x86_64/nested-contract-{backend}-{cpu_profile}.log");
+        if let Err(error) = fs::copy("bin/x86_64/serial.log", &evidence) {
+            failures.push(format!("Failed to preserve {evidence}: {error}"));
+        }
+    }
+    for backend in ["outer-kvm", "direct-vmx"] {
+        match fs::remove_file("bin/x86_64/serial.log") {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failures.push(format!("Cannot clear prior Linux evidence: {error}"));
+                continue;
+            }
+        }
+        eprintln!("\n--- Nested Linux state/lifetime backend={backend} environment=QEMU/kvm ---");
+        let result = Command::new("./scripts/x86_64/run-linux-kvm-test.sh")
+            .env("LINUX_KVM_BACKEND", backend)
+            .env("X86_UEFI_PHYSICAL_POLICY", "0")
+            .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        match result {
+            Ok(status) if status.success() => eprintln!("nested Linux: PASS backend={backend}"),
+            other => failures.push(format!("nested Linux backend={backend}: {other:?}")),
+        }
+        let evidence = format!("bin/x86_64/nested-linux-{backend}.log");
+        if let Err(error) = fs::copy("bin/x86_64/serial.log", &evidence) {
+            failures.push(format!("Failed to preserve {evidence}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        eprintln!(
+            "nested suite: PASS environment=QEMU/kvm l1_cpus=1 physical_hardware=unverified hyperv=unverified"
+        );
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
 fn run_x86_uefi(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--nested") {
+        let build_args: Vec<_> = args
+            .iter()
+            .filter(|arg| *arg != "--nested")
+            .cloned()
+            .collect();
+        build_x86_uefi(&build_args)?;
+        return run_x86_nested();
+    }
     let binary_path = build_x86_uefi(args)?;
     eprintln!("\n--- Running QEMU/KVM direct-vmx / project L0 smoke test ---");
     let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
@@ -3109,6 +3277,93 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn nested_contract_gate_requires_complete_architectural_and_cleanup_evidence() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-nested-contract-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check_profile = |backend: &str, cpu_profile: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-nested-contract-log", backend, cpu_profile])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let check = |backend: &str, contents: &str| check_profile(backend, "native", contents);
+        for backend in ["direct-vmx", "outer-kvm"] {
+            let (provenance, terminal) = if backend == "direct-vmx" {
+                (
+                    "thin-hv: backend=direct-vmx role=project-l0\n\
+                  thin-hv: backend=direct-vmx role=project-l0\n\
+                  thin-hv: private host state PASS\n",
+                    "thin-hv: vmx guest PASS start_image_status=0x0000000000000000\n",
+                )
+            } else {
+                (
+                    "thin-hv: backend=outer-kvm role=reference\n",
+                    "thin-hv: trusted outer KVM guest PASS\n",
+                )
+            };
+            let start = "thin-hv: nested contract START\n";
+            for capabilities in 0..8 {
+                let invept = capabilities & 1;
+                let invvpid = (capabilities >> 1) & 1;
+                let readonly = (capabilities >> 2) & 1;
+                let count = 9 + invept + invvpid + readonly;
+                let pass = format!(
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=1 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2\n"
+                );
+                let valid = format!("{provenance}{start}{pass}{terminal}");
+                assert!(check(backend, &valid));
+                assert_eq!(
+                    check_profile(backend, "readonly-vmcs", &valid),
+                    readonly == 1
+                );
+                assert!(!check_profile(backend, "unknown", &valid));
+                assert!(check(backend, &valid.replace('\n', "\r\n")));
+                for invalid in [
+                    valid.replace(start, ""),
+                    valid.replace(&pass, ""),
+                    valid.replace(terminal, ""),
+                    format!("{valid}{pass}"),
+                    format!("{provenance}{pass}{start}{terminal}"),
+                    valid.replace("vmcs=2", "vmcs=1"),
+                    valid.replace("cycles=8", "cycles=0"),
+                    valid.replace("vmfail_invalid=1", "vmfail_invalid=0"),
+                    valid.replace(&format!("vmfail_valid={count}"), "vmfail_valid=0"),
+                    valid.replace("wide_fields=2", "wide_fields=1"),
+                    valid.replace("invept=", "invept=0"),
+                    valid.clone() + "thin-hv: nested contract FAIL stage=late\n",
+                    valid.clone() + "thin-hv: vmx guest FAIL\n",
+                    valid.clone() + "thin-hv: backend=physical-preflight project_vmx=0\n",
+                    valid.clone() + "\0",
+                ] {
+                    assert!(!check(backend, &invalid), "accepted: {invalid}");
+                }
+            }
+            assert!(!check(backend, &"x".repeat(262145)));
+            assert!(!check(backend, ""));
+        }
+        assert!(!check("physical-chainload", ""));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn linux_kvm_lifecycle_gate_requires_exact_order_backend_and_clean_shutdown() {
         struct FixtureLog(std::path::PathBuf);
         impl Drop for FixtureLog {
@@ -3139,7 +3394,7 @@ mod tests {
         for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
             let cycle = |number| {
                 format!(
-                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK process_exit=0\n"
+                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 teardown=explicit process_exit=0\n"
                 )
             };
             let valid = format!(
@@ -3154,6 +3409,8 @@ mod tests {
             assert!(check(backend, "2", &valid));
             assert!(check(backend, "2", &valid.replace('\n', "\r\n")));
             assert!(!check(backend, "3", &valid));
+            assert!(!check(backend, "2", &(valid.clone() + "\0")));
+            assert!(!check(backend, "2", &"x".repeat(2_097_153)));
             assert!(!check(backend, "02", &valid));
             assert!(!check("unknown", "2", &valid));
             assert!(!check(backend, "2", &valid.replace(&cycle(1), "")));
@@ -3168,6 +3425,18 @@ mod tests {
                 "2",
                 &valid.replace("process_exit=0", "process_exit=1")
             ));
+            for missing in [
+                " vm_contexts=2",
+                " rounds=8",
+                " io_in=16",
+                " io_out=32",
+                " halt=16",
+                " remaps=14",
+                " state_checks=16",
+                " teardown=explicit",
+            ] {
+                assert!(!check(backend, "2", &valid.replace(missing, "")));
+            }
             assert!(!check(
                 backend,
                 "2",
