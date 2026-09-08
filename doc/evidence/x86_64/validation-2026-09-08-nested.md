@@ -1,5 +1,10 @@
 # Expanded QEMU nested validation, 2026-09-08
 
+Follow-up evidence, including actual Linux L2 OS boots and the completed reference
+Windows 60-minute/S5 rerun, is in the
+[extended upstream matrix](validation-2026-09-08-upstream.md). The results below
+remain the historical outcomes of their own commands, including failed attempts.
+
 Branch: `feat/x86-thin-monitor`; starting commit: `24da228`. The requested branch,
 short status and last 20 commits were recorded before edits. No branch switch,
 Claude use, new dependency, AArch64 production change or physical-machine write.

@@ -170,7 +170,8 @@ non-root guest_entry trampoline; blindly unmapping it breaks the present handoff
 ### QEMU-first nested gate (2026-09-08)
 
 Latest expanded coverage, reproduced failures and exact commands are recorded in
-[the QEMU nested validation report](evidence/x86_64/validation-2026-09-08-nested.md).
+[the QEMU nested validation report](evidence/x86_64/validation-2026-09-08-nested.md)
+and the subsequent [upstream/real-L2 matrix](evidence/x86_64/validation-2026-09-08-upstream.md).
 The older result tables below describe their own increments, not the latest matrix.
 
 The target is to finish architectural development and reproducible nested regressions in QEMU
