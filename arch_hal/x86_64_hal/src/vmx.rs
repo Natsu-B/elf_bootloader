@@ -301,6 +301,125 @@ pub unsafe fn vmptrst(destination: &mut u64) -> VmxStatus {
     VmxStatus::from_flags(carry, zero)
 }
 
+/// Errors which can be recorded by an instruction guaranteed not to succeed.
+///
+/// These instructions let a direct-VMCS monitor preserve the hardware-owned
+/// VM-instruction error field without assuming that read-only fields are writable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RecordedFailure {
+    /// VMCLEAR with an address which is not page aligned.
+    VmclearInvalidAddress = 2,
+    /// VMCLEAR targeting the active hardware VMXON region.
+    VmclearVmxonPointer = 3,
+    /// VMPTRLD with an address which is not page aligned.
+    VmptrldInvalidAddress = 9,
+    /// VMPTRLD targeting the active hardware VMXON region.
+    VmptrldVmxonPointer = 10,
+    /// VMREAD with an encoding containing reserved bits.
+    UnsupportedComponent = 12,
+    /// VMWRITE to a read-only field on a CPU without writable exit information.
+    ReadOnlyComponent = 13,
+    /// VMXON while already in VMX root operation.
+    VmxonInRoot = 15,
+    /// INVVPID with an unsupported invalidation type.
+    InvalidInveptInvvpidOperand = 28,
+}
+
+impl RecordedFailure {
+    /// Accepts only error numbers with a side-effect-free failing instruction.
+    #[must_use]
+    pub const fn from_error(error: u32) -> Option<Self> {
+        match error {
+            2 => Some(Self::VmclearInvalidAddress),
+            3 => Some(Self::VmclearVmxonPointer),
+            9 => Some(Self::VmptrldInvalidAddress),
+            10 => Some(Self::VmptrldVmxonPointer),
+            12 => Some(Self::UnsupportedComponent),
+            13 => Some(Self::ReadOnlyComponent),
+            15 => Some(Self::VmxonInRoot),
+            28 => Some(Self::InvalidInveptInvvpidOperand),
+            _ => None,
+        }
+    }
+}
+
+/// Records one error in the current VMCS using a guaranteed-failing instruction.
+///
+/// Intel SDM Vol. 3C sections 31.2–31.4 define these failure conditions and the
+/// VM-instruction error update; no opaque VMCS bytes are accessed by software.
+/// The caller must check for `FailValid` and read back the expected error number.
+///
+/// # Safety
+///
+/// The CPU must be in VMX root operation at CPL0 with a valid, exclusively owned
+/// current VMCS. `vmxon_region` must be this CPU's *active hardware* VMXON region,
+/// not a nested guest's VMXON pointer. INVVPID must be supported for error 28.
+/// For error 13, physical IA32_VMX_MISC[29] must be clear (VM-exit information
+/// fields must actually be read-only on this CPU).
+pub unsafe fn record_failure(failure: RecordedFailure, vmxon_region: VmxonPhys) -> VmxStatus {
+    if failure == RecordedFailure::UnsupportedComponent {
+        // SAFETY: the caller supplies a valid current VMCS. Bit 15 is reserved
+        // in VMCS field encodings, so this register-form access must fail.
+        return match unsafe { vmread(1 << 15) } {
+            Ok(_) => VmxStatus::Success,
+            Err(status) => status,
+        };
+    }
+    if failure == RecordedFailure::ReadOnlyComponent {
+        // SAFETY: physical IA32_VMX_MISC[29] is clear by the caller's contract;
+        // VMWRITE cannot write this read-only field and instead records error 13.
+        return unsafe { vmwrite(crate::vmcs::VM_INSTRUCTION_ERROR, 0) };
+    }
+    if failure == RecordedFailure::VmxonInRoot {
+        // SAFETY: the caller is already in root operation; VMXON fails with error
+        // 15 before changing VMX ownership or accessing a new VMXON region.
+        return unsafe { vmxon(vmxon_region) };
+    }
+    if failure == RecordedFailure::InvalidInveptInvvpidOperand {
+        // SAFETY: INVVPID is supported, the local descriptor is aligned/readable,
+        // and type 4 is architecturally invalid, so no invalidation takes place.
+        return unsafe { invvpid(4, &InvvpidDescriptor::default()) };
+    }
+    let physical = match failure {
+        RecordedFailure::VmclearInvalidAddress | RecordedFailure::VmptrldInvalidAddress => 1_u64,
+        _ => vmxon_region.get(),
+    };
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: the memory operand itself is a readable local u64. Its value is
+    // either deliberately misaligned or the active VMXON pointer: both are
+    // rejected before a VMCS is accessed, cleared, or made current. The caller
+    // supplies the root-mode/current-VMCS prerequisites for VMfailValid.
+    unsafe {
+        if matches!(
+            failure,
+            RecordedFailure::VmclearInvalidAddress | RecordedFailure::VmclearVmxonPointer
+        ) {
+            asm!(
+                "vmclear [{physical}]",
+                "setc {carry}",
+                "setz {zero}",
+                physical = in(reg) &physical,
+                carry = lateout(reg_byte) carry,
+                zero = lateout(reg_byte) zero,
+                options(nostack)
+            );
+        } else {
+            asm!(
+                "vmptrld [{physical}]",
+                "setc {carry}",
+                "setz {zero}",
+                physical = in(reg) &physical,
+                carry = lateout(reg_byte) carry,
+                zero = lateout(reg_byte) zero,
+                options(nostack)
+            );
+        }
+    }
+    VmxStatus::from_flags(carry, zero)
+}
+
 /// Operand for INVEPT.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C, align(16))]
@@ -343,8 +462,12 @@ impl InvvpidDescriptor {
 ///
 /// # Safety
 ///
-/// The caller must be in VMX root operation and provide a supported kind and
-/// architecturally valid descriptor.
+/// The CPU must be in VMX root operation at CPL0 with INVEPT available. Any
+/// current VMCS must be exclusively owned: VMfailValid updates its error field.
+/// Invalid kinds and descriptor values are permitted and return a VMX failure;
+/// the referenced descriptor must remain readable for the instruction. For a
+/// valid request, the caller must coordinate the affected EPT contexts and any
+/// memory or translation reuse with all CPUs which can use those contexts.
 pub unsafe fn invept(kind: u64, descriptor: &InveptDescriptor) -> VmxStatus {
     let carry: u8;
     let zero: u8;
@@ -368,8 +491,12 @@ pub unsafe fn invept(kind: u64, descriptor: &InveptDescriptor) -> VmxStatus {
 ///
 /// # Safety
 ///
-/// The caller must be in VMX root operation and provide a supported kind and
-/// architecturally valid descriptor.
+/// The CPU must be in VMX root operation at CPL0 with INVVPID available. Any
+/// current VMCS must be exclusively owned: VMfailValid updates its error field.
+/// Invalid kinds and descriptor values are permitted and return a VMX failure;
+/// the referenced descriptor must remain readable for the instruction. For a
+/// valid request, the caller must coordinate the affected VPID contexts and
+/// subsequent translation reuse with all CPUs which can use those contexts.
 pub unsafe fn invvpid(kind: u64, descriptor: &InvvpidDescriptor) -> VmxStatus {
     let carry: u8;
     let zero: u8;
@@ -393,7 +520,10 @@ pub unsafe fn invvpid(kind: u64, descriptor: &InvvpidDescriptor) -> VmxStatus {
 ///
 /// # Safety
 ///
-/// A valid VMCS must be current and `field` must be a supported encoding.
+/// The CPU must be in VMX root operation at CPL0. Any current VMCS must be
+/// exclusively owned, including its hardware-maintained error field. Unsupported
+/// field encodings are permitted and return VMfailValid; a missing current VMCS
+/// returns VMfailInvalid. No guest-memory operand is accessed by this wrapper.
 pub unsafe fn vmread(field: u32) -> Result<u64, VmxStatus> {
     let value: u64;
     let carry: u8;
@@ -421,11 +551,19 @@ pub unsafe fn vmread(field: u32) -> Result<u64, VmxStatus> {
 ///
 /// # Safety
 ///
-/// A valid VMCS must be current and the field/value pair must be supported.
+/// The CPU must be in VMX root operation at CPL0. Any current VMCS must be
+/// exclusively owned, including its hardware-maintained error field. Unsupported
+/// encodings or writes to fields which are read-only on this CPU are permitted
+/// and return VMfailValid; a missing current VMCS returns VMfailInvalid. On
+/// success, the caller owns the field mutation and must validate all resulting
+/// control, host, guest, and memory-reference state before any VM entry; VMWRITE
+/// does not itself validate arbitrary field values for subsequent execution.
 pub unsafe fn vmwrite(field: u32, value: u64) -> VmxStatus {
     let carry: u8;
     let zero: u8;
-    // SAFETY: upheld by the caller; hardware validates the field/value pair.
+    // SAFETY: the caller supplies root mode and exclusive VMCS ownership.
+    // Hardware validates field accessibility; later VM-entry validity remains
+    // the caller's responsibility, as documented above.
     unsafe {
         asm!(
             "vmwrite {field}, {value}",
@@ -507,11 +645,24 @@ unsafe fn vm_entry_instruction(resume: bool) -> VmxStatus {
 #[cfg(test)]
 mod tests {
     use super::InvvpidDescriptor;
+    use super::RecordedFailure;
     use super::VmxBasic;
     use super::adjust_controls;
     use super::memory_operand_address_64;
     use super::register_operand_indices;
     use super::restrict_controls;
+
+    #[test]
+    fn recorded_failures_accept_only_guaranteed_instruction_errors() {
+        let supported = [2, 3, 9, 10, 12, 13, 15, 28];
+        for error in 0..=64 {
+            assert_eq!(
+                RecordedFailure::from_error(error).map(|failure| failure as u32),
+                supported.contains(&error).then_some(error)
+            );
+        }
+        assert_eq!(RecordedFailure::from_error(u32::MAX), None);
+    }
 
     #[test]
     fn capability_adjustment_enforces_required_and_allowed_bits() {

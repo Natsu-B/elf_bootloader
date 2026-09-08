@@ -19,10 +19,13 @@ use nested_vmx::PIN_EXTERNAL_INTERRUPT_EXITING;
 use nested_vmx::PRIMARY_INTERRUPT_WINDOW_EXITING;
 use nested_vmx::PatchKind;
 use nested_vmx::VMXERR_INVALID_INVEPT_INVVPID_OPERAND;
+use nested_vmx::VMXERR_UNSUPPORTED_VMCS_COMPONENT;
 use nested_vmx::VMXERR_VMCLEAR_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMCLEAR_VMXON_POINTER;
 use nested_vmx::VMXERR_VMPTRLD_INVALID_ADDRESS;
 use nested_vmx::VMXERR_VMPTRLD_VMXON_POINTER;
+use nested_vmx::VMXERR_VMWRITE_READ_ONLY_COMPONENT;
+use nested_vmx::VMXERR_VMXON_IN_ROOT;
 use nested_vmx::VcpuState;
 use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
@@ -2223,9 +2226,10 @@ fn handle_l1_vmxon(
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    if L1_VCPU_STATE.lock().in_vmx_operation() {
+    let state = *L1_VCPU_STATE.lock();
+    if state.in_vmx_operation() {
         complete_vmx_instruction(
-            VmInstructionResult::VmfailInvalid,
+            l1_vmx_failure(&state, VMXERR_VMXON_IN_ROOT),
             reason,
             qualification,
             guest_rip,
@@ -2381,30 +2385,23 @@ fn handle_l1_vmclear(
             registers,
         );
     }
-    let status = unsafe { vmx::vmclear(region) };
-    let result = match status {
-        VmxStatus::Success => {
-            L1_VCPU_STATE.lock().record_vmclear_success(region);
-            VmInstructionResult::Vmsucceed
-        }
-        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
-        VmxStatus::FailValid => {
-            let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
-                .ok()
-                .and_then(|value| u32::try_from(value).ok())
-            else {
-                stop_unexpected_exit(
-                    b"reading VMCLEAR error failed",
-                    reason,
-                    qualification,
-                    guest_rip,
-                    instruction_len,
-                    registers,
-                );
-            };
-            l1_vmx_failure(&state, error)
-        }
+    let Some(result) = execute_l1_vmx_instruction(&state, || {
+        // SAFETY: the aligned, in-range L1-owned VMCS is neither the carrier nor
+        // its VMXON page; any retained host patch was materialized above.
+        unsafe { vmx::vmclear(region) }
+    }) else {
+        stop_unexpected_exit(
+            b"executing VMCLEAR with L1 VMCS failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
     };
+    if result == VmInstructionResult::Vmsucceed {
+        L1_VCPU_STATE.lock().record_vmclear_success(region);
+    }
     complete_vmx_instruction(
         result,
         reason,
@@ -2507,45 +2504,24 @@ fn handle_l1_vmptrld(
         );
     }
 
-    let status = unsafe { vmx::vmptrld(region) };
-    let hardware_error = if status == VmxStatus::FailValid {
-        (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
-            .ok()
-            .and_then(|value| u32::try_from(value).ok())
-    } else {
-        None
-    };
-    if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+    let Some(result) = execute_l1_vmx_instruction(&state, || {
+        // SAFETY: the operand is an aligned, in-range trusted L1 allocation,
+        // distinct from the carrier and VMXON pages. Hardware validates its
+        // revision before making it current, retaining the old VMCS on failure.
+        unsafe { vmx::vmptrld(region) }
+    }) else {
         stop_unexpected_exit(
-            b"restoring VMPTRLD carrier failed",
+            b"executing VMPTRLD with L1 VMCS failed",
             reason,
             qualification,
             guest_rip,
             instruction_len,
             registers,
         );
-    }
-
-    let result = match status {
-        VmxStatus::Success => {
-            L1_VCPU_STATE.lock().record_vmptrld_success(region);
-            VmInstructionResult::Vmsucceed
-        }
-        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
-        VmxStatus::FailValid => {
-            let Some(error) = hardware_error else {
-                stop_unexpected_exit(
-                    b"reading VMPTRLD error failed",
-                    reason,
-                    qualification,
-                    guest_rip,
-                    instruction_len,
-                    registers,
-                );
-            };
-            l1_vmx_failure(&state, error)
-        }
     };
+    if result == VmInstructionResult::Vmsucceed {
+        L1_VCPU_STATE.lock().record_vmptrld_success(region);
+    }
     complete_vmx_instruction(
         result,
         reason,
@@ -3293,16 +3269,54 @@ fn handle_l1_vmcs_access(
     } else {
         None
     };
+    // VMWRITE source-memory faults precede unsupported-field validation (SDM
+    // Vol. 3C, VMWRITE); do not skip the source access for a wide field operand.
     let Some(field) = field_value.and_then(|value| u32::try_from(value).ok()) else {
-        stop_unexpected_exit(
-            b"invalid VMCS field operand",
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_UNSUPPORTED_VMCS_COMPONENT),
             reason,
             qualification,
             guest_rip,
             instruction_len,
             registers,
         );
+        return;
     };
+    // The exposed VMX_MISC[29] is zero: VM-exit information remains read-only
+    // even when this physical CPU permits VMWRITE to those fields. Probe field
+    // existence first so reserved/unsupported encodings return error 12, not 13.
+    if write && vmcs_field_is_read_only(field) {
+        let Some(result) = execute_l1_vmx_instruction(&state, || {
+            // SAFETY: the helper selects L1's valid VMCS; register-form VMREAD
+            // validates this encoding without changing the addressed field.
+            match unsafe { vmx::vmread(field) } {
+                Ok(_) => VmxStatus::Success,
+                Err(status) => status,
+            }
+        }) else {
+            stop_unexpected_exit(
+                b"validating read-only VMWRITE field failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        complete_vmx_instruction(
+            if result == VmInstructionResult::Vmsucceed {
+                l1_vmx_failure(&state, VMXERR_VMWRITE_READ_ONLY_COMPONENT)
+            } else {
+                result
+            },
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+        return;
+    }
     let shadowed = {
         let mut cached = DIRECT_PATCH_VALUES.lock();
         match cached.as_mut() {
@@ -3517,28 +3531,20 @@ fn handle_l1_invept(
             registers,
         );
     };
-    let status = unsafe { vmx::invept(kind, &descriptor) };
-    let result = match status {
-        VmxStatus::Success => VmInstructionResult::Vmsucceed,
-        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
-        VmxStatus::FailValid => {
-            let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
-                .ok()
-                .and_then(|value| u32::try_from(value).ok())
-            else {
-                stop_unexpected_exit(
-                    b"reading INVEPT error failed",
-                    reason,
-                    qualification,
-                    guest_rip,
-                    instruction_len,
-                    registers,
-                );
-            };
-            // ponytail: type-2 with a zero descriptor is the measured path;
-            // switch to L1's VMCS before supporting observable failure errors.
-            l1_vmx_failure(&state, error)
-        }
+    let Some(result) = execute_l1_vmx_instruction(&state, || {
+        // SAFETY: L0 remains in VMX root operation; supported INVEPT receives a
+        // local aligned descriptor copied from the checked L1 operand. Hardware
+        // validates its type/EPTP while L1's current VMCS owns any error result.
+        unsafe { vmx::invept(kind, &descriptor) }
+    }) else {
+        stop_unexpected_exit(
+            b"executing INVEPT with L1 VMCS failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
     };
     complete_vmx_instruction(
         result,
@@ -3625,26 +3631,20 @@ fn handle_l1_invvpid(
     };
     // ponytail: VPID tags are direct and globally shared with this trusted
     // one-vCPU L1; add per-pCPU VPID ownership before monitor SMP.
-    let status = unsafe { vmx::invvpid(kind, &descriptor) };
-    let result = match status {
-        VmxStatus::Success => VmInstructionResult::Vmsucceed,
-        VmxStatus::FailInvalid => VmInstructionResult::VmfailInvalid,
-        VmxStatus::FailValid => {
-            let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
-                .ok()
-                .and_then(|value| u32::try_from(value).ok())
-            else {
-                stop_unexpected_exit(
-                    b"reading INVVPID error failed",
-                    reason,
-                    qualification,
-                    guest_rip,
-                    instruction_len,
-                    registers,
-                );
-            };
-            l1_vmx_failure(&state, error)
-        }
+    let Some(result) = execute_l1_vmx_instruction(&state, || {
+        // SAFETY: L0 remains in VMX root operation; supported INVVPID receives a
+        // local aligned descriptor. Hardware validates reserved bits and VPID
+        // while L1's current VMCS owns any error result.
+        unsafe { vmx::invvpid(kind, &descriptor) }
+    }) else {
+        stop_unexpected_exit(
+            b"executing INVVPID with L1 VMCS failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
     };
     complete_vmx_instruction(
         result,
@@ -3656,15 +3656,118 @@ fn handle_l1_invvpid(
     );
 }
 
+/// Runs an operation with L1's current VMCS selected and restores the carrier.
+///
+/// A missing L1 pointer intentionally leaves the carrier current: callers must
+/// translate a hardware VMfailValid into L1's VMfailInvalid in that case. The
+/// operation may itself change or clear the current pointer (VMPTRLD/VMCLEAR).
+fn with_l1_current_vmcs<T>(current: Option<VmcsPhys>, operation: impl FnOnce() -> T) -> Option<T> {
+    let mut carrier_address = u64::MAX;
+    // SAFETY: only the BSP VM-exit handler calls this helper, in VMX root mode;
+    // the local destination is writable and no other CPU owns these VMCSs.
+    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+        return None;
+    }
+    let carrier = validate_l1_vmcs_address(carrier_address)?;
+    if let Some(current) = current {
+        if current == carrier {
+            return None;
+        }
+        // SAFETY: VcpuState records only a VMCS successfully loaded by this BSP,
+        // and that L1-owned allocation remains live while it is current in L1.
+        if unsafe { vmx::vmptrld(current) } != VmxStatus::Success {
+            return None;
+        }
+    }
+    let result = operation();
+    // SAFETY: this is the reserved carrier captured above; no operation passed
+    // here clears/frees it. Restore even if the operation returned an error.
+    if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+        return None;
+    }
+    Some(result)
+}
+
+/// Executes a VMX instruction and captures its error before selecting carrier.
+fn execute_l1_vmx_instruction(
+    state: &VcpuState,
+    instruction: impl FnOnce() -> VmxStatus,
+) -> Option<VmInstructionResult> {
+    with_l1_current_vmcs(
+        state.current_vmcs().map(|current| current.address()),
+        || {
+            match instruction() {
+                VmxStatus::Success => Some(VmInstructionResult::Vmsucceed),
+                VmxStatus::FailInvalid => Some(VmInstructionResult::VmfailInvalid),
+                VmxStatus::FailValid => {
+                    // SAFETY: VMfailValid guarantees a valid hardware current VMCS;
+                    // no intervening failing instruction has overwritten its error.
+                    let error = unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.ok()?;
+                    Some(l1_vmx_failure(state, u32::try_from(error).ok()?))
+                }
+            }
+        },
+    )?
+}
+
+/// Commits a synthetic error to the opaque hardware VMCS, on the cold fail path.
+fn publish_l1_instruction_error(error: u32) -> Option<()> {
+    let current = L1_VCPU_STATE.lock().current_vmcs()?.address();
+    let mut carrier_address = u64::MAX;
+    // SAFETY: completion runs in the BSP's root-mode carrier exit handler, with
+    // an exclusive writable local destination for its current VMCS pointer.
+    if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
+        return None;
+    }
+    let carrier = validate_l1_vmcs_address(carrier_address)?;
+    // run_direct_monitor reserves VMXON as page 0 and carrier as page 1 of the
+    // same live runtime allocation. Per-pCPU bring-up must retain this ownership
+    // relationship or pass the owning CPU's VMXON address explicitly.
+    let vmxon = VmxonPhys::new(carrier.get().checked_sub(PAGE_SIZE)?)?;
+    with_l1_current_vmcs(Some(current), || {
+        // SAFETY: the helper selected L1's valid hardware VMCS; VMREAD does not
+        // modify the opaque error field on success.
+        if unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.ok() == Some(u64::from(error)) {
+            return Some(());
+        }
+        // SAFETY: IA32_VMX_MISC exists on this VMX-enabled CPU and this read
+        // occurs at CPL0. This is the physical capability, not L1's masked MSR.
+        let writable_exit_fields = unsafe { cpu::rdmsr(vmx::IA32_VMX_MISC) } & (1 << 29) != 0;
+        let recorded = if writable_exit_fields {
+            // SAFETY: physical IA32_VMX_MISC[29] explicitly permits VMWRITE to
+            // VM-exit information, including the current VMCS's error field.
+            (unsafe { vmx::vmwrite(vmcs::VM_INSTRUCTION_ERROR, u64::from(error)) })
+                == VmxStatus::Success
+        } else {
+            let failure = vmx::RecordedFailure::from_error(error)?;
+            // SAFETY: this BSP is in root mode with L1's valid current VMCS;
+            // vmxon is its active page by the allocation invariant above.
+            // INVVPID support is required by Direct-VMX capabilities; physical
+            // VMX_MISC[29] was clear, so the error-13 instruction cannot succeed.
+            (unsafe { vmx::record_failure(failure, vmxon) }) == VmxStatus::FailValid
+        };
+        if !recorded {
+            return None;
+        }
+        // SAFETY: the checked instruction retained the selected VMCS; verify
+        // its error before making the result observable to L1.
+        (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.ok() == Some(u64::from(error)))
+            .then_some(())
+    })?
+}
+
 /// Converts a VMfail error according to whether L1 has a current VMCS.
 fn l1_vmx_failure(state: &VcpuState, error: u32) -> VmInstructionResult {
     if state.current_vmcs().is_some() {
-        // ponytail: write this error into L1's direct VMCS when VMPTRLD makes
-        // one current; today's observed VMCLEAR sequence has no current VMCS.
         VmInstructionResult::VmfailValid(error)
     } else {
         VmInstructionResult::VmfailInvalid
     }
+}
+
+/// VMCS field type 1 is read-only VM-exit information; hardware checks encoding.
+const fn vmcs_field_is_read_only(field: u32) -> bool {
+    (field >> 10) & 3 == 1
 }
 
 /// Decodes and reads one nested-VMX m64 pointer operand.
@@ -3837,6 +3940,18 @@ fn complete_vmx_instruction(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
+    if let Some(error) = result.instruction_error() {
+        if publish_l1_instruction_error(error).is_none() {
+            stop_unexpected_exit(
+                b"publishing L1 VM-instruction error failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    }
     let Some(rflags) = (unsafe { vmx::vmread(vmcs::GUEST_RFLAGS) }).ok() else {
         stop_unexpected_exit(
             b"VMREAD(GUEST_RFLAGS) failed",
@@ -4164,6 +4279,57 @@ fn leave_vmx() -> VmxStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vmx_failure_requires_l1_current_vmcs_not_the_hardware_carrier() {
+        use nested_vmx::VcpuState;
+        use nested_vmx::VmInstructionResult;
+        use x86_64_hal::addr::VmcsPhys;
+        use x86_64_hal::addr::VmxonPhys;
+
+        let mut state = VcpuState::new();
+        let vmcs = VmcsPhys::new(0x2000).unwrap();
+        state.record_vmxon_success(VmxonPhys::new(0x1000).unwrap());
+        for error in [2, 3, 9, 10, 12, 13, 15, 28] {
+            assert_eq!(
+                super::l1_vmx_failure(&state, error),
+                VmInstructionResult::VmfailInvalid
+            );
+        }
+        state.record_vmptrld_success(vmcs);
+        for error in [2, 3, 9, 10, 12, 13, 15, 28] {
+            assert_eq!(
+                super::l1_vmx_failure(&state, error),
+                VmInstructionResult::VmfailValid(error)
+            );
+        }
+        state.record_vmclear_success(vmcs);
+        assert_eq!(
+            super::l1_vmx_failure(&state, 15),
+            VmInstructionResult::VmfailInvalid
+        );
+    }
+
+    #[test]
+    fn vmcs_read_only_classification_does_not_imply_field_existence() {
+        use x86_64_hal::vmcs;
+
+        for field in [
+            vmcs::VM_INSTRUCTION_ERROR,
+            vmcs::VM_EXIT_REASON,
+            vmcs::EXIT_QUALIFICATION,
+        ] {
+            assert!(super::vmcs_field_is_read_only(field));
+            assert!(super::vmcs_field_is_read_only(field | (1 << 15)));
+        }
+        for field in [
+            vmcs::GUEST_RIP,
+            vmcs::HOST_RIP,
+            vmcs::VM_ENTRY_INTR_INFO_FIELD,
+        ] {
+            assert!(!super::vmcs_field_is_read_only(field));
+        }
+    }
+
     use super::DIRECT_VMCS_PATCH_MANIFEST;
     use super::DiagnosticEvent;
     use super::ExitCounterValues;

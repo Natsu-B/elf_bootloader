@@ -36,6 +36,12 @@ pub const VMXERR_VMCLEAR_VMXON_POINTER: u32 = 3;
 pub const VMXERR_VMPTRLD_INVALID_ADDRESS: u32 = 9;
 /// `VM_INSTRUCTION_ERROR` for VMPTRLD targeting the active VMXON region.
 pub const VMXERR_VMPTRLD_VMXON_POINTER: u32 = 10;
+/// `VM_INSTRUCTION_ERROR` for an unsupported VMCS field encoding.
+pub const VMXERR_UNSUPPORTED_VMCS_COMPONENT: u32 = 12;
+/// `VM_INSTRUCTION_ERROR` for writing a read-only VMCS field.
+pub const VMXERR_VMWRITE_READ_ONLY_COMPONENT: u32 = 13;
+/// `VM_INSTRUCTION_ERROR` for VMXON while already in VMX root operation.
+pub const VMXERR_VMXON_IN_ROOT: u32 = 15;
 /// `VM_INSTRUCTION_ERROR` for an invalid INVEPT or INVVPID operand.
 pub const VMXERR_INVALID_INVEPT_INVVPID_OPERAND: u32 = 28;
 
