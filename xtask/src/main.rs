@@ -3394,7 +3394,7 @@ mod tests {
         for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
             let cycle = |number| {
                 format!(
-                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 teardown=explicit process_exit=0\n"
+                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 sse_checks=16 teardown=explicit process_exit=0\n"
                 )
             };
             let valid = format!(
@@ -3433,6 +3433,7 @@ mod tests {
                 " halt=16",
                 " remaps=14",
                 " state_checks=16",
+                " sse_checks=16",
                 " teardown=explicit",
             ] {
                 assert!(!check(backend, "2", &valid.replace(missing, "")));

@@ -84,7 +84,7 @@ if [ -c /dev/kvm ]; then
                 fail_lifecycle "probe-process-exit cycle=$((completed + 1))"
             fi
             completed=$((completed + 1))
-            echo "thin-hv: linux L2 lifecycle cycle=$completed KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 teardown=explicit process_exit=0"
+            echo "thin-hv: linux L2 lifecycle cycle=$completed KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 sse_checks=16 teardown=explicit process_exit=0"
         done
         echo "thin-hv: linux L2 lifecycle PASS backend=$lifecycle_backend cycles=$completed"
         echo 'thin-hv: linux L2 lifecycle poweroff requested'

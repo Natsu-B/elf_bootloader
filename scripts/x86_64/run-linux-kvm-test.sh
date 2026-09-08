@@ -38,7 +38,7 @@ check_log() {
             } else if (index($0, "thin-hv: linux L2 lifecycle cycle=") == 1) {
                 count++
                 if (begin != 1 || done || poweroff || count > cycles ||
-                    $0 != "thin-hv: linux L2 lifecycle cycle=" count " KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 teardown=explicit process_exit=0") bad=1
+                    $0 != "thin-hv: linux L2 lifecycle cycle=" count " KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 sse_checks=16 teardown=explicit process_exit=0") bad=1
             } else if ($0 == "thin-hv: linux L2 lifecycle PASS backend=" backend " cycles=" cycles) {
                 if (begin != 1 || count != cycles || done || poweroff) bad=1
                 done++
