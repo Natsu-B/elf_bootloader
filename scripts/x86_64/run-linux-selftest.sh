@@ -4,7 +4,7 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 die() { printf 'x86 Linux KVM selftest: %s\n' "$*" >&2; exit 1; }
-valid_test() { case "$1" in tsc_msrs_test|userspace_msr_exit_test|cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs) ;; *) return 1 ;; esac; }
+valid_test() { case "$1" in tsc_msrs_test|userspace_msr_exit_test|cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs|apic_bus_clock_test|xapic_tpr_test) ;; *) return 1 ;; esac; }
 
 check_log() {
     local backend=$1 test_name=$2 log=$3 bytes transcript LC_ALL=C
@@ -79,7 +79,7 @@ test_name=${LINUX_SELFTEST_NAME:-}
 selftest=${LINUX_SELFTEST_ELF:-}
 timeout_seconds=${LINUX_SELFTEST_TIMEOUT_SECONDS:-300}
 valid_test "$test_name" || die 'unsupported pinned KVM selftest name'
-# The three non-TAP upstream programs return 0 only after UCALL_DONE and all
+# The non-TAP upstream programs return 0 only after UCALL_DONE and all
 # assertions. For those, assertions=1 counts the completed program, not its
 # individual guest assertions; exit 4 (KSFT_SKIP) is always a failure here.
 case "$test_name" in tsc_msrs_test) assertions=5 ;; userspace_msr_exit_test) assertions=4 ;; *) assertions=1 ;; esac

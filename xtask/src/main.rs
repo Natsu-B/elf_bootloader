@@ -3776,7 +3776,13 @@ mod tests {
             }
         }
         for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
-            for name in ["cr4_cpuid_sync_test", "xcr0_cpuid_test", "debug_regs"] {
+            for name in [
+                "cr4_cpuid_sync_test",
+                "xcr0_cpuid_test",
+                "debug_regs",
+                "apic_bus_clock_test",
+                "xapic_tpr_test",
+            ] {
                 let valid = format!(
                     "thin-hv: backend={backend} role={role}\nthin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus=1\nthin-hv: linux KVM selftest exit backend={backend} test={name} process_exit=0\nthin-hv: linux KVM selftest PASS backend={backend} test={name} assertions=1\nthin-hv: linux KVM selftest poweroff requested\n"
                 );

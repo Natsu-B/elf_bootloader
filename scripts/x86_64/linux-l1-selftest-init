@@ -31,7 +31,7 @@ for argument in $boot_arguments; do
             case "$test_name" in
                 tsc_msrs_test) assertions=5 ;;
                 userspace_msr_exit_test) assertions=4 ;;
-                cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs) assertions=1 ;;
+                cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs|apic_bus_clock_test|xapic_tpr_test) assertions=1 ;;
                 *) fail invalid-test ;;
             esac
             ;;
