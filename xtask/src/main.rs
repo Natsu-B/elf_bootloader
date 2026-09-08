@@ -3340,10 +3340,14 @@ mod tests {
                     + (vpid_types & 11).count_ones();
                 let count = 14 - shadow + invept + invvpid + readonly + descriptors;
                 let pass = format!(
-                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1\n"
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4\n"
                 );
                 let valid = format!("{provenance}{start}{pass}{terminal}");
                 assert!(check(backend, &valid));
+                assert!(check(
+                    backend,
+                    &valid.replace("pku=1 ospke_toggles=4", "pku=0 ospke_toggles=0")
+                ));
                 assert_eq!(
                     check_profile(backend, "readonly-vmcs", &valid),
                     readonly == 1
@@ -3369,6 +3373,8 @@ mod tests {
                     valid.replace("xsetbv_valid=4", "xsetbv_valid=0"),
                     valid.replace("xsetbv_gp=4", "xsetbv_gp=0"),
                     valid.replace("xsetbv_ud=1", "xsetbv_ud=0"),
+                    valid.replace("ospke_toggles=4", "ospke_toggles=0"),
+                    valid.replace("pku=1", "pku=0"),
                     valid.replace("invalidation_success=", "invalidation_success=9"),
                     valid.replace("descriptor_failures=", "descriptor_failures=9"),
                     valid.clone() + "thin-hv: nested contract FAIL stage=late\n",

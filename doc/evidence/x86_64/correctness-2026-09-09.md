@@ -119,3 +119,42 @@ which needs the same L1-state treatment; it is not silently claimed fixed by the
 OSXSAVE-specific change. Existing INVVPID already rejects types above 3 before
 reading its descriptor, whereas INVEPT still lacks the corresponding ordering
 check. These distinctions will guide the next increments.
+
+## Step 1 follow-up: CPUID.OSPKE
+
+The same private HOST_CR4 issue also affects CPUID.7.0:ECX.OSPKE. The new
+`xstate::leaf7_for_cr4` changes only that dynamic bit using L1-visible CR4.PKE;
+it does not advertise PKU when hardware lacks it. Other leaf 7 subleaves remain
+unchanged. This follows the Intel SDM CPUID/WRPKRU definition, not an assumption
+that all host CPUID values should be virtualized.
+
+`l1_xstate::protection_keys` tests four CR4.PKE transitions when PKU is present.
+It saves PKRU and temporarily permits all keys using a register-only sequence
+before accessing data with PKE enabled; it restores PKRU and original CR4
+without intervening data access. The absent-PKU branch verifies OSPKE is clear
+without executing unsupported control-register changes. The contract marker
+reports both `pku` and `ospke_toggles`; the existing shell/xtask gate checks their
+relationship and rejects omitted or contradictory coverage.
+
+Changes: `xstate.rs`, `vmx_smoke::dispatch_l1_exit`, `l1_xstate.rs`,
+`nested_contract::Prerequisites`/final marker, `check_nested_contract_log`, and
+its existing xtask fixture test. No new framework or package entry.
+
+Before-fix Direct **FAIL, as expected**: `l1-cpuid-ospke actual=0x0 expected=0x1`,
+using the step-1 monitor SHA256 recorded above. Evidence:
+`/tmp/x86-correctness-ospke-before-direct.log`.
+The four affected host package runs all pass: **129 tests, zero failures**
+(HAL 44, loader 45, guest fixture 9, xtask 31). Evidence:
+`/tmp/x86-correctness-ospke-{x86_64_hal,x86_uefi_loader,x86_guest_uefi_test,xtask}.log`.
+The unchanged `nested_vmx` package's eight tests passed in step 1.
+
+The same 4096-cycle release nested command **passes all six cases**, with both
+backends' full lifecycle coverage, clean S5 and host exit 0:
+`/tmp/x86-correctness-ospke-nested-release.log`. All four instruction-contract
+combinations pass with `pku=1 ospke_toggles=4`.
+Two additional isolated runs with `X86_UEFI_CPU=host,+vmx,-hypervisor,kvm=off,-pku`
+also pass the existing runner and transcript gate, reporting
+`pku=0 ospke_toggles=0`, not pretending to exercise unavailable hardware:
+`/tmp/x86-correctness-ospke-no-pku-{outer-kvm,direct-vmx}.log`.
+Release monitor SHA256:
+`6a1071c374bac144ce1a506facce744bb31ab78f59230139e584d764ae81130e`.

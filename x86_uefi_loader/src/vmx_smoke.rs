@@ -2077,7 +2077,7 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
         } else {
             cpu::cpuid(leaf, subleaf)
         };
-        if leaf == 1 {
+        if leaf == 1 || (leaf == 7 && subleaf == 0) {
             let Some(cr4) = l1_visible_cr4() else {
                 stop_unexpected_exit(
                     b"reading CPUID virtual CR4 failed",
@@ -2088,7 +2088,13 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
                     registers,
                 );
             };
-            result = xstate::leaf1_for_cr4(result, cr4);
+            result = if leaf == 1 {
+                xstate::leaf1_for_cr4(result, cr4)
+            } else {
+                xstate::leaf7_for_cr4(result, cr4)
+            };
+        }
+        if leaf == 1 {
             result.ecx |= 1 << 5;
             result.ecx &= !(1 << 31);
         }

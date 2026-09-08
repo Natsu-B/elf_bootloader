@@ -139,6 +139,7 @@ struct Prerequisites {
     shadow: bool,
     invept_types: u8,
     invvpid_types: u8,
+    pku: bool,
 }
 
 impl Prerequisites {
@@ -269,6 +270,7 @@ fn prerequisites() -> Result<Prerequisites> {
         shadow: secondary & (1 << 46) != 0,
         invept_types,
         invvpid_types,
+        pku: cpu::cpuid(7, 0).ecx & x86_64_hal::xstate::CPUID_PKU != 0,
     })
 }
 
@@ -1078,12 +1080,13 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={}",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,
                 capabilities.invvpid_types, capabilities.invalidation_successes(),
-                capabilities.descriptor_failures()).is_ok() {
+                capabilities.descriptor_failures(), u8::from(capabilities.pku),
+                u8::from(capabilities.pku) * 4).is_ok() {
                 efi::Status::SUCCESS
             } else { efi::Status::DEVICE_ERROR }
         }
@@ -1122,6 +1125,7 @@ mod tests {
                     shadow: false,
                     invept_types: ept,
                     invvpid_types: vpid,
+                    pku: false,
                 };
                 let mut good = 0;
                 let mut bad = 0;

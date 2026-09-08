@@ -54,8 +54,8 @@ check_backend_log() {
 # Optional capability checks remain explicit in the evidence, never implied PASS.
 check_nested_contract_log() {
     local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 expected_backends
-    local valid invept invvpid readonly shadow ept_types vpid_types success descriptors bit expected_success expected_descriptors LC_ALL=C
-    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1$'
+    local valid invept invvpid readonly shadow ept_types vpid_types success descriptors pku ospke_toggles bit expected_success expected_descriptors LC_ALL=C
+    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04])$'
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     case "$cpu_profile" in native|readonly-vmcs) ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -79,6 +79,9 @@ check_nested_contract_log() {
             vpid_types=${BASH_REMATCH[7]}
             success=${BASH_REMATCH[8]}
             descriptors=${BASH_REMATCH[9]}
+            pku=${BASH_REMATCH[10]}
+            ospke_toggles=${BASH_REMATCH[11]}
+            ((ospke_toggles == pku * 4)) || return 1
             ((invept == (ept_types != 0) && invvpid == (vpid_types != 0))) || return 1
             expected_success=0
             expected_descriptors=$(((ept_types & 1) + (vpid_types & 1)))

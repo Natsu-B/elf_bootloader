@@ -7,6 +7,12 @@ use crate::cpu::CpuidResult;
 
 /// CR4.OSXSAVE enables the XSAVE instruction set, not static CPU availability.
 pub const CR4_OSXSAVE: u64 = 1 << 18;
+/// CR4.PKE enables user-page protection keys and their access instructions.
+pub const CR4_PKE: u64 = 1 << 22;
+/// CPUID.7.0:ECX.PKU, static protection-key availability.
+pub const CPUID_PKU: u32 = 1 << 3;
+/// CPUID.7.0:ECX.OSPKE, reflecting the executing context's CR4.PKE.
+pub const CPUID_OSPKE: u32 = 1 << 4;
 /// CPUID.1:ECX.XSAVE, a static feature bit.
 pub const CPUID_XSAVE: u32 = 1 << 26;
 /// CPUID.1:ECX.OSXSAVE, reflecting the executing context's CR4.OSXSAVE.
@@ -24,6 +30,16 @@ pub const fn leaf1_for_cr4(mut leaf: CpuidResult, cr4: u64) -> CpuidResult {
     leaf.ecx &= !CPUID_OSXSAVE;
     if leaf.ecx & CPUID_XSAVE != 0 && cr4 & CR4_OSXSAVE != 0 {
         leaf.ecx |= CPUID_OSXSAVE;
+    }
+    leaf
+}
+
+/// Changes only leaf 7 subleaf 0's dynamic OSPKE bit, not PKU availability.
+#[must_use]
+pub const fn leaf7_for_cr4(mut leaf: CpuidResult, cr4: u64) -> CpuidResult {
+    leaf.ecx &= !CPUID_OSPKE;
+    if leaf.ecx & CPUID_PKU != 0 && cr4 & CR4_PKE != 0 {
+        leaf.ecx |= CPUID_OSPKE;
     }
     leaf
 }
@@ -73,6 +89,26 @@ pub const fn validate_xsetbv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ospke_tracks_guest_pke_without_changing_static_capabilities() {
+        for available in [0, CPUID_PKU] {
+            for host in [0, CPUID_OSPKE] {
+                for guest in [0, CR4_PKE] {
+                    let input = CpuidResult {
+                        eax: 2,
+                        ebx: 3,
+                        ecx: available | host | (1 << 9),
+                        edx: 5,
+                    };
+                    let output = leaf7_for_cr4(input, guest);
+                    assert_eq!(output.ecx & CPUID_OSPKE != 0, available != 0 && guest != 0);
+                    assert_eq!(output.ecx & !CPUID_OSPKE, input.ecx & !CPUID_OSPKE);
+                    assert_eq!((output.eax, output.ebx, output.edx), (2, 3, 5));
+                }
+            }
+        }
+    }
 
     #[test]
     fn virtual_cr4_and_osxsave_ignore_private_host_enablement() {

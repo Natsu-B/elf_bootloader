@@ -123,6 +123,66 @@ fn enabled_area_size(xcr0: u64) -> Result<()> {
     )
 }
 
+/// Temporarily makes PKRU permissive before any data access with PKE enabled.
+/// PKRU may outlive a cleared CR4.PKE, so enabling PKE alone is not safe.
+fn protection_keys(cr4: u64) -> Result<()> {
+    let features = cpu::cpuid(7, 0).ecx;
+    if features & xstate::CPUID_PKU == 0 {
+        return equal(
+            "l1-cpuid-ospke-unavailable",
+            u64::from(features & xstate::CPUID_OSPKE),
+            0,
+        );
+    }
+    let saved_pkru: u32;
+    // SAFETY: PKU was advertised; IF is clear and this fixture owns its CPU.
+    // After enabling PKE, no data access occurs before saving PKRU in a GPR
+    // and making all keys permissive. ECX/EDX satisfy RDPKRU/WRPKRU constraints.
+    unsafe {
+        asm!(
+            "mov cr4, {enabled}", "xor ecx, ecx", "rdpkru",
+            "mov {saved:e}, eax", "xor eax, eax", "wrpkru",
+            enabled = in(reg) cr4 | xstate::CR4_PKE,
+            saved = out(reg) saved_pkru,
+            out("eax") _, out("ecx") _, out("edx") _,
+            options(nostack),
+        );
+    }
+    let result = (|| {
+        for enabled in [false, true, false, true] {
+            let value = (cr4 & !xstate::CR4_PKE) | if enabled { xstate::CR4_PKE } else { 0 };
+            // SAFETY: only supported PKE changes and live PKRU is zero, so this
+            // cannot revoke any access to the fixture, stack or firmware tables.
+            unsafe { cpu::write_cr4(value) };
+            let actual = cpu::cpuid(7, 0).ecx;
+            equal(
+                "l1-cpuid-ospke",
+                u64::from(actual & xstate::CPUID_OSPKE != 0),
+                u64::from(enabled),
+            )?;
+            equal(
+                "l1-cpuid-pku-static",
+                u64::from(actual & !xstate::CPUID_OSPKE),
+                u64::from(features & !xstate::CPUID_OSPKE),
+            )?;
+        }
+        Ok(())
+    })();
+    // SAFETY: all fallible checks return here. There is no data access between
+    // restoring the original PKRU and restoring CR4's original PKE enablement.
+    // The exact original permissions are then in force before Rust resumes.
+    unsafe {
+        asm!(
+            "mov cr4, {enabled}", "wrpkru", "mov cr4, {original}",
+            enabled = in(reg) cr4 | xstate::CR4_PKE,
+            original = in(reg) cr4,
+            in("eax") saved_pkru, in("ecx") 0_u32, in("edx") 0_u32,
+            options(nostack),
+        );
+    }
+    result
+}
+
 /// Runs before VMXON in L1, so CPUID/XSETBV exercise the project L0 interception,
 /// not KVM's L2 emulation. No asynchronous handler calls firmware or uses SIMD.
 pub(super) fn run() -> Result<()> {
@@ -202,6 +262,7 @@ pub(super) fn run() -> Result<()> {
                 u64::from(leafd.ebx),
             )?;
         }
+        protection_keys(cr4 | xstate::CR4_OSXSAVE)?;
         for value in [1, 3, xcr0] {
             equal("l1-xsetbv-valid", probe(0, value, 0).0, u64::MAX)?;
             // SAFETY: OSXSAVE remains enabled after the toggle loop.
