@@ -20,3 +20,4 @@ pub mod platform_memory;
 pub mod vmcs;
 #[cfg(feature = "vmx")]
 pub mod vmx;
+pub mod xstate;

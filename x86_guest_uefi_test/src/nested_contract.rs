@@ -12,6 +12,8 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+mod l1_xstate;
+
 use core::arch::asm;
 use core::fmt;
 use core::fmt::Write;
@@ -953,6 +955,7 @@ fn fatal(serial: &mut Serial, error: Failure) -> ! {
 }
 
 fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisites> {
+    l1_xstate::run()?;
     equal("system-table", u64::from(!table.is_null()), 1)?;
     // SAFETY: UEFI supplies this live SystemTable; this fixture never calls EBS.
     let boot = unsafe { (*table).boot_services };
@@ -1075,7 +1078,7 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={}",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,

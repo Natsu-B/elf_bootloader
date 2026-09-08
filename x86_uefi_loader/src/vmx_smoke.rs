@@ -49,6 +49,8 @@ use x86_64_hal::platform_memory::FirmwareDescriptor;
 use x86_64_hal::vmcs;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
+use x86_64_hal::xstate;
+use x86_64_hal::xstate::XsetbvFault;
 
 /// Pages allocated as one reserved monitor block.
 const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES;
@@ -2076,9 +2078,25 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
             cpu::cpuid(leaf, subleaf)
         };
         if leaf == 1 {
+            let Some(cr4) = l1_visible_cr4() else {
+                stop_unexpected_exit(
+                    b"reading CPUID virtual CR4 failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            result = xstate::leaf1_for_cr4(result, cr4);
             result.ecx |= 1 << 5;
             result.ecx &= !(1 << 31);
         }
+        // Leaf 0D's enabled-area sizes depend on XCR0 and IA32_XSS, not CR4.
+        // VMX does not switch either register and this L0 path changes neither
+        // while answering CPUID, so the hardware result uses the live guest
+        // values. If L0 gains private XCR0/XSS, synthesize these sizes from the
+        // saved guest values instead; never use the private host values.
         registers.rax = u64::from(result.eax);
         registers.rbx = u64::from(result.ebx);
         registers.rcx = u64::from(result.ecx);
@@ -2089,18 +2107,64 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_XSETBV {
-        // SAFETY: L1 is trusted and supplied the architectural ECX/EDX:EAX
-        // operands. Invalid values are not yet converted into a guest #GP.
-        // ponytail: validate XCR0 dependencies and inject #GP before accepting
-        // untrusted L1 input; the current Linux L1 is part of the TCB.
-        unsafe {
-            cpu::xsetbv(
-                registers.rcx as u32,
-                (registers.rdx << 32) | (registers.rax & u64::from(u32::MAX)),
+        let Some(cr4) = l1_visible_cr4() else {
+            stop_unexpected_exit(
+                b"reading XSETBV virtual CR4 failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
             );
+        };
+        // SAFETY: the current carrier VMCS belongs to this BSP and contains
+        // the exiting L1 state. VM86 always has CPL3 regardless of CS bits.
+        let privilege = unsafe {
+            vmx::vmread(vmcs::GUEST_RFLAGS).and_then(|flags| {
+                vmx::vmread(vmcs::GUEST_CS_SELECTOR).map(|cs| {
+                    if flags & (1 << 17) != 0 {
+                        3
+                    } else {
+                        (cs & 3) as u8
+                    }
+                })
+            })
+        };
+        let Ok(cpl) = privilege else {
+            stop_unexpected_exit(
+                b"reading XSETBV privilege failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        let value = (u64::from(registers.rdx as u32) << 32) | u64::from(registers.rax as u32);
+        let available = cpu::cpuid(1, 0).ecx & xstate::CPUID_XSAVE != 0;
+        let capabilities = cpu::cpuid(0xd, 0);
+        let supported = (u64::from(capabilities.edx) << 32) | u64::from(capabilities.eax);
+        match xstate::validate_xsetbv(available, cr4, cpl, registers.rcx as u32, value, supported) {
+            Err(XsetbvFault::InvalidOpcode) => {
+                inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
+                return VMEXIT_ACTION_RESUME;
+            }
+            Err(XsetbvFault::GeneralProtection) => {
+                inject_general_protection(
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+                return VMEXIT_ACTION_RESUME;
+            }
+            Ok(()) => {}
         }
-        // ponytail: this one-vCPU smoke shares extended register state with
-        // L0; add per-vCPU XSAVE switching before SMP or L2 workloads.
+        // SAFETY: CPL0 host CR4.OSXSAVE was enabled before VMXON. The same
+        // CPU's advertised bitmap, XCR index, guest privilege and every XCR0
+        // dependency were validated above; no invalid guest input reaches XSETBV.
+        unsafe { cpu::xsetbv(0, value) };
         advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
         return VMEXIT_ACTION_RESUME;
     }
@@ -4187,6 +4251,19 @@ fn set_guest_gpr(registers: &mut GuestRegisters, index: u8, value: u64) -> bool 
     true
 }
 
+/// Reads L1's architectural CR4, including bits L0 masks through a read shadow.
+fn l1_visible_cr4() -> Option<u64> {
+    // SAFETY: only the BSP's L1-exit dispatcher calls this with its carrier
+    // VMCS current; these VMREADs cannot access another CPU's VMCS state.
+    unsafe {
+        Some(xstate::visible_cr(
+            vmx::vmread(vmcs::GUEST_CR4).ok()?,
+            vmx::vmread(vmcs::CR4_GUEST_HOST_MASK).ok()?,
+            vmx::vmread(vmcs::CR4_READ_SHADOW).ok()?,
+        ))
+    }
+}
+
 /// Injects the fault an unsupported bitmap-outside MSR would raise on Intel.
 fn inject_general_protection(
     reason: u64,
@@ -4199,6 +4276,8 @@ fn inject_general_protection(
         (vmcs::VM_ENTRY_EXCEPTION_ERROR_CODE, 0),
         (vmcs::VM_ENTRY_INTR_INFO_FIELD, INJECT_GENERAL_PROTECTION),
     ] {
+        // SAFETY: the BSP's carrier VMCS is current. The fields describe a
+        // hardware #GP(0) on the unchanged L1 RIP, not an L0 exception.
         let status = unsafe { vmx::vmwrite(field, value) };
         if status != VmxStatus::Success {
             stop_unexpected_exit(
@@ -4221,6 +4300,8 @@ fn inject_invalid_opcode(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
+    // SAFETY: the BSP's carrier VMCS is current; this is a hardware #UD event
+    // with no error code and does not change the faulting L1 RIP.
     let status = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, INJECT_INVALID_OPCODE) };
     if status != VmxStatus::Success {
         stop_unexpected_exit(
