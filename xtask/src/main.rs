@@ -3340,7 +3340,7 @@ mod tests {
                     + (vpid_types & 11).count_ones();
                 let count = 14 - shadow + invept + invvpid + readonly + descriptors;
                 let pass = format!(
-                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8\n"
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1\n"
                 );
                 let valid = format!("{provenance}{start}{pass}{terminal}");
                 if ept_types & 2 == 0 || vpid_types & 4 == 0 {
@@ -3383,6 +3383,10 @@ mod tests {
                     valid.replace("operand_ss=1", "operand_ss=0"),
                     valid.replace("operand_cross=6", "operand_cross=5"),
                     valid.replace("operand_priority=8", "operand_priority=7"),
+                    valid.replace(" host_invalid=34", ""),
+                    valid.replace("host_invalid=34", "host_invalid=33"),
+                    valid.replace("host_priority=2", "host_priority=0"),
+                    valid.replace("host_restore=1", "host_restore=0"),
                     valid.replace("ospke_toggles=4", "ospke_toggles=0"),
                     valid.replace("pku=1", "pku=0"),
                     valid.replace("invalidation_success=", "invalidation_success=9"),

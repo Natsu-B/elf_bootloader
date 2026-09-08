@@ -593,6 +593,36 @@ pub unsafe fn vmwrite(field: u32, value: u64) -> VmxStatus {
     VmxStatus::from_flags(carry, zero)
 }
 
+/// Records a real early VM-entry failure without allowing guest state to load.
+///
+/// Temporarily making HOST_CS null guarantees failure before loading guest
+/// state or an entry MSR list. Hardware still checks launch state and controls
+/// first, preserving their error priority. The original selector is restored;
+/// successful VMWRITE does not overwrite VM_INSTRUCTION_ERROR.
+///
+/// # Safety
+///
+/// The caller is outside SMM at CPL0 in VMX root, owns a valid current VMCS, and
+/// keeps all its fields and backing live. Use this only after finding invalid
+/// original host state: it intentionally cannot validate an otherwise good host.
+/// L1 fields hidden by Direct patching must already have been materialized.
+pub unsafe fn reject_host_entry(resume: bool) -> Option<VmxStatus> {
+    // SAFETY: current VMCS ownership is the caller's invariant. HOST_CS is a
+    // writable 16-bit field; a null selector is unconditionally invalid for
+    // host state on VM entry outside SMM, even with invalid controls/guest state.
+    unsafe {
+        let original = vmread(crate::vmcs::HOST_CS_SELECTOR).ok()?;
+        if vmwrite(crate::vmcs::HOST_CS_SELECTOR, 0) != VmxStatus::Success {
+            return None;
+        }
+        let status = vm_entry_instruction(resume);
+        if vmwrite(crate::vmcs::HOST_CS_SELECTOR, original) != VmxStatus::Success {
+            return None;
+        }
+        Some(status)
+    }
+}
+
 /// Executes VMLAUNCH for the current VMCS.
 ///
 /// On successful entry this function returns only after some host entry path
@@ -631,7 +661,10 @@ pub unsafe fn vmcall() {
 unsafe fn vm_entry_instruction(resume: bool) -> VmxStatus {
     let carry: u8;
     let zero: u8;
-    // SAFETY: upheld by the caller.
+    // SAFETY: the caller owns the current VMCS at CPL0 in VMX root. Public
+    // entry wrappers require a complete entry/exit environment; the rejection
+    // wrapper instead guarantees early failure with HOST_CS=0 outside SMM.
+    // The local flag outputs remain live if the instruction reports VMfail.
     unsafe {
         if resume {
             asm!(

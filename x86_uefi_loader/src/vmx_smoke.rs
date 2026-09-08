@@ -31,6 +31,7 @@ use nested_vmx::VcpuState;
 use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
+use nested_vmx::host_validation;
 use nested_vmx::restrict_vmx_capability;
 use nested_vmx::vmcs_revision_is_supported;
 use r_efi::efi;
@@ -2913,6 +2914,16 @@ fn handle_l1_vmentry(
     };
     let l1_interruptibility =
         unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
+    let Some(host_limits) = l1_host_validation_limits() else {
+        stop_unexpected_exit(
+            b"reading L1 host validation context failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
 
     if unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success {
         stop_unexpected_exit(
@@ -2939,6 +2950,98 @@ fn handle_l1_vmentry(
         };
         values
     };
+    // SAFETY: L1's direct VMCS is current, owned by this BSP. Its original host
+    // fields are either still materialized or retained in saved_direct; the
+    // exit controls themselves are not replaced by the current patch manifest.
+    let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.ok();
+    let Some(exit_controls) = exit_controls else {
+        stop_unexpected_exit(
+            b"reading L1 host exit controls failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    match host_validation::validate(host_limits, exit_controls, |field| {
+        direct_patch_value(&saved_direct, field)
+    }) {
+        Ok(()) => {}
+        Err(host_validation::Error::Field(_) | host_validation::Error::AddressSpaceSize) => {
+            // Restore originals before asking hardware to record a guaranteed
+            // failed entry: otherwise L0's zeroed MSR-list counts could hide an
+            // invalid-control error which has priority over invalid host state.
+            if !restore_direct_vmcs(&saved_direct) {
+                stop_unexpected_exit(
+                    b"materializing invalid L1 host state failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+            *DIRECT_PATCH_VALUES.lock() = None;
+            *DIRECT_ENTRY_POLICY.lock() = None;
+            // SAFETY: the BSP owns this current direct VMCS, outside SMM; all
+            // original fields are materialized. The helper forces HOST_CS=0,
+            // guaranteeing an early VMfail without guest/MSR loading, then
+            // restores the selector. Capture the error before selecting carrier.
+            let result = unsafe {
+                match vmx::reject_host_entry(instruction == VmEntryInstruction::Vmresume) {
+                    Some(VmxStatus::FailInvalid) => Some(VmInstructionResult::VmfailInvalid),
+                    Some(VmxStatus::FailValid) => vmx::vmread(vmcs::VM_INSTRUCTION_ERROR)
+                        .ok()
+                        .and_then(|error| u32::try_from(error).ok())
+                        .map(VmInstructionResult::VmfailValid),
+                    _ => None,
+                }
+            };
+            let Some(result) = result else {
+                stop_unexpected_exit(
+                    b"recording invalid L1 host state failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            // SAFETY: the reserved carrier remains owned/live and the guarded
+            // failure did not clear or launch either VMCS. Restore its selection
+            // before changing L1 flags/RIP; completion reads the preserved error.
+            if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+                stop_unexpected_exit(
+                    b"restoring carrier after host rejection failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+            complete_vmx_instruction(
+                result,
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+            return VMEXIT_ACTION_RESUME;
+        }
+        Err(host_validation::Error::Limits | host_validation::Error::Missing(_)) => {
+            stop_unexpected_exit(
+                b"invalid L0 host validation metadata",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    }
     let exit_store_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrStoreCount);
     let exit_load_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrLoadCount);
     let cached_exit_controls = match *DIRECT_ENTRY_POLICY.lock() {
@@ -3053,6 +3156,46 @@ fn handle_l1_vmentry(
     match instruction {
         VmEntryInstruction::Vmlaunch => VMEXIT_ACTION_VMLAUNCH,
         VmEntryInstruction::Vmresume => VMEXIT_ACTION_VMRESUME,
+    }
+}
+
+/// Captures CPU limits and the stopped L1's mode while its carrier is current.
+/// No extra VMX capability is exposed by these host checks.
+fn l1_host_validation_limits() -> Option<host_validation::Limits> {
+    let features = cpu::cpuid(7, 0);
+    let extended = cpu::cpuid(0x8000_0001, 0);
+    let linear_bits = if cpu::cpuid(0x8000_0000, 0).eax >= 0x8000_0008 {
+        ((cpu::cpuid(0x8000_0008, 0).eax >> 8) & 255) as u8
+    } else {
+        48
+    };
+    let cet_allowed = (if features.ecx & (1 << 7) != 0 { 3 } else { 0 })
+        | (if features.edx & (1 << 20) != 0 {
+            0x3c | (!0_u64 << 10)
+        } else {
+            0
+        });
+    // SAFETY: this is the VMX-enabled BSP's root-mode L1-exit path with carrier
+    // current. The four fixed-bit MSRs exist and are read-only; GUEST_EFER holds
+    // L1's captured architectural mode, not L0's private long-mode EFER.
+    unsafe {
+        Some(host_validation::Limits {
+            cr0_fixed0: cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0),
+            cr0_fixed1: cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1),
+            cr4_fixed0: cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0),
+            cr4_fixed1: cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1),
+            physical_bits: max_physical_address_bits()?,
+            linear_bits,
+            lam: features.eax >= 1 && cpu::cpuid(7, 1).eax & (1 << 26) != 0,
+            efer_allowed: 0x501
+                | if extended.edx & (1 << 20) != 0 {
+                    1 << 11
+                } else {
+                    0
+                },
+            cet_allowed,
+            l1_ia32e: vmx::vmread(vmcs::GUEST_IA32_EFER).ok()? & (1 << 10) != 0,
+        })
     }
 }
 

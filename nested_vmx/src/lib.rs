@@ -7,6 +7,8 @@
 //! architectural state and the deliberately small feature policy exposed to a
 //! trusted L1 hypervisor.
 
+pub mod host_validation;
+
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
 use x86_64_hal::vmx;

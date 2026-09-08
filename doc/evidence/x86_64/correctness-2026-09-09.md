@@ -282,3 +282,81 @@ These are host unit and **QEMU/KVM** results only. No new QEMU TCG, Direct Windo
 normal-boot/Hyper-V/WSL2, S3 or physical-machine result is claimed in steps 1–2.
 The known Direct periodic-signal invalid-state, Hyper-V and S3 failures are not
 resolved by the memory-fault work. Outer-KVM remains reference evidence only.
+
+## Step 3: original L1 host-state validation before patching
+
+Changed files and major symbols:
+
+* `nested_vmx/src/host_validation.rs`, `nested_vmx/src/lib.rs`: exported pure
+  `Limits`, `Error` and `validate`, with eight new policy tests.
+* `arch_hal/x86_64_hal/src/vmx.rs`: `reject_host_entry`, a guaranteed-early
+  hardware failure that preserves the original selector and opaque error field.
+* `x86_uefi_loader/src/vmx_smoke.rs`: `l1_host_validation_limits` and the
+  pre-patch validation/rejection branch in `handle_l1_vmentry`.
+* `x86_guest_uefi_test/src/nested_contract.rs`: `host_field_boundaries`,
+  `reject_host_field`, shared `read_field`, complete original-field restoration
+  checks, and explicit cold/final coverage markers.
+* `scripts/x86_64/run-uefi-smoke.sh`, `xtask/src/main.rs`: require all three
+  host-validation coverage fields and reject missing/incomplete evidence.
+
+The validator checks original CR0/CR4 fixed bits (without guest-mode
+relaxations), CET/WP dependence, CR3 physical width and LAM exceptions, all seven
+selector RPL/TI constraints and applicable null restrictions, canonical FS/GS,
+TR/GDTR/IDTR and SYSENTER addresses, host mode and RIP, and conditional PAT/EFER
+and CET fields already in the patch manifest. No VMX capability is added.
+Unpatched PERF_GLOBAL_CTRL remains subject to hardware validation.
+
+Architectural distinctions matter: HOST_CR0 CD/NW are not checked/switched by
+VM entry/exit; descriptor/MSR canonicality uses maximum CPU width, while RIP
+uses the CR4.LA57 value loaded on exit. HOST_RSP itself has no VM-entry
+canonicality check, and SYSENTER_CS is an MSR field, not a host segment selector
+subject to RPL/TI checks. They retain their original VMCS-width values instead
+of acquiring invented VMfail conditions. These rules were checked against the
+[Intel host-state checks, sections 27.2.2–27.2.4](https://cdrdv2-public.intel.com/825750/326019-sdm-vol-3c.pdf),
+[Intel LAM VM-entry rules, section 6.6.2](https://cdrdv2-public.intel.com/782879/architecture-instruction-set-extensions-programming-reference.pdf),
+and Linux 7.1.5 `nested_vmx_check_host_state` and canonicality helpers.
+
+For an invalid original host value, the monitor first materializes **all**
+original patch fields, including MSR-list counts/addresses. It temporarily
+sets HOST_CS to zero and executes the requested VMLAUNCH/VMRESUME. This cannot
+reach guest state or MSR-list loading, but preserves higher-priority launch and
+control checks. The hardware-maintained error is captured, the original CS and
+carrier selection are restored, and normal VMX completion publishes that same
+error. This works with read-only VMCS exit fields: no VMWRITE-to-error assumption,
+opaque VMCS access or VMCS12/VMCS02 translation is introduced. Materialized
+fields invalidate the existing patch/policy caches before returning to L1.
+
+Native probes cover **34 invalid host values**, plus VMRESUME-on-clear error 5
+and invalid-control error 7 priority over an invalid host selector. Each invalid
+host case requires VMfailValid/error 8 and VMREAD of the original bad value,
+then restoration. All twenty baseline host fields and modified control/MSR
+fields are checked after restoration. No valid nested entry is attempted by
+this instruction-contract fixture; real L2 entry remains the Linux KVM probe.
+
+### Validation
+
+* Initial pure-policy run: `cargo xtest -p nested_vmx`, **16 PASS, 0 FAIL**;
+  `/tmp/x86-correctness-step3-policy.log`.
+* All five package runs through `nix develop`: **152 PASS, 0 FAIL**
+  (nested_vmx 16, HAL 51, loader 45, guest fixture 9, xtask 31);
+  `/tmp/x86-correctness-step3-<package>.log`.
+* Intermediate release suite with `LINUX_KVM_CYCLES=1`: Direct native and
+  read-only-VMCS contracts and both Linux backends PASS; the same two reference
+  no-partial-store assertions FAIL. `/tmp/x86-correctness-step3-native-first.log`.
+* Final release command uses `LINUX_KVM_CYCLES=4096
+  LINUX_KVM_TIMEOUT_SECONDS=600 cargo xrun x86 --nested --release` through
+  `nix develop --accept-flake-config --command`: **4 PASS, 2 FAIL**, exit 1.
+  `/tmp/x86-correctness-step3-nested-release.log`. Both Direct contract profiles
+  require `host_invalid=34 host_priority=2 host_restore=1`; both reference
+  profiles also emit the completed host-check marker before failing the separate
+  partial-store requirement. Both backends complete 4096 Linux L2 cycles.
+* `cargo xbuild x86` through `nix develop`: **PASS**;
+  `/tmp/x86-correctness-step3-xbuild.log`.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**. Complete diff
+  review found no AArch64 implementation changes; the user's `AGENTS.md` and
+  all generated EFI/guest/firmware/log artifacts remain excluded from staging.
+
+These remain QEMU/KVM and host results only. CET VM-exit capability remains
+hidden; conditional policy tests are not a claim of a running CET nested guest.
+Windows/Hyper-V, S3, per-pCPU ownership, platform-map wiring and physical hardware
+are not newly qualified by this step.

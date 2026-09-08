@@ -633,8 +633,270 @@ unsafe fn entry_boundaries(capabilities: &Prerequisites) -> Result<()> {
             vmcs::CPU_BASED_VM_EXEC_CONTROL,
             1,
         )?;
+        // SAFETY: the VMCS remains clear and owned; the helper substitutes an
+        // invalid host field before every entry with otherwise valid controls.
+        host_field_boundaries()?;
+        for (field, value) in host_fields {
+            field_equal("host-check-all-originals-restored", field, value)?;
+        }
     }
     Ok(())
+}
+
+/// Rejects 34 invalid original host values and checks two higher-priority
+/// failures. No entry may reach guest-state loading: one host field is always
+/// invalid, including when the test selects otherwise valid control settings.
+///
+/// # Safety
+/// The caller owns a clear current VMCS initialized by entry_boundaries, with
+/// valid baseline host fields and primary bit zero proved reserved. No CPU may
+/// concurrently modify its fields or launch it. Failure cleanup retains pages.
+unsafe fn host_field_boundaries() -> Result<()> {
+    // SAFETY: VMX is active at CPL0; BASIC determines whether TRUE controls
+    // exist. All four capability MSRs are read-only and present in this mode.
+    let capabilities = unsafe {
+        let basic = vmx::VmxBasic::from_msr(cpu::rdmsr(vmx::IA32_VMX_BASIC));
+        [
+            (
+                vmcs::PIN_BASED_VM_EXEC_CONTROL,
+                0,
+                cpu::rdmsr(if basic.true_controls {
+                    vmx::IA32_VMX_TRUE_PINBASED_CTLS
+                } else {
+                    vmx::IA32_VMX_PINBASED_CTLS
+                }),
+            ),
+            (
+                vmcs::CPU_BASED_VM_EXEC_CONTROL,
+                0,
+                cpu::rdmsr(if basic.true_controls {
+                    vmx::IA32_VMX_TRUE_PROCBASED_CTLS
+                } else {
+                    vmx::IA32_VMX_PROCBASED_CTLS
+                }),
+            ),
+            (
+                vmcs::VM_EXIT_CONTROLS,
+                (1 << 9) | vmcs::VM_EXIT_LOAD_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_EFER,
+                cpu::rdmsr(if basic.true_controls {
+                    vmx::IA32_VMX_TRUE_EXIT_CTLS
+                } else {
+                    vmx::IA32_VMX_EXIT_CTLS
+                }),
+            ),
+            (
+                vmcs::VM_ENTRY_CONTROLS,
+                vmcs::VM_ENTRY_LOAD_IA32_PAT | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+                cpu::rdmsr(if basic.true_controls {
+                    vmx::IA32_VMX_TRUE_ENTRY_CTLS
+                } else {
+                    vmx::IA32_VMX_ENTRY_CTLS
+                }),
+            ),
+        ]
+    };
+    for (_, requested, capability) in capabilities {
+        equal(
+            "host-check-control-supported",
+            u64::from(requested) & !(capability >> 32),
+            0,
+        )?;
+    }
+    let mut saved_controls = [0_u64; 4];
+    let saved_pat;
+    let saved_efer;
+    // SAFETY: these mandatory VMCS encodings are readable on the owned current
+    // VMCS. Read all original values before the first mutation for cleanup.
+    unsafe {
+        for (slot, (field, _, _)) in saved_controls.iter_mut().zip(capabilities) {
+            *slot = read_field("host-check-save-control", field)?;
+        }
+        saved_pat = read_field("host-check-save-pat", vmcs::HOST_IA32_PAT)?;
+        saved_efer = read_field("host-check-save-efer", vmcs::HOST_IA32_EFER)?;
+    }
+    let result = (|| {
+        // SAFETY: only owned VMCS fields change, with no entry until one host
+        // field is deliberately invalidated. PAT/EFER copies are valid live L1
+        // MSRs; no MSR is written and no guest/host state is actually loaded.
+        unsafe {
+            for (field, requested, capability) in capabilities {
+                success(
+                    "host-check-control",
+                    vmx::vmwrite(
+                        field,
+                        u64::from(vmx::adjust_controls(requested, capability)),
+                    ),
+                )?;
+            }
+            success(
+                "host-check-pat",
+                vmx::vmwrite(vmcs::HOST_IA32_PAT, cpu::rdmsr(cpu::IA32_PAT)),
+            )?;
+            success(
+                "host-check-efer",
+                vmx::vmwrite(vmcs::HOST_IA32_EFER, cpu::rdmsr(cpu::IA32_EFER)),
+            )?;
+        }
+        let address_bits = cpu::cpuid(0x8000_0008, 0).eax;
+        let physical_bits = address_bits & 255;
+        let linear_bits = (address_bits >> 8) & 255;
+        equal(
+            "host-check-linear-width",
+            u64::from(matches!(linear_bits, 48 | 57)),
+            1,
+        )?;
+        let mut failures = 0;
+        // SAFETY: all probes below retain this clear VMCS and restore their
+        // individual mutated field on success or assertion failure. A null or
+        // RPL/TI selector, invalid CR/MSR or noncanonical checked base must fail
+        // before hardware loads any guest state or entry MSR list.
+        unsafe {
+            for field in [
+                vmcs::HOST_CS_SELECTOR,
+                vmcs::HOST_SS_SELECTOR,
+                vmcs::HOST_DS_SELECTOR,
+                vmcs::HOST_ES_SELECTOR,
+                vmcs::HOST_FS_SELECTOR,
+                vmcs::HOST_GS_SELECTOR,
+                vmcs::HOST_TR_SELECTOR,
+            ] {
+                for value in [1, 4] {
+                    reject_host_field(field, value)?;
+                    failures += 1;
+                }
+            }
+            for field in [vmcs::HOST_CS_SELECTOR, vmcs::HOST_TR_SELECTOR] {
+                reject_host_field(field, 0)?;
+                failures += 1;
+            }
+            let cr0 = read_field("host-check-cr0", vmcs::HOST_CR0)?;
+            let cr4 = read_field("host-check-cr4", vmcs::HOST_CR4)?;
+            for (field, value) in [
+                (vmcs::HOST_CR0, cr0 & !(1 << 31)),
+                (vmcs::HOST_CR0, cr0 & !1),
+                (vmcs::HOST_CR4, cr4 & !(1 << 13)),
+                (vmcs::HOST_CR4, cr4 & !(1 << 5)),
+                (vmcs::HOST_CR4, cr4 | (1 << 63)),
+                (vmcs::HOST_CR3, 1 << 63),
+                (vmcs::HOST_CR3, 1 << physical_bits),
+            ] {
+                reject_host_field(field, value)?;
+                failures += 1;
+            }
+            for field in [
+                vmcs::HOST_FS_BASE,
+                vmcs::HOST_GS_BASE,
+                vmcs::HOST_TR_BASE,
+                vmcs::HOST_GDTR_BASE,
+                vmcs::HOST_IDTR_BASE,
+                vmcs::HOST_IA32_SYSENTER_ESP,
+                vmcs::HOST_IA32_SYSENTER_EIP,
+                vmcs::HOST_RIP,
+            ] {
+                reject_host_field(field, 1 << linear_bits)?;
+                failures += 1;
+            }
+            for (field, value) in [
+                (vmcs::HOST_IA32_PAT, 2),
+                (vmcs::HOST_IA32_EFER, 0),
+                (vmcs::HOST_IA32_EFER, 0xd03),
+            ] {
+                reject_host_field(field, value)?;
+                failures += 1;
+            }
+            equal("host-check-failure-count", failures, 34)?;
+            let cs = read_field("host-check-priority-cs", vmcs::HOST_CS_SELECTOR)?;
+            let primary = read_field(
+                "host-check-priority-controls",
+                vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            )?;
+            success(
+                "host-check-invalid-cs",
+                vmx::vmwrite(vmcs::HOST_CS_SELECTOR, 0),
+            )?;
+            let priority = (|| {
+                equal(
+                    "host-check-resume-priority-flags",
+                    rejected_entry(true),
+                    FAIL_VALID,
+                )?;
+                field_equal(
+                    "host-check-resume-priority-error",
+                    vmcs::VM_INSTRUCTION_ERROR,
+                    5,
+                )?;
+                success(
+                    "host-check-invalid-control",
+                    vmx::vmwrite(vmcs::CPU_BASED_VM_EXEC_CONTROL, primary | 1),
+                )?;
+                equal(
+                    "host-check-control-priority-flags",
+                    rejected_entry(false),
+                    FAIL_VALID,
+                )?;
+                field_equal(
+                    "host-check-control-priority-error",
+                    vmcs::VM_INSTRUCTION_ERROR,
+                    7,
+                )
+            })();
+            success(
+                "host-check-restore-cs",
+                vmx::vmwrite(vmcs::HOST_CS_SELECTOR, cs),
+            )?;
+            success(
+                "host-check-restore-primary",
+                vmx::vmwrite(vmcs::CPU_BASED_VM_EXEC_CONTROL, primary),
+            )?;
+            priority?;
+        }
+        Ok(())
+    })();
+    // SAFETY: every entry was guarded by an invalid host field or an invalid
+    // control; no guest ran and the VMCS remains clear/current. Restore all
+    // changed control/MSR fields even on an ordinary assertion failure.
+    unsafe {
+        for ((field, _, _), value) in capabilities.into_iter().zip(saved_controls) {
+            success("host-check-restore-control", vmx::vmwrite(field, value))?;
+            field_equal("host-check-restored-control", field, value)?;
+        }
+        success(
+            "host-check-restore-pat",
+            vmx::vmwrite(vmcs::HOST_IA32_PAT, saved_pat),
+        )?;
+        success(
+            "host-check-restore-efer",
+            vmx::vmwrite(vmcs::HOST_IA32_EFER, saved_efer),
+        )?;
+        field_equal("host-check-restored-pat", vmcs::HOST_IA32_PAT, saved_pat)?;
+        field_equal("host-check-restored-efer", vmcs::HOST_IA32_EFER, saved_efer)?;
+    }
+    result
+}
+
+/// # Safety
+/// The current test-owned VMCS has valid controls and baseline host state.
+/// The supplied replacement is architecturally invalid for this host field,
+/// guaranteeing VMfail before guest state or MSR-list loading.
+unsafe fn reject_host_field(field: u32, value: u64) -> Result<()> {
+    // SAFETY: the caller owns this writable field and supplies a guaranteed
+    // invalid replacement. Restore it even when the returned status is wrong.
+    unsafe {
+        let original = read_field("host-check-save-field", field)?;
+        success("host-check-invalid-field", vmx::vmwrite(field, value))?;
+        let result = (|| {
+            equal(
+                "host-check-vmlaunch-flags",
+                rejected_entry(false),
+                FAIL_VALID,
+            )?;
+            field_equal("host-check-vmlaunch-error", vmcs::VM_INSTRUCTION_ERROR, 8)?;
+            field_equal("host-check-original-visible", field, value)
+        })();
+        success("host-check-restore-field", vmx::vmwrite(field, original))?;
+        field_equal("host-check-restored-field", field, original)?;
+        result
+    }
 }
 
 /// Descriptor-error probe; no invalidation or physical pointer access can occur.
@@ -754,12 +1016,23 @@ unsafe fn invalidation_descriptors(capabilities: &Prerequisites, ept_root: u64) 
 
 /// The current VMCS is exclusively test-owned throughout each successful call.
 unsafe fn field_equal(stage: &'static str, field: u32, expected: u64) -> Result<()> {
+    // SAFETY: inherited owned-current-VMCS and supported-field invariant.
+    equal(stage, unsafe { read_field(stage, field) }?, expected)
+}
+
+/// Reads a supported field of the caller's exclusively owned current VMCS.
+unsafe fn read_field(stage: &'static str, field: u32) -> Result<u64> {
     // SAFETY: callers have successfully loaded their owned VMCS; every call
     // passes a mandatory supported guest, host, control, or error-field encoding.
-    match unsafe { vmx::vmread(field) } {
-        Ok(actual) => equal(stage, actual, expected),
-        Err(status) => success(stage, status),
-    }
+    unsafe { vmx::vmread(field) }.map_err(|status| Failure {
+        stage,
+        actual: match status {
+            VmxStatus::Success => 0,
+            VmxStatus::FailInvalid => FAIL_INVALID,
+            VmxStatus::FailValid => FAIL_VALID,
+        },
+        expected: 0,
+    })
 }
 
 unsafe fn pointer_equal(stage: &'static str, expected: u64) -> Result<()> {
@@ -834,6 +1107,10 @@ unsafe fn instructions(
     unsafe {
         entry_boundaries(capabilities)?;
     }
+    let _ = writeln!(
+        serial,
+        "thin-hv: L1 original host validation PASS invalid=34 priority=2 restored=1"
+    );
     // SAFETY: first is current and owned; the reserved/read-only fields and
     // VMXON pointer exercise defined VMfailValid paths. Physical value 1 is held
     // in a readable operand and rejected for alignment before VMCS memory access.
@@ -1105,7 +1382,7 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,
