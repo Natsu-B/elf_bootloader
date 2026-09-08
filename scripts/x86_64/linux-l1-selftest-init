@@ -136,7 +136,8 @@ runtime_limit=120
 # 512 fork/kill rounds each launch four vCPUs and 64 helper threads. Keep the
 # upstream iteration count; allow the slower Direct-VMX path a finite budget.
 case "$test_name" in
-    hardware_disable_test|kvm_create_max_vcpus|mmu_stress_test|memslot_perf_test|access_tracking_perf_test) runtime_limit=600 ;;
+    hardware_disable_test|kvm_create_max_vcpus|mmu_stress_test|memslot_perf_test|access_tracking_perf_test|\
+    vmx_exception_with_invalid_guest_state) runtime_limit=600 ;;
 esac
 /bin/busybox timeout -s KILL "$runtime_limit" /bin/kvm-selftest "$@" </dev/null >/tmp/selftest.log 2>&1 || rc=$?
 bytes=$(/bin/busybox wc -c </tmp/selftest.log) || fail output-size

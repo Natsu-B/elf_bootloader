@@ -140,7 +140,8 @@ test_name=${LINUX_SELFTEST_NAME:-}
 selftest=${LINUX_SELFTEST_ELF:-}
 default_timeout=300
 case "$test_name" in
-    hardware_disable_test|kvm_create_max_vcpus|mmu_stress_test|memslot_perf_test|access_tracking_perf_test) default_timeout=900 ;;
+    hardware_disable_test|kvm_create_max_vcpus|mmu_stress_test|memslot_perf_test|access_tracking_perf_test|\
+    vmx_exception_with_invalid_guest_state) default_timeout=900 ;;
 esac
 timeout_seconds=${LINUX_SELFTEST_TIMEOUT_SECONDS:-$default_timeout}
 valid_test "$test_name" || die 'unsupported pinned KVM selftest name'

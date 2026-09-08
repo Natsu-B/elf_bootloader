@@ -4038,11 +4038,21 @@ mod tests {
             manifest.clone() + "x2apic|apic.flat|2|128|30|qemu64|-\n",
             manifest.replace("apic.flat", "../apic.flat"),
             manifest.replace("|128|", "|9999999999999|"),
-            manifest.replace("|1200|", "|1801|"),
+            manifest.replace("|1200|", "|5401|"),
             manifest.replace("|2|", "|0|"),
             manifest.replace("|qemu64|", "|qemu64;reboot|"),
         ] {
             assert_ne!(check(&["--check-manifest"], &invalid), 0);
+        }
+        for (seconds, accepted) in [(0, false), (1, true), (5400, true), (5401, false)] {
+            let single = format!("probe|emulator.flat|1|128|{seconds}|qemu64|-\n");
+            assert_eq!(check(&["--check-manifest"], &single) == 0, accepted);
+        }
+        for (last_seconds, accepted) in [(3480, true), (3481, false)] {
+            let total_boundary = format!(
+                "a|emulator.flat|1|128|5400|qemu64|-\nb|emulator.flat|1|128|5400|qemu64|-\nc|emulator.flat|1|128|{last_seconds}|qemu64|-\n"
+            );
+            assert_eq!(check(&["--check-manifest"], &total_boundary) == 0, accepted);
         }
         for (text, status, expected) in [
             ("SUMMARY: 3 tests, 1 skipped\n", "1", 5),

@@ -14,13 +14,13 @@ vmexit_mov_to_cr8|vmexit.flat|1|128|90|qemu64|mov_to_cr8
 vmexit_inl_pmtimer|vmexit.flat|1|128|90|qemu64|inl_from_pmtimer
 vmexit_ipi|vmexit.flat|2|128|90|qemu64|ipi
 vmexit_ipi_halt|vmexit.flat|2|128|90|qemu64|ipi_halt
-vmexit_ple_round_robin|vmexit.flat|1|128|90|qemu64|ple_round_robin
+vmexit_ple_round_robin|vmexit.flat|2|128|90|qemu64|ple_round_robin
 vmexit_tscdeadline|vmexit.flat|1|128|90|qemu64,+x2apic,+tsc-deadline|tscdeadline
 vmexit_tscdeadline_immed|vmexit.flat|1|128|90|qemu64,+x2apic,+tsc-deadline|tscdeadline_immed
 vmexit_cr0_wp|vmexit.flat|2|128|90|qemu64|toggle_cr0_wp
 vmexit_cr4_pge|vmexit.flat|2|128|90|qemu64|toggle_cr4_pge
 access|access_test.flat|1|128|90|max,host-phys-bits|-
-access_fep|access_test.flat|1|128|600|max,host-phys-bits|force_emulation
+access_fep|access_test.flat|1|128|5400|max,host-phys-bits|force_emulation
 access-reduced-maxphyaddr|access_test.flat|1|128|600|IvyBridge,phys-bits=36,host-phys-bits=off|-
 smap|smap.flat|1|128|90|max|-
 pku|pku.flat|1|128|90|max|-

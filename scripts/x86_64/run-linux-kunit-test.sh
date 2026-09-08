@@ -3,6 +3,7 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 manifest="$repo_root/scripts/x86_64/linux-l2-kunit-cases.txt"
 classifier="$repo_root/scripts/x86_64/check-kunit-case.awk"
+matrix_timeout_seconds=14400
 die() { printf 'x86 KVM unit matrix: %s\n' "$*" >&2; exit 1; }
 check_text_file() {
     local file=$1 limit=$2 bytes transcript
@@ -13,17 +14,19 @@ check_text_file() {
 }
 check_manifest() {
     check_text_file "$1" 16384 || return 1
-    awk -F'|' '
+    awk -F'|' -v outer_budget="$matrix_timeout_seconds" '
         /^#/ || /^$/ { next }
         {
             if (NF != 7 || $1 !~ /^[a-z][a-z0-9_-]*$/ || seen[$1]++ ||
                 $2 !~ /^[a-z][a-z0-9_-]*\.flat$/ || $3 !~ /^[1-4]$/ ||
                 $4 !~ /^[0-9]+$/ || $4 < 128 || $4 > 2048 ||
-                $5 !~ /^[0-9]+$/ || $5 < 1 || $5 > 1800 ||
+                $5 !~ /^[0-9]+$/ || $5 < 1 || $5 > 5400 ||
                 $6 !~ /^[A-Za-z0-9_.,+=-]+$/ || $7 !~ /^[-a-z0-9_]+$/) bad=1
+            seconds += $5
             count++
         }
-        END { exit (bad || count < 1 || count > 100) }
+        # Leave boot/setup/shutdown headroom even if every child reaches its limit.
+        END { exit (bad || count < 1 || count > 100 || seconds + 120 > outer_budget) }
     ' "$1"
 }
 if [[ ${1:-} == --check-manifest ]]; then
@@ -80,7 +83,7 @@ env X86_UEFI_BACKEND="$backend" X86_UEFI_ACCEL=kvm X86_MONITOR_IMAGE="$monitor" 
     X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' X86_UEFI_MEMORY=4G X86_UEFI_SMP=1 \
     X86_UEFI_GUEST_LOCATION=guest X86_UEFI_ALLOW_REBOOT=0 X86_UEFI_REQUIRE_POWEROFF=1 \
     X86_UEFI_ACPI_S3=0 X86_UEFI_WAKE_CYCLES=0 X86_UEFI_DATA_DISK="$swap_disk" X86_UEFI_USERNET=0 \
-    X86_UEFI_TIMEOUT_SECONDS=7200 X86_VARIABLE_MARKER= \
+    X86_UEFI_TIMEOUT_SECONDS="$matrix_timeout_seconds" X86_VARIABLE_MARKER= \
     X86_RETURN_MARKER="thin-hv: KVM unit matrix complete backend=$backend selection=$selection" \
     X86_GUEST_MARKER='thin-hv: KVM unit matrix poweroff requested' \
     X86_GUEST_FAILURE_MARKER='thin-hv: KVM unit matrix FAIL' \
