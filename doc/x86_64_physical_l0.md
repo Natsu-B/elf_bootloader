@@ -155,7 +155,7 @@ unfinished physical monitor. Missing VMX is tested under TCG without probing uns
 | 4: private L0 state | Carrier and direct-L2 VM-exit host fields now use private GDT/IDT/TSS, selectors, FS/GS/SYSENTER targets, an ordinary host stack and four separate IST stacks. Every root exception stops visibly; NMI forwarding is not implemented. HOST_CR3 is still a fixed 8 GiB identity map. A separate L1 bootstrap and platform host map remain required before physical deployment. |
 | 5: pCPU ownership | VMXON/carrier and L1_VCPU_STATE, CARRIER_PATCH_VALUES, DIRECT_PATCH_VALUES, DIRECT_ENTRY_POLICY, NESTED_RUN remain single-CPU. No AP bringup, VMCS migration or normal Windows SMP claim. |
 | 6: identity | New baseline/preflight leave system tables, real TPM, Secure Boot data and storage untouched. Physical Direct-VMX reservations/identity preservation have not been established. |
-| 7: Linux nested KVM | Direct-VMX Linux and 64 repeated real KVM lifecycles pass in single-vCPU QEMU/KVM. Synthesized VMfailValid error exposure and operand exception delivery still need correction; this is not a physical Linux/SMP result, and reference soaks are not Direct-VMX evidence. |
+| 7: Linux nested KVM | Direct-VMX Linux passes repeated two-VM context switching, IO completion, register/CR2/XMM0–7/MXCSR checks, and same-GPA memslot replacement in single-vCPU QEMU/KVM. VMfailValid error exposure is corrected and checked by a native VMX fixture; operand exception delivery remains incomplete. This is not physical Linux/SMP or full XSAVE coverage, and reference soaks are not Direct-VMX evidence. |
 | 8: Hyper-V state | CR2/XSAVE remain shared; XSETBV inputs are not independently validated; nonempty MSR lists fail-stop. ControlProvenance/MSR mirrors are not runtime-integrated; all direct L2 exits currently reflect. VPID ownership/reuse is not implemented. |
 | 9: watchdog | Bounded BSP-only exit counters and fixed-size timeout capture are implemented; repeated nonfatal VMX logging is removed. No validated watchdog correction or full state-management solution is established. The latest Windows timeout is a separate observation, not proof of the historical bugcheck. |
 | 10: original Windows | Read-only status collection/documentation can be exercised under QEMU, but the actual original motherboard/firmware installation is untested. |
@@ -166,6 +166,146 @@ correctly virtualized. Excluding the runtime PE from L1 also requires relocating
 non-root guest_entry trampoline; blindly unmapping it breaks the present handoff.
 
 ## Validation procedure and evidence classes
+
+### QEMU-first nested gate (2026-09-08)
+
+The target is to finish architectural development and reproducible nested regressions in QEMU
+before exposing an original physical Windows installation to L0. Real-machine testing must still
+validate firmware, actual MMIO/DMA/device behavior, microcode/CPU differences, Secure Boot, TPM,
+activation **status only**, and platform power transitions. QEMU cannot certify those properties.
+The present Direct-VMX prototype is not ready for that production qualification: the active
+physical EPT/host map, all-CPU ownership, operand faults and Hyper-V state gaps above remain.
+
+Run the existing x86 test framework's bounded nested suite:
+
+```sh
+nix develop --accept-flake-config --command cargo xrun x86 --nested --release
+nix develop --accept-flake-config --command env LINUX_KVM_CYCLES=256 cargo xrun x86 --nested --release
+```
+
+It runs six QEMU/KVM cases serially, reports every case failure, and exits nonzero if any case
+fails. Do not run another generic UEFI/Linux runner concurrently: those existing runners share
+the serial log, ESP and OVMF variable-store paths. Windows tests with separate private work
+directories can run alongside them, subject to the three-QEMU limit. There is no backend
+fallback. Four native-UEFI instruction-contract cases compare
+`outer-kvm / reference` against `direct-vmx / project L0` under the native CPU capabilities and
+under `vmx-vmwrite-vmexit-fields=off`. This second profile tests error publication without
+assuming physical `IA32_VMX_MISC[29]` makes the VMCS error field writable; the matching reference
+fixture must report its read-only assertion as executed. The same binary runs under both
+backends. Two Linux cases run the real KVM probe with the requested cycle count (default 64,
+range 1..4096). Linux UKIs and monitors are built in release by its existing runner; use the
+explicit `--release` command above for a uniform release suite.
+
+The instruction fixture allocates only three disposable BootServices pages, validates their
+layout/ownership, executes no VMLAUNCH/VMRESUME and writes no firmware variable or identity data.
+It checks VMXON/OFF, VMPTRST, VMCLEAR/VMPTRLD, VMREAD/VMWRITE, two-VMCS state/error persistence
+over eight switches, exact CF/ZF and errors 2/3/9/10/12/13/15/28, including wide field encodings,
+misaligned physical operands and capability-gated invalid INVEPT/INVVPID. All VMCS pages are
+cleared and VMXOFF, exact control restoration and FreePages must succeed before its PASS.
+The existing Linux probe separately provides actual L2 VMLAUNCH/VMRESUME/exit evidence.
+
+Each Linux probe process owns two independent single-vCPU VMs, interleaving every phase of eight
+OUT→IN→OUT→HLT rounds. It verifies all GPRs, selected flags/segments and CR2, completes userspace
+IO before inspecting state, deletes/recreates the data slot at the same GPA with alternating
+backing pages, and checks both active and retired backing data. PASS requires successful explicit
+`munmap`/`close` of both VM/vCPU contexts and `/dev/kvm`; process exit remains a cleanup backstop,
+not a substitute for the gate. Per process: 64 `KVM_RUN` calls, 16 completed HLT/state checks,
+14 remaps. Each VM initializes distinct XMM0–7/MXCSR sentinels once using actual guest
+`MOVDQU`/`LDMXCSR`, then executes SSE2 `PXOR` and `MOVDQU` stores each round. Every completed
+HLT checks `KVM_GET_FPU` against all eight expected XMM values and independently checks the
+vector actually stored by L2; guest `STMXCSR` stores verify MXCSR each round. Initializing in
+the guest avoids assumptions about the legacy FPU ioctl: the
+[Linux v7.1.5 implementation](https://raw.githubusercontent.com/gregkh/linux/v7.1.5/arch/x86/kvm/x86.c)
+does not transfer its structure's MXCSR member or mark the XSAVE SSE component active when
+copying XMM bytes. Real-mode instructions do not initialize XMM8–15, so those registers are
+explicitly outside this probe's coverage.
+FPU state is not reset between rounds; this is not a cached SET/GET-only test. The cycle
+transcript requires `sse_checks=16`. At 256 cycles this is 512 created VMs, 16,384 KVM_RUN
+calls, 3,584 remaps and 4,096 SSE-state checks **per backend**.
+Two VMs on one L1 CPU are not L2 SMP; real-mode memslot checks do not establish guest-paging
+TLB semantics, concurrent invalidation, VPID generation correctness, full XSAVE/AVX or device interrupt
+delivery. Those need additional QEMU gates before a daily-use claim.
+
+The native fixture first reproduced an actual Direct-VMX defect on the prior `7373d97` EFI:
+`VMCLEAR(VMXON pointer)` returned ZF=1 but VMREAD(error) still returned 12 rather than 3. The
+reference passed. The monitor now executes native failures with the L1-selected VMCS current,
+captures their error before restoring the carrier, and records synthetic errors in that same
+hardware VMCS. On CPUs without writable exit fields, a closed set of guaranteed-failing VMX
+operations records the architectural error, followed by readback verification. No opaque VMCS
+bytes, software VMCS12/02 layer, error registry or new crate was added. Repeated VMXON, read-only
+VMWRITE under the advertised capability mask, and wide invalid field operands are also corrected.
+The successful hot path gains no formatted logging. This is a verified instruction-contract fix,
+**not evidence that the Hyper-V "Please wait" cause is fixed**.
+
+The runner preserves generated transcripts under `bin/x86_64/nested-contract-<backend>-<cpu-profile>.log`
+and `bin/x86_64/nested-linux-<backend>.log`. Old serial evidence is removed before each case;
+failure to clear it prevents that case from running. Gates reject mixed backends, incomplete or
+out-of-order coverage, missing cleanup/return evidence, late failures, NULs and oversized logs.
+No generated EFI, disk, variable-store or diagnostic artifact belongs in a commit.
+
+Before physical production qualification, require independently passing QEMU gates for the
+following unfinished items (do not reclassify a reference pass as Direct success):
+
+| QEMU gate still required | What must be established before relying on physical testing |
+| --- | --- |
+| Physical-backend execution | Install the platform-derived EPT and private host map, discover MMIO, and separate the shared L1 bootstrap from monitor-private storage in the actual backend. |
+| Architectural exception/entry matrix | Precise CPL/operand faults and VM-entry failures; nonempty MSR lists; CR2/XCR0/XSAVE/debug/PAT/EFER state; event/NMI injection and L0-only versus reflected exits. |
+| SMP and lifetime | Virtualize every visible L1 CPU, AP startup and reset, per-CPU VMCS ownership/migration, VPID reuse and invalidation, then nested L2 SMP. |
+| Real OS nested workloads | Linux L2 OS workloads and repeated suspend/reboot; Direct Windows Hyper-V boot and WSL2 workloads, reboot and sustained device/interrupt load. |
+| Power-state regressions | Direct backend S3/S4/reset recovery with active nested guests and persistent-state checks; reference-only power tests are not sufficient. |
+
+Only after these are passed should physical tests become chiefly original-installation,
+firmware/device, activation-status, reboot and real power-management qualification. A direct
+firmware boot path bypassing L0 must remain available throughout.
+
+This increment started on branch `feat/x86-thin-monitor` at `7373d97` with only the user's
+`AGENTS.md` change dirty. The requested branch/status/log-20 inspection was repeated before
+edits. VMX corrections are committed in `5f574a6`, the native contract/extended Linux
+suite in `4f6f1d8`, and actual SSE lifecycle checks in `3bd5918`. Changed production symbols
+are HAL `RecordedFailure`/`record_failure`,
+monitor `with_l1_current_vmcs`/`execute_l1_vmx_instruction`/`publish_l1_instruction_error`,
+and the VMX instruction handlers. No AArch64 production paths or dependencies were changed.
+
+Available validation for that increment:
+
+| Evidence class | Check | Result |
+| --- | --- | --- |
+| Host | All affected package entries: HAL 40, nested 7, loader 43, guest 7, xtask 26 | PASS: 123 test executions |
+| Build | `cargo xbuild x86`, release builds, non-VMX artifact disassembly, `cargo fmt --check` | PASS |
+| QEMU/KVM | Native VMX contracts: two backends × native/read-only VMCS CPU profiles | PASS: 4 cases; invalid INVEPT/INVVPID checked in all four |
+| QEMU/KVM | Linux two-VM IO/state/memslot/SSE lifecycle, 256 cycles each backend | PASS: 2 cases, 4,096 SSE checks per backend, clean guest poweroff |
+| QEMU TCG/KVM | Unchanged standard xrun matrix in debug and release, including expected root exceptions | PASS: 18 cases |
+| QEMU/KVM | Fresh reference Windows Hyper-V overlay from the existing evaluation seed | PASS, runner exit 0 |
+| QEMU/KVM | Fresh Direct Windows Hyper-V overlay, 1200-second deadline | FAIL, runner exit 1; final screen remained "Please wait", no BSOD observed |
+| Physical hardware | Original installed Windows/Linux, activation status, devices, firmware, all CPUs, power | UNVERIFIED; no physical-machine state was changed |
+
+The final Direct Windows snapshot recorded 9,789,052 observed L2 entries, 9,789,051 reflected
+exits, 1,068,048 external-interrupt exits and zero nested-entry failures; phase 4/nested-exit
+and reason 31/RDMSR are consistent with one reflection still in progress. These are bounded diagnostics,
+not proof of Windows initialization progress or correct interrupt/MSR/XSAVE semantics, and
+not a performance benchmark. The instruction-error fix did not resolve the observed boot stall.
+
+Evidence logs are local generated artifacts, excluded from Git:
+
+* `/tmp/x86-nested-contract-baseline-20260908.log`: initial reference PASS / old Direct error 3 failure.
+* `/tmp/x86-nested-full-matrix-20260908.log`: six-case suite plus debug/release standard matrix PASS.
+* `/tmp/x86-nested-sse-final-suite-20260908.log`: final six-case suite PASS including SSE at 256 cycles per backend.
+* `/tmp/x86-nested-sse-final-host-20260908.log`: final 123 host executions and format check PASS.
+* `/tmp/x86-nested-sse-final-build-20260908.log`: final debug x86 build PASS.
+* `/tmp/x86-nested-windows-reference-20260908.log`: reference Hyper-V PASS.
+* `/tmp/x86-nested-windows-hyperv-20260908.log`: Direct Hyper-V timeout; private work directory
+  `/tmp/thin-hv-nested-windows-hyperv.vctJUP`, final screen/counters under
+  `monitor-hyperv-failure-diagnostics.pnlb3P/`.
+
+Intermediate test-development failures were not hidden: a missing `std::path::Path` qualifier
+stopped the first xtask host build; a too-short expected terminal marker rejected a successful
+Direct contract until the gate required its exact zero StartImage status; the initial SSE
+probe incorrectly expected the KVM FPU ioctl's MXCSR member to be transferred. A subsequent
+reference diagnostic verified that SET/GET copied XMM seed bytes before entry, but the first
+actual L2 execution received zeros (`/tmp/x86-nested-sse-state-diagnostic-20260908.log`),
+consistent with the unmarked XSAVE component described above. Both were fixture-initialization
+failures before Direct was attempted, not accepted backend passes. Actual one-time guest
+initialization passed one-cycle A/B checks and then the final 256-cycle suite on both backends.
 
 Use the existing Nix development environment and repository test framework:
 
