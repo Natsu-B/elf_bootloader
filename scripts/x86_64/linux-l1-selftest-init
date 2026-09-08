@@ -34,7 +34,7 @@ for argument in $boot_arguments; do
             test_name=${argument#*=}
             case "$test_name" in
                 tsc_msrs_test) assertions=5 ;;
-                userspace_msr_exit_test|kvm_binary_stats_test) assertions=4 ;;
+                userspace_msr_exit_test|kvm_binary_stats_test|steal_time) assertions=4 ;;
                 sync_regs_test) assertions=10 ;;
                 fix_hypercall_test) assertions=2 ;;
                 monitor_mwait_test) assertions=12 ;;
@@ -45,7 +45,12 @@ for argument in $boot_arguments; do
                 hyperv_clock|hyperv_cpuid|hyperv_features|hyperv_ipi|hyperv_tlb_flush|hyperv_extended_hypercalls|\
                 set_boot_cpu_id|max_vcpuid_cap_test|smm_test|amx_test|pmu_counters_test|pmu_event_filter_test|\
                 dirty_log_test|guest_print_test|irqfd_test|set_memory_region_test|coalesced_io_test|\
-                hardware_disable_test|guest_memfd_test|system_counter_offset_test|pre_fault_memory_test) assertions=1 ;;
+                hardware_disable_test|guest_memfd_test|system_counter_offset_test|pre_fault_memory_test|\
+                demand_paging_test|kvm_create_max_vcpus|kvm_page_table_test|memslot_modification_stress_test|\
+                memslot_perf_test|access_tracking_perf_test|dirty_log_perf_test|mmu_stress_test|rseq_test|\
+                xen_vmcall_test|xen_shinfo_test|private_mem_kvm_exits_test|private_mem_conversions_test|\
+                nx_huge_pages_test|dirty_log_page_splitting_test|vmx_exception_with_invalid_guest_state|\
+                aperfmperf_test|kvm_buslock_test|hwcr_msr_test) assertions=1 ;;
                 *) fail invalid-test ;;
             esac
             ;;
@@ -54,7 +59,13 @@ done
 set +f
 [ -n "$backend" ] && [ -n "$test_name" ] || fail missing-arguments
 read -r online_cpus </sys/devices/system/cpu/online
-[ "$online_cpus" = 0 ] || fail requires-one-L1-cpu
+l1_cpus=1
+if [ "$test_name" = rseq_test ] && [ "$backend" = outer-kvm ]; then
+    [ "$online_cpus" = 0-1 ] || fail requires-two-reference-L1-cpus
+    l1_cpus=2
+else
+    [ "$online_cpus" = 0 ] || fail requires-one-L1-cpu
+fi
 grep -qw vmx /proc/cpuinfo || fail VMX-unavailable
 if [ "$test_name" = fastops_test ]; then
     # This upstream test requires KVMs explicit test-only emulation prefix.
@@ -65,6 +76,9 @@ else
 fi
 if [ "$test_name" = smaller_maxphyaddr_emulation_test ]; then
     modprobe kvm_intel nested=0 allow_smaller_maxphyaddr=1 || fail kvm-test-maxphyaddr-module
+elif [ "$test_name" = vmx_exception_with_invalid_guest_state ]; then
+    # Exercise KVMs real-mode emulation path in this disposable L1 only.
+    modprobe kvm_intel nested=0 unrestricted_guest=0 || fail kvm-test-unrestricted-module
 else
     modprobe kvm_intel nested=0 || fail kvm-intel-module
 fi
@@ -82,7 +96,38 @@ case "$test_name" in
         done
         ;;
 esac
-echo "thin-hv: linux KVM selftest begin backend=$backend test=$test_name l1_cpus=1"
+echo "thin-hv: linux KVM selftest begin backend=$backend test=$test_name l1_cpus=$l1_cpus"
+
+# Fixed, auditable upstream options bound RAM without modifying assertions or
+# enabling L3. Do not accept arbitrary command-line fragments from firmware.
+set --
+case "$test_name" in
+    demand_paging_test) set -- -b 64M -v 2 -u MISSING ;;
+    kvm_page_table_test) set -- -b 64M -v 2 ;;
+    memslot_modification_stress_test|dirty_log_perf_test) set -- -b 64M -v 2 ;;
+    access_tracking_perf_test)
+        mount -t debugfs debugfs /sys/kernel/debug || fail mount-debugfs
+        mount -t cgroup2 cgroup2 /sys/fs/cgroup || fail mount-cgroup2
+        echo +memory >/sys/fs/cgroup/cgroup.subtree_control || fail enable-memory-controller
+        set -- -b 64M -v 2 -w 0 ;;
+    mmu_stress_test) set -- -m 1 -s 1 -c 2 ;;
+    # The upstream map subtest supports <=8209 slots and otherwise silently
+    # continues. Exercise all six subtests with the same explicit slot cap.
+    memslot_perf_test) set -- -s 4096 ;;
+    private_mem_conversions_test) set -- -n 2 -m 4 ;;
+    dirty_log_page_splitting_test)
+        echo 128 >/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages || fail reserve-hugepages
+        set -- -b 64M -s anonymous_hugetlb_2mb ;;
+    nx_huge_pages_test)
+        # Match the upstream root wrapper, solely in this disposable guest.
+        echo 1 >/sys/module/kvm/parameters/nx_huge_pages || fail enable-nx-hugepages
+        echo 1 >/sys/module/kvm/parameters/nx_huge_pages_recovery_ratio || fail nx-recovery-ratio
+        echo 100 >/sys/module/kvm/parameters/nx_huge_pages_recovery_period_ms || fail nx-recovery-period
+        echo 3 >/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages || fail reserve-hugepages
+        set -- -t 887563923 -p 100 -r ;;
+    aperfmperf_test) modprobe msr || fail msr-module ;;
+esac
+echo "selftest arguments: $*"
 
 # Upstream lib/elf.c reopens program_invocation_name, so use an absolute path.
 # The tmpfs bounds output storage; timeout bounds all guest/user test execution.
@@ -90,8 +135,10 @@ rc=0
 runtime_limit=120
 # 512 fork/kill rounds each launch four vCPUs and 64 helper threads. Keep the
 # upstream iteration count; allow the slower Direct-VMX path a finite budget.
-[ "$test_name" != hardware_disable_test ] || runtime_limit=600
-/bin/busybox timeout -s KILL "$runtime_limit" /bin/kvm-selftest >/tmp/selftest.log 2>&1 || rc=$?
+case "$test_name" in
+    hardware_disable_test|kvm_create_max_vcpus|mmu_stress_test|memslot_perf_test|access_tracking_perf_test) runtime_limit=600 ;;
+esac
+/bin/busybox timeout -s KILL "$runtime_limit" /bin/kvm-selftest "$@" </dev/null >/tmp/selftest.log 2>&1 || rc=$?
 bytes=$(/bin/busybox wc -c </tmp/selftest.log) || fail output-size
 [ "$bytes" -le 1048576 ] || fail output-size
 # Non-TAP programs report completion via exit 0 after their assertions; some
@@ -99,7 +146,7 @@ bytes=$(/bin/busybox wc -c </tmp/selftest.log) || fail output-size
 # state_test deliberately covers L2 save/restore here, not its optional L3
 # checks: nested=0 prevents VMX/SVM exposure to the test's guest.
 case "$test_name" in
-    tsc_msrs_test|userspace_msr_exit_test|sync_regs_test|fix_hypercall_test|kvm_binary_stats_test|monitor_mwait_test)
+    tsc_msrs_test|userspace_msr_exit_test|sync_regs_test|fix_hypercall_test|kvm_binary_stats_test|monitor_mwait_test|steal_time)
         [ "$bytes" -gt 0 ] || fail missing-TAP ;;
 esac
 /bin/busybox cat /tmp/selftest.log || fail output-read

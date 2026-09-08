@@ -184,7 +184,7 @@ if [[ ${LINUX_L1_L2_OS:-0} != 0 ]]; then
     printf '%s\n' "${runtime_files[@]}" | sed 's|/[^/]*$||' | sort -u | paste -sd: - >"$root/opt/l2/library-path"
     ln -s -- "$qemu" "$root/opt/l2/qemu"
     firmware=${LINUX_L2_FIRMWARE:-"$(dirname -- "$qemu")/../share/qemu"}
-    for rom in bios-256k.bin kvmvapic.bin linuxboot_dma.bin; do
+    for rom in bios-256k.bin kvmvapic.bin linuxboot_dma.bin multiboot.bin multiboot_dma.bin; do
         [[ -f "$firmware/$rom" && -r "$firmware/$rom" ]] || die "missing L2 firmware: $rom"
         install -m 0644 -- "$firmware/$rom" "$root/opt/l2/firmware/$rom"
     done

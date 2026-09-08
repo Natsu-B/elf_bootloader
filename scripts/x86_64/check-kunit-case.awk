@@ -4,7 +4,7 @@ function reset_case() {
     bad=summaries=tests=skipped=expected_failures=passed=bare_pass=s3=sieve_static=sieve_mapped=sieve_virtual=measured=0
 }
 function record(line, fields, parts, item, i, words) {
-    if (line ~ /^FAIL:|^KFAIL:|^XPASS:|^ABORT:|^PANIC:|unexpected failures|known failures|Assertion failed/) bad=1
+    if (line ~ /(^|: )FAIL:|^KFAIL:|^XPASS:|^ABORT:|^PANIC:|unexpected failures|known failures|Assertion failed/) bad=1
     if (line ~ /^SUMMARY: /) {
         summaries++
         if (line !~ /^SUMMARY: [0-9]+ tests(, [0-9]+ expected failures)?(, [0-9]+ skipped)?$/) bad=1
@@ -36,7 +36,9 @@ function classify(status, name) {
     if (name == "s3") return summaries || s3 != 1
     if (name == "sieve") return summaries || sieve_static != 1 || sieve_mapped != 1 || sieve_virtual != 3
     if (name ~ /^vmexit_/) return summaries || measured != 1
-    return summaries != 1 || tests <= skipped
+    if (summaries != 1 || tests <= skipped) return 1
+    # Optional unsupported subtests are visible, never full-suite PASS.
+    return skipped || expected_failures ? 5 : 0
 }
 BEGIN {
     if (matrix) {
@@ -72,13 +74,13 @@ BEGIN {
         status=$6; sub(/^process_exit=/, "", status)
         if (status !~ /^[0-9]+$/ || status > 255) matrix_bad=1
         result=classify(status, name)
-        outcome=result == 0 ? "PASS" : (result == 4 ? "SKIP" : "FAIL")
+        outcome=result == 0 ? "PASS" : (result == 4 ? "SKIP" : (result == 5 ? "PARTIAL" : "FAIL"))
         if ($0 != "thin-hv: KVM unit exit name=" name " process_exit=" status " outcome=" outcome) matrix_bad=1
-        if (result == 0) ok++; else if (result == 4) unavailable++; else failed++
+        if (result == 0) ok++; else if (result == 4) unavailable++; else if (result == 5) partial++; else failed++
         active=0; exits++
     } else if ($0 ~ /^thin-hv: KVM unit matrix complete /) {
         if (begin != 1 || active || exits != count || complete ||
-            $0 != "thin-hv: KVM unit matrix complete backend=" backend " selection=" selection " cases=" count " passed=" ok+0 " failed=" failed+0 " skipped=" unavailable+0) matrix_bad=1
+            $0 != "thin-hv: KVM unit matrix complete backend=" backend " selection=" selection " cases=" count " passed=" ok+0 " failed=" failed+0 " skipped=" unavailable+0 " partial=" partial+0) matrix_bad=1
         complete++
     } else if ($0 == "thin-hv: KVM unit matrix poweroff requested") {
         if (complete != 1 || poweroff) matrix_bad=1
@@ -87,5 +89,5 @@ BEGIN {
 }
 END {
     if (!matrix) exit classify(status, name)
-    exit (matrix_bad || begin != 1 || complete != 1 || poweroff != 1 || active || failed || unavailable)
+    exit (matrix_bad || begin != 1 || complete != 1 || poweroff != 1 || active || failed || unavailable || partial)
 }

@@ -3769,6 +3769,11 @@ mod tests {
                     false,
                 ),
                 ("monitor_mwait_test", mwait_names, false),
+                (
+                    "steal_time",
+                    (0..4).map(|n| format!("vcpu{n}")).collect::<Vec<_>>(),
+                    false,
+                ),
             ] {
                 let count = labels.len();
                 let assertions = labels
@@ -3901,11 +3906,65 @@ mod tests {
                 "guest_memfd_test",
                 "system_counter_offset_test",
                 "pre_fault_memory_test",
+                "demand_paging_test",
+                "kvm_create_max_vcpus",
+                "kvm_page_table_test",
+                "memslot_modification_stress_test",
+                "memslot_perf_test",
+                "access_tracking_perf_test",
+                "dirty_log_perf_test",
+                "mmu_stress_test",
+                "rseq_test",
+                "xen_vmcall_test",
+                "xen_shinfo_test",
+                "private_mem_kvm_exits_test",
+                "private_mem_conversions_test",
+                "nx_huge_pages_test",
+                "dirty_log_page_splitting_test",
+                "vmx_exception_with_invalid_guest_state",
+                "aperfmperf_test",
+                "kvm_buslock_test",
+                "hwcr_msr_test",
             ] {
+                let cpus = if name == "rseq_test" && backend == "outer-kvm" {
+                    2
+                } else {
+                    1
+                };
                 let valid = format!(
-                    "thin-hv: backend={backend} role={role}\nthin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus=1\nthin-hv: linux KVM selftest exit backend={backend} test={name} process_exit=0\nthin-hv: linux KVM selftest PASS backend={backend} test={name} assertions=1\nthin-hv: linux KVM selftest poweroff requested\n"
+                    "thin-hv: backend={backend} role={role}\nthin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus={cpus}\nthin-hv: linux KVM selftest exit backend={backend} test={name} process_exit=0\nthin-hv: linux KVM selftest PASS backend={backend} test={name} assertions=1\nthin-hv: linux KVM selftest poweroff requested\n"
                 );
+                let valid = if name == "memslot_perf_test" {
+                    let results = ["map", "unmap", "unmap chunked", "move active area", "move inactive area", "RW"]
+                        .map(|label| format!("Testing {label} performance with 1 runs, 5 seconds each\nDone 42 iterations, avg 0.100000000s each\n"))
+                        .join("");
+                    valid.replace(
+                        "thin-hv: linux KVM selftest exit",
+                        &(results + "thin-hv: linux KVM selftest exit"),
+                    )
+                } else {
+                    valid
+                };
                 assert!(check(backend, name, &valid));
+                if name == "memslot_perf_test" {
+                    for (from, to) in [
+                        ("Done 42", "Done 0"),
+                        ("Testing map performance", "Testing unmap performance"),
+                        ("Done 42 iterations, avg 0.100000000s each\n", ""),
+                    ] {
+                        assert!(!check(backend, name, &valid.replace(from, to)));
+                    }
+                    assert!(!check(
+                        backend,
+                        name,
+                        &(valid.clone() + "Memslot count too high for this test\n")
+                    ));
+                }
+                assert!(!check(
+                    backend,
+                    name,
+                    &valid.replace(&format!("l1_cpus={cpus}"), "l1_cpus=3")
+                ));
                 for status in ["1", "4", "137"] {
                     assert!(!check(
                         backend,
@@ -3979,19 +4038,25 @@ mod tests {
             manifest.clone() + "x2apic|apic.flat|2|128|30|qemu64|-\n",
             manifest.replace("apic.flat", "../apic.flat"),
             manifest.replace("|128|", "|9999999999999|"),
-            manifest.replace("|30|", "|301|"),
+            manifest.replace("|1200|", "|1801|"),
             manifest.replace("|2|", "|0|"),
             manifest.replace("|qemu64|", "|qemu64;reboot|"),
         ] {
             assert_ne!(check(&["--check-manifest"], &invalid), 0);
         }
         for (text, status, expected) in [
-            ("SUMMARY: 3 tests, 1 skipped\n", "1", 0),
+            ("SUMMARY: 3 tests, 1 skipped\n", "1", 5),
+            ("SUMMARY: 3 tests, 1 expected failures\n", "1", 5),
             ("SUMMARY: 1 tests, 1 skipped\n", "77", 4),
             ("SUMMARY: 1 tests, 1 skipped\n", "1", 1),
             ("SUMMARY: 1 tests\n", "3", 1),
             ("SUMMARY: 1 tests\n", "137", 1),
             ("SUMMARY: 1 tests\nFAIL: late\n", "1", 1),
+            (
+                "test pte.a: FAIL: wrong accessed bit\nSUMMARY: 1 tests\n",
+                "1",
+                1,
+            ),
             ("SUMMARY: 1 tests, 1 known failures\n", "1", 1),
             ("SUMMARY: 1 tests, 2 skipped\n", "1", 1),
             ("SUMMARY: 1 tests, 1 expected failures, 1 skipped\n", "1", 1),
@@ -4044,7 +4109,7 @@ mod tests {
                     "thin-hv: KVM unit exit name={name} process_exit=1 outcome=PASS\n"
                 ));
             }
-            valid.push_str(&format!("thin-hv: KVM unit matrix complete backend={backend} selection=all cases={} passed={} failed=0 skipped=0\nthin-hv: KVM unit matrix poweroff requested\n", cases.len(), cases.len()));
+            valid.push_str(&format!("thin-hv: KVM unit matrix complete backend={backend} selection=all cases={} passed={} failed=0 skipped=0 partial=0\nthin-hv: KVM unit matrix poweroff requested\n", cases.len(), cases.len()));
             assert_eq!(check(&["--check-log", backend, "all"], &valid), 0);
             assert_eq!(
                 check(

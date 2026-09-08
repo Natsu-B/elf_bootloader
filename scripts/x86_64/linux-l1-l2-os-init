@@ -48,7 +48,7 @@ for cpus in 1 2 1 2 1 2; do
         -netdev user,id=net0,restrict=on -device virtio-net-pci,netdev=net0,romfile= \
         -kernel /opt/l2/kernel -initrd /opt/l2/initrd.cpio.gz \
         -append "console=ttyS0,115200 rdinit=/init panic=0 loglevel=3 net.ifnames=0 thin_hv_l2_cpus=$cpus thin_hv_l2_boot=$boot" \
-        >/tmp/l2.log 2>&1 || rc=$?
+        </dev/null >/tmp/l2.log 2>&1 || rc=$?
     bytes=$("$bb" wc -c </tmp/l2.log)
     [ "$bytes" -gt 0 ] && [ "$bytes" -le 1048576 ] || fail output-size
     "$bb" sed 's/\r$//; s/^/L2: /' /tmp/l2.log

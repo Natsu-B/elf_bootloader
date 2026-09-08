@@ -14,7 +14,12 @@ valid_test() {
         hyperv_clock|hyperv_cpuid|hyperv_features|hyperv_ipi|hyperv_tlb_flush|hyperv_extended_hypercalls|\
         set_boot_cpu_id|max_vcpuid_cap_test|smm_test|amx_test|pmu_counters_test|pmu_event_filter_test|\
         dirty_log_test|guest_print_test|irqfd_test|set_memory_region_test|coalesced_io_test|\
-        hardware_disable_test|guest_memfd_test|system_counter_offset_test|pre_fault_memory_test) ;;
+        hardware_disable_test|guest_memfd_test|system_counter_offset_test|pre_fault_memory_test|\
+        demand_paging_test|kvm_create_max_vcpus|kvm_page_table_test|memslot_modification_stress_test|\
+        memslot_perf_test|access_tracking_perf_test|dirty_log_perf_test|mmu_stress_test|rseq_test|steal_time|\
+        xen_vmcall_test|xen_shinfo_test|private_mem_kvm_exits_test|private_mem_conversions_test|\
+        nx_huge_pages_test|dirty_log_page_splitting_test|vmx_exception_with_invalid_guest_state|\
+        aperfmperf_test|kvm_buslock_test|hwcr_msr_test) ;;
         *) return 1 ;;
     esac
 }
@@ -31,6 +36,8 @@ check_log() {
     awk -v backend="$backend" -v test_name="$test_name" '
         BEGIN {
             count = 1
+            l1_cpus = test_name == "rseq_test" && backend == "outer-kvm" ? 2 : 1
+            split("map|unmap|unmap chunked|move active area|move inactive area|RW", slot_names, "|")
             names[1] = "msr_filter_allow"; names[2] = "msr_filter_deny"
             names[3] = "msr_permission_bitmap"; names[4] = "user_exit_msr_flags"
             prefix="user_msr."
@@ -45,6 +52,10 @@ check_log() {
                 split("enable_quirk disable_quirk", names, " ")
             }
             if (test_name == "kvm_binary_stats_test") { tap=1; count=4 }
+            if (test_name == "steal_time") {
+                tap=1; count=4; prefix=""
+                for (i=1; i<=count; i++) names[i]="vcpu" (i-1)
+            }
             if (test_name == "monitor_mwait_test") {
                 tap=1; count=12; prefix=""
                 for (tc=0; tc<16; tc++) {
@@ -60,11 +71,12 @@ check_log() {
             sub(/\r$/, "")
             if ($0 ~ /Kernel panic|Oops:|BUG:|thin-hv: linux KVM selftest FAIL|Test Assertion Failure|^not ok |^Bail out!|^#.*FAIL|^#.*ERROR|# SKIP|# XFAIL|# XPASS/) bad=1
             if (index($0, "thin-hv: linux KVM selftest ") == 1) {
-                if ($0 == "thin-hv: linux KVM selftest begin backend=" backend " test=" test_name " l1_cpus=1") {
+                if ($0 == "thin-hv: linux KVM selftest begin backend=" backend " test=" test_name " l1_cpus=" l1_cpus) {
                     if (begin || ended || done || poweroff) bad=1
                     begin++
                 } else if ($0 == "thin-hv: linux KVM selftest exit backend=" backend " test=" test_name " process_exit=0") {
                     if (begin != 1 || (tap && (header != 1 || plan != 1 || passed != count || totals != 1)) ||
+                        (test_name == "memslot_perf_test" && (slot_starts != 6 || slot_done != 6)) ||
                         (harness && suite != 1) || ended || done || poweroff) bad=1
                     ended++
                 } else if ($0 == "thin-hv: linux KVM selftest PASS backend=" backend " test=" test_name " assertions=" count) {
@@ -75,6 +87,19 @@ check_log() {
                     poweroff++
                 } else bad=1
                 next
+            }
+            if (test_name == "memslot_perf_test") {
+                if ($0 ~ /Memslot count|No iterations/) bad=1
+                if ($0 ~ /^Testing /) {
+                    if (slot_starts != slot_done || begin != 1 || ended) bad=1
+                    slot_starts++
+                    if ($0 != "Testing " slot_names[slot_starts] " performance with 1 runs, 5 seconds each") bad=1
+                }
+                if ($0 ~ /^Done /) {
+                    if ($0 !~ /^Done [1-9][0-9]* iterations, avg [0-9]+\.[0-9]+s each$/ ||
+                        slot_starts != slot_done+1 || ended) bad=1
+                    slot_done++
+                }
             }
             if ($0 ~ /^TAP version |^1\.\.|^ok |^# Totals:|^# PASSED:/) {
                 if (!tap) bad=1
@@ -114,7 +139,9 @@ backend=${LINUX_SELFTEST_BACKEND:-direct-vmx}
 test_name=${LINUX_SELFTEST_NAME:-}
 selftest=${LINUX_SELFTEST_ELF:-}
 default_timeout=300
-[[ "$test_name" != hardware_disable_test ]] || default_timeout=900
+case "$test_name" in
+    hardware_disable_test|kvm_create_max_vcpus|mmu_stress_test|memslot_perf_test|access_tracking_perf_test) default_timeout=900 ;;
+esac
 timeout_seconds=${LINUX_SELFTEST_TIMEOUT_SECONDS:-$default_timeout}
 valid_test "$test_name" || die 'unsupported pinned KVM selftest name'
 # The non-TAP upstream programs return 0 only after UCALL_DONE and all
@@ -122,7 +149,7 @@ valid_test "$test_name" || die 'unsupported pinned KVM selftest name'
 # individual guest assertions; exit 4 (KSFT_SKIP) is always a failure here.
 case "$test_name" in
     tsc_msrs_test) assertions=5 ;;
-    userspace_msr_exit_test|kvm_binary_stats_test) assertions=4 ;;
+    userspace_msr_exit_test|kvm_binary_stats_test|steal_time) assertions=4 ;;
     sync_regs_test) assertions=10 ;;
     fix_hypercall_test) assertions=2 ;;
     monitor_mwait_test) assertions=12 ;;
@@ -143,15 +170,38 @@ case "$backend" in
 esac
 output="$repo_root/bin/x86_64/linux-selftest-$test_name-$backend.efi"
 serial_log="$repo_root/bin/x86_64/serial.log"
+cpu='host,+vmx,-hypervisor,kvm=off'
+memory=2G
+pci_profile=firmware-default
+l1_cpus=1
+if [[ "$test_name" == rseq_test && "$backend" == outer-kvm ]]; then
+    # CPU migration requires two L1 CPUs. Direct L0 does not own APs yet;
+    # never infer Direct SMP success from this reference-only topology.
+    l1_cpus=2
+fi
+case "$test_name" in
+    kvm_create_max_vcpus|mmu_stress_test)
+        # Bound these memory-heavy tests inside the explicit QEMU fixture.
+        memory=4G; pci_profile=q35-smoke-1g ;;
+esac
+if [[ "$test_name" == monitor_mwait_test ]]; then
+    # QEMU masks MONITOR by default even on supporting Intel hardware. This
+    # named test profile requests it explicitly; unsupported KVM still fails.
+    cpu='host,+vmx,+monitor,-hypervisor,kvm=off'
+fi
+printf 'x86 Linux KVM selftest: test=%s cpu=%s\n' "$test_name" "$cpu"
+extra_modules=
+[[ "$test_name" != aperfmperf_test ]] || extra_modules=msr
 cd -- "$repo_root"
 cargo xbuild x86 --release
 env LINUX_L1_INIT="$repo_root/scripts/x86_64/linux-l1-selftest-init" \
-    LINUX_L1_KVM_SELFTEST="$selftest" LINUX_L1_EXTRA_MODULES= \
-    LINUX_L1_CMDLINE="console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=1 panic=0 thin_hv_selftest_backend=$backend thin_hv_selftest_name=$test_name" \
+    LINUX_L1_KVM_SELFTEST="$selftest" LINUX_L1_EXTRA_MODULES="$extra_modules" \
+    LINUX_L1_CMDLINE="console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=$l1_cpus panic=0 thin_hv_selftest_backend=$backend thin_hv_selftest_name=$test_name" \
     scripts/x86_64/build-linux-uki.sh "$output"
 env X86_UEFI_BACKEND="$backend" X86_UEFI_ACCEL=kvm X86_MONITOR_IMAGE="$monitor" \
     X86_UEFI_PHYSICAL_POLICY=0 X86_UEFI_HOST_EXCEPTION_TEST=0 \
-    X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' X86_UEFI_MEMORY=2G X86_UEFI_SMP=1 \
+    X86_UEFI_CPU="$cpu" X86_UEFI_MEMORY="$memory" X86_UEFI_SMP="$l1_cpus" \
+    X86_UEFI_PCI_PROFILE="$pci_profile" \
     X86_UEFI_GUEST_LOCATION=guest X86_UEFI_ALLOW_REBOOT=0 X86_UEFI_REQUIRE_POWEROFF=1 \
     X86_UEFI_ACPI_S3=0 X86_UEFI_WAKE_CYCLES=0 X86_UEFI_DATA_DISK= X86_UEFI_USERNET=0 \
     X86_UEFI_TIMEOUT_SECONDS="$timeout_seconds" \

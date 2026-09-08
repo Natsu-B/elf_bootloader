@@ -1,8 +1,9 @@
 # name|flat|vcpus|memory_mib|timeout_seconds|cpu|guest_argument
 # Pinned kvm-unit-tests 714bfd622b00cb5e8f2dad9e620641a0adb74ab7.
 # VMX/SVM/EPT tests require another nesting level (L3), not enabled here.
-x2apic|apic.flat|2|128|30|qemu64,+x2apic,+tsc-deadline|-
-xapic|apic.flat|2|128|60|qemu64,-x2apic,+tsc-deadline|-
+# NMI stress retains all 30,000/100,000 upstream repetitions on one L1 CPU.
+x2apic|apic.flat|2|128|1200|qemu64,+x2apic,+tsc-deadline|-
+xapic|apic.flat|2|128|1200|qemu64,-x2apic,+tsc-deadline|-
 ioapic|ioapic.flat|4|128|90|qemu64,+x2apic|-
 smptest|smptest.flat|2|128|90|qemu64|-
 smptest3|smptest.flat|3|128|90|qemu64|-
@@ -19,12 +20,12 @@ vmexit_tscdeadline_immed|vmexit.flat|1|128|90|qemu64,+x2apic,+tsc-deadline|tscde
 vmexit_cr0_wp|vmexit.flat|2|128|90|qemu64|toggle_cr0_wp
 vmexit_cr4_pge|vmexit.flat|2|128|90|qemu64|toggle_cr4_pge
 access|access_test.flat|1|128|90|max,host-phys-bits|-
-access_fep|access_test.flat|1|128|240|max,host-phys-bits|force_emulation
-access-reduced-maxphyaddr|access_test.flat|1|128|90|IvyBridge,phys-bits=36,host-phys-bits=off|-
+access_fep|access_test.flat|1|128|600|max,host-phys-bits|force_emulation
+access-reduced-maxphyaddr|access_test.flat|1|128|600|IvyBridge,phys-bits=36,host-phys-bits=off|-
 smap|smap.flat|1|128|90|max|-
 pku|pku.flat|1|128|90|max|-
 pks|pks.flat|1|128|90|max|-
-asyncpf|asyncpf.flat|1|2048|90|host|-
+asyncpf|asyncpf.flat|1|2048|600|host|-
 emulator|emulator.flat|1|128|90|qemu64|-
 eventinj|eventinj.flat|1|128|90|qemu64|-
 hypercall|hypercall.flat|1|128|90|qemu64|-

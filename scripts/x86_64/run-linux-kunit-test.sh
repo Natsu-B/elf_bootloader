@@ -19,7 +19,7 @@ check_manifest() {
             if (NF != 7 || $1 !~ /^[a-z][a-z0-9_-]*$/ || seen[$1]++ ||
                 $2 !~ /^[a-z][a-z0-9_-]*\.flat$/ || $3 !~ /^[1-4]$/ ||
                 $4 !~ /^[0-9]+$/ || $4 < 128 || $4 > 2048 ||
-                $5 !~ /^[0-9]+$/ || $5 < 1 || $5 > 300 ||
+                $5 !~ /^[0-9]+$/ || $5 < 1 || $5 > 1800 ||
                 $6 !~ /^[A-Za-z0-9_.,+=-]+$/ || $7 !~ /^[-a-z0-9_]+$/) bad=1
             count++
         }
@@ -66,12 +66,20 @@ env LINUX_L1_L2_OS=1 LINUX_L1_KVM_SELFTEST= LINUX_L1_EXTRA_MODULES= \
     LINUX_L1_INIT="$repo_root/scripts/x86_64/linux-l1-kunit-init" \
     LINUX_L1_CMDLINE="console=ttyS0,115200n8 rdinit=/init maxcpus=1 panic=0 thin_hv_kunit_backend=$backend thin_hv_kunit_case=$selection" \
     bash scripts/x86_64/build-linux-uki.sh "$output"
+swap_disk=
+if [[ "$selection" == all || "$selection" == asyncpf ]]; then
+    # Same private scratch-disk lifetime as the existing Linux soak runner.
+    # No physical block device or host swap configuration is ever used.
+    swap_disk=$(mktemp "$repo_root/bin/x86_64/kunit-swap.XXXXXX.raw")
+    trap 'rm -f -- "$swap_disk"' EXIT
+    truncate -s 2G "$swap_disk"
+fi
 env X86_UEFI_BACKEND="$backend" X86_UEFI_ACCEL=kvm X86_MONITOR_IMAGE="$monitor" \
     X86_UEFI_PCI_PROFILE=q35-smoke-1g \
     X86_UEFI_PHYSICAL_POLICY=0 X86_UEFI_HOST_EXCEPTION_TEST=0 \
     X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' X86_UEFI_MEMORY=4G X86_UEFI_SMP=1 \
     X86_UEFI_GUEST_LOCATION=guest X86_UEFI_ALLOW_REBOOT=0 X86_UEFI_REQUIRE_POWEROFF=1 \
-    X86_UEFI_ACPI_S3=0 X86_UEFI_WAKE_CYCLES=0 X86_UEFI_DATA_DISK= X86_UEFI_USERNET=0 \
+    X86_UEFI_ACPI_S3=0 X86_UEFI_WAKE_CYCLES=0 X86_UEFI_DATA_DISK="$swap_disk" X86_UEFI_USERNET=0 \
     X86_UEFI_TIMEOUT_SECONDS=7200 X86_VARIABLE_MARKER= \
     X86_RETURN_MARKER="thin-hv: KVM unit matrix complete backend=$backend selection=$selection" \
     X86_GUEST_MARKER='thin-hv: KVM unit matrix poweroff requested' \

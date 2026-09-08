@@ -27,10 +27,37 @@ read -r online </sys/devices/system/cpu/online
 "$bb" modprobe kvm force_emulation_prefix=1 enable_vmware_backdoor=1 || fail kvm-module
 "$bb" modprobe kvm_intel nested=0 allow_smaller_maxphyaddr=1 || fail kvm-intel-module
 [ -c /dev/kvm ] || fail missing-kvm
+if [ "$selection" = all ] || [ "$selection" = asyncpf ]; then
+    "$bb" modprobe virtio_pci || fail virtio-pci-module
+    "$bb" modprobe virtio_blk || fail virtio-blk-module
+    # Select the existing runner's explicit scratch-device serial, not firmware
+    # enumeration order (the ESP itself may also be a virtio disk).
+    swap_device=
+    for block in /sys/block/*; do
+        serial=$("$bb" cat "$block/serial" 2>/dev/null || true)
+        [ -n "$serial" ] || serial=$("$bb" cat "$block/device/serial" 2>/dev/null || true)
+        [ "$serial" = THINHVDATA ] || continue
+        [ -z "$swap_device" ] || fail duplicate-private-swap-disk
+        swap_device=/dev/${block##*/}
+        read -r sectors <"$block/size"
+    done
+    [ -n "$swap_device" ] && [ -b "$swap_device" ] || fail missing-private-swap-disk
+    [ "$sectors" = 4194304 ] || fail private-swap-disk-size
+    "$bb" mkswap "$swap_device" || fail format-private-swap
+    "$bb" swapon "$swap_device" || fail enable-private-swap
+    "$bb" mount -t cgroup2 cgroup2 /sys/fs/cgroup || fail mount-cgroup2
+    echo +memory >/sys/fs/cgroup/cgroup.subtree_control || fail enable-memory-controller
+    "$bb" mkdir /sys/fs/cgroup/kunit-asyncpf || fail create-memory-cgroup
+    # Throttle/reclaim before the hard ceiling so temporary swap-cache
+    # writeback does not immediately OOM the test instead of producing APFs.
+    echo 402653184 >/sys/fs/cgroup/kunit-asyncpf/memory.high || fail memory-pressure
+    echo 1610612736 >/sys/fs/cgroup/kunit-asyncpf/memory.max || fail memory-limit
+    echo 2147483648 >/sys/fs/cgroup/kunit-asyncpf/memory.swap.max || fail swap-limit
+fi
 read -r l2_library_path </opt/l2/library-path
 [ -n "$l2_library_path" ] || fail library-path
 echo "thin-hv: KVM unit matrix begin backend=$backend selection=$selection l1_cpus=1"
-cases=0; passed=0; failed=0; skipped=0
+cases=0; passed=0; failed=0; skipped=0; partial=0
 while IFS='|' read -r name flat cpus memory seconds cpu argument; do
     case "$name" in ''|'#'*) continue ;; esac
     [ "$selection" = all ] || [ "$selection" = "$name" ] || continue
@@ -47,27 +74,42 @@ while IFS='|' read -r name flat cpus memory seconds cpu argument; do
     [ "$name" != kvmclock_test ] || guest_args="10000000 $("$bb" date +%s)"
     echo "thin-hv: KVM unit start name=$name cpus=$cpus memory_mib=$memory timeout_seconds=$seconds accel=kvm"
     rc=0
-    LD_LIBRARY_PATH="$l2_library_path" "$bb" timeout -s KILL "$seconds" /opt/l2/qemu \
+    # Only the async-PF child enters the bounded swapping cgroup. exec keeps
+    # timeout ownership on the QEMU PID; it cannot kill an unrelated VM.
+    LD_LIBRARY_PATH="$l2_library_path" "$bb" timeout -s KILL "$seconds" "$bb" sh -c '
+        if [ "$1" = asyncpf ]; then
+            echo $$ >/sys/fs/cgroup/kunit-asyncpf/cgroup.procs || exit 1
+        fi
+        shift
+        exec "$@"
+    ' kunit-child "$name" /opt/l2/qemu \
         -L /opt/l2/firmware -accel kvm -cpu "$cpu" -smp "$cpus" -m "$memory" \
         -no-reboot -nodefaults -display none -serial stdio -monitor none \
         -global kvm-pit.lost_tick_policy=discard -device pc-testdev -device pci-testdev \
         -device isa-debug-exit,iobase=0xf4,iosize=0x4 "$@" \
-        -kernel "/opt/l2/kunit/$flat" -append "$guest_args" >/tmp/unit.log 2>&1 || rc=$?
+        -kernel "/opt/l2/kunit/$flat" -append "$guest_args" </dev/null >/tmp/unit.log 2>&1 || rc=$?
     bytes=$("$bb" wc -c </tmp/unit.log)
     [ "$bytes" -le 4194304 ] || fail output-size
     "$bb" sed 's/\r$//; s/^/KUNIT: /' /tmp/unit.log
+    if [ "$name" = asyncpf ]; then
+        echo 'AsyncPF memory-pressure counters:'
+        "$bb" cat /sys/fs/cgroup/kunit-asyncpf/memory.events \
+            /sys/fs/cgroup/kunit-asyncpf/memory.peak \
+            /sys/fs/cgroup/kunit-asyncpf/memory.swap.peak || fail pressure-counters
+    fi
     classification=0
     "$bb" awk -v name="$name" -v argument="$argument" -v status="$rc" \
         -f /opt/l2/check-kunit-case.awk /tmp/unit.log || classification=$?
     case "$classification" in
         0) outcome=PASS; passed=$((passed + 1)) ;;
         4) outcome=SKIP; skipped=$((skipped + 1)) ;;
+        5) outcome=PARTIAL; partial=$((partial + 1)) ;;
         *) outcome=FAIL; failed=$((failed + 1)) ;;
     esac
     echo "thin-hv: KVM unit exit name=$name process_exit=$rc outcome=$outcome"
 done </opt/l2/kunit-cases.txt
 [ "$cases" -gt 0 ] || fail empty-selection
-echo "thin-hv: KVM unit matrix complete backend=$backend selection=$selection cases=$cases passed=$passed failed=$failed skipped=$skipped"
+echo "thin-hv: KVM unit matrix complete backend=$backend selection=$selection cases=$cases passed=$passed failed=$failed skipped=$skipped partial=$partial"
 echo 'thin-hv: KVM unit matrix poweroff requested'
 "$bb" poweroff -f || fail poweroff-failed
 fail poweroff-returned
