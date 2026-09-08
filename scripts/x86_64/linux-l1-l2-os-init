@@ -1,0 +1,62 @@
+#!/bin/sh
+# Execute real Linux L2 boots exclusively with KVM; no TCG fallback.
+set -eu
+export PATH=/bin
+bb=/bin/busybox
+fail() {
+    echo "thin-hv: linux L2 OS FAIL $*"
+    "$bb" poweroff -f || true
+    exit 1
+}
+"$bb" mount -t devtmpfs devtmpfs /dev || fail mount-dev
+"$bb" mount -t proc proc /proc || fail mount-proc
+"$bb" mount -t sysfs sysfs /sys || fail mount-sys
+"$bb" mkdir -p /tmp || fail mkdir-tmp
+"$bb" mount -t tmpfs -o size=96m tmpfs /tmp || fail mount-tmp
+backend=
+read -r arguments </proc/cmdline
+set -f
+for argument in $arguments; do
+    case "$argument" in
+        thin_hv_l2_os_backend=*)
+            [ -z "$backend" ] || fail duplicate-backend
+            backend=${argument#*=}
+            case "$backend" in direct-vmx|outer-kvm) ;; *) fail invalid-backend ;; esac
+            ;;
+    esac
+done
+set +f
+[ -n "$backend" ] || fail missing-backend
+read -r online </sys/devices/system/cpu/online
+[ "$online" = 0 ] || fail requires-one-L1-cpu
+"$bb" modprobe kvm_intel nested=0 || fail kvm-module
+[ -c /dev/kvm ] || fail missing-kvm
+read -r l2_library_path </opt/l2/library-path
+[ -n "$l2_library_path" ] || fail library-path
+"$bb" dd if=/dev/zero of=/tmp/l2.disk bs=1048576 count=64 status=none || fail create-disposable-disk
+echo "thin-hv: linux L2 OS begin backend=$backend boots=6 l1_cpus=1"
+boot=0
+for cpus in 1 2 1 2 1 2; do
+    boot=$((boot + 1))
+    echo "thin-hv: linux L2 OS start boot=$boot cpus=$cpus accel=kvm"
+    rc=0
+    LD_LIBRARY_PATH="$l2_library_path" "$bb" timeout -s KILL 120 /opt/l2/qemu -L /opt/l2/firmware \
+        -machine q35 -accel kvm -cpu host -smp "$cpus" -m 512 \
+        -nodefaults -display none -serial stdio -monitor none -no-reboot \
+        -drive if=none,id=disk,format=raw,file=/tmp/l2.disk \
+        -device virtio-blk-pci,drive=disk \
+        -netdev user,id=net0,restrict=on -device virtio-net-pci,netdev=net0,romfile= \
+        -kernel /opt/l2/kernel -initrd /opt/l2/initrd.cpio.gz \
+        -append "console=ttyS0,115200 rdinit=/init panic=0 loglevel=3 net.ifnames=0 thin_hv_l2_cpus=$cpus thin_hv_l2_boot=$boot" \
+        >/tmp/l2.log 2>&1 || rc=$?
+    bytes=$("$bb" wc -c </tmp/l2.log)
+    [ "$bytes" -gt 0 ] && [ "$bytes" -le 1048576 ] || fail output-size
+    "$bb" sed 's/\r$//; s/^/L2: /' /tmp/l2.log
+    echo "thin-hv: linux L2 OS exit boot=$boot cpus=$cpus process_exit=$rc"
+    [ "$rc" = 0 ] || fail "qemu-exit=$rc"
+    "$bb" grep -q "^thin-hv: linux OS L2 PASS cpus=$cpus " /tmp/l2.log || fail missing-L2-PASS
+done
+echo "thin-hv: linux L2 OS PASS backend=$backend boots=6 l1_cpus=1 l2_cpus=1,2"
+echo 'thin-hv: linux L2 OS poweroff requested'
+"$bb" poweroff -f || fail poweroff-failed
+fail poweroff-returned

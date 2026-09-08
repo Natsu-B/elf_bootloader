@@ -149,6 +149,74 @@ install -m 0755 -- "$init_source" "$root/init"
 if [[ -n "$selftest" ]]; then
     install -m 0755 -- "$selftest" "$root/bin/kvm-selftest"
 fi
+if [[ ${LINUX_L1_L2_OS:-0} != 0 ]]; then
+    [[ ${LINUX_L1_L2_OS} == 1 && -z "$selftest" ]] || die 'L2 OS mode must be 0 or 1 and cannot include a selftest'
+    qemu=$(first_command "${LINUX_L2_QEMU:-qemu-system-x86_64}") || die 'QEMU for L2 not found'
+    qemu=$(readlink -f -- "$qemu")
+    # Nix wraps QEMU to configure desktop plugins. The headless L2 needs the
+    # actual ELF, not that wrapper or the host desktop environment.
+    if [[ -x "$(dirname -- "$qemu")/.qemu-system-x86_64-wrapped" ]]; then
+        qemu="$(dirname -- "$qemu")/.qemu-system-x86_64-wrapped"
+    fi
+    case "$($file_cmd -Lb -- "$qemu")" in
+        'ELF 64-bit LSB executable, x86-64,'*|'ELF 64-bit LSB pie executable, x86-64,'*) ;;
+        *) die 'L2 QEMU is not an x86-64 executable' ;;
+    esac
+    ldd=$(first_command ldd) || die 'ldd not found for the trusted development QEMU'
+    dependencies=$(LC_ALL=C "$ldd" "$qemu") || die 'cannot resolve L2 QEMU dependencies'
+    [[ "$dependencies" != *'not found'* ]] || die 'missing L2 QEMU dependency'
+    # Keep absolute DT_NEEDED/RUNPATH and interpreter paths intact. Only
+    # existing runtime files are copied; no host directories/devices are shared.
+    mapfile -t runtime_files < <(awk '{ for (i=1; i<=NF; i++) if ($i ~ /^\//) print $i }' <<<"$dependencies" | sort -u)
+    ((${#runtime_files[@]} > 0 && ${#runtime_files[@]} <= 256)) || die 'unsupported QEMU dependency count'
+    total=0
+    for input in "$qemu" "${runtime_files[@]}"; do
+        [[ "$input" == /* && "$input" != *'/../'* && "$input" != *'/./'* && -f "$input" && -r "$input" ]] || die 'invalid QEMU runtime path'
+        bytes=$(stat -Lc %s -- "$input")
+        [[ "$bytes" =~ ^[0-9]{1,9}$ ]] && ((bytes > 0 && bytes <= 134217728)) || die 'oversized QEMU runtime file'
+        total=$((total + bytes))
+        ((total <= 536870912)) || die 'QEMU runtime exceeds 512 MiB'
+        install -Dm 0755 -- "$input" "$root$input"
+    done
+    mkdir -p -- "$root/opt/l2/firmware" "$work/l2/bin" "$work/l2/dev" "$work/l2/proc" "$work/l2/sys"
+    # Some Nix wrappers supply search paths absent from the ELF RUNPATH.
+    # Preserve the resolved library directories for this child process only.
+    printf '%s\n' "${runtime_files[@]}" | sed 's|/[^/]*$||' | sort -u | paste -sd: - >"$root/opt/l2/library-path"
+    ln -s -- "$qemu" "$root/opt/l2/qemu"
+    firmware=${LINUX_L2_FIRMWARE:-"$(dirname -- "$qemu")/../share/qemu"}
+    for rom in bios-256k.bin kvmvapic.bin linuxboot_dma.bin; do
+        [[ -f "$firmware/$rom" && -r "$firmware/$rom" ]] || die "missing L2 firmware: $rom"
+        install -m 0644 -- "$firmware/$rom" "$root/opt/l2/firmware/$rom"
+    done
+    install -m 0644 -- "$kernel" "$root/opt/l2/kernel"
+    install -m 0755 -- "$busybox" "$work/l2/bin/busybox"
+    ln -s busybox "$work/l2/bin/sh"
+    install -m 0755 -- "$repo_root/scripts/x86_64/linux-l2-os-init" "$work/l2/init"
+    if [[ -n ${LINUX_L2_KUNIT_DIR:-} ]]; then
+        manifest="$repo_root/scripts/x86_64/linux-l2-kunit-cases.txt"
+        bash "$repo_root/scripts/x86_64/run-linux-kunit-test.sh" --check-manifest "$manifest" || die 'invalid kvm-unit-tests manifest'
+        mkdir -p -- "$root/opt/l2/kunit"
+        while IFS= read -r flat; do
+            input="$LINUX_L2_KUNIT_DIR/$flat"
+            [[ -f "$input" && -r "$input" ]] || die "missing flat program: $flat"
+            bytes=$(stat -Lc %s -- "$input")
+            [[ "$bytes" =~ ^[0-9]{1,8}$ ]] && ((bytes > 0 && bytes <= 16777216)) || die "oversized flat program: $flat"
+            # file(1) versions name EM_386 either "i386" or "80386".
+            case "$($file_cmd -Lb -- "$input")" in
+                'ELF 32-bit LSB executable, Intel i386,'*'statically linked'*|\
+                'ELF 32-bit LSB executable, Intel 80386,'*'statically linked'*) ;;
+                *) die "not a Multiboot ELF: $flat" ;;
+            esac
+            install -m 0644 -- "$input" "$root/opt/l2/kunit/$flat"
+            sha256sum -- "$input"
+        done < <(awk -F'|' '!/^#/ && NF { print $2 }' "$manifest" | sort -u)
+        install -m 0644 -- "$manifest" "$root/opt/l2/kunit-cases.txt"
+        install -m 0644 -- "$repo_root/scripts/x86_64/check-kunit-case.awk" "$root/opt/l2/check-kunit-case.awk"
+    fi
+    extra_modules+=(virtio_pci virtio_blk virtio_net)
+    printf 'linux L1 UKI: L2 QEMU=%s runtime_files=%s runtime_bytes=%s\n' "$qemu" "${#runtime_files[@]}" "$total"
+    sha256sum -- "$qemu" "$kernel"
+fi
 "$cc" -Os -Wall -Wextra -Werror -ffreestanding -fno-pie -fno-stack-protector \
     -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdlib -static -no-pie -s \
     -Wl,--build-id=none,-e,_start "$kvm_probe_source" -o "$root/bin/kvm-probe"
@@ -174,6 +242,16 @@ find "$root/lib/modules/$kernel_release" -name 'efivarfs.ko*' -print -quit | gre
     || die "efivarfs module not found for $kernel_release"
 install -m 0644 -- "$modules_root"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kernel_release/"
 "$depmod" -b "$root" "$kernel_release"
+if [[ ${LINUX_L1_L2_OS:-0} == 1 ]]; then
+    mkdir -p -- "$work/l2/lib"
+    cp -a -- "$root/lib/modules" "$work/l2/lib/"
+    find "$work/l2" -exec touch -h -d '@0' -- {} +
+    (
+        cd -- "$work/l2"
+        find . -print0 | sort -z | "$cpio" --null --create --format=newc --owner=0:0 --reproducible 2>/dev/null
+    ) | "$gzip" -9n >"$root/opt/l2/initrd.cpio.gz"
+    sha256sum -- "$root/opt/l2/initrd.cpio.gz"
+fi
 find "$root" -exec touch -h -d '@0' -- {} +
 
 (

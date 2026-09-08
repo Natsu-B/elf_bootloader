@@ -1,0 +1,88 @@
+#!/bin/sh
+# Real L2 Linux userspace workload. No host disk, credentials or networking.
+set -eu
+export PATH=/bin
+bb=/bin/busybox
+fail() {
+    echo "thin-hv: linux OS L2 FAIL $*"
+    "$bb" poweroff -f || true
+    exit 1
+}
+"$bb" mount -t devtmpfs devtmpfs /dev || fail mount-dev
+"$bb" mount -t proc proc /proc || fail mount-proc
+"$bb" mount -t sysfs sysfs /sys || fail mount-sys
+"$bb" mkdir -p /tmp || fail mkdir-tmp
+"$bb" mount -t tmpfs -o size=96m tmpfs /tmp || fail mount-tmp
+cpus=
+boot=
+read -r arguments </proc/cmdline
+set -f
+for argument in $arguments; do
+    case "$argument" in
+        thin_hv_l2_cpus=*)
+            [ -z "$cpus" ] || fail duplicate-cpus
+            cpus=${argument#*=}
+            case "$cpus" in 1|2) ;; *) fail invalid-cpus ;; esac
+            ;;
+        thin_hv_l2_boot=*)
+            [ -z "$boot" ] || fail duplicate-boot
+            boot=${argument#*=}
+            case "$boot" in 1|2|3|4|5|6) ;; *) fail invalid-boot ;; esac
+            ;;
+    esac
+done
+set +f
+[ -n "$boot" ] || fail missing-boot
+read -r online </sys/devices/system/cpu/online
+case "$cpus:$online" in 1:0|2:0-1) ;; *) fail "cpu-topology=$cpus:$online" ;; esac
+echo "thin-hv: linux OS L2 begin cpus=$cpus"
+"$bb" dd if=/dev/zero of=/tmp/memory bs=1048576 count=32 status=none || fail allocate-memory
+# This fixed hash is independently checked by the host gate as well.
+expected=83ee47245398adee79bd9c0a8bc57b821e92aba10f5f9ade8a5d1fae4d8c4302
+worker() {
+    index=0
+    while [ "$index" -lt 16 ]; do
+        set -- $("$bb" sha256sum /tmp/memory)
+        [ "$1" = "$expected" ] || return 1
+        index=$((index + 1))
+        "$bb" sleep 0.01 || return 1
+    done
+}
+worker & first=$!
+worker & second=$!
+wait "$first" || fail worker-one
+wait "$second" || fail worker-two
+"$bb" cp /tmp/memory /tmp/copy || fail copy
+"$bb" cmp /tmp/memory /tmp/copy || fail compare
+"$bb" modprobe virtio_pci || fail virtio-pci
+"$bb" modprobe virtio_blk || fail virtio-blk
+"$bb" modprobe virtio_net || fail virtio-net
+[ -b /dev/vda ] || fail missing-disposable-disk
+read -r sectors </sys/class/block/vda/size
+[ "$sectors" = 131072 ] || fail disk-size
+persist=0
+expected_disk=371036ccdfc733fa30542a26a4f276536147c906d1570f0becc1d6f8b868c311
+if [ "$boot" -gt 1 ]; then
+    previous=$("$bb" dd if=/dev/vda bs=512 count=1 status=none | "$bb" tr -d '\000')
+    [ "$previous" = "thin-hv L2 persistent boot=$((boot - 1))" ] || fail disk-persistence
+    previous_hash=$("$bb" dd if=/dev/vda bs=1048576 skip=1 count=32 status=none | "$bb" sha256sum)
+    set -- $previous_hash
+    [ "$1" = "$expected_disk" ] || fail disk-payload-persistence
+    persist=1
+fi
+# Non-zero data ensures a lost write cannot pass against the initially zero
+# disposable disk. Check actual device readback, not the source buffer.
+"$bb" tr '\000' Z </tmp/memory >/tmp/copy || fail pattern
+"$bb" dd if=/tmp/copy of=/dev/vda bs=1048576 seek=1 count=32 conv=fsync status=none || fail disk-write
+disk_hash=$("$bb" dd if=/dev/vda bs=1048576 skip=1 count=32 status=none | "$bb" sha256sum)
+set -- $disk_hash
+[ "$1" = "$expected_disk" ] || fail disk-readback
+printf 'thin-hv L2 persistent boot=%s\n' "$boot" | "$bb" dd of=/dev/vda bs=512 count=1 conv=sync,fsync status=none || fail disk-sentinel
+"$bb" ip link set eth0 up || fail net-link
+"$bb" ip addr add 10.0.2.15/24 dev eth0 || fail net-address
+"$bb" ping -c 3 -W 3 10.0.2.2 >/tmp/ping.log 2>&1 || fail net-ping
+"$bb" grep -q '3 packets transmitted, 3 packets received, 0% packet loss' /tmp/ping.log || fail net-packets
+"$bb" sync || fail sync
+echo "thin-hv: linux OS L2 PASS cpus=$cpus workers=2 hashes=32 memory_mib=32 copy_mib=32 sha256=$expected boot=$boot disk_mib=32 disk_persist=$persist net_packets=3"
+"$bb" poweroff -f || fail poweroff-failed
+fail poweroff-returned

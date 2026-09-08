@@ -13,6 +13,10 @@ mount -t proc proc /proc || fail mount-proc
 mount -t sysfs sysfs /sys || fail mount-sys
 /bin/busybox mkdir -p /tmp || fail mkdir-tmp
 mount -t tmpfs -o size=8m tmpfs /tmp || fail mount-tmp
+# POSIX named semaphores (hardware_disable_test) live here. A missing mount
+# makes upstream sem_open fail before KVM is tested.
+/bin/busybox mkdir -p /dev/shm || fail mkdir-shm
+mount -t tmpfs -o size=4m,mode=1777 tmpfs /dev/shm || fail mount-shm
 
 backend=
 test_name=
@@ -30,8 +34,18 @@ for argument in $boot_arguments; do
             test_name=${argument#*=}
             case "$test_name" in
                 tsc_msrs_test) assertions=5 ;;
-                userspace_msr_exit_test) assertions=4 ;;
-                cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs|apic_bus_clock_test|xapic_tpr_test) assertions=1 ;;
+                userspace_msr_exit_test|kvm_binary_stats_test) assertions=4 ;;
+                sync_regs_test) assertions=10 ;;
+                fix_hypercall_test) assertions=2 ;;
+                monitor_mwait_test) assertions=12 ;;
+                cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs|apic_bus_clock_test|xapic_tpr_test|\
+                cpuid_test|msrs_test|set_sregs_test|userspace_io_test|state_test|xapic_state_test|xapic_ipi_test|\
+                recalc_apic_map_test|tsc_scaling_sync|kvm_clock_test|feature_msrs_test|xss_msr_test|fastops_test|\
+                kvm_pv_test|platform_info_test|ucna_injection_test|exit_on_emulation_failure_test|smaller_maxphyaddr_emulation_test|\
+                hyperv_clock|hyperv_cpuid|hyperv_features|hyperv_ipi|hyperv_tlb_flush|hyperv_extended_hypercalls|\
+                set_boot_cpu_id|max_vcpuid_cap_test|smm_test|amx_test|pmu_counters_test|pmu_event_filter_test|\
+                dirty_log_test|guest_print_test|irqfd_test|set_memory_region_test|coalesced_io_test|\
+                hardware_disable_test|guest_memfd_test|system_counter_offset_test|pre_fault_memory_test) assertions=1 ;;
                 *) fail invalid-test ;;
             esac
             ;;
@@ -42,21 +56,51 @@ set +f
 read -r online_cpus </sys/devices/system/cpu/online
 [ "$online_cpus" = 0 ] || fail requires-one-L1-cpu
 grep -qw vmx /proc/cpuinfo || fail VMX-unavailable
-modprobe kvm || fail kvm-module
-modprobe kvm_intel nested=0 || fail kvm-intel-module
+if [ "$test_name" = fastops_test ]; then
+    # This upstream test requires KVMs explicit test-only emulation prefix.
+    # Configure only this disposable Linux guest, never the development host.
+    modprobe kvm force_emulation_prefix=1 || fail kvm-test-emulation-module
+else
+    modprobe kvm || fail kvm-module
+fi
+if [ "$test_name" = smaller_maxphyaddr_emulation_test ]; then
+    modprobe kvm_intel nested=0 allow_smaller_maxphyaddr=1 || fail kvm-test-maxphyaddr-module
+else
+    modprobe kvm_intel nested=0 || fail kvm-intel-module
+fi
 [ -d /sys/module/kvm_intel ] && [ -c /dev/kvm ] || fail KVM-unavailable
+case "$test_name" in
+    kvm_clock_test|hyperv_clock)
+        # Linux initially uses HPET while calibrating TSC. Wait for the normal
+        # transition; do not force an unstable clocksource to make a test pass.
+        attempts=0
+        while [ "$attempts" -lt 10 ]; do
+            read -r clocksource </sys/devices/system/clocksource/clocksource0/current_clocksource
+            case "$clocksource" in tsc|hyperv_clocksource_tsc_page) break ;; esac
+            /bin/busybox sleep 1
+            attempts=$((attempts + 1))
+        done
+        ;;
+esac
 echo "thin-hv: linux KVM selftest begin backend=$backend test=$test_name l1_cpus=1"
 
 # Upstream lib/elf.c reopens program_invocation_name, so use an absolute path.
 # The tmpfs bounds output storage; timeout bounds all guest/user test execution.
 rc=0
-/bin/busybox timeout -s KILL 120 /bin/kvm-selftest >/tmp/selftest.log 2>&1 || rc=$?
+runtime_limit=120
+# 512 fork/kill rounds each launch four vCPUs and 64 helper threads. Keep the
+# upstream iteration count; allow the slower Direct-VMX path a finite budget.
+[ "$test_name" != hardware_disable_test ] || runtime_limit=600
+/bin/busybox timeout -s KILL "$runtime_limit" /bin/kvm-selftest >/tmp/selftest.log 2>&1 || rc=$?
 bytes=$(/bin/busybox wc -c </tmp/selftest.log) || fail output-size
 [ "$bytes" -le 1048576 ] || fail output-size
-# These unmodified upstream programs are silent on success. Their exit 0 is
-# reached only after guest UCALL_DONE; skipped prerequisites exit 4, not 0.
+# Non-TAP programs report completion via exit 0 after their assertions; some
+# also print diagnostics. Skipped prerequisites exit 4, never a successful run.
+# state_test deliberately covers L2 save/restore here, not its optional L3
+# checks: nested=0 prevents VMX/SVM exposure to the test's guest.
 case "$test_name" in
-    tsc_msrs_test|userspace_msr_exit_test) [ "$bytes" -gt 0 ] || fail missing-TAP ;;
+    tsc_msrs_test|userspace_msr_exit_test|sync_regs_test|fix_hypercall_test|kvm_binary_stats_test|monitor_mwait_test)
+        [ "$bytes" -gt 0 ] || fail missing-TAP ;;
 esac
 /bin/busybox cat /tmp/selftest.log || fail output-read
 echo "thin-hv: linux KVM selftest exit backend=$backend test=$test_name process_exit=$rc"

@@ -330,6 +330,10 @@ probe_s4() {
     printf 'sendkey alt-y 20\n' >&9
 }
 
+valid_poweroff_timeout() {
+    [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$1 <= 1800))
+}
+
 run_windows() {
     local mode=$1
     local s4_phase=${2:-}
@@ -345,6 +349,7 @@ run_windows() {
     local trusted_boot_count
     local marker_seen=0 wsl_failed=0 wsl_monitor_offset=-1 wsl_probe_offset=0
     local s4_probe_elapsed=-1
+    local poweroff_timeout_seconds=${WINDOWS_POWEROFF_TIMEOUT_SECONDS:-120}
     local wsl_ready_matches=0
     local is_trusted=0 is_wsl=0 is_s4=0 is_daily_soak=0
     local backend_label='outer-kvm / reference'
@@ -352,6 +357,8 @@ run_windows() {
     local physical_desktop_probe_sent=0
     local is_direct=0 diagnostics_failure_captured=0
     local -a media_args network_args=(-netdev user,id=net0)
+
+    valid_poweroff_timeout "$poweroff_timeout_seconds" || die 'poweroff timeout must be 1..1800 seconds'
 
     [[ "$mode" == check-physical-status ]] && is_physical_test=1
 
@@ -1066,13 +1073,14 @@ run_windows() {
     if ((!is_s4 && !is_physical_test && !is_daily_soak)); then
         printf 'system_powerdown\n' >&9
     fi
-    for _ in {1..120}; do
+    printf 'Windows x86 test: waiting for final poweroff timeout_seconds=%s\n' "$poweroff_timeout_seconds"
+    for ((elapsed = 0; elapsed < poweroff_timeout_seconds; elapsed++)); do
         kill -0 "$qemu_pid" 2>/dev/null || break
         sleep 1
     done
     if kill -0 "$qemu_pid" 2>/dev/null; then
         if ((is_daily_soak || is_s4 || is_physical_test)); then
-            die "Windows did not shut down within 120 seconds after $mode PASS"
+            die "Windows did not shut down within $poweroff_timeout_seconds seconds after $mode PASS"
         fi
         printf 'quit\n' >&9
     fi
@@ -1157,7 +1165,7 @@ check_wsl_soak() {
         grep -Fq -- "$needle" "$hibernate" || die "S4 verifier check missing: $needle"
     done
     for needle in \
-        'Windows did not shut down within 120 seconds after $mode PASS' \
+        'Windows did not shut down within $poweroff_timeout_seconds seconds after $mode PASS' \
         'QEMU exited with status $qemu_status after $mode PASS' \
         'qemu-img check "$disk_image"' \
         'cargo xbuild x86 --release' \
@@ -1192,6 +1200,10 @@ case ${1:-} in
     check-wsl-soak) check_wsl_soak ;;
     check-physical-status) run_windows check-physical-status ;;
     physical-test-command) physical_test_command ;;
+    check-poweroff-timeout)
+        (($# == 2)) || die 'check-poweroff-timeout requires SECONDS'
+        valid_poweroff_timeout "$2"
+        ;;
     check-serial-marker)
         (($# == 2 || $# == 3)) || die 'check-serial-marker requires MARKER and optional LOG'
         shift

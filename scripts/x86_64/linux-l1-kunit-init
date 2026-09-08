@@ -1,0 +1,73 @@
+#!/bin/sh
+# Run the pinned upstream x86 flat programs as real KVM L2 guests.
+set -eu
+export PATH=/bin
+bb=/bin/busybox
+fail() { echo "thin-hv: KVM unit matrix FAIL $*"; "$bb" poweroff -f || true; exit 1; }
+"$bb" mount -t devtmpfs devtmpfs /dev || fail mount-dev
+"$bb" mount -t proc proc /proc || fail mount-proc
+"$bb" mount -t sysfs sysfs /sys || fail mount-sys
+"$bb" mkdir -p /tmp || fail mkdir-tmp
+"$bb" mount -t tmpfs -o size=16m tmpfs /tmp || fail mount-tmp
+backend=
+selection=
+read -r arguments </proc/cmdline
+set -f
+for argument in $arguments; do
+    case "$argument" in
+        thin_hv_kunit_backend=*) [ -z "$backend" ] || fail duplicate-backend; backend=${argument#*=} ;;
+        thin_hv_kunit_case=*) [ -z "$selection" ] || fail duplicate-case; selection=${argument#*=} ;;
+    esac
+done
+set +f
+case "$backend" in direct-vmx|outer-kvm) ;; *) fail backend ;; esac
+[ -n "$selection" ] || fail selection
+read -r online </sys/devices/system/cpu/online
+[ "$online" = 0 ] || fail requires-one-L1-cpu
+"$bb" modprobe kvm force_emulation_prefix=1 enable_vmware_backdoor=1 || fail kvm-module
+"$bb" modprobe kvm_intel nested=0 allow_smaller_maxphyaddr=1 || fail kvm-intel-module
+[ -c /dev/kvm ] || fail missing-kvm
+read -r l2_library_path </opt/l2/library-path
+[ -n "$l2_library_path" ] || fail library-path
+echo "thin-hv: KVM unit matrix begin backend=$backend selection=$selection l1_cpus=1"
+cases=0; passed=0; failed=0; skipped=0
+while IFS='|' read -r name flat cpus memory seconds cpu argument; do
+    case "$name" in ''|'#'*) continue ;; esac
+    [ "$selection" = all ] || [ "$selection" = "$name" ] || continue
+    cases=$((cases + 1))
+    set -- -machine pc
+    case "$name" in
+        vmexit_ipi) set -- -machine pc,pit=off ;;
+        vmware_backdoors) set -- -machine pc,vmport=on ;;
+        intel_iommu) set -- -machine q35,kernel-irqchip=split -device intel-iommu,intremap=on,eim=off -device edu ;;
+        hyperv_synic|hyperv_connections) set -- -machine pc -device hyperv-testdev ;;
+    esac
+    guest_args=$argument
+    [ "$guest_args" != - ] || guest_args=
+    [ "$name" != kvmclock_test ] || guest_args="10000000 $("$bb" date +%s)"
+    echo "thin-hv: KVM unit start name=$name cpus=$cpus memory_mib=$memory timeout_seconds=$seconds accel=kvm"
+    rc=0
+    LD_LIBRARY_PATH="$l2_library_path" "$bb" timeout -s KILL "$seconds" /opt/l2/qemu \
+        -L /opt/l2/firmware -accel kvm -cpu "$cpu" -smp "$cpus" -m "$memory" \
+        -no-reboot -nodefaults -display none -serial stdio -monitor none \
+        -global kvm-pit.lost_tick_policy=discard -device pc-testdev -device pci-testdev \
+        -device isa-debug-exit,iobase=0xf4,iosize=0x4 "$@" \
+        -kernel "/opt/l2/kunit/$flat" -append "$guest_args" >/tmp/unit.log 2>&1 || rc=$?
+    bytes=$("$bb" wc -c </tmp/unit.log)
+    [ "$bytes" -le 4194304 ] || fail output-size
+    "$bb" sed 's/\r$//; s/^/KUNIT: /' /tmp/unit.log
+    classification=0
+    "$bb" awk -v name="$name" -v argument="$argument" -v status="$rc" \
+        -f /opt/l2/check-kunit-case.awk /tmp/unit.log || classification=$?
+    case "$classification" in
+        0) outcome=PASS; passed=$((passed + 1)) ;;
+        4) outcome=SKIP; skipped=$((skipped + 1)) ;;
+        *) outcome=FAIL; failed=$((failed + 1)) ;;
+    esac
+    echo "thin-hv: KVM unit exit name=$name process_exit=$rc outcome=$outcome"
+done </opt/l2/kunit-cases.txt
+[ "$cases" -gt 0 ] || fail empty-selection
+echo "thin-hv: KVM unit matrix complete backend=$backend selection=$selection cases=$cases passed=$passed failed=$failed skipped=$skipped"
+echo 'thin-hv: KVM unit matrix poweroff requested'
+"$bb" poweroff -f || fail poweroff-failed
+fail poweroff-returned

@@ -3698,27 +3698,88 @@ mod tests {
                 .success()
         };
         for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
-            for (name, count) in [("tsc_msrs_test", 5), ("userspace_msr_exit_test", 4)] {
-                let assertions = if count == 5 {
-                    (1..=5)
-                        .map(|n| format!("ok {n} stage {} passed\n", n + 1))
-                        .collect::<String>()
-                } else {
+            let mwait_names = (0..16)
+                .filter(|tc| tc & 2 != 0 || (tc & 4 != 0) == (tc & 8 != 0))
+                .map(|tc| {
+                    format!(
+                        "MWAIT {}, {}, CPUID {}{}",
+                        if tc & 1 != 0 {
+                            "can fault"
+                        } else {
+                            "never faults"
+                        },
+                        if tc & 2 != 0 {
+                            "MISC_ENABLE updates CPUID"
+                        } else {
+                            "no CPUID updates"
+                        },
+                        if tc & 8 != 0 { "clear" } else { "set" },
+                        if tc & 4 != 0 { ", MWAIT disabled" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (name, labels, harness) in [
+                (
+                    "tsc_msrs_test",
+                    (2..=6)
+                        .map(|n| format!("stage {n} passed"))
+                        .collect::<Vec<_>>(),
+                    false,
+                ),
+                (
+                    "userspace_msr_exit_test",
                     [
                         "msr_filter_allow",
                         "msr_filter_deny",
                         "msr_permission_bitmap",
                         "user_exit_msr_flags",
                     ]
+                    .map(|n| format!("user_msr.{n}"))
+                    .to_vec(),
+                    true,
+                ),
+                (
+                    "sync_regs_test",
+                    [
+                        "read_invalid",
+                        "set_invalid",
+                        "req_and_verify_all_valid",
+                        "set_and_verify_various",
+                        "clear_kvm_dirty_regs_bits",
+                        "clear_kvm_valid_and_dirty_regs",
+                        "clear_kvm_valid_regs_bits",
+                        "race_cr4",
+                        "race_exc",
+                        "race_inj_pen",
+                    ]
+                    .map(|n| format!("sync_regs_test.{n}"))
+                    .to_vec(),
+                    true,
+                ),
+                (
+                    "fix_hypercall_test",
+                    ["enable_quirk", "disable_quirk"]
+                        .map(|n| format!("fix_hypercall.{n}"))
+                        .to_vec(),
+                    true,
+                ),
+                (
+                    "kvm_binary_stats_test",
+                    (0..4).map(|n| format!("vm{n}")).collect::<Vec<_>>(),
+                    false,
+                ),
+                ("monitor_mwait_test", mwait_names, false),
+            ] {
+                let count = labels.len();
+                let assertions = labels
                     .iter()
                     .enumerate()
-                    .map(|(n, name)| format!("ok {} user_msr.{name}\n", n + 1))
-                    .collect::<String>()
-                };
-                let suite = if count == 4 {
-                    "# PASSED: 4 / 4 tests passed.\n"
+                    .map(|(n, label)| format!("ok {} {label}\n", n + 1))
+                    .collect::<String>();
+                let suite = if harness {
+                    format!("# PASSED: {count} / {count} tests passed.\n")
                 } else {
-                    ""
+                    String::new()
                 };
                 let begin = format!(
                     "thin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus=1\n"
@@ -3775,8 +3836,8 @@ mod tests {
                     name,
                     &valid.replace(&begin, &(begin.clone() + &begin))
                 ));
-                if count == 4 {
-                    assert!(!check(backend, name, &valid.replace(suite, "")));
+                if harness {
+                    assert!(!check(backend, name, &valid.replace(&suite, "")));
                 }
                 for suffix in [
                     "\0",
@@ -3801,6 +3862,45 @@ mod tests {
                 "debug_regs",
                 "apic_bus_clock_test",
                 "xapic_tpr_test",
+                "cpuid_test",
+                "msrs_test",
+                "set_sregs_test",
+                "userspace_io_test",
+                "state_test",
+                "xapic_state_test",
+                "xapic_ipi_test",
+                "recalc_apic_map_test",
+                "tsc_scaling_sync",
+                "kvm_clock_test",
+                "feature_msrs_test",
+                "xss_msr_test",
+                "fastops_test",
+                "kvm_pv_test",
+                "platform_info_test",
+                "ucna_injection_test",
+                "exit_on_emulation_failure_test",
+                "smaller_maxphyaddr_emulation_test",
+                "hyperv_clock",
+                "hyperv_cpuid",
+                "hyperv_features",
+                "hyperv_ipi",
+                "hyperv_tlb_flush",
+                "hyperv_extended_hypercalls",
+                "set_boot_cpu_id",
+                "max_vcpuid_cap_test",
+                "smm_test",
+                "amx_test",
+                "pmu_counters_test",
+                "pmu_event_filter_test",
+                "dirty_log_test",
+                "guest_print_test",
+                "irqfd_test",
+                "set_memory_region_test",
+                "coalesced_io_test",
+                "hardware_disable_test",
+                "guest_memfd_test",
+                "system_counter_offset_test",
+                "pre_fault_memory_test",
             ] {
                 let valid = format!(
                     "thin-hv: backend={backend} role={role}\nthin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus=1\nthin-hv: linux KVM selftest exit backend={backend} test={name} process_exit=0\nthin-hv: linux KVM selftest PASS backend={backend} test={name} assertions=1\nthin-hv: linux KVM selftest poweroff requested\n"
@@ -3839,6 +3939,249 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_kunit_gates_require_real_results_and_complete_ordered_matrix() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let output = Command::new("mktemp")
+            .args(["-t", "thin-hv-kunit-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let log = Fixture(String::from_utf8(output.stdout).unwrap().trim().into());
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/x86_64");
+        let runner = directory.join("run-linux-kunit-test.sh");
+        let manifest = fs::read_to_string(directory.join("linux-l2-kunit-cases.txt")).unwrap();
+        let check = |args: &[&str], contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(args)
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .code()
+                .unwrap()
+        };
+        assert_eq!(check(&["--check-manifest"], &manifest), 0);
+        for invalid in [
+            String::new(),
+            manifest.clone() + "\0",
+            manifest.clone() + "x2apic|apic.flat|2|128|30|qemu64|-\n",
+            manifest.replace("apic.flat", "../apic.flat"),
+            manifest.replace("|128|", "|9999999999999|"),
+            manifest.replace("|30|", "|301|"),
+            manifest.replace("|2|", "|0|"),
+            manifest.replace("|qemu64|", "|qemu64;reboot|"),
+        ] {
+            assert_ne!(check(&["--check-manifest"], &invalid), 0);
+        }
+        for (text, status, expected) in [
+            ("SUMMARY: 3 tests, 1 skipped\n", "1", 0),
+            ("SUMMARY: 1 tests, 1 skipped\n", "77", 4),
+            ("SUMMARY: 1 tests, 1 skipped\n", "1", 1),
+            ("SUMMARY: 1 tests\n", "3", 1),
+            ("SUMMARY: 1 tests\n", "137", 1),
+            ("SUMMARY: 1 tests\nFAIL: late\n", "1", 1),
+            ("SUMMARY: 1 tests, 1 known failures\n", "1", 1),
+            ("SUMMARY: 1 tests, 2 skipped\n", "1", 1),
+            ("SUMMARY: 1 tests, 1 expected failures, 1 skipped\n", "1", 1),
+            ("SUMMARY: 1 tests\nSUMMARY: 1 tests\n", "1", 1),
+            ("only diagnostics\n", "1", 1),
+            ("SUMMARY: 1 tests\0\n", "1", 1),
+        ] {
+            assert_eq!(
+                check(&["--check-case", "emulator", status], text),
+                expected,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            check(&["--check-case", "vmexit_cpuid", "1"], "cpuid 150\n"),
+            0
+        );
+        assert_ne!(
+            check(&["--check-case", "vmexit_cpuid", "1"], "vmcall 150\n"),
+            0
+        );
+        assert_ne!(
+            check(&["--check-case", "vmexit_cpuid", "1"], "SUMMARY: 1 tests\n"),
+            0
+        );
+        let cases = manifest
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.split('|').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for (backend, role) in [("outer-kvm", "reference"), ("direct-vmx", "project-l0")] {
+            let mut valid = format!(
+                "thin-hv: backend={backend} role={role}\nthin-hv: KVM unit matrix begin backend={backend} selection=all l1_cpus=1\n"
+            );
+            for case in &cases {
+                let name = case[0];
+                let result = match name {
+                    "realmode" => "PASS: realmode instruction\n".to_string(),
+                    "rmap_chain" => "PASS\n".to_string(),
+                    "s3" => "PM1a event registers at 600\n".to_string(),
+                    "sieve" => "static:78498 out of 1000000\nmapped:78498 out of 1000000\nvirtual:5761455 out of 100000000\nvirtual:5761455 out of 100000000\nvirtual:5761455 out of 100000000\n".to_string(),
+                    _ if name.starts_with("vmexit_") => format!("{} 1234\n", case[6]),
+                    _ => "SUMMARY: 1 tests\n".to_string(),
+                };
+                valid.push_str(&format!("thin-hv: KVM unit start name={name} cpus={} memory_mib={} timeout_seconds={} accel=kvm\n", case[2], case[3], case[4]));
+                for line in result.lines() {
+                    valid.push_str(&format!("KUNIT: {line}\n"));
+                }
+                valid.push_str(&format!(
+                    "thin-hv: KVM unit exit name={name} process_exit=1 outcome=PASS\n"
+                ));
+            }
+            valid.push_str(&format!("thin-hv: KVM unit matrix complete backend={backend} selection=all cases={} passed={} failed=0 skipped=0\nthin-hv: KVM unit matrix poweroff requested\n", cases.len(), cases.len()));
+            assert_eq!(check(&["--check-log", backend, "all"], &valid), 0);
+            assert_eq!(
+                check(
+                    &["--check-log", backend, "all"],
+                    &valid.replace('\n', "\r\n")
+                ),
+                0
+            );
+            for (from, to) in [
+                ("accel=kvm", "accel=tcg"),
+                ("process_exit=1", "process_exit=0"),
+                ("name=xapic", "name=x2apic"),
+                ("outcome=PASS", "outcome=SKIP"),
+                (
+                    "SUMMARY: 1 tests",
+                    "SUMMARY: 1 tests, 1 unexpected failures",
+                ),
+                ("thin-hv: KVM unit matrix poweroff requested\n", ""),
+            ] {
+                assert_ne!(
+                    check(&["--check-log", backend, "all"], &valid.replace(from, to)),
+                    0,
+                    "{from}"
+                );
+            }
+            for suffix in [
+                "\0",
+                "KUNIT: FAIL: late\n",
+                "Kernel panic\n",
+                "thin-hv: KVM unit matrix poweroff requested\n",
+            ] {
+                assert_ne!(
+                    check(&["--check-log", backend, "all"], &(valid.clone() + suffix)),
+                    0
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_poweroff_timeout_is_bounded_and_decimal() {
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/windows/windows-test.sh");
+        for (input, accepted) in [
+            ("1", true),
+            ("120", true),
+            ("1200", true),
+            ("1800", true),
+            ("0", false),
+            ("1801", false),
+            ("99999", false),
+            ("0120", false),
+            ("-1", false),
+            ("1+1", false),
+            ("1\n2", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                Command::new("bash")
+                    .arg(&runner)
+                    .args(["check-poweroff-timeout", input])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                accepted,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_l2_os_gate_requires_six_complete_kvm_boots() {
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-l2-os-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = std::path::PathBuf::from(String::from_utf8(temporary.stdout).unwrap().trim());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-linux-l2-os-test.sh");
+        let check = |backend: &str, contents: &str| {
+            fs::write(&log, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-log", backend])
+                .arg(&log)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
+            let mut valid = format!(
+                "thin-hv: backend={backend} role={role}\nthin-hv: linux L2 OS begin backend={backend} boots=6 l1_cpus=1\n"
+            );
+            for boot in 1..=6 {
+                let cpus = if boot % 2 == 1 { 1 } else { 2 };
+                let persist = if boot == 1 { 0 } else { 1 };
+                valid.push_str(&format!(
+                    "thin-hv: linux L2 OS start boot={boot} cpus={cpus} accel=kvm\nL2: thin-hv: linux OS L2 begin cpus={cpus}\nL2: thin-hv: linux OS L2 PASS cpus={cpus} workers=2 hashes=32 memory_mib=32 copy_mib=32 sha256=83ee47245398adee79bd9c0a8bc57b821e92aba10f5f9ade8a5d1fae4d8c4302 boot={boot} disk_mib=32 disk_persist={persist} net_packets=3\nL2: [    1.250000] reboot: Power down\nthin-hv: linux L2 OS exit boot={boot} cpus={cpus} process_exit=0\n"
+                ));
+            }
+            valid.push_str(&format!(
+                "thin-hv: linux L2 OS PASS backend={backend} boots=6 l1_cpus=1 l2_cpus=1,2\nthin-hv: linux L2 OS poweroff requested\n"
+            ));
+            assert!(check(backend, &valid));
+            assert!(check(backend, &valid.replace('\n', "\r\n")));
+            for (from, to) in [
+                ("accel=kvm", "accel=tcg"),
+                ("boot=3", "boot=2"),
+                ("process_exit=0", "process_exit=137"),
+                ("cpus=2", "cpus=1"),
+                ("hashes=32", "hashes=31"),
+                ("disk_persist=1", "disk_persist=0"),
+                ("net_packets=3", "net_packets=2"),
+                ("83ee4724", "00000000"),
+                ("L2: [    1.250000] reboot: Power down\n", ""),
+                ("thin-hv: linux L2 OS poweroff requested\n", ""),
+            ] {
+                assert!(!check(backend, &valid.replace(from, to)), "{from}");
+            }
+            for suffix in [
+                "\0",
+                "Kernel panic\n",
+                "L2: thin-hv: linux OS L2 FAIL late\n",
+                "thin-hv: linux L2 OS poweroff requested\n",
+                "thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0\n",
+            ] {
+                assert!(!check(backend, &(valid.clone() + suffix)));
+            }
+        }
+        fs::remove_file(log).unwrap();
     }
 
     #[cfg(unix)]

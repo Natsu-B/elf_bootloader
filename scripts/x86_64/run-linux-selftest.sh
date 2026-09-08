@@ -4,7 +4,20 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 die() { printf 'x86 Linux KVM selftest: %s\n' "$*" >&2; exit 1; }
-valid_test() { case "$1" in tsc_msrs_test|userspace_msr_exit_test|cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs|apic_bus_clock_test|xapic_tpr_test) ;; *) return 1 ;; esac; }
+valid_test() {
+    case "$1" in
+        tsc_msrs_test|userspace_msr_exit_test|cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs|apic_bus_clock_test|xapic_tpr_test|\
+        cpuid_test|msrs_test|set_sregs_test|userspace_io_test|state_test|xapic_state_test|xapic_ipi_test|\
+        recalc_apic_map_test|tsc_scaling_sync|kvm_clock_test|feature_msrs_test|xss_msr_test|fastops_test|\
+        kvm_pv_test|platform_info_test|ucna_injection_test|exit_on_emulation_failure_test|smaller_maxphyaddr_emulation_test|\
+        sync_regs_test|fix_hypercall_test|kvm_binary_stats_test|monitor_mwait_test|\
+        hyperv_clock|hyperv_cpuid|hyperv_features|hyperv_ipi|hyperv_tlb_flush|hyperv_extended_hypercalls|\
+        set_boot_cpu_id|max_vcpuid_cap_test|smm_test|amx_test|pmu_counters_test|pmu_event_filter_test|\
+        dirty_log_test|guest_print_test|irqfd_test|set_memory_region_test|coalesced_io_test|\
+        hardware_disable_test|guest_memfd_test|system_counter_offset_test|pre_fault_memory_test) ;;
+        *) return 1 ;;
+    esac
+}
 
 check_log() {
     local backend=$1 test_name=$2 log=$3 bytes transcript LC_ALL=C
@@ -17,10 +30,31 @@ check_log() {
     bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" --check-backend-log "$backend" "$log" || return 1
     awk -v backend="$backend" -v test_name="$test_name" '
         BEGIN {
-            tap = test_name == "tsc_msrs_test" || test_name == "userspace_msr_exit_test"
-            count = test_name == "tsc_msrs_test" ? 5 : (tap ? 4 : 1)
+            count = 1
             names[1] = "msr_filter_allow"; names[2] = "msr_filter_deny"
             names[3] = "msr_permission_bitmap"; names[4] = "user_exit_msr_flags"
+            prefix="user_msr."
+            if (test_name == "tsc_msrs_test") { tap=1; count=5 }
+            if (test_name == "userspace_msr_exit_test") { tap=1; harness=1; count=4 }
+            if (test_name == "sync_regs_test") {
+                tap=1; harness=1; count=10; prefix="sync_regs_test."
+                split("read_invalid set_invalid req_and_verify_all_valid set_and_verify_various clear_kvm_dirty_regs_bits clear_kvm_valid_and_dirty_regs clear_kvm_valid_regs_bits race_cr4 race_exc race_inj_pen", names, " ")
+            }
+            if (test_name == "fix_hypercall_test") {
+                tap=1; harness=1; count=2; prefix="fix_hypercall."
+                split("enable_quirk disable_quirk", names, " ")
+            }
+            if (test_name == "kvm_binary_stats_test") { tap=1; count=4 }
+            if (test_name == "monitor_mwait_test") {
+                tap=1; count=12; prefix=""
+                for (tc=0; tc<16; tc++) {
+                    misc=int(tc/2)%2; disabled=int(tc/4)%2; cpuid=int(tc/8)%2
+                    if (!misc && cpuid != disabled) continue
+                    names[++n]=(tc%2 ? "MWAIT can fault" : "MWAIT never faults") ", " \
+                        (misc ? "MISC_ENABLE updates CPUID" : "no CPUID updates") ", CPUID " \
+                        (cpuid ? "clear" : "set") (disabled ? ", MWAIT disabled" : "")
+                }
+            }
         }
         {
             sub(/\r$/, "")
@@ -31,7 +65,7 @@ check_log() {
                     begin++
                 } else if ($0 == "thin-hv: linux KVM selftest exit backend=" backend " test=" test_name " process_exit=0") {
                     if (begin != 1 || (tap && (header != 1 || plan != 1 || passed != count || totals != 1)) ||
-                        (test_name == "userspace_msr_exit_test" && suite != 1) || ended || done || poweroff) bad=1
+                        (harness && suite != 1) || ended || done || poweroff) bad=1
                     ended++
                 } else if ($0 == "thin-hv: linux KVM selftest PASS backend=" backend " test=" test_name " assertions=" count) {
                     if (ended != 1 || done || poweroff) bad=1
@@ -49,9 +83,11 @@ check_log() {
                 else if ($0 == "1.." count) { if (header != 1 || plan || passed || totals) bad=1; plan++ }
                 else if ($0 ~ /^ok /) {
                     passed++
-                    expected = test_name == "tsc_msrs_test" ? "ok " passed " stage " (passed + 1) " passed" : "ok " passed " user_msr." names[passed]
+                    expected = "ok " passed " " prefix names[passed]
+                    if (test_name == "tsc_msrs_test") expected = "ok " passed " stage " (passed + 1) " passed"
+                    if (test_name == "kvm_binary_stats_test") expected = "ok " passed " vm" (passed - 1)
                     if (plan != 1 || totals || passed > count || $0 != expected) bad=1
-                } else if ($0 == "# PASSED: 4 / 4 tests passed." && test_name == "userspace_msr_exit_test") {
+                } else if ($0 == "# PASSED: " count " / " count " tests passed." && harness) {
                     if (passed != count || totals || suite) bad=1
                     suite++
                 } else if ($0 == "# Totals: pass:" count " fail:0 xfail:0 xpass:0 skip:0 error:0") {
@@ -77,12 +113,21 @@ fi
 backend=${LINUX_SELFTEST_BACKEND:-direct-vmx}
 test_name=${LINUX_SELFTEST_NAME:-}
 selftest=${LINUX_SELFTEST_ELF:-}
-timeout_seconds=${LINUX_SELFTEST_TIMEOUT_SECONDS:-300}
+default_timeout=300
+[[ "$test_name" != hardware_disable_test ]] || default_timeout=900
+timeout_seconds=${LINUX_SELFTEST_TIMEOUT_SECONDS:-$default_timeout}
 valid_test "$test_name" || die 'unsupported pinned KVM selftest name'
 # The non-TAP upstream programs return 0 only after UCALL_DONE and all
 # assertions. For those, assertions=1 counts the completed program, not its
 # individual guest assertions; exit 4 (KSFT_SKIP) is always a failure here.
-case "$test_name" in tsc_msrs_test) assertions=5 ;; userspace_msr_exit_test) assertions=4 ;; *) assertions=1 ;; esac
+case "$test_name" in
+    tsc_msrs_test) assertions=5 ;;
+    userspace_msr_exit_test|kvm_binary_stats_test) assertions=4 ;;
+    sync_regs_test) assertions=10 ;;
+    fix_hypercall_test) assertions=2 ;;
+    monitor_mwait_test) assertions=12 ;;
+    *) assertions=1 ;;
+esac
 [[ "$timeout_seconds" =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$timeout_seconds <= 3600)) || die 'timeout must be 1..3600 seconds'
 bash "$repo_root/scripts/x86_64/build-linux-uki.sh" --check-selftest-elf "$selftest"
 case "$backend" in
