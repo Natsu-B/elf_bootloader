@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Shared by transcript validation and the live runner; a halted monitor cannot
+# recover by waiting for an unrelated guest success marker.
+direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|host exception |panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
+
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
     exit 1
@@ -26,14 +30,7 @@ check_backend_log() {
             # Runtime entry is logged before VMX setup. Firmware may continue
             # booting Windows after setup returns an error; that is not L0 PASS.
             # VMXOFF status is emitted only by the terminal failure handlers.
-            case "$line" in
-                *'thin-hv: vmx smoke FAIL'* | *'thin-hv: vmx guest FAIL'* | \
-                *'thin-hv: VMRESUME FAIL'* | *'thin-hv: VMXOFF status='* | \
-                *'thin-hv: host exception '* | \
-                *'thin-hv: panic'* | *'thin-hv: CPUID VMX=0'* | \
-                *'thin-hv: IA32_FEATURE_CONTROL=unavailable'* | \
-                *'thin-hv: IA32_VMX_BASIC=unavailable'*) return 1 ;;
-            esac
+            [[ ! "$line" =~ $direct_failure_pattern ]] || return 1
         fi
         if [[ "$backend" != direct-vmx ]]; then
             case "$line" in
@@ -57,8 +54,8 @@ check_backend_log() {
 # Optional capability checks remain explicit in the evidence, never implied PASS.
 check_nested_contract_log() {
     local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 expected_backends
-    local valid invept invvpid readonly LC_ALL=C
-    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=1 vmfail_valid=(9|1[0-2]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2$'
+    local valid invept invvpid readonly shadow ept_types vpid_types success descriptors bit expected_success expected_descriptors LC_ALL=C
+    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9])$'
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     case "$cpu_profile" in native|readonly-vmcs) ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -77,7 +74,21 @@ check_nested_contract_log() {
             invept=${BASH_REMATCH[2]}
             invvpid=${BASH_REMATCH[3]}
             readonly=${BASH_REMATCH[4]}
-            ((valid == 9 + invept + invvpid + readonly)) || return 1
+            shadow=${BASH_REMATCH[5]}
+            ept_types=${BASH_REMATCH[6]}
+            vpid_types=${BASH_REMATCH[7]}
+            success=${BASH_REMATCH[8]}
+            descriptors=${BASH_REMATCH[9]}
+            ((invept == (ept_types != 0) && invvpid == (vpid_types != 0))) || return 1
+            expected_success=0
+            expected_descriptors=$(((ept_types & 1) + (vpid_types & 1)))
+            for bit in 0 1 2 3; do
+                expected_success=$((expected_success + ((vpid_types >> bit) & 1)))
+                expected_descriptors=$((expected_descriptors + ((vpid_types >> bit) & 1) + (((vpid_types & 11) >> bit) & 1)))
+            done
+            expected_success=$((expected_success + (ept_types & 1) + ((ept_types >> 1) & 1)))
+            ((success == expected_success && descriptors == expected_descriptors &&
+              valid == 14 - shadow + invept + invvpid + readonly + descriptors)) || return 1
             [[ "$cpu_profile" != readonly-vmcs || "$readonly" == 1 ]] || return 1
             phase=2
             continue
@@ -334,6 +345,18 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
+pci_profile=${X86_UEFI_PCI_PROFILE:-firmware-default}
+pci_args=()
+case "$pci_profile" in
+    firmware-default) ;;
+    q35-smoke-1g)
+        # Same bounded QEMU-only aperture as the existing Windows runner.
+        # Explicit A/B fixture, never a platform-derived EPT or a fallback.
+        pci_args=(-global q35-pcihost.pci-hole64-size=1G
+            -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024) ;;
+    *) die 'X86_UEFI_PCI_PROFILE must be firmware-default or q35-smoke-1g' ;;
+esac
+printf 'x86 UEFI smoke: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
 physical_policy=${X86_UEFI_PHYSICAL_POLICY:-0}
 host_exception_test=${X86_UEFI_HOST_EXCEPTION_TEST:-0}
 [[ "$physical_policy" =~ ^[01]$ ]] || die 'X86_UEFI_PHYSICAL_POLICY must be 0 or 1'
@@ -449,8 +472,12 @@ fi
 [[ -z "$data_disk" || -f "$data_disk" ]] || die "data disk not found: $data_disk"
 ((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
 if ((acpi_s3)); then
-    [[ "$backend" == outer-kvm ]] || \
-        die 'X86_UEFI_ACPI_S3 is restricted to trusted outer-KVM artifacts'
+    # Direct S3 is a QEMU correctness test, not a supported hardware boot mode.
+    # Its one visible CPU must remain distinct from reference CPU-hotplug coverage.
+    case "$backend:$smp" in
+        outer-kvm:2|direct-vmx:1) ;;
+        *) die 'S3 tests require outer-kvm with two CPUs or direct-vmx with one CPU' ;;
+    esac
 fi
 if ((physical_policy)); then
     [[ "$smp" == 1 && "$acpi_s3" == 0 && "$wake_cycles" == 0 && \
@@ -612,6 +639,7 @@ set +e
 timeout --foreground --kill-after=2s "${timeout_seconds}s" \
     "$qemu" \
     -machine "q35,accel=$accel" \
+    "${pci_args[@]}" \
     "${sleep_args[@]}" \
     -cpu "$cpu" \
     -smp "$smp" \
@@ -651,6 +679,15 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
         fi
     fi
     if [[ -n "$failure_marker" ]] && grep -Fq -- "$failure_marker" "$serial_log"; then
+        printf 'quit\n' >&9
+        break
+    fi
+    if grep -Eq 'Kernel panic|Oops:|BUG:' "$serial_log"; then
+        printf 'quit\n' >&9
+        break
+    fi
+    if [[ "$backend" == direct-vmx ]] && ((!host_exception_test)) &&
+        grep -Eq -- "$direct_failure_pattern" "$serial_log"; then
         printf 'quit\n' >&9
         break
     fi
@@ -712,8 +749,10 @@ fi
 if ((wake_cycles)); then
     offline_count=$(grep -Fc -- 'smpboot: CPU 1 is now offline' "$serial_log" || true)
     online_count=$(grep -Fc -- 'CPU1 is up' "$serial_log" || true)
-    ((offline_count == wake_cycles)) || die "observed $offline_count of $wake_cycles CPU1 offline events"
-    ((online_count == wake_cycles)) || die "observed $online_count of $wake_cycles CPU1 online events"
+    expected_cpu_events=0
+    [[ "$smp" == 2 ]] && expected_cpu_events=$wake_cycles
+    ((offline_count == expected_cpu_events)) || die "observed $offline_count of $expected_cpu_events CPU1 offline events"
+    ((online_count == expected_cpu_events)) || die "observed $online_count of $expected_cpu_events CPU1 online events"
 fi
 
 ((qemu_status == 0)) || die "QEMU exited with status $qemu_status"

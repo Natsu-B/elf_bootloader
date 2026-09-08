@@ -23,16 +23,29 @@ mount -t tmpfs -o size=768m tmpfs /tmp
 
 hash_rounds=40
 l2_probes=1000
+backend=
 for argument in $(/bin/busybox cat /proc/cmdline); do
     case "$argument" in
+        thin_hv_soak_backend=*)
+            [ -z "$backend" ] || fail 'duplicate-backend'
+            backend=${argument#*=}
+            ;;
         thin_hv_soak_hash_rounds=*) hash_rounds=${argument#*=} ;;
         thin_hv_soak_l2_probes=*) l2_probes=${argument#*=} ;;
     esac
 done
 positive_integer "$hash_rounds" || fail "invalid hash rounds: $hash_rounds"
 positive_integer "$l2_probes" || fail "invalid L2 probe count: $l2_probes"
+case "$backend" in
+    direct-vmx) cpus=1; expected_online=0 ;;
+    outer-kvm) cpus=2; expected_online=0-1 ;;
+    *) fail 'unsupported-backend' ;;
+esac
+[ "$(/bin/busybox cat /sys/devices/system/cpu/online)" = "$expected_online" ] \
+    || fail 'unexpected-online-cpus'
 
 echo "thin-hv-soak: L1 boot begin uptime=$(/bin/busybox cat /proc/uptime)"
+echo "thin-hv-soak: topology backend=$backend l1_cpus=$cpus"
 grep -qw vmx /proc/cpuinfo || fail 'vmx-missing'
 modprobe kvm || fail 'modprobe-kvm'
 modprobe kvm_intel nested=0 || fail 'modprobe-kvm-intel'

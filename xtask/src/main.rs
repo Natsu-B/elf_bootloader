@@ -3320,13 +3320,27 @@ mod tests {
                 )
             };
             let start = "thin-hv: nested contract START\n";
-            for capabilities in 0..8 {
-                let invept = capabilities & 1;
-                let invvpid = (capabilities >> 1) & 1;
-                let readonly = (capabilities >> 2) & 1;
-                let count = 9 + invept + invvpid + readonly;
+            let cases = (0_u32..16)
+                .map(|bits| {
+                    (
+                        (bits & 1) * 3,
+                        ((bits >> 1) & 1) * 15,
+                        (bits >> 2) & 1,
+                        (bits >> 3) & 1,
+                    )
+                })
+                .chain((0_u32..4).flat_map(|ept| (0_u32..16).map(move |vpid| (ept, vpid, 1, 0))));
+            for (ept_types, vpid_types, readonly, shadow) in cases {
+                let invept = u32::from(ept_types != 0);
+                let invvpid = u32::from(vpid_types != 0);
+                let success = ept_types.count_ones() + vpid_types.count_ones();
+                let descriptors = (ept_types & 1)
+                    + (vpid_types & 1)
+                    + vpid_types.count_ones()
+                    + (vpid_types & 11).count_ones();
+                let count = 14 - shadow + invept + invvpid + readonly + descriptors;
                 let pass = format!(
-                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=1 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2\n"
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors}\n"
                 );
                 let valid = format!("{provenance}{start}{pass}{terminal}");
                 assert!(check(backend, &valid));
@@ -3344,10 +3358,15 @@ mod tests {
                     format!("{provenance}{pass}{start}{terminal}"),
                     valid.replace("vmcs=2", "vmcs=1"),
                     valid.replace("cycles=8", "cycles=0"),
-                    valid.replace("vmfail_invalid=1", "vmfail_invalid=0"),
+                    valid.replace("vmfail_invalid=9", "vmfail_invalid=0"),
                     valid.replace(&format!("vmfail_valid={count}"), "vmfail_valid=0"),
                     valid.replace("wide_fields=2", "wide_fields=1"),
                     valid.replace("invept=", "invept=0"),
+                    valid.replace("revision=3", "revision=0"),
+                    valid.replace("entry_failures=3", "entry_failures=0"),
+                    valid.replace("no_current=7", "no_current=0"),
+                    valid.replace("invalidation_success=", "invalidation_success=9"),
+                    valid.replace("descriptor_failures=", "descriptor_failures=9"),
                     valid.clone() + "thin-hv: nested contract FAIL stage=late\n",
                     valid.clone() + "thin-hv: vmx guest FAIL\n",
                     valid.clone() + "thin-hv: backend=physical-preflight project_vmx=0\n",
@@ -3360,6 +3379,17 @@ mod tests {
             assert!(!check(backend, ""));
         }
         assert!(!check("physical-chainload", ""));
+        let unsupported_pci = Command::new("bash")
+            .arg(&runner)
+            .env("X86_UEFI_PCI_PROFILE", "silent-fallback")
+            .output()
+            .unwrap();
+        assert!(!unsupported_pci.status.success());
+        assert!(
+            String::from_utf8(unsupported_pci.stderr)
+                .unwrap()
+                .contains("X86_UEFI_PCI_PROFILE must be")
+        );
     }
 
     #[cfg(unix)]
@@ -3394,7 +3424,7 @@ mod tests {
         for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
             let cycle = |number| {
                 format!(
-                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=32 halt=16 remaps=14 state_checks=16 sse_checks=16 teardown=explicit process_exit=0\n"
+                    "thin-hv: linux L2 lifecycle cycle={number} KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=96 halt=32 remaps=14 state_checks=16 sse_checks=16 long64_rounds=16 paging_checks=64 invlpg=16 cr3_writes=48 xmm16_checks=16 msr_checks=16 debug_checks=16 tsc_checks=16 teardown=explicit process_exit=0\n"
                 )
             };
             let valid = format!(
@@ -3429,11 +3459,19 @@ mod tests {
                 " vm_contexts=2",
                 " rounds=8",
                 " io_in=16",
-                " io_out=32",
-                " halt=16",
+                " io_out=96",
+                " halt=32",
                 " remaps=14",
                 " state_checks=16",
                 " sse_checks=16",
+                " long64_rounds=16",
+                " paging_checks=64",
+                " invlpg=16",
+                " cr3_writes=48",
+                " xmm16_checks=16",
+                " msr_checks=16",
+                " debug_checks=16",
+                " tsc_checks=16",
                 " teardown=explicit",
             ] {
                 assert!(!check(backend, "2", &valid.replace(missing, "")));
@@ -3454,6 +3492,328 @@ mod tests {
                 assert!(!check(backend, "2", &format!("{valid}{failure}\n")));
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_nested_power_gates_require_backend_coverage_and_shutdown() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-power-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let check = |script: &str, backend: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            let mut command = Command::new("bash");
+            command
+                .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+                .args(["--check-log", backend]);
+            if script.ends_with("run-linux-soak-test.sh") {
+                command.args(["2", "3"]);
+            }
+            command
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let soak_runner = "../scripts/x86_64/run-linux-soak-test.sh";
+        let s3_runner = "../scripts/x86_64/run-linux-suspend-test.sh";
+        for (backend, cpus) in [("direct-vmx", 1), ("outer-kvm", 2)] {
+            let boot = if backend == "direct-vmx" {
+                "thin-hv: uefi entry\nthin-hv: backend=direct-vmx role=project-l0\n\
+                 thin-hv: uefi entry\nthin-hv: backend=direct-vmx role=project-l0\nthin-hv: private host state PASS\n"
+            } else {
+                "thin-hv: uefi entry\nthin-hv: backend=outer-kvm role=reference\n\
+                 thin-hv: trusted outer KVM direct chainload profile=2 resident_runtime=0\n"
+            };
+            let mut soak = String::new();
+            for phase in 1..=2 {
+                soak.push_str(&format!(
+                    "{boot}thin-hv-soak: L1 boot begin uptime=0\n\
+                     thin-hv-soak: topology backend={backend} l1_cpus={cpus}\n\
+                     thin-hv-soak: nested KVM ready\n\
+                     thin-hv-soak: phase={phase}\n\
+                     thin-hv-soak: usernet PASS packets=5\n\
+                     thin-hv-soak: cpu-memory PASS bytes=134217728 workers=2 hashes=4 sha256=fixture\n\
+                     thin-hv-soak: repeated L2 PASS count=3 start=0 end=1\n"
+                ));
+                if phase == 1 {
+                    soak.push_str("thin-hv-soak: virtio-blk PASS phase=write bytes=134217728 sha256=fixture\nthin-hv-soak: reboot requested\n");
+                } else {
+                    soak.push_str("thin-hv-soak: virtio-blk PASS phase=reboot-read bytes=134217728 sha256=fixture\nthin-hv-soak: PASS phase=2 hashes=4 l2=3 uptime=1\nthin-hv-soak: poweroff requested\n");
+                }
+            }
+            let mut s3 = format!(
+                "{boot}thin-hv: linux S3 begin backend={backend} l1_cpus={cpus}\n\
+                 thin-hv: linux S3 CPUs online PASS before suspend cycles\n\
+                 thin-hv: linux L1 L2 KVM PASS\n"
+            );
+            for cycle in 1..=3 {
+                s3.push_str(&format!(
+                    "thin-hv: linux S3 EFI runtime write PASS cycle={cycle} variable=DriverFFFF\n\
+                     thin-hv: linux S3 suspend begin cycle={cycle}\n\
+                     thin-hv: linux S3 resume cycle={cycle}\n\
+                     thin-hv: linux S3 CPUs online PASS cycle={cycle}\n\
+                     thin-hv: linux L1 L2 KVM PASS\n\
+                     thin-hv: linux S3 EFI runtime resume PASS cycle={cycle} variable=DriverFFFF\n\
+                     thin-hv: linux S3 EFI runtime delete PASS cycle={cycle} variable=DriverFFFF\n\
+                     thin-hv: linux S3 EFI runtime PASS cycle={cycle}\n"
+                ));
+            }
+            s3.push_str("thin-hv: linux S3 nested KVM PASS cycles=3\nthin-hv: linux S3 poweroff requested\n");
+            for (runner, valid) in [(soak_runner, &soak), (s3_runner, &s3)] {
+                assert!(check(runner, backend, valid));
+                assert!(check(runner, backend, &valid.replace('\n', "\r\n")));
+                for invalid in [
+                    valid.replace("poweroff requested", "missing shutdown"),
+                    valid.replace("l1_cpus=", "wrong_topology="),
+                    format!("{valid}\0"),
+                    format!("{valid}thin-hv: backend=physical-preflight project_vmx=0\n"),
+                    format!("{valid}Kernel panic\n"),
+                    format!("{valid}thin-hv-soak: FAIL late\nthin-hv: linux S3 FAIL late\n"),
+                ] {
+                    assert!(!check(runner, backend, &invalid));
+                }
+                assert!(!check(runner, "unknown", valid));
+                assert!(!check(runner, backend, &"x".repeat(2_097_153)));
+            }
+            assert!(!check(
+                soak_runner,
+                backend,
+                &soak.replacen("thin-hv: uefi entry\n", "", 1)
+            ));
+            assert!(!check(
+                soak_runner,
+                backend,
+                &soak.replace("count=3", "count=2")
+            ));
+            assert!(!check(
+                soak_runner,
+                backend,
+                &soak.replace(&format!("l1_cpus={cpus}"), &format!("l1_cpus={cpus}0"))
+            ));
+            assert!(!check(
+                soak_runner,
+                backend,
+                &soak.replace("hashes=4", "hashes=0")
+            ));
+            assert!(!check(
+                soak_runner,
+                backend,
+                &soak.replace("phase=1\n", "phase=2\n")
+            ));
+            assert!(!check(
+                s3_runner,
+                backend,
+                &s3.replace("thin-hv: linux L1 L2 KVM PASS\n", "")
+            ));
+            assert!(!check(
+                s3_runner,
+                backend,
+                &s3.replace("resume cycle=2", "resume cycle=1")
+            ));
+            assert!(!check(
+                s3_runner,
+                backend,
+                &s3.replace("EFI runtime PASS cycle=3", "EFI runtime PASS cycle=2")
+            ));
+            let kernel_records = s3
+                .lines()
+                .map(|line| {
+                    if line.starts_with("thin-hv: linux") {
+                        format!("[    1.234567] {line}\n")
+                    } else {
+                        format!("{line}\n")
+                    }
+                })
+                .collect::<String>();
+            assert!(check(s3_runner, backend, &kernel_records));
+            assert!(!check(
+                s3_runner,
+                backend,
+                &kernel_records.replace(
+                    "variable=DriverFFFF",
+                    "variable=Driver[    1.2] PM: suspend\nFFFF"
+                )
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_upstream_selftest_gate_requires_all_tap_assertions_and_exit_status() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-selftest-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-linux-selftest.sh");
+        let check = |backend: &str, name: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-log", backend, name])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
+            for (name, count) in [("tsc_msrs_test", 5), ("userspace_msr_exit_test", 4)] {
+                let assertions = if count == 5 {
+                    (1..=5)
+                        .map(|n| format!("ok {n} stage {} passed\n", n + 1))
+                        .collect::<String>()
+                } else {
+                    [
+                        "msr_filter_allow",
+                        "msr_filter_deny",
+                        "msr_permission_bitmap",
+                        "user_exit_msr_flags",
+                    ]
+                    .iter()
+                    .enumerate()
+                    .map(|(n, name)| format!("ok {} user_msr.{name}\n", n + 1))
+                    .collect::<String>()
+                };
+                let suite = if count == 4 {
+                    "# PASSED: 4 / 4 tests passed.\n"
+                } else {
+                    ""
+                };
+                let begin = format!(
+                    "thin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus=1\n"
+                );
+                let end = format!(
+                    "thin-hv: linux KVM selftest exit backend={backend} test={name} process_exit=0\n"
+                );
+                let pass = format!(
+                    "thin-hv: linux KVM selftest PASS backend={backend} test={name} assertions={count}\n"
+                );
+                let totals =
+                    format!("# Totals: pass:{count} fail:0 xfail:0 xpass:0 skip:0 error:0\n");
+                let poweroff = "thin-hv: linux KVM selftest poweroff requested\n";
+                let valid = format!(
+                    "thin-hv: backend={backend} role={role}\n{begin}TAP version 13\n1..{count}\n{assertions}{suite}{totals}{end}{pass}{poweroff}"
+                );
+                assert!(check(backend, name, &valid));
+                assert!(check(backend, name, &valid.replace('\n', "\r\n")));
+                for missing in [
+                    &begin,
+                    &end,
+                    &pass,
+                    &assertions,
+                    &totals,
+                    poweroff,
+                    "TAP version 13\n",
+                ] {
+                    assert!(
+                        !check(backend, name, &valid.replace(missing, "")),
+                        "missing {missing}"
+                    );
+                }
+                for (from, to) in [
+                    ("process_exit=0", "process_exit=1"),
+                    ("l1_cpus=1", "l1_cpus=2"),
+                    ("TAP version 13", "TAP version 12"),
+                    ("skip:0", "skip:1"),
+                    ("fail:0", "fail:1"),
+                    ("ok 1 ", "ok 2 "),
+                    ("1..", "1..0 # SKIP "),
+                ] {
+                    assert!(
+                        !check(backend, name, &valid.replace(from, to)),
+                        "mutation {from}"
+                    );
+                }
+                assert!(!check(
+                    backend,
+                    name,
+                    &valid.replace(&end, &(pass.clone() + &end))
+                ));
+                assert!(!check(
+                    backend,
+                    name,
+                    &valid.replace(&begin, &(begin.clone() + &begin))
+                ));
+                if count == 4 {
+                    assert!(!check(backend, name, &valid.replace(suite, "")));
+                }
+                for suffix in [
+                    "\0",
+                    "not ok 6 unexpected\n",
+                    "Bail out!\n",
+                    "Kernel panic\n",
+                    "thin-hv: linux KVM selftest FAIL late\n",
+                    "ok 6 unexpected\n",
+                    "thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0\n",
+                ] {
+                    assert!(!check(backend, name, &(valid.clone() + suffix)));
+                }
+                assert!(!check("unknown", name, &valid));
+                assert!(!check(backend, "vmx_test", &valid));
+                assert!(!check(backend, name, &"x".repeat(2_097_153)));
+            }
+        }
+        for (backend, role) in [("direct-vmx", "project-l0"), ("outer-kvm", "reference")] {
+            for name in ["cr4_cpuid_sync_test", "xcr0_cpuid_test", "debug_regs"] {
+                let valid = format!(
+                    "thin-hv: backend={backend} role={role}\nthin-hv: linux KVM selftest begin backend={backend} test={name} l1_cpus=1\nthin-hv: linux KVM selftest exit backend={backend} test={name} process_exit=0\nthin-hv: linux KVM selftest PASS backend={backend} test={name} assertions=1\nthin-hv: linux KVM selftest poweroff requested\n"
+                );
+                assert!(check(backend, name, &valid));
+                for status in ["1", "4", "137"] {
+                    assert!(!check(
+                        backend,
+                        name,
+                        &valid.replace("process_exit=0", &format!("process_exit={status}"))
+                    ));
+                }
+                for suffix in [
+                    "TAP version 13\n",
+                    "ok 1 forged\n",
+                    "Test Assertion Failure\n",
+                    "thin-hv: linux KVM selftest FAIL late\n",
+                ] {
+                    assert!(!check(backend, name, &(valid.clone() + suffix)));
+                }
+                assert!(!check(
+                    backend,
+                    name,
+                    &valid.replace("assertions=1", "assertions=0")
+                ));
+            }
+        }
+        assert!(
+            !Command::new("bash")
+                .arg(&runner)
+                .arg("--check-elf")
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[cfg(unix)]

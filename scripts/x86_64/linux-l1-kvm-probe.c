@@ -9,7 +9,19 @@
 enum {
     CONTEXTS = 2, ROUNDS = 8, PAGE_SIZE = 4096, DATA_GPA = 4096,
     CPUID_ENTRIES = 256, SSE_REGISTERS = 8, SSE_INITIALIZER_SIZE = 53,
+    LONG_PAGES = 10, LONG_ROOT_A = 0x2000, LONG_ROOT_B = 0x6000,
+    LONG_ALIAS = 0x10000, LONG_DATA_A = 0xa000, LONG_DATA_B = 0xb000,
 };
+_Static_assert(LONG_ROOT_A == 2 * PAGE_SIZE &&
+               LONG_ROOT_B == LONG_ROOT_A + 4 * PAGE_SIZE &&
+               LONG_DATA_A == LONG_ROOT_A + 8 * PAGE_SIZE &&
+               LONG_DATA_B + PAGE_SIZE == LONG_ROOT_A + LONG_PAGES * PAGE_SIZE,
+               "long-mode roots/data occupy exactly the mapped pages");
+_Static_assert(LONG_ALIAS >= LONG_ROOT_A + LONG_PAGES * PAGE_SIZE &&
+               LONG_ALIAS / PAGE_SIZE < PAGE_SIZE / sizeof(uint64_t),
+               "long-mode alias is distinct and fits one level-1 table");
+_Static_assert(0x100 + 16 * 16 <= 0x800 && 0x900 + 104 <= PAGE_SIZE,
+               "long-mode XMM seeds, GDT and TSS fit disjoint data-page regions");
 
 static struct {
     uint32_t nent;
@@ -45,6 +57,53 @@ static const uint8_t guest_code[] = {
 static uint8_t guest_memory[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
 static uint32_t guest_data[CONTEXTS][2][PAGE_SIZE / sizeof(uint32_t)]
     __attribute__((aligned(PAGE_SIZE)));
+static uint64_t long_memory[CONTEXTS][LONG_PAGES][PAGE_SIZE / sizeof(uint64_t)]
+    __attribute__((aligned(PAGE_SIZE)));
+
+/* This copied payload has no host relocations, stack calls, or external labels.
+ * Its bootstrap executes once; named linker symbols define the rewind/size.
+ * Both roots use 4 KiB leaves, PCID/PGE/LA57 are disabled, and each round observes
+ * actual loads after INVLPG and CR3 writes, not merely userspace page-table edits.
+ * Intel SDM Vol. 3A sections 4.5 and 4.10 describe these paging/flush semantics. */
+extern const uint8_t thin_hv_l2_long_start[];
+extern const uint8_t thin_hv_l2_long_loop[];
+extern const uint8_t thin_hv_l2_long_end[];
+__asm__(
+    ".pushsection .rodata.thin_hv_l2_long,\"a\",@progbits\n"
+    ".code64\n.balign 16\n"
+    ".global thin_hv_l2_long_start, thin_hv_l2_long_loop, thin_hv_l2_long_end\n"
+    "thin_hv_l2_long_start:\n"
+    "ldmxcsr 0x1008\n"
+    ".irp reg,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15\n"
+    "movdqu 0x1100+16*\\reg, %xmm\\reg\n"
+    ".endr\n"
+    "thin_hv_l2_long_loop:\n"
+    "pxor %xmm15, %xmm0\n"
+    "pxor %xmm7, %xmm8\n"
+    "movdqu %xmm0, 0x1020\n"
+    "movdqu %xmm8, 0x1030\n"
+    "stmxcsr 0x1040\n"
+    "lfence\nrdtsc\nshl $32, %rdx\nor %rdx, %rax\nmov %rax, 0x1068\n"
+    "movq $0xa003, 0x5080\n" /* root A alias -> data A */
+    "mov $0x2000, %eax\nmov %rax, %cr3\n"
+    "mov 0x10000, %eax\nmov $0xe9, %edx\nout %eax, %dx\n"
+    "movq $0xb003, 0x5080\ninvlpg 0x10000\n"
+    "mov 0x10000, %eax\nout %eax, %dx\n"
+    "movq $0xa003, 0x9080\n" /* root B alias -> data A */
+    "mov $0x6000, %eax\nmov %rax, %cr3\n"
+    "mov 0x10000, %eax\nout %eax, %dx\n"
+    "movq $0xb003, 0x9080\nmov %cr3, %rax\nmov %rax, %cr3\n"
+    "mov 0x10000, %eax\nout %eax, %dx\n"
+    "mov %cr3, %rax\nmov %rax, 0x1048\n"
+    "mov $0xc0000080, %ecx\nrdmsr\nshl $32, %rdx\nor %rdx, %rax\n"
+    "mov %rax, 0x1050\n"
+    "mov $0x277, %ecx\nrdmsr\nshl $32, %rdx\nor %rdx, %rax\n"
+    "mov %rax, 0x1058\n"
+    "mov %dr0, %rax\nmov %rax, 0x1060\n"
+    "lfence\nrdtsc\nshl $32, %rdx\nor %rdx, %rax\nmov %rax, 0x1070\n"
+    "hlt\n"
+    "thin_hv_l2_long_end:\n.popsection\n"
+);
 
 struct context {
     long vm_fd;
@@ -272,7 +331,8 @@ static int create_context(long kvm_fd, long run_size, unsigned int number,
     /* Initialize SSE in actual guest instructions once, not KVM_SET_FPU:
      * Linux v7.1.5 copies its XMM bytes but does not set SSE's XSTATE_BV bit,
      * so XRSTOR can discard that image as init state on the first KVM_RUN.
-     * Real mode exposes XMM0-7; XMM8-15, AVX and full XSAVE are not tested. */
+     * This real-mode stage exposes XMM0-7; the later long-mode stage exercises
+     * XMM8-15 as well. Neither stage tests AVX or the complete XSAVE state. */
     for (reg = 0; reg < SSE_REGISTERS; ++reg) {
         for (byte = 0; byte < 16; ++byte) {
             ((uint8_t *)guest_data[number][0])[256 + reg * 16 + byte] =
@@ -410,6 +470,365 @@ static int destroy_context(struct context *context, long run_size)
     return status;
 }
 
+struct long_saved {
+    struct kvm_sregs sregs;
+    struct kvm_regs regs;
+    struct kvm_debugregs debug;
+    uint64_t pat;
+    uint64_t last_tsc;
+    int changed;
+    int mapped;
+};
+
+static uint64_t long_value(unsigned int number, unsigned int offset)
+{
+    const uint32_t *data = guest_data[number][(ROUNDS - 1) % 2];
+
+    return data[offset / 4] | ((uint64_t)data[offset / 4 + 1] << 32);
+}
+
+static void set_long_value(unsigned int number, unsigned int offset, uint64_t value)
+{
+    uint32_t *data = guest_data[number][(ROUNDS - 1) % 2];
+
+    data[offset / 4] = (uint32_t)value;
+    data[offset / 4 + 1] = (uint32_t)(value >> 32);
+}
+
+/* KVM GET/SET_MSRS return the number of completed entries, not just 0/-1.
+ * The exact one-entry check rejects partial completion before using any value.
+ * https://www.kernel.org/doc/html/latest/virt/kvm/api.html#kvm-set-msrs */
+static int access_msr(long vcpu_fd, unsigned long request, uint32_t index, uint64_t *value)
+{
+    struct {
+        uint32_t count;
+        uint32_t padding;
+        struct kvm_msr_entry entry[1];
+    } msrs = {.count = 1, .entry = {{.index = index, .data = *value}}};
+    _Static_assert(offsetof(struct kvm_msrs, entries) == offsetof(typeof(msrs), entry),
+                   "KVM MSR header layout");
+
+    if (syscall3(__NR_ioctl, vcpu_fd, (long)request, (long)&msrs) != 1) {
+        return FAIL("long64-msr-access");
+    }
+    *value = msrs.entry[0].data;
+    return 0;
+}
+
+static uint64_t long_pat(unsigned int number)
+{
+    /* Only unused PAT entry 1 differs (WT versus WC). All probe PTEs select
+     * entry 0, WB. This is state preservation, not a cache-type benchmark. */
+    return number == 0 ? UINT64_C(0x0007040600070406) : UINT64_C(0x0007040600070106);
+}
+
+static int setup_long_mode(struct context *context, unsigned int number,
+                           struct long_saved *saved)
+{
+    struct kvm_userspace_memory_region region = {
+        .slot = 2,
+        .guest_phys_addr = LONG_ROOT_A,
+        .memory_size = sizeof(long_memory[number]),
+        .userspace_addr = (uint64_t)long_memory[number],
+    };
+    struct kvm_sregs sregs = saved->sregs;
+    struct kvm_regs regs = {
+        .rbx = UINT64_C(0x1234567800000000) | number,
+        .r8 = UINT64_C(0x8877665500000000) | number,
+        .r15 = UINT64_C(0xfedcba9800000000) | number,
+        .rsp = 0x1f00,
+        .rflags = 2,
+    };
+    struct kvm_debugregs debug = {
+        .db = {LONG_ALIAS + number * PAGE_SIZE},
+        .dr6 = 0xffff0ff0,
+        .dr7 = 0x400,
+    };
+    uint64_t pat = long_pat(number);
+    uint32_t *data = guest_data[number][(ROUNDS - 1) % 2];
+    unsigned int root;
+    unsigned int index;
+    unsigned int reg;
+    unsigned int byte;
+
+    /* Both roots identity-map every present guest page (0..0xbfff); the one
+     * alias at 0x10000 maps one of two private data pages, never an absent GPA.
+     * All addresses fit the mandatory x86-64 physical/linear address widths. */
+    for (root = 0; root < LONG_PAGES; ++root) {
+        for (index = 0; index < PAGE_SIZE / sizeof(uint64_t); ++index) {
+            long_memory[number][root][index] = 0;
+        }
+    }
+    for (root = 0; root < 8; root += 4) {
+        long_memory[number][root][0] = (LONG_ROOT_A + (root + 1) * PAGE_SIZE) | 3;
+        long_memory[number][root + 1][0] = (LONG_ROOT_A + (root + 2) * PAGE_SIZE) | 3;
+        long_memory[number][root + 2][0] = (LONG_ROOT_A + (root + 3) * PAGE_SIZE) | 3;
+        for (index = 0; index < 12; ++index) {
+            long_memory[number][root + 3][index] = (index * PAGE_SIZE) | 3;
+        }
+        long_memory[number][root + 3][LONG_ALIAS / PAGE_SIZE] =
+            (root == 0 ? LONG_DATA_A : LONG_DATA_B) | 3;
+    }
+    for (index = 0; index < PAGE_SIZE / sizeof(uint32_t); ++index) {
+        data[index] = 0;
+    }
+    data[2] = 0x1f80 | (number << 13);
+    for (reg = 0; reg < 16; ++reg) {
+        for (byte = 0; byte < 16; ++byte) {
+            ((uint8_t *)data)[256 + reg * 16 + byte] = xmm_seed(number, reg, byte);
+        }
+    }
+    set_long_value(number, 0x808, UINT64_C(0x00af9b000000ffff));
+    set_long_value(number, 0x810, UINT64_C(0x00cf93000000ffff));
+    set_long_value(number, 0x818, UINT64_C(0x00008b0019000067));
+    ((uint8_t *)data)[0x900 + 102] = 0x68; /* TSS I/O bitmap is beyond its limit. */
+    if (syscall3(__NR_ioctl, context->vm_fd, KVM_SET_USER_MEMORY_REGION,
+                 (long)&region) < 0) {
+        return FAIL("long64-map-tables");
+    }
+    saved->mapped = 1;
+    sregs.cs = (struct kvm_segment){
+        .limit = UINT32_MAX, .selector = 8, .type = 11,
+        .present = 1, .s = 1, .l = 1, .g = 1,
+    };
+    sregs.ds = (struct kvm_segment){
+        .limit = UINT32_MAX, .selector = 16, .type = 3,
+        .present = 1, .db = 1, .s = 1, .g = 1,
+    };
+    sregs.es = sregs.ss = sregs.fs = sregs.gs = sregs.ds;
+    sregs.tr = (struct kvm_segment){
+        .base = 0x1900, .limit = 0x67, .selector = 24, .type = 11, .present = 1,
+    };
+    sregs.ldt = (struct kvm_segment){.unusable = 1};
+    sregs.gdt = (struct kvm_dtable){.base = 0x1800, .limit = 39};
+    sregs.idt = (struct kvm_dtable){0};
+    sregs.cr0 = UINT64_C(0x80010033); /* PG, WP, NE, ET, MP, PE; no EM/TS/CD/NW. */
+    sregs.cr3 = LONG_ROOT_A;
+    sregs.cr4 = 0x220;              /* PAE, OSFXSR; no PCID, PGE, LA57 or OSXSAVE. */
+    sregs.efer = 0x500;             /* LME and LMA; no NX or SYSCALL assumption. */
+    saved->changed = 1;
+    if (access_msr(context->vcpu_fd, KVM_SET_MSRS, 0x277, &pat) ||
+        syscall3(__NR_ioctl, context->vcpu_fd, KVM_SET_DEBUGREGS, (long)&debug) < 0 ||
+        syscall3(__NR_ioctl, context->vcpu_fd, KVM_SET_SREGS, (long)&sregs) < 0 ||
+        syscall3(__NR_ioctl, context->vcpu_fd, KVM_SET_REGS, (long)&regs) < 0) {
+        return FAIL("long64-set-state");
+    }
+    return 0;
+}
+
+static int check_long_halt(struct context *context, unsigned int number, unsigned int round,
+                           size_t code_size, size_t loop_offset, struct long_saved *saved)
+{
+    struct kvm_regs regs;
+    struct kvm_sregs sregs;
+    struct kvm_debugregs debug;
+    struct kvm_fpu fpu;
+    const uint8_t *data = (const uint8_t *)guest_data[number][(ROUNDS - 1) % 2];
+    uint64_t pat = 0;
+    uint64_t efer = 0;
+    uint64_t started;
+    uint64_t ended;
+    unsigned int reg;
+    unsigned int byte;
+
+    if (syscall3(__NR_ioctl, context->vcpu_fd, KVM_RUN, 0) < 0 ||
+        context->run->exit_reason != KVM_EXIT_HLT) {
+        return FAIL("long64-complete-io-halt");
+    }
+    if (syscall3(__NR_ioctl, context->vcpu_fd, KVM_GET_REGS, (long)&regs) < 0 ||
+        syscall3(__NR_ioctl, context->vcpu_fd, KVM_GET_SREGS, (long)&sregs) < 0 ||
+        syscall3(__NR_ioctl, context->vcpu_fd, KVM_GET_DEBUGREGS, (long)&debug) < 0 ||
+        syscall3(__NR_ioctl, context->vcpu_fd, KVM_GET_FPU, (long)&fpu) < 0) {
+        return FAIL("long64-get-state");
+    }
+    if (regs.rip != code_size || regs.rsp != 0x1f00 || (regs.rflags & 0x202) != 2 ||
+        regs.rbx != (UINT64_C(0x1234567800000000) | number) ||
+        regs.r8 != (UINT64_C(0x8877665500000000) | number) ||
+        regs.r15 != (UINT64_C(0xfedcba9800000000) | number) ||
+        sregs.cr0 != UINT64_C(0x80010033) || sregs.cr3 != LONG_ROOT_B ||
+        sregs.cr4 != 0x220 || sregs.efer != 0x500 || !sregs.cs.l || sregs.cs.db ||
+        long_value(number, 0x48) != LONG_ROOT_B ||
+        (long_memory[number][3][LONG_ALIAS / PAGE_SIZE] & ~UINT64_C(0xfff)) != LONG_DATA_B ||
+        (long_memory[number][7][LONG_ALIAS / PAGE_SIZE] & ~UINT64_C(0xfff)) != LONG_DATA_B) {
+        return FAIL("long64-control-state");
+    }
+    if (access_msr(context->vcpu_fd, KVM_GET_MSRS, 0x277, &pat) ||
+        access_msr(context->vcpu_fd, KVM_GET_MSRS, 0xc0000080, &efer)) {
+        return 1;
+    }
+    if (pat != long_pat(number) || long_value(number, 0x58) != pat ||
+        efer != 0x500 || long_value(number, 0x50) != efer) {
+        return FAIL("long64-pat-efer-state");
+    }
+    if (debug.db[0] != LONG_ALIAS + number * PAGE_SIZE || debug.dr7 != 0x400 ||
+        long_value(number, 0x60) != debug.db[0]) {
+        return FAIL("long64-debug-state");
+    }
+    if (guest_data[number][(ROUNDS - 1) % 2][0x40 / 4] != (0x1f80 | (number << 13))) {
+        return FAIL("long64-mxcsr-state");
+    }
+    for (reg = 0; reg < 16; ++reg) {
+        for (byte = 0; byte < 16; ++byte) {
+            uint8_t expected = xmm_seed(number, reg, byte);
+
+            if (round % 2 == 0 && (reg == 0 || reg == 8)) {
+                expected ^= xmm_seed(number, reg == 0 ? 15 : 7, byte);
+            }
+            if (fpu.xmm[reg][byte] != expected ||
+                (reg == 0 && data[0x20 + byte] != expected) ||
+                (reg == 8 && data[0x30 + byte] != expected)) {
+                int status = FAIL_VALUE("long64-xmm-state", fpu.xmm[reg][byte], expected);
+
+                HEX_FIELD(" reg=0x", reg);
+                HEX_FIELD(" byte=0x", byte);
+                if (reg == 0 || reg == 8) {
+                    HEX_FIELD(" stored=0x", data[(reg == 0 ? 0x20 : 0x30) + byte]);
+                }
+                write_all("\n", 1);
+                return status;
+            }
+        }
+    }
+    started = long_value(number, 0x68);
+    ended = long_value(number, 0x70);
+    if (started == 0 || ended < started || (round != 0 && started < saved->last_tsc)) {
+        return FAIL("long64-tsc-order");
+    }
+    saved->last_tsc = ended;
+    if (round + 1 < ROUNDS) {
+        regs.rip = loop_offset;
+        if (syscall3(__NR_ioctl, context->vcpu_fd, KVM_SET_REGS, (long)&regs) < 0) {
+            return FAIL("long64-rewind-rip");
+        }
+    }
+    return 0;
+}
+
+static int probe_long_mode(long kvm_fd, long run_size, struct context contexts[CONTEXTS])
+{
+    struct long_saved saved[CONTEXTS] = {0};
+    uintptr_t start = (uintptr_t)thin_hv_l2_long_start;
+    uintptr_t loop = (uintptr_t)thin_hv_l2_long_loop;
+    uintptr_t end = (uintptr_t)thin_hv_l2_long_end;
+    uint32_t expected[CONTEXTS][2];
+    unsigned int number = 0;
+    unsigned int round = 0;
+    unsigned int phase = 0;
+    unsigned int index;
+    int long_mode = 0;
+    int features = 0;
+    int status = 1;
+
+    if (end <= start || loop <= start || loop >= end || end - start > PAGE_SIZE) {
+        return FAIL("long64-payload-bounds");
+    }
+    if (syscall3(__NR_ioctl, kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_DEBUGREGS) <= 0) {
+        return FAIL("long64-debug-capability");
+    }
+    for (index = 0; index < supported_cpuid.nent; ++index) {
+        const struct kvm_cpuid_entry2 *entry = &supported_cpuid.entries[index];
+
+        if (entry->function == 0x80000001 && (entry->edx & (1U << 29))) {
+            long_mode = 1;
+        }
+        if (entry->function == 1 && entry->index == 0 &&
+            (entry->edx & ((1U << 4) | (1U << 5) | (1U << 6) | (1U << 16))) ==
+            ((1U << 4) | (1U << 5) | (1U << 6) | (1U << 16))) {
+            features = 1; /* TSC, MSR, PAE, PAT; FXSR/SSE2 already required. */
+        }
+    }
+    if (!long_mode || !features) {
+        return FAIL("long64-cpuid-capability");
+    }
+    /* Snapshot every recoverable guest state before changing either context.
+     * The original code/PAT/CR3/EFER/debug state is restored before teardown. */
+    for (number = 0; number < CONTEXTS; ++number) {
+        if (syscall3(__NR_ioctl, contexts[number].vcpu_fd, KVM_GET_SREGS,
+                     (long)&saved[number].sregs) < 0 ||
+            syscall3(__NR_ioctl, contexts[number].vcpu_fd, KVM_GET_REGS,
+                     (long)&saved[number].regs) < 0 ||
+            syscall3(__NR_ioctl, contexts[number].vcpu_fd, KVM_GET_DEBUGREGS,
+                     (long)&saved[number].debug) < 0 ||
+            access_msr(contexts[number].vcpu_fd, KVM_GET_MSRS, 0x277, &saved[number].pat)) {
+            FAIL("long64-save-state");
+            goto out;
+        }
+    }
+    for (index = 0; index < end - start; ++index) {
+        guest_memory[index] = thin_hv_l2_long_start[index];
+    }
+    for (number = 0; number < CONTEXTS; ++number) {
+        if (setup_long_mode(&contexts[number], number, &saved[number])) {
+            goto out;
+        }
+    }
+    for (round = 0; round < ROUNDS; ++round) {
+        for (number = 0; number < CONTEXTS; ++number) {
+            expected[number][0] = 0x13579bdf ^ (number * 0x1010101) ^ (round * 0x10001);
+            expected[number][1] = expected[number][0] ^ 0xf0f00f0f;
+            long_memory[number][8][0] = expected[number][0];
+            long_memory[number][9][0] = expected[number][1];
+            for (index = 0x20 / 4; index < 0x78 / 4; ++index) {
+                guest_data[number][(ROUNDS - 1) % 2][index] = 0;
+            }
+        }
+        for (phase = 0; phase < 4; ++phase) {
+            for (number = 0; number < CONTEXTS; ++number) {
+                if (run_io(&contexts[number], run_size, KVM_EXIT_IO_OUT,
+                           expected[number][phase % 2])) {
+                    goto out;
+                }
+            }
+        }
+        for (number = 0; number < CONTEXTS; ++number) {
+            if (check_long_halt(&contexts[number], number, round, end - start,
+                                loop - start, &saved[number])) {
+                goto out;
+            }
+        }
+    }
+    status = 0;
+out:
+    if (status != 0) {
+        HEX_FIELD(" long64_vm=0x", number);
+        HEX_FIELD(" round=0x", round);
+        HEX_FIELD(" phase=0x", phase);
+        write_all("\n", 1);
+    }
+    for (number = 0; number < CONTEXTS; ++number) {
+        if (saved[number].changed) {
+            if (access_msr(contexts[number].vcpu_fd, KVM_SET_MSRS, 0x277,
+                           &saved[number].pat)) {
+                status = 1;
+            }
+            if (syscall3(__NR_ioctl, contexts[number].vcpu_fd, KVM_SET_SREGS,
+                         (long)&saved[number].sregs) < 0) {
+                status = FAIL("long64-restore-sregs");
+            }
+            if (syscall3(__NR_ioctl, contexts[number].vcpu_fd, KVM_SET_REGS,
+                         (long)&saved[number].regs) < 0) {
+                status = FAIL("long64-restore-regs");
+            }
+            if (syscall3(__NR_ioctl, contexts[number].vcpu_fd, KVM_SET_DEBUGREGS,
+                         (long)&saved[number].debug) < 0) {
+                status = FAIL("long64-restore-debug");
+            }
+        }
+        if (saved[number].mapped) {
+            struct kvm_userspace_memory_region region = {.slot = 2};
+
+            if (syscall3(__NR_ioctl, contexts[number].vm_fd, KVM_SET_USER_MEMORY_REGION,
+                         (long)&region) < 0) {
+                status = FAIL("long64-remove-tables");
+            }
+        }
+    }
+    for (index = 0; index < sizeof(guest_code); ++index) {
+        guest_memory[index] = guest_code[index];
+    }
+    return status;
+}
+
 static int probe(void)
 {
     static const char success[] = "thin-hv: linux L1 L2 KVM PASS\n";
@@ -520,7 +939,7 @@ static int probe(void)
             retired[number][active] = output;
         }
     }
-    status = 0;
+    status = probe_long_mode(kvm_fd, run_size, contexts);
 out:
     for (number = 0; number < CONTEXTS; ++number) {
         if (destroy_context(&contexts[number], run_size)) {

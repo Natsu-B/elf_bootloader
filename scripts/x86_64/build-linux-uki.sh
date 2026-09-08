@@ -44,8 +44,29 @@ first_command() {
 }
 
 file_cmd=$(first_command "${FILE:-}" file) || die 'file not found; set FILE'
-objcopy=$(first_command "${OBJCOPY:-}" objcopy llvm-objcopy) || die 'objcopy not found; set OBJCOPY'
 objdump=$(first_command "${OBJDUMP:-}" objdump llvm-objdump) || die 'objdump not found; set OBJDUMP'
+
+valid_selftest() {
+    local candidate=$1 description headers bytes
+    # llvm-objdump does not accept "--"; make every input an absolute operand.
+    [[ "$candidate" == /* ]] || candidate="$PWD/$candidate"
+    [[ -f "$candidate" && -r "$candidate" && -x "$candidate" ]] || return 1
+    bytes=$(wc -c <"$candidate") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 67108864)) || return 1
+    description=$(LC_ALL=C "$file_cmd" -Lb -- "$candidate") || return 1
+    [[ "$description" == 'ELF 64-bit LSB executable, x86-64,'* &&
+       "$description" == *'statically linked'* ]] || return 1
+    headers=$("$objdump" -p "$candidate") || return 1
+    ! grep -Eq '^[[:space:]]*(INTERP|DYNAMIC)[[:space:]]' <<<"$headers"
+}
+
+if [[ ${1:-} == --check-selftest-elf ]]; then
+    [[ $# == 2 ]] || die 'usage: --check-selftest-elf ELF'
+    valid_selftest "$2" || die 'selftest must be a bounded static non-PIE x86-64 ELF executable'
+    exit 0
+fi
+
+objcopy=$(first_command "${OBJCOPY:-}" objcopy llvm-objcopy) || die 'objcopy not found; set OBJCOPY'
 cpio=$(first_command "${CPIO:-}" cpio) || die 'cpio not found; set CPIO'
 gzip=$(first_command "${GZIP:-}" gzip) || die 'gzip not found; set GZIP'
 modprobe=$(first_command "${MODPROBE:-}" modprobe) || die 'modprobe not found; set MODPROBE'
@@ -97,6 +118,13 @@ init_source=$(first_file "${LINUX_L1_INIT:-}" "$repo_root/scripts/x86_64/linux-l
     || die 'init source not found; set LINUX_L1_INIT'
 kvm_probe_source=$(first_file "${LINUX_L1_KVM_PROBE:-}" "$repo_root/scripts/x86_64/linux-l1-kvm-probe.c") \
     || die 'KVM probe source not found; set LINUX_L1_KVM_PROBE'
+selftest=${LINUX_L1_KVM_SELFTEST:-}
+if [[ -n "$selftest" ]]; then
+    valid_selftest "$selftest" || die 'selftest must be a bounded static non-PIE x86-64 ELF executable'
+    for applet in awk timeout wc cat mkdir poweroff sleep; do
+        "$busybox" --list | grep -Fxq -- "$applet" || die "static BusyBox lacks $applet"
+    done
+fi
 kernel_release=${LINUX_KERNEL_RELEASE:-$(uname -r)}
 modules_prefix=${LINUX_MODULES_PREFIX:-/run/current-system/kernel-modules}
 modules_root=$modules_prefix/lib/modules/$kernel_release
@@ -105,7 +133,7 @@ modules_root=$modules_prefix/lib/modules/$kernel_release
 [[ "$($file_cmd -Lb -- "$stub")" == *'PE32+ executable (EFI application) x86-64'* ]] || die "not an x86-64 EFI stub: $stub"
 [[ -n "$cmdline" && "$cmdline" != *$'\n'* ]] || die 'LINUX_L1_CMDLINE must be one non-empty line'
 [[ -r "$modules_root/modules.dep" ]] || die "kernel modules not found: $modules_root"
-for input in "$kernel" "$stub" "$busybox" "$init_source" "$kvm_probe_source"; do
+for input in "$kernel" "$stub" "$busybox" "$init_source" "$kvm_probe_source" "$selftest"; do
     [[ ! -e "$output" || ! "$output" -ef "$input" ]] || die "output would overwrite input: $input"
 done
 
@@ -118,6 +146,9 @@ for applet in sh mount grep modprobe setsid cttyhack; do
     ln -s busybox "$root/bin/$applet"
 done
 install -m 0755 -- "$init_source" "$root/init"
+if [[ -n "$selftest" ]]; then
+    install -m 0755 -- "$selftest" "$root/bin/kvm-selftest"
+fi
 "$cc" -Os -Wall -Wextra -Werror -ffreestanding -fno-pie -fno-stack-protector \
     -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdlib -static -no-pie -s \
     -Wl,--build-id=none,-e,_start "$kvm_probe_source" -o "$root/bin/kvm-probe"

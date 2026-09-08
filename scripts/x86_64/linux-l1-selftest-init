@@ -1,0 +1,69 @@
+#!/bin/sh
+# Finite upstream KVM selftest run, one Linux L1 CPU; no L3/VMX test suite.
+set -eu
+
+fail() {
+    echo "thin-hv: linux KVM selftest FAIL $*"
+    /bin/busybox poweroff -f || true
+    exit 1
+}
+
+mount -t devtmpfs devtmpfs /dev || fail mount-dev
+mount -t proc proc /proc || fail mount-proc
+mount -t sysfs sysfs /sys || fail mount-sys
+/bin/busybox mkdir -p /tmp || fail mkdir-tmp
+mount -t tmpfs -o size=8m tmpfs /tmp || fail mount-tmp
+
+backend=
+test_name=
+read -r boot_arguments </proc/cmdline
+set -f
+for argument in $boot_arguments; do
+    case "$argument" in
+        thin_hv_selftest_backend=*)
+            [ -z "$backend" ] || fail duplicate-backend
+            backend=${argument#*=}
+            case "$backend" in direct-vmx|outer-kvm) ;; *) fail invalid-backend ;; esac
+            ;;
+        thin_hv_selftest_name=*)
+            [ -z "$test_name" ] || fail duplicate-test
+            test_name=${argument#*=}
+            case "$test_name" in
+                tsc_msrs_test) assertions=5 ;;
+                userspace_msr_exit_test) assertions=4 ;;
+                cr4_cpuid_sync_test|xcr0_cpuid_test|debug_regs) assertions=1 ;;
+                *) fail invalid-test ;;
+            esac
+            ;;
+    esac
+done
+set +f
+[ -n "$backend" ] && [ -n "$test_name" ] || fail missing-arguments
+read -r online_cpus </sys/devices/system/cpu/online
+[ "$online_cpus" = 0 ] || fail requires-one-L1-cpu
+grep -qw vmx /proc/cpuinfo || fail VMX-unavailable
+modprobe kvm || fail kvm-module
+modprobe kvm_intel nested=0 || fail kvm-intel-module
+[ -d /sys/module/kvm_intel ] && [ -c /dev/kvm ] || fail KVM-unavailable
+echo "thin-hv: linux KVM selftest begin backend=$backend test=$test_name l1_cpus=1"
+
+# Upstream lib/elf.c reopens program_invocation_name, so use an absolute path.
+# The tmpfs bounds output storage; timeout bounds all guest/user test execution.
+rc=0
+/bin/busybox timeout -s KILL 120 /bin/kvm-selftest >/tmp/selftest.log 2>&1 || rc=$?
+bytes=$(/bin/busybox wc -c </tmp/selftest.log) || fail output-size
+[ "$bytes" -le 1048576 ] || fail output-size
+# These unmodified upstream programs are silent on success. Their exit 0 is
+# reached only after guest UCALL_DONE; skipped prerequisites exit 4, not 0.
+case "$test_name" in
+    tsc_msrs_test|userspace_msr_exit_test) [ "$bytes" -gt 0 ] || fail missing-TAP ;;
+esac
+/bin/busybox cat /tmp/selftest.log || fail output-read
+echo "thin-hv: linux KVM selftest exit backend=$backend test=$test_name process_exit=$rc"
+[ "$rc" = 0 ] || fail "process-exit=$rc"
+# The host independently checks the exact TAP plan, all named assertions, and
+# zero skip/failure totals; success text alone never substitutes for exit 0.
+echo "thin-hv: linux KVM selftest PASS backend=$backend test=$test_name assertions=$assertions"
+echo 'thin-hv: linux KVM selftest poweroff requested'
+/bin/busybox poweroff -f || fail poweroff-failed
+fail poweroff-returned

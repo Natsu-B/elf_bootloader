@@ -8,6 +8,12 @@ mount -t sysfs sysfs /sys
 runtime_var=
 runtime_var_owned=0
 
+# Kernel console records serialize with PM messages, unlike tty writes that can
+# be interrupted halfway through a marker by a suspend/resume printk.
+log() {
+    printf '<5>%s\n' "$*" >/dev/kmsg
+}
+
 cleanup() {
     if [ "$runtime_var_owned" = 1 ] && [ -n "$runtime_var" ]; then
         /bin/busybox rm -f "$runtime_var" || true
@@ -16,7 +22,7 @@ cleanup() {
 }
 
 fail() {
-    echo "thin-hv: linux S3 FAIL $1"
+    log "thin-hv: linux S3 FAIL $1"
     cleanup
     /bin/busybox poweroff -f
     exit 1
@@ -32,15 +38,30 @@ verify_runtime_var() {
 
 verify_cpus_online() {
     cpus_online=$(/bin/busybox cat /sys/devices/system/cpu/online)
-    [ "$cpus_online" = '0-1' ] || fail "expected CPUs 0-1 online, got $cpus_online"
+    [ "$cpus_online" = "$expected_online" ] || fail "expected CPUs $expected_online online, got $cpus_online"
 }
 
 trap cleanup EXIT
+backend=
+for argument in $(/bin/busybox cat /proc/cmdline); do
+    case "$argument" in
+        thin_hv_s3_backend=*)
+            [ -z "$backend" ] || fail 'duplicate-backend'
+            backend=${argument#*=}
+            ;;
+    esac
+done
+case "$backend" in
+    direct-vmx) cpus=1; expected_online=0 ;;
+    outer-kvm) cpus=2; expected_online=0-1 ;;
+    *) fail 'unsupported-backend' ;;
+esac
+log "thin-hv: linux S3 begin backend=$backend l1_cpus=$cpus"
 
 state=$(/bin/busybox cat /sys/power/state)
 mem_sleep=$(/bin/busybox cat /sys/power/mem_sleep)
-echo "thin-hv: linux suspend states=$state"
-echo "thin-hv: linux mem_sleep=$mem_sleep"
+log "thin-hv: linux suspend states=$state"
+log "thin-hv: linux mem_sleep=$mem_sleep"
 
 case " $state " in
     *' mem '*) ;;
@@ -59,13 +80,13 @@ firmware_var=$(/bin/busybox find /sys/firmware/efi/efivars -maxdepth 1 -type f \
     | /bin/busybox head -n 1)
 [ -r "$firmware_var" ] || fail 'EFI variable unavailable'
 firmware_var_hash=$(/bin/busybox sha256sum "$firmware_var")
-echo "thin-hv: linux EFI runtime variable=$(/bin/busybox basename "$firmware_var")"
+log "thin-hv: linux EFI runtime variable=$(/bin/busybox basename "$firmware_var")"
 # Exercise a disposable Driver#### variable without adding it to DriverOrder.
 runtime_var_name=DriverFFFF
 runtime_var="/sys/firmware/efi/efivars/$runtime_var_name-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 verify_cpus_online
-echo 'thin-hv: linux S3 CPUs online PASS before suspend cycles'
-/bin/kvm-probe
+log 'thin-hv: linux S3 CPUs online PASS before suspend cycles'
+/bin/kvm-probe >/dev/kmsg
 echo deep >/sys/power/mem_sleep
 for cycle in 1 2 3; do
     [ ! -e "$runtime_var" ] || fail 'EFI runtime probe variable already exists'
@@ -79,25 +100,26 @@ for cycle in 1 2 3; do
     runtime_var_hash=$(/bin/busybox sha256sum "$runtime_var") \
         || fail 'EFI runtime probe hash failed'
     verify_runtime_var
-    echo "thin-hv: linux S3 EFI runtime write PASS cycle=$cycle variable=$runtime_var_name"
-    echo "thin-hv: linux S3 suspend begin cycle=$cycle"
+    log "thin-hv: linux S3 EFI runtime write PASS cycle=$cycle variable=$runtime_var_name"
+    log "thin-hv: linux S3 suspend begin cycle=$cycle"
     /bin/busybox sync
     echo mem >/sys/power/state
-    echo "thin-hv: linux S3 resume cycle=$cycle"
+    log "thin-hv: linux S3 resume cycle=$cycle"
     verify_cpus_online
-    echo "thin-hv: linux S3 CPUs online PASS cycle=$cycle"
-    /bin/kvm-probe
+    log "thin-hv: linux S3 CPUs online PASS cycle=$cycle"
+    /bin/kvm-probe >/dev/kmsg
     /bin/busybox umount /sys/firmware/efi/efivars
     mount -t efivarfs efivarfs /sys/firmware/efi/efivars
     [ "$(/bin/busybox sha256sum "$firmware_var")" = "$firmware_var_hash" ] \
         || fail 'EFI variable changed after resume'
     verify_runtime_var
-    echo "thin-hv: linux S3 EFI runtime resume PASS cycle=$cycle variable=$runtime_var_name"
+    log "thin-hv: linux S3 EFI runtime resume PASS cycle=$cycle variable=$runtime_var_name"
     /bin/busybox rm "$runtime_var" || fail 'EFI runtime probe delete failed'
     [ ! -e "$runtime_var" ] || fail 'EFI runtime probe remained after delete'
     runtime_var_owned=0
-    echo "thin-hv: linux S3 EFI runtime delete PASS cycle=$cycle variable=$runtime_var_name"
-    echo "thin-hv: linux S3 EFI runtime PASS cycle=$cycle"
+    log "thin-hv: linux S3 EFI runtime delete PASS cycle=$cycle variable=$runtime_var_name"
+    log "thin-hv: linux S3 EFI runtime PASS cycle=$cycle"
 done
-echo 'thin-hv: linux S3 nested KVM PASS cycles=3'
+log 'thin-hv: linux S3 nested KVM PASS cycles=3'
+log 'thin-hv: linux S3 poweroff requested'
 /bin/busybox poweroff -f

@@ -27,7 +27,8 @@ use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
 
 const PAGE: usize = 4096;
-const PAGES: usize = 3;
+/// VMXON, two VMCS regions, and an empty EPT root used only by INVEPT.
+const PAGES: usize = 4;
 const CYCLES: u64 = 8;
 /// Reserved encoding bit 12 guarantees this is not a supported VMCS field.
 const UNSUPPORTED_FIELD: u64 = 0x1000;
@@ -133,6 +134,33 @@ struct Prerequisites {
     invept: bool,
     invvpid: bool,
     readonly: bool,
+    shadow: bool,
+    invept_types: u8,
+    invvpid_types: u8,
+}
+
+impl Prerequisites {
+    /// One successful instruction for each advertised invalidation type.
+    fn invalidation_successes(&self) -> u32 {
+        self.invept_types.count_ones() + self.invvpid_types.count_ones()
+    }
+
+    /// Single EPTP, all VPID reserved fields, non-global zero VPIDs, and a
+    /// noncanonical individual address are separate negative descriptor cases.
+    fn descriptor_failures(&self) -> u32 {
+        u32::from(self.invept_types & 1)
+            + self.invvpid_types.count_ones()
+            + (self.invvpid_types & 0b1011).count_ones()
+            + u32::from(self.invvpid_types & 1)
+    }
+
+    fn valid_failures(&self) -> u32 {
+        14 - u32::from(self.shadow)
+            + u32::from(self.invept)
+            + u32::from(self.invvpid)
+            + u32::from(self.readonly)
+            + self.descriptor_failures()
+    }
 }
 
 fn prerequisites() -> Result<Prerequisites> {
@@ -186,6 +214,8 @@ fn prerequisites() -> Result<Prerequisites> {
             vmx::IA32_VMX_PROCBASED_CTLS
         })
     };
+    // The entry-failure fixture deliberately sets this reserved primary bit.
+    equal("entry-invalid-control-bit", primary & (1 << 32), 0)?;
     let mut secondary = 0;
     if primary & (1 << 63) != 0 {
         // SAFETY: allowed-one activate-secondary-controls establishes this MSR.
@@ -198,13 +228,45 @@ fn prerequisites() -> Result<Prerequisites> {
     }
     // SAFETY: CPUID.VMX establishes the mandatory VMX_MISC capability MSR.
     let misc = unsafe { cpu::rdmsr(vmx::IA32_VMX_MISC) };
+    let invept = secondary & (1 << 33) != 0 && translation_caps & (1 << 20) != 0;
+    let invvpid = secondary & (1 << 37) != 0 && translation_caps & (1 << 32) != 0;
+    let invept_types = if invept {
+        ((translation_caps >> 25) & 3) as u8
+    } else {
+        0
+    };
+    let invvpid_types = if invvpid {
+        ((translation_caps >> 40) & 15) as u8
+    } else {
+        0
+    };
+    equal(
+        "invept-types",
+        u64::from(invept_types != 0),
+        u64::from(invept),
+    )?;
+    equal(
+        "invvpid-types",
+        u64::from(invvpid_types != 0),
+        u64::from(invvpid),
+    )?;
+    if invept_types & 1 != 0 {
+        equal(
+            "invept-single-format",
+            translation_caps & ((1 << 6) | (1 << 14)),
+            (1 << 6) | (1 << 14),
+        )?;
+    }
     Ok(Prerequisites {
         revision: basic.revision_id,
         cr0,
         cr4,
-        invept: secondary & (1 << 33) != 0 && translation_caps & (1 << 20) != 0,
-        invvpid: secondary & (1 << 37) != 0 && translation_caps & (1 << 32) != 0,
+        invept,
+        invvpid,
         readonly: misc & (1 << 29) == 0,
+        shadow: secondary & (1 << 46) != 0,
+        invept_types,
+        invvpid_types,
     })
 }
 
@@ -323,13 +385,14 @@ unsafe fn rejected_read(field: u64) -> (u64, u64) {
 /// Executes an unsupported/read-only VMWRITE without claiming the HAL contract.
 ///
 /// # Safety
-/// The caller must be in VMX root operation with a current, exclusively owned
-/// VMCS. The field must be reserved, or read-only with VMX_MISC[29] clear.
+/// The caller must be in VMX root operation, either without a current VMCS or
+/// with a current, exclusively owned VMCS and a reserved field or read-only
+/// field with VMX_MISC[29] clear.
 unsafe fn rejected_write(field: u64) -> u64 {
     let carry: u8;
     let zero: u8;
-    // SAFETY: VMX root/current VMCS and the architecturally failing field are
-    // caller invariants. No memory operand exists; the error field alone changes.
+    // SAFETY: VMX root and the absent VMCS or architecturally failing field are
+    // caller invariants. No memory operand exists; only a current error may change.
     unsafe {
         asm!("vmwrite {field}, {value}", "setc {carry}", "setz {zero}",
         field = in(reg) field, value = in(reg) SENTINEL,
@@ -342,16 +405,20 @@ unsafe fn rejected_write(field: u64) -> u64 {
 /// Tests rejected physical pointers without dereferencing malformed addresses.
 ///
 /// # Safety
-/// VMX root operation must be active. `physical` must be this CPU's current
-/// VMXON pointer, or 1 with operation 1 (VMCLEAR) or 2 (VMPTRLD). The current
-/// VMCS must be test-owned. Each case must reject without changing ownership.
+/// For operation 0, VMX must already be active, or `physical` must identify an
+/// owned, inactive VMXON page with a deliberately rejected revision/header and
+/// VMX prerequisites set. For operations 1/2, VMX root must be active and
+/// `physical` must be this CPU's VMXON pointer, 1, or an owned inactive VMCS
+/// with a test header. Any current VMCS must be test-owned. A shadow VMPTRLD
+/// may succeed only when advertised; VMCLEAR ignores revision/header bits.
+/// Callers must clear any accepted region before rewriting its header.
 unsafe fn rejected_pointer(physical: u64, operation: u8) -> u64 {
     let carry: u8;
     let zero: u8;
     // SAFETY: the memory operand is the readable live stack slot, not `physical`.
-    // VMXON in root and VMCLEAR/VMPTRLD with the VMXON pointer are defined VMfail
-    // cases. For physical value 1, VMCLEAR/VMPTRLD reject alignment before any
-    // access to a VMCS region; no CPU dereference of address 1 is performed.
+    // Address 1 is rejected before dereference; all other operands name exclusively
+    // owned regions. The caller enforces VMX state/header rules and accounts for
+    // whether hardware accepted the page before modifying any region header.
     unsafe {
         match operation {
             0 => asm!("vmxon [{pointer}]", "setc {carry}", "setz {zero}",
@@ -396,10 +463,293 @@ unsafe fn rejected_invalidation(vpid: bool) -> u64 {
     u64::from(carry) | (u64::from(zero) << 1)
 }
 
+/// Captures immediate entry failure without invoking a successful-entry wrapper.
+///
+/// # Safety
+/// VMX root operation is active and the current VMCS is absent or test-owned.
+/// VMRESUME must target clear launch state; VMLAUNCH must have no current VMCS
+/// or the explicitly reserved primary control bit set. No entry can succeed.
+unsafe fn rejected_entry(resume: bool) -> u64 {
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: the caller establishes an architectural pre-entry failure. Neither
+    // instruction can install guest/host state, and there are no memory operands.
+    unsafe {
+        if resume {
+            asm!("vmresume", "setc {carry}", "setz {zero}",
+                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+                options(nostack));
+        } else {
+            asm!("vmlaunch", "setc {carry}", "setz {zero}",
+                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+                options(nostack));
+        }
+    }
+    u64::from(carry) | (u64::from(zero) << 1)
+}
+
+/// Tests revision and shadow-header policy while preserving the active VMCS.
+///
+/// # Safety
+/// `first` is current; `second` is initialized, cleared and inactive. Both pages
+/// are owned and identity mapped. No VM entry occurs in this helper.
+unsafe fn vmcs_headers(
+    first: VmcsPhys,
+    second: VmcsPhys,
+    capabilities: &Prerequisites,
+    serial: &mut Serial,
+) -> Result<()> {
+    for (stage, header, expected) in [
+        ("vmcs-revision", capabilities.revision ^ 1, FAIL_VALID),
+        (
+            "vmcs-shadow",
+            capabilities.revision | (1 << 31),
+            if capabilities.shadow { 0 } else { FAIL_VALID },
+        ),
+    ] {
+        // SAFETY: second was cleared before this iteration and is not active on
+        // any CPU. Only its owned four-byte header changes, before VMPTRLD.
+        unsafe { ptr::write_volatile(second.get() as *mut u32, header) };
+        // SAFETY: the modified region is owned; VMPTRLD either rejects its header
+        // or makes it current. Both outcomes are handled before any header rewrite.
+        let flags = unsafe { rejected_pointer(second.get(), 2) };
+        let result = (|| {
+            equal(stage, flags, expected)?;
+            // SAFETY: flags established the actual current VMCS. Both candidate
+            // pages are exclusively owned and only mandatory fields are read.
+            unsafe {
+                pointer_equal(
+                    "header-current-pointer",
+                    if flags == 0 {
+                        second.get()
+                    } else {
+                        first.get()
+                    },
+                )?;
+                if flags == FAIL_VALID {
+                    field_equal(stage, vmcs::VM_INSTRUCTION_ERROR, 11)?;
+                }
+            }
+            Ok(())
+        })();
+        // SAFETY: second remains exclusively owned. VMCLEAR does not validate
+        // revision/shadow bits; it makes any accepted page inactive before writes.
+        if let Err(error) = equal(
+            "header-clear-retaining-pages",
+            unsafe { rejected_pointer(second.get(), 1) },
+            0,
+        ) {
+            fatal(serial, error);
+        }
+        // SAFETY: VMCLEAR succeeded, so the second region is inactive and its
+        // original header can be restored. The first remains a valid owned VMCS.
+        unsafe {
+            ptr::write_volatile(second.get() as *mut u32, capabilities.revision);
+            if let Err(error) = success("header-restore-current", vmx::vmptrld(first)) {
+                fatal(serial, error);
+            }
+        }
+        result?;
+    }
+    Ok(())
+}
+
+/// Enters no guest: primary control bit zero is reserved and must fail first.
+///
+/// # Safety
+/// A test-owned clear ordinary VMCS is current, and capability checks established
+/// that primary control bit zero cannot be one. The caller is in VMX root.
+unsafe fn entry_boundaries(capabilities: &Prerequisites) -> Result<()> {
+    // Host values satisfy host-state field checks without installing descriptors.
+    // They are never loaded because the deliberately invalid primary control
+    // prevents guest-state loading. This is not a usable guest bootstrap.
+    let host_fields = [
+        (vmcs::HOST_CR0, capabilities.cr0),
+        (vmcs::HOST_CR3, cpu::read_cr3()),
+        (vmcs::HOST_CR4, capabilities.cr4 | (1 << 13)),
+        (vmcs::HOST_CS_SELECTOR, 8),
+        (vmcs::HOST_SS_SELECTOR, 16),
+        (vmcs::HOST_DS_SELECTOR, 0),
+        (vmcs::HOST_ES_SELECTOR, 0),
+        (vmcs::HOST_FS_SELECTOR, 0),
+        (vmcs::HOST_GS_SELECTOR, 0),
+        (vmcs::HOST_TR_SELECTOR, 24),
+        (vmcs::HOST_FS_BASE, 0),
+        (vmcs::HOST_GS_BASE, 0),
+        (vmcs::HOST_TR_BASE, 0),
+        (vmcs::HOST_GDTR_BASE, 0),
+        (vmcs::HOST_IDTR_BASE, 0),
+        (vmcs::HOST_IA32_SYSENTER_CS, 0),
+        (vmcs::HOST_IA32_SYSENTER_ESP, 0),
+        (vmcs::HOST_IA32_SYSENTER_EIP, 0),
+        (vmcs::HOST_RSP, cpu::read_rsp()),
+        (vmcs::HOST_RIP, 0),
+    ];
+    // SAFETY: the current VMCS is owned. All encodings/widths are mandatory and
+    // writable; the reserved control prevents any of these host fields loading.
+    unsafe {
+        for (field, value) in host_fields {
+            success("entry-host-field", vmx::vmwrite(field, value))?;
+        }
+        for (field, value) in [
+            (vmcs::CPU_BASED_VM_EXEC_CONTROL, 1),
+            (vmcs::PIN_BASED_VM_EXEC_CONTROL, 0),
+            (vmcs::VM_ENTRY_CONTROLS, 0),
+            (vmcs::VM_EXIT_CONTROLS, 1 << 9),
+            (vmcs::VM_ENTRY_MSR_LOAD_COUNT, 0),
+            (vmcs::VM_EXIT_MSR_LOAD_COUNT, 0),
+            (vmcs::VM_EXIT_MSR_STORE_COUNT, 0),
+            (vmcs::VM_ENTRY_INTR_INFO_FIELD, 0),
+        ] {
+            success("entry-control-field", vmx::vmwrite(field, value))?;
+        }
+        equal("resume-clear-flags", rejected_entry(true), FAIL_VALID)?;
+        field_equal("resume-clear-error", vmcs::VM_INSTRUCTION_ERROR, 5)?;
+        equal("launch-controls-flags", rejected_entry(false), FAIL_VALID)?;
+        field_equal("launch-controls-error", vmcs::VM_INSTRUCTION_ERROR, 7)?;
+        equal(
+            "resume-after-failed-launch-flags",
+            rejected_entry(true),
+            FAIL_VALID,
+        )?;
+        field_equal(
+            "resume-after-failed-launch-error",
+            vmcs::VM_INSTRUCTION_ERROR,
+            5,
+        )?;
+        // L0 must not leak its required host-field patches through VMREAD after
+        // an immediate entry failure; all twenty retained L1 values are checked.
+        for (field, value) in host_fields {
+            field_equal("entry-host-field-preserved", field, value)?;
+        }
+        field_equal(
+            "entry-control-preserved",
+            vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            1,
+        )?;
+    }
+    Ok(())
+}
+
+/// Descriptor-error probe; no invalidation or physical pointer access can occur.
+///
+/// # Safety
+/// VMX root/current test-owned VMCS and instruction/type support are required.
+/// The readable descriptor must encode one of the deliberately invalid cases.
+unsafe fn invalid_descriptor(kind: u64, words: [u64; 2], vpid: bool) -> u64 {
+    // A stack m128 operand need not be 16-byte aligned for INVEPT/INVVPID.
+    let carry: u8;
+    let zero: u8;
+    // SAFETY: this live 16-byte operand is readable. All malformed cases fail
+    // architectural operand validation before invalidation; no L2 entry exists.
+    unsafe {
+        if vpid {
+            asm!("invvpid {kind}, [{words}]", "setc {carry}", "setz {zero}",
+                kind = in(reg) kind, words = in(reg) &words,
+                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+                options(nostack));
+        } else {
+            asm!("invept {kind}, [{words}]", "setc {carry}", "setz {zero}",
+                kind = in(reg) kind, words = in(reg) &words,
+                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
+                options(nostack));
+        }
+    }
+    u64::from(carry) | (u64::from(zero) << 1)
+}
+
+/// Covers every advertised invalidation type and its distinct operand checks.
+///
+/// # Safety
+/// A test-owned VMCS is current in VMX root, with error 28 from the prior invalid
+/// type probes if either instruction is advertised. `ept_root` is an owned,
+/// aligned WB zero page. No EPT/VPID tested here has ever run an L2.
+unsafe fn invalidation_descriptors(capabilities: &Prerequisites, ept_root: u64) -> Result<()> {
+    for kind in 1..=2_u64 {
+        if capabilities.invept_types & (1 << (kind - 1)) == 0 {
+            continue;
+        }
+        let descriptor = vmx::InveptDescriptor {
+            // Global INVEPT ignores EPTP completely; the reserved word stays zero.
+            ept_pointer: if kind == 1 {
+                ept_root | 6 | (3 << 3)
+            } else {
+                u64::MAX
+            },
+            reserved: 0,
+        };
+        // SAFETY: the captured capability advertised this type; single-context
+        // uses the validated WB/four-level EPTP, global ignores its EPTP entirely.
+        unsafe {
+            success("invept-valid-descriptor", vmx::invept(kind, &descriptor))?;
+            field_equal(
+                "invept-success-error-preserved",
+                vmcs::VM_INSTRUCTION_ERROR,
+                28,
+            )?;
+            if kind == 1 {
+                equal(
+                    "invept-invalid-eptp-flags",
+                    invalid_descriptor(kind, [0, 0], false),
+                    FAIL_VALID,
+                )?;
+                field_equal("invept-invalid-eptp-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
+            }
+        }
+    }
+    for kind in 0..4_u64 {
+        if capabilities.invvpid_types & (1 << kind) == 0 {
+            continue;
+        }
+        let descriptor = vmx::InvvpidDescriptor {
+            vpid: if kind == 2 { 0 } else { 1 },
+            reserved: [0; 3],
+            linear_address: if kind == 0 { 0 } else { 1 << 63 },
+        };
+        // SAFETY: this advertised type sees a supported descriptor: nonzero VPID
+        // except for global, canonical address only where individual requires it.
+        // Other types ignore the linear address. Invalidations are safe with no L2.
+        unsafe {
+            success("invvpid-valid-descriptor", vmx::invvpid(kind, &descriptor))?;
+            field_equal(
+                "invvpid-success-error-preserved",
+                vmcs::VM_INSTRUCTION_ERROR,
+                28,
+            )?;
+            // Intel checks bits63:16 before the type-specific switch, including
+            // type2 whose VPID and linear address themselves are ignored.
+            equal(
+                "invvpid-reserved-flags",
+                invalid_descriptor(kind, [(1 << 16) | 1, 0], true),
+                FAIL_VALID,
+            )?;
+            field_equal("invvpid-reserved-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
+            if kind != 2 {
+                equal(
+                    "invvpid-zero-flags",
+                    invalid_descriptor(kind, [0, 0], true),
+                    FAIL_VALID,
+                )?;
+                field_equal("invvpid-zero-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
+            }
+            if kind == 0 {
+                // Bit63 alone is noncanonical under both 48- and 57-bit addressing.
+                equal(
+                    "invvpid-noncanonical-flags",
+                    invalid_descriptor(kind, [1, 1 << 63], true),
+                    FAIL_VALID,
+                )?;
+                field_equal("invvpid-noncanonical-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The current VMCS is exclusively test-owned throughout each successful call.
 unsafe fn field_equal(stage: &'static str, field: u32, expected: u64) -> Result<()> {
-    // SAFETY: callers have successfully loaded their owned VMCS; they pass only
-    // mandatory GUEST_RIP/GUEST_RSP/VM_INSTRUCTION_ERROR encodings.
+    // SAFETY: callers have successfully loaded their owned VMCS; every call
+    // passes a mandatory supported guest, host, control, or error-field encoding.
     match unsafe { vmx::vmread(field) } {
         Ok(actual) => equal(stage, actual, expected),
         Err(status) => success(stage, status),
@@ -419,6 +769,7 @@ unsafe fn instructions(
     first: VmcsPhys,
     second: VmcsPhys,
     capabilities: &Prerequisites,
+    serial: &mut Serial,
 ) -> Result<()> {
     // SAFETY: VMXON succeeded and no VMPTRLD has executed in this session.
     unsafe {
@@ -426,6 +777,36 @@ unsafe fn instructions(
         let (flags, value) = rejected_read(u64::from(vmcs::GUEST_RIP));
         equal("read-no-current-flags", flags, FAIL_INVALID)?;
         equal("read-no-current-destination", value, SENTINEL)?;
+        equal(
+            "write-no-current-flags",
+            rejected_write(u64::from(vmcs::GUEST_RIP)),
+            FAIL_INVALID,
+        )?;
+        equal(
+            "vmxon-no-current-flags",
+            rejected_pointer(vmxon.get(), 0),
+            FAIL_INVALID,
+        )?;
+        equal(
+            "clear-no-current-flags",
+            rejected_pointer(1, 1),
+            FAIL_INVALID,
+        )?;
+        equal(
+            "load-no-current-flags",
+            rejected_pointer(1, 2),
+            FAIL_INVALID,
+        )?;
+        equal(
+            "launch-no-current-flags",
+            rejected_entry(false),
+            FAIL_INVALID,
+        )?;
+        equal(
+            "resume-no-current-flags",
+            rejected_entry(true),
+            FAIL_INVALID,
+        )?;
     }
     // SAFETY: both aligned, initialized WB VMCS pages are exclusively test-owned.
     unsafe {
@@ -434,6 +815,16 @@ unsafe fn instructions(
         success("load-first", vmx::vmptrld(first))?;
         success("write-first-rip", vmx::vmwrite(vmcs::GUEST_RIP, 0x1000))?;
         success("write-first-rsp", vmx::vmwrite(vmcs::GUEST_RSP, 0x8000))?;
+    }
+    // SAFETY: first is current, second was cleared and has not been loaded.
+    // The header helper restores ordinary second/first ownership before return.
+    unsafe {
+        vmcs_headers(first, second, capabilities, serial)?;
+    }
+    // SAFETY: first is ordinary and clear. Only explicitly failing VM-entry
+    // instructions run; the capability check proved primary control bit0 invalid.
+    unsafe {
+        entry_boundaries(capabilities)?;
     }
     // SAFETY: first is current and owned; the reserved/read-only fields and
     // VMXON pointer exercise defined VMfailValid paths. Physical value 1 is held
@@ -543,6 +934,11 @@ unsafe fn instructions(
             field_equal("invvpid-error", vmcs::VM_INSTRUCTION_ERROR, 28)?;
         }
     }
+    // SAFETY: second remains current with error28 if invalidations are supported.
+    // The final allocation page is an owned, aligned, zero-filled WB EPT root.
+    unsafe {
+        invalidation_descriptors(capabilities, vmxon.get() + (3 * PAGE) as u64)?;
+    }
     Ok(())
 }
 
@@ -556,7 +952,7 @@ fn fatal(serial: &mut Serial, error: Failure) -> ! {
     }
 }
 
-fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<(bool, bool, bool)> {
+fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisites> {
     equal("system-table", u64::from(!table.is_null()), 1)?;
     // SAFETY: UEFI supplies this live SystemTable; this fixture never calls EBS.
     let boot = unsafe { (*table).boot_services };
@@ -591,12 +987,12 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<(bool, bool,
             actual: base,
             expected: 0,
         })?;
-        // SAFETY: the entire exclusive three-page low-memory allocation was
+        // SAFETY: the entire exclusive four-page low-memory allocation was
         // checked against the current UEFI map before any pointer dereference.
         // OVMF supplies WB RAM; CR0 caching is enabled and BASIC requires WB.
         unsafe {
             ptr::write_bytes(base as *mut u8, 0, PAGES * PAGE);
-            for index in 0..PAGES {
+            for index in 0..3 {
                 ptr::write_volatile(
                     (base + (index * PAGE) as u64) as *mut u32,
                     capabilities.revision,
@@ -604,13 +1000,32 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<(bool, bool,
             }
             cpu::write_cr4(capabilities.cr4 | (1 << 13));
         }
+        for (stage, header) in [
+            ("vmxon-revision", capabilities.revision ^ 1),
+            ("vmxon-shadow", capabilities.revision | (1 << 31)),
+        ] {
+            // SAFETY: VMX has not entered and the VMXON page is exclusively owned.
+            // VMX prerequisites are active; Intel rejects each header without entry.
+            let flags = unsafe {
+                ptr::write_volatile(base as *mut u32, header);
+                rejected_pointer(base, 0)
+            };
+            if let Err(error) = equal(stage, flags, FAIL_INVALID) {
+                // Unexpected success means the page could now be active. Never
+                // overwrite or free it on any contradictory result; halt visibly.
+                fatal(serial, error);
+            }
+        }
+        // SAFETY: both VMXON probes returned VMfailInvalid and left the owned
+        // region inactive. Restore the ordinary header before the valid VMXON.
+        unsafe { ptr::write_volatile(base as *mut u32, capabilities.revision) };
         // SAFETY: FEATURE_CONTROL, fixed CR bits, cacheability, revision and
         // exclusive VMXON storage were checked. No VMX session was active at entry.
         let entered = unsafe { vmx::vmxon(vmxon) };
         let result = if entered == VmxStatus::Success {
             // SAFETY: this CPU owns the newly entered session and both initialized
             // VMCS pages. The finite contract never enters a guest or migrates.
-            let result = unsafe { instructions(vmxon, first, second, &capabilities) };
+            let result = unsafe { instructions(vmxon, first, second, &capabilities, serial) };
             // SAFETY: these are our initialized VMCS pages even after a failed
             // assertion. Clear both to evict cached VMCS state before VMXOFF.
             let (clear_first, clear_second, left) =
@@ -639,11 +1054,7 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<(bool, bool,
             fatal(serial, error);
         }
         result?;
-        Ok((
-            capabilities.invept,
-            capabilities.invvpid,
-            capabilities.readonly,
-        ))
+        Ok(capabilities)
     })();
     // SAFETY: the closure returns only before VMXON, after its failure, or after
     // both VMCLEARs and VMXOFF succeeded. No active VMCS or references survive.
@@ -662,11 +1073,14 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
         return efi::Status::DEVICE_ERROR;
     }
     match run(table, &mut serial) {
-        Ok((invept, invvpid, readonly)) => {
+        Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=1 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2",
-                9 + u8::from(invept) + u8::from(invvpid) + u8::from(readonly),
-                u8::from(invept), u8::from(invvpid), u8::from(readonly)).is_ok() {
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={}",
+                capabilities.valid_failures(), u8::from(capabilities.invept),
+                u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
+                u8::from(capabilities.shadow), capabilities.invept_types,
+                capabilities.invvpid_types, capabilities.invalidation_successes(),
+                capabilities.descriptor_failures()).is_ok() {
                 efi::Status::SUCCESS
             } else { efi::Status::DEVICE_ERROR }
         }
@@ -690,6 +1104,45 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_totals_follow_advertised_invalidation_types() {
+        for ept in 0..4_u8 {
+            for vpid in 0..16_u8 {
+                let capabilities = Prerequisites {
+                    revision: 1,
+                    cr0: 0,
+                    cr4: 0,
+                    invept: ept != 0,
+                    invvpid: vpid != 0,
+                    readonly: true,
+                    shadow: false,
+                    invept_types: ept,
+                    invvpid_types: vpid,
+                };
+                let mut good = 0;
+                let mut bad = 0;
+                for kind in 1..=2 {
+                    if ept & (1 << (kind - 1)) != 0 {
+                        good += 1;
+                        bad += u32::from(kind == 1);
+                    }
+                }
+                for kind in 0..4 {
+                    if vpid & (1 << kind) != 0 {
+                        good += 1;
+                        bad += 1 + u32::from(kind != 2) + u32::from(kind == 0);
+                    }
+                }
+                assert_eq!(capabilities.invalidation_successes(), good);
+                assert_eq!(capabilities.descriptor_failures(), bad);
+                assert_eq!(
+                    capabilities.valid_failures(),
+                    15 + u32::from(ept != 0) + u32::from(vpid != 0) + bad
+                );
+            }
+        }
+    }
 
     #[test]
     fn allocation_requires_complete_unique_writable_wb_pages() {
