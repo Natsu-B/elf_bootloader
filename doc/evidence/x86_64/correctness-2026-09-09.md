@@ -158,3 +158,127 @@ also pass the existing runner and transcript gate, reporting
 `/tmp/x86-correctness-ospke-no-pku-{outer-kvm,direct-vmx}.log`.
 Release monitor SHA256:
 `6a1071c374bac144ce1a506facce744bb31ab78f59230139e584d764ae81130e`.
+
+### Unmodified upstream tests after `d0149e2`
+
+The existing `scripts/x86_64/run-linux-selftest.sh` ran the locally pinned,
+unmodified Linux 7.1.5 selftest executables in both backends. Each invocation
+used `LINUX_SELFTEST_BACKEND`, `LINUX_SELFTEST_NAME` and `LINUX_SELFTEST_ELF`;
+no timeout or upstream source was changed.
+
+| Test | outer-kvm/reference | direct-vmx/project L0 |
+| --- | --- | --- |
+| `xcr0_cpuid_test` | PASS | PASS |
+| `vmx_exception_with_invalid_guest_state` | PASS | FAIL: killed at the existing 600-second guest bound, exit 137 |
+
+Total: **3 PASS, 1 FAIL**. Logs:
+`/tmp/x86-correctness-d0149e2-<test>-<backend>.log`.
+The original periodic-signal invalid-state Direct failure remains open; a
+reference PASS is not a workaround or Direct evidence.
+
+## Step 2: precise VMX memory-operand faults
+
+Changed files and major symbols:
+
+* `arch_hal/x86_64_hal/src/paging.rs`: `DataAccess`, `DataFault`,
+  `operand_range`, `untag`, `translate_data`, canonicality and permission checks.
+  Removed the now-unused `Option`-only `translate_long_mode`, retaining its
+  Linux-stack/five-level regression through the new walker.
+* `x86_uefi_loader/src/vmx_smoke.rs`: `l1_memory_operand`, `l1_data_access`,
+  `read_l1_vmx_pointer`, m64/m128 readers, m64 writer,
+  `access_l1_paging_word`, `inject_l1_operand_fault`; wired VMXON, VMCLEAR,
+  VMPTRLD, VMPTRST, memory VMREAD/VMWRITE, INVEPT and INVVPID callers.
+* `x86_guest_uefi_test/src/l1_fault.rs`: shared exact-RIP #UD/#SS/#GP/#PF
+  fixture, including CR2 capture and scoped IDTR/CR2/IF restoration.
+* `x86_guest_uefi_test/src/l1_xstate.rs`: uses that shared fixture; unchanged
+  OSXSAVE/OSPKE/XSETBV assertions and CR4/XCR0 cleanup.
+* `x86_guest_uefi_test/src/l1_memory.rs`: private 4-/5-level L1 paging fixture,
+  bad-pointer, permissions, exception-priority and discontiguous crossing tests.
+* `x86_guest_uefi_test/src/nested_contract.rs`: allocates/checks the additional
+  seven WB fixture pages, calls the probes before VMXON, without a current VMCS,
+  and with a current VMCS, and requires completed coverage in its final marker.
+* `scripts/x86_64/run-uefi-smoke.sh`, `xtask/src/main.rs`: strict coverage gate
+  and missing/contradictory evidence tests. Global INVEPT/INVVPID are explicit
+  prerequisites for this expanded contract, not silently skipped instructions.
+
+The walker preserves not-present versus protection/reserved-bit #PF and
+P/W/U/RSVD/PK error bits. It accumulates RW/US across levels, honors CR0.WP,
+SMAP/AC and live PKRU/PKRS, validates NX/reserved address bits and large-leaf
+alignment/support, and sets architectural A/D bits. Data LAM untagging precedes
+whole-operand canonicality/overflow checks; invalidation descriptor *contents*
+are not LAM-untagged. SS noncanonical accesses produce #SS(0), others #GP(0).
+The carrier's virtual CR0/CR4, not private host values, drive permissions.
+
+Fault injection preserves RIP/VMX flags and publishes #PF's linear address in
+CR2. VMREAD field validity and invalid INVEPT/INVVPID types precede operand
+access; VMWRITE reads its source before field-encoding failure. Missing-current
+VMCS results retain VMfailInvalid. Every destination byte is checked before the
+first payload store; discontiguous pages are not treated as a contiguous host
+pointer. No guest bad linear pointer becomes a generic VMfail or monitor panic.
+
+This remains the **single-BSP fixed-map backend**. Paging-word A/D updates are
+serialized by the stopped sole L1 CPU, not a claim of SMP. An inaccessible L0
+physical backing range or invalid monitor context stays a distinct fail-closed
+diagnostic: it must not be fabricated as an architectural nonpresent L1 PTE.
+Platform-map integration and pCPU ownership remain required. CR2 is still live
+shared state; the later L0 scratch-frame work must preserve injected CR2 rather
+than restore an obsolete L1 snapshot.
+
+Native contract coverage now requires **16 #PF, 8 #GP, 1 #SS, 6 successful
+page crossings and 8 exception-priority cases**, plus all prior VMX/XSTATE
+checks. Each fault is accepted only at the exact test instruction RIP, returns
+to its assembly continuation, and checks its error code and (for #PF) CR2.
+The physical order of the two payload pages is reversed. All original firmware
+mappings remain in a copied root; CR3/CR0 and exception state are restored before
+VMCS cleanup and FreePages.
+
+Architecture references: [Intel VMX instruction reference](https://cdrdv2-public.intel.com/825750/326019-sdm-vol-3c.pdf),
+[Intel architectural PKRS MSR definition](https://www.intel.com/content/dam/develop/external/us/en/documents-tps/335592-sdm-vol-4-testsize.pdf),
+and the pinned Linux 7.1.5 `vmx_get_untagged_addr`, `get_vmx_mem_address`,
+INVEPT/INVVPID handlers and MMU protection-key rules.
+
+### Validation and reference discrepancy
+
+The first complete stage-2 release run used the same command as step 1, with
+4096 cycles and the unchanged 600-second lifecycle bound. Direct native and
+read-only-VMCS contracts **PASS**; both Linux lifecycle backends **PASS** all
+4096 cycles and clean S5. The two outer-KVM contract profiles **FAIL** the newly
+added no-partial-store assertion. Suite total: **4 PASS, 2 FAIL**, exit 1;
+`/tmp/x86-correctness-step2-nested-release.log`.
+
+The reference failure is preserved, not accepted by the PASS gate. The fixture
+was then extended to record partial-store counts without aborting the remaining
+memory cases or the old VMX contract. It still fails at the end if any partial
+store occurred. Both reference profiles report `partial_stores=1`; both Direct
+profiles report zero. All expanded exception/crossing/priority probes complete.
+The host kernel is 7.1.5. Its corresponding source's
+`kvm_write_guest_virt_helper` writes a page chunk before translating the next
+chunk, consistent with the observed VMPTRST first-word modification followed by
+#PF on the second page. This is a failure of this suite's strict no-partial-store
+safety requirement, **not proof of physical Intel behavior or an independently
+established SDM violation**. No host KVM code was modified to conceal the result.
+
+Final stage-2 verification, after the complete/no-current fixture expansion:
+
+* `cargo xtest -p x86_64_hal`, `-p nested_vmx`, `-p x86_uefi_loader`,
+  `-p x86_guest_uefi_test`, `-p xtask` through `nix develop`: **144 PASS,
+  0 FAIL** (51 + 8 + 45 + 9 + 31).
+  `/tmp/x86-correctness-step2-final-<package>.log`.
+* `nix develop --accept-flake-config --command env LINUX_KVM_CYCLES=4096
+  LINUX_KVM_TIMEOUT_SECONDS=600 cargo xrun x86 --nested --release`:
+  **4 PASS, 2 FAIL**, exit 1, same reference-only partial-store failures.
+  `/tmp/x86-correctness-step2-nested-final.log`.
+  Direct and reference each complete all 4096 lifecycle cycles with the existing
+  KVM_RUN I/O, XMM0–15/MXCSR, CR2, paging, MSR/debug/TSC and teardown checks.
+  Guest-observed lifecycle completion: reference 38.960 s, Direct 299.527 s;
+  these are instrumented probe timings, not desktop-performance claims.
+* `nix develop --accept-flake-config --command cargo xbuild x86`: **PASS**;
+  `/tmp/x86-correctness-step2-xbuild.log`.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**.
+  Diff review found no AArch64 production changes. `AGENTS.md` remains the
+  pre-existing user change and is not staged. Generated artifacts are not staged.
+
+These are host unit and **QEMU/KVM** results only. No new QEMU TCG, Direct Windows
+normal-boot/Hyper-V/WSL2, S3 or physical-machine result is claimed in steps 1–2.
+The known Direct periodic-signal invalid-state, Hyper-V and S3 failures are not
+resolved by the memory-fault work. Outer-KVM remains reference evidence only.

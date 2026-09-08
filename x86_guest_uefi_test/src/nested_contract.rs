@@ -12,6 +12,8 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+mod l1_fault;
+mod l1_memory;
 mod l1_xstate;
 
 use core::arch::asm;
@@ -29,8 +31,8 @@ use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
 
 const PAGE: usize = 4096;
-/// VMXON, two VMCS regions, and an empty EPT root used only by INVEPT.
-const PAGES: usize = 4;
+/// VMXON, two VMCS regions, an empty EPT root, and private operand-fault pages.
+const PAGES: usize = 4 + l1_memory::PAGES;
 const CYCLES: u64 = 8;
 /// Reserved encoding bit 12 guarantees this is not a supported VMCS field.
 const UNSUPPORTED_FIELD: u64 = 0x1000;
@@ -775,6 +777,7 @@ unsafe fn instructions(
     capabilities: &Prerequisites,
     serial: &mut Serial,
 ) -> Result<()> {
+    l1_memory::without_current(vmxon.get() + (4 * PAGE) as u64)?;
     // SAFETY: VMXON succeeded and no VMPTRLD has executed in this session.
     unsafe {
         pointer_equal("initial-pointer", u64::MAX)?;
@@ -820,6 +823,7 @@ unsafe fn instructions(
         success("write-first-rip", vmx::vmwrite(vmcs::GUEST_RIP, 0x1000))?;
         success("write-first-rsp", vmx::vmwrite(vmcs::GUEST_RSP, 0x8000))?;
     }
+    let partial_stores = l1_memory::in_vmx(vmxon.get() + (4 * PAGE) as u64, serial)?;
     // SAFETY: first is current, second was cleared and has not been loaded.
     // The header helper restores ordinary second/first ownership before return.
     unsafe {
@@ -943,7 +947,9 @@ unsafe fn instructions(
     unsafe {
         invalidation_descriptors(capabilities, vmxon.get() + (3 * PAGE) as u64)?;
     }
-    Ok(())
+    // Retain this strict assertion, but only after exercising the existing
+    // contract as well; a reference partial write must not hide later evidence.
+    equal("l1-operand-no-partial-stores", partial_stores, 0)
 }
 
 /// Halts only after one bounded diagnostic; runner owns the finite test deadline.
@@ -963,6 +969,16 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisite
     let boot = unsafe { (*table).boot_services };
     equal("boot-services", u64::from(!boot.is_null()), 1)?;
     let capabilities = prerequisites()?;
+    equal(
+        "operand-invept-global-required",
+        u64::from(capabilities.invept_types & 2 != 0),
+        1,
+    )?;
+    equal(
+        "operand-invvpid-global-required",
+        u64::from(capabilities.invvpid_types & 4 != 0),
+        1,
+    )?;
     let mut base = u64::from(u32::MAX);
     // SAFETY: boot is live and base is a writable output slot. A low allocation
     // satisfies BASIC's optional 32-bit operand limit and UEFI identity mapping.
@@ -992,7 +1008,7 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisite
             actual: base,
             expected: 0,
         })?;
-        // SAFETY: the entire exclusive four-page low-memory allocation was
+        // SAFETY: the entire exclusive low-memory allocation was
         // checked against the current UEFI map before any pointer dereference.
         // OVMF supplies WB RAM; CR0 caching is enabled and BASIC requires WB.
         unsafe {
@@ -1004,6 +1020,15 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisite
                 );
             }
             cpu::write_cr4(capabilities.cr4 | (1 << 13));
+        }
+        if let Err(error) = l1_memory::before_vmxon(base + (4 * PAGE) as u64) {
+            // SAFETY: only architecturally faulting VMXON probes ran; restore
+            // the controls before ordinary allocation cleanup on assertion error.
+            unsafe {
+                cpu::write_cr4(capabilities.cr4);
+                cpu::write_cr0(capabilities.cr0);
+            }
+            return Err(error);
         }
         for (stage, header) in [
             ("vmxon-revision", capabilities.revision ^ 1),
@@ -1080,7 +1105,7 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={}",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,

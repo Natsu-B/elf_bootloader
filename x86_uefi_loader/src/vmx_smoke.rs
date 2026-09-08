@@ -44,6 +44,8 @@ use x86_64_hal::host_state;
 use x86_64_hal::host_state::HostEnvironment;
 use x86_64_hal::host_state::HostStack;
 use x86_64_hal::paging;
+use x86_64_hal::paging::DataAccess;
+use x86_64_hal::paging::DataFault;
 use x86_64_hal::platform_memory;
 use x86_64_hal::platform_memory::FirmwareDescriptor;
 use x86_64_hal::vmcs;
@@ -2428,8 +2430,11 @@ fn handle_l1_vmxon(
         return;
     }
 
-    let region_address =
-        read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
+    let Some(region_address) =
+        read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers)
+    else {
+        return;
+    };
 
     let result = validate_l1_vmxon_region(region_address).map_or(
         VmInstructionResult::VmfailInvalid,
@@ -2519,7 +2524,11 @@ fn handle_l1_vmclear(
         return;
     }
 
-    let address = read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
+    let Some(address) =
+        read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers)
+    else {
+        return;
+    };
     let Some(region) = validate_l1_vmcs_address(address) else {
         complete_vmx_instruction(
             l1_vmx_failure(&state, VMXERR_VMCLEAR_INVALID_ADDRESS),
@@ -2638,7 +2647,11 @@ fn handle_l1_vmptrld(
         return;
     }
 
-    let address = read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers);
+    let Some(address) =
+        read_l1_vmx_pointer(reason, qualification, guest_rip, instruction_len, registers)
+    else {
+        return;
+    };
     // SAFETY: this CPL0 VM-exit handler runs after successful hardware VMXON;
     // the VMX_BASIC MSR is present and its physical-address restriction is stable.
     let basic = vmx::VmxBasic::from_msr(unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) });
@@ -2775,44 +2788,21 @@ fn handle_l1_vmptrst(
         return;
     }
 
-    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
-        .ok()
-        .and_then(|value| u32::try_from(value).ok());
-    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
-    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
-    let linear = instruction_info.and_then(|information| {
-        vmx::memory_operand_address_64(
-            information,
-            qualification,
-            |register| guest_gpr(registers, register),
-            fs_base,
-            gs_base,
-        )
-    });
-    let Some(linear) = linear else {
-        stop_unexpected_exit(
-            b"decoding VMPTRST destination failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    };
     let current = state
         .current_vmcs()
         .map_or(u64::MAX, |vmcs| vmcs.address().get());
-    if write_l1_linear_u64(linear, current).is_none() {
-        // ponytail: trusted long-mode L1 supplies a valid mapped m64
-        // destination; synthesize precise memory faults before relaxing it.
-        stop_unexpected_exit(
-            b"writing VMPTRST destination failed",
+    if let Err(fault) = l1_memory_operand(qualification, registers)
+        .and_then(|linear| write_l1_linear_u64(linear, current))
+    {
+        inject_l1_operand_fault(
+            fault,
             reason,
             qualification,
             guest_rip,
             instruction_len,
             registers,
         );
+        return;
     }
     complete_vmx_instruction(
         VmInstructionResult::Vmsucceed,
@@ -3437,26 +3427,17 @@ fn handle_l1_vmcs_access(
     {
         (Some(register1), None, field_register)
     } else {
-        let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
-        let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
-        let linear = vmx::memory_operand_address_64(
-            instruction_info,
-            qualification,
-            |register| guest_gpr(registers, register),
-            fs_base,
-            gs_base,
-        );
-        let Some(linear) = linear else {
-            // ponytail: trusted long-mode L1 supplies a valid mapped m64
-            // operand; synthesize precise memory faults before relaxing it.
-            stop_unexpected_exit(
-                b"decoding memory-form VMCS access failed",
+        let linear = l1_memory_operand(qualification, registers);
+        let Ok(linear) = linear else {
+            inject_l1_operand_fault(
+                DataFault::InvalidState,
                 reason,
                 qualification,
                 guest_rip,
                 instruction_len,
                 registers,
             );
+            return;
         };
         (None, Some(linear), ((instruction_info >> 28) & 0xf) as u8)
     };
@@ -3475,17 +3456,22 @@ fn handle_l1_vmcs_access(
             };
             Some(value)
         } else {
-            let Some(value) = memory_linear.and_then(read_l1_linear_u64) else {
-                // ponytail: trusted L1 memory operands fail-stop until this
-                // path synthesizes the architectural #PF/#GP/#SS exception.
-                stop_unexpected_exit(
-                    b"reading memory-form VMWRITE source failed",
-                    reason,
-                    qualification,
-                    guest_rip,
-                    instruction_len,
-                    registers,
-                );
+            let value = match memory_linear
+                .ok_or(DataFault::InvalidState)
+                .and_then(read_l1_linear_u64)
+            {
+                Ok(value) => value,
+                Err(fault) => {
+                    inject_l1_operand_fault(
+                        fault,
+                        reason,
+                        qualification,
+                        guest_rip,
+                        instruction_len,
+                        registers,
+                    );
+                    return;
+                }
             };
             Some(value)
         }
@@ -3664,20 +3650,19 @@ fn handle_l1_vmcs_access(
                     registers,
                 );
             }
-        } else if memory_linear
+        } else if let Err(fault) = memory_linear
+            .ok_or(DataFault::InvalidState)
             .and_then(|linear| write_l1_linear_u64(linear, value))
-            .is_none()
         {
-            // ponytail: trusted L1 memory operands fail-stop until this path
-            // synthesizes the architectural #PF/#GP/#SS exception.
-            stop_unexpected_exit(
-                b"writing memory-form VMREAD destination failed",
+            inject_l1_operand_fault(
+                fault,
                 reason,
                 qualification,
                 guest_rip,
                 instruction_len,
                 registers,
             );
+            return;
         }
     }
     complete_vmx_instruction(
@@ -3736,23 +3721,35 @@ fn handle_l1_invept(
             registers,
         );
     };
-    let descriptor = read_l1_linear_u64(linear).and_then(|ept_pointer| {
-        read_l1_linear_u64(linear.checked_add(8)?).map(|reserved| vmx::InveptDescriptor {
-            ept_pointer,
-            reserved,
-        })
-    });
-    let Some(descriptor) = descriptor else {
-        // ponytail: trusted long-mode L1 supplies a valid m128 operand. Add
-        // precise #PF/#GP/#SS synthesis before accepting untrusted L1 input.
-        stop_unexpected_exit(
-            b"reading INVEPT descriptor failed",
+    // Both types are required by the conservative capability policy. Unsupported
+    // types fail before reading the descriptor, even if its pointer would fault.
+    if kind != 1 && kind != 2 {
+        complete_vmx_instruction(
+            l1_vmx_failure(&state, VMXERR_INVALID_INVEPT_INVVPID_OPERAND),
             reason,
             qualification,
             guest_rip,
             instruction_len,
             registers,
         );
+        return;
+    }
+    let descriptor = match read_l1_linear_u128(linear) {
+        Ok((ept_pointer, reserved)) => vmx::InveptDescriptor {
+            ept_pointer,
+            reserved,
+        },
+        Err(fault) => {
+            inject_l1_operand_fault(
+                fault,
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+            return;
+        }
     };
     let Some(result) = execute_l1_vmx_instruction(&state, || {
         // SAFETY: L0 remains in VMX root operation; supported INVEPT receives a
@@ -3836,21 +3833,19 @@ fn handle_l1_invvpid(
         );
         return;
     }
-    let descriptor = read_l1_linear_u64(linear).and_then(|first| {
-        read_l1_linear_u64(linear.checked_add(8)?)
-            .map(|address| vmx::InvvpidDescriptor::from_words(first, address))
-    });
-    let Some(descriptor) = descriptor else {
-        // ponytail: trusted long-mode L1 supplies a valid m128 operand. Add
-        // precise #PF/#GP/#SS synthesis before accepting untrusted L1 input.
-        stop_unexpected_exit(
-            b"reading INVVPID descriptor failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
+    let descriptor = match read_l1_linear_u128(linear) {
+        Ok((first, address)) => vmx::InvvpidDescriptor::from_words(first, address),
+        Err(fault) => {
+            inject_l1_operand_fault(
+                fault,
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+            return;
+        }
     };
     // ponytail: VPID tags are direct and globally shared with this trusted
     // one-vCPU L1; add per-pCPU VPID ownership before monitor SMP.
@@ -4010,44 +4005,44 @@ fn read_l1_vmx_pointer(
     guest_rip: u64,
     instruction_len: u64,
     registers: &GuestRegisters,
-) -> u64 {
-    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
-        .ok()
-        .and_then(|value| u32::try_from(value).ok());
-    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
-    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
-    let linear = instruction_info.and_then(|information| {
-        vmx::memory_operand_address_64(
-            information,
-            qualification,
-            |register| guest_gpr(registers, register),
-            fs_base,
-            gs_base,
+) -> Option<u64> {
+    let result = l1_memory_operand(qualification, registers).and_then(read_l1_linear_u64);
+    match result {
+        Ok(pointer) => Some(pointer),
+        Err(fault) => {
+            inject_l1_operand_fault(
+                fault,
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+            None
+        }
+    }
+}
+
+/// Decodes only the effective address: each instruction decides when to access
+/// it, preserving VMfail versus memory-fault priority (notably VMREAD/INVEPT).
+fn l1_memory_operand(qualification: u64, registers: &GuestRegisters) -> Result<u64, DataFault> {
+    // SAFETY: the BSP's carrier is current throughout L1 instruction emulation.
+    let (information, fs_base, gs_base) = unsafe {
+        (
+            vmx::vmread(vmcs::VMX_INSTRUCTION_INFO),
+            vmx::vmread(vmcs::GUEST_FS_BASE),
+            vmx::vmread(vmcs::GUEST_GS_BASE),
         )
-    });
-    let Some(linear) = linear else {
-        stop_unexpected_exit(
-            b"decoding VMX pointer failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
     };
-    let Some(pointer) = read_l1_linear_u64(linear) else {
-        // ponytail: trusted long-mode L1 uses a valid operand. Add precise
-        // #PF/#GP/#SS synthesis before accepting untrusted or 32-bit L1s.
-        stop_unexpected_exit(
-            b"reading VMX pointer failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    };
-    pointer
+    vmx::memory_operand_address_64(
+        u32::try_from(information.map_err(|_| DataFault::InvalidState)?)
+            .map_err(|_| DataFault::InvalidState)?,
+        qualification,
+        |register| guest_gpr(registers, register),
+        fs_base.map_err(|_| DataFault::InvalidState)?,
+        gs_base.map_err(|_| DataFault::InvalidState)?,
+    )
+    .ok_or(DataFault::InvalidState)
 }
 
 /// Checks the fixed-bit contract used by VMXON.
@@ -4073,59 +4068,193 @@ fn validate_l1_vmcs_address(address: u64) -> Option<VmcsPhys> {
 }
 
 /// Reads an m64 operand through L1's current long-mode page tables.
-fn read_l1_linear_u64(linear: u64) -> Option<u64> {
-    let cr3 = unsafe { vmx::vmread(vmcs::GUEST_CR3) }.ok()?;
-    let cr4 = unsafe { vmx::vmread(vmcs::GUEST_CR4) }.ok()?;
-    let max_physical_bits = max_physical_address_bits()?;
-    let mut bytes = [0_u8; 8];
-    // ponytail: eight walks make a cold VMX operand cross-page safe; cache
-    // translated pages only if instruction emulation becomes measurable.
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let address = linear.checked_add(index as u64)?;
-        let physical =
-            paging::translate_long_mode(address, cr3, cr4, max_physical_bits, |entry| {
-                read_l1_physical_u64(entry)
-            })?;
-        if physical >= IDENTITY_MAP_LIMIT {
-            return None;
-        }
-        // SAFETY: the trusted L1 page walk resolved this byte inside the
-        // identity-mapped eight-gibibyte smoke address space.
-        *byte = unsafe { ptr::read_volatile(physical as *const u8) };
-    }
-    Some(u64::from_le_bytes(bytes))
+fn read_l1_linear_u64(linear: u64) -> Result<u64, DataFault> {
+    let state = l1_data_access().ok_or(DataFault::InvalidState)?;
+    let linear = state.operand_range(linear, 8)?;
+    read_l1_operand_word(linear, state)
 }
 
-/// Writes an m64 operand through L1's current long-mode page tables.
-fn write_l1_linear_u64(linear: u64, value: u64) -> Option<()> {
-    let cr3 = unsafe { vmx::vmread(vmcs::GUEST_CR3) }.ok()?;
-    let cr4 = unsafe { vmx::vmread(vmcs::GUEST_CR4) }.ok()?;
-    let max_physical_bits = max_physical_address_bits()?;
-    // ponytail: mirror the read path's eight walks so an m64 crossing a page
-    // boundary remains valid without adding a translation cache to the TCB.
-    for (index, byte) in value.to_le_bytes().iter().enumerate() {
-        let address = linear.checked_add(index as u64)?;
-        let physical =
-            paging::translate_long_mode(address, cr3, cr4, max_physical_bits, |entry| {
-                read_l1_physical_u64(entry)
-            })?;
-        if physical >= IDENTITY_MAP_LIMIT {
-            return None;
-        }
-        // SAFETY: the trusted L1 page walk resolved this byte inside the
-        // identity-mapped eight-gibibyte smoke address space.
-        unsafe { ptr::write_volatile(physical as *mut u8, *byte) };
-    }
-    Some(())
+/// Reads an m128 after validating its whole range, before either word's walk.
+fn read_l1_linear_u128(linear: u64) -> Result<(u64, u64), DataFault> {
+    let state = l1_data_access().ok_or(DataFault::InvalidState)?;
+    let linear = state.operand_range(linear, 16)?;
+    Ok((
+        read_l1_operand_word(linear, state)?,
+        read_l1_operand_word(linear + 8, state)?,
+    ))
 }
 
-/// Reads one aligned paging entry from identity-mapped L1 physical memory.
-fn read_l1_physical_u64(physical: u64) -> Option<u64> {
+/// Captures architectural L1 paging inputs, not L0's private control registers.
+fn l1_data_access() -> Option<DataAccess> {
+    let cr4 = l1_visible_cr4()?;
+    let mut pkru = 0;
+    if cr4 & (1 << 22) != 0 {
+        let host_cr4 = cpu::read_cr4();
+        // SAFETY: guest PKE implies hardware PKU support. All private L0 page
+        // tables map supervisor pages, so temporarily enabling PKE cannot let
+        // the guest's PKRU deny L0 data accesses. Read the shared live register
+        // without changing it, then restore host CR4 before leaving this block.
+        unsafe {
+            core::arch::asm!(
+                "mov cr4, {enabled}", "rdpkru", "mov cr4, {original}",
+                enabled = in(reg) host_cr4 | (1 << 22), original = in(reg) host_cr4,
+                in("ecx") 0_u32, out("eax") pkru, out("edx") _,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+    // SAFETY: the carrier is current; all VMREADs describe the stopped L1.
+    // PKRS exists if guest CR4.PKS is set (validated by VM entry). L0 does not
+    // write this live guest register. IA32_PKRS is architectural MSR 0x6e1.
+    unsafe {
+        Some(DataAccess {
+            cr0: xstate::visible_cr(
+                vmx::vmread(vmcs::GUEST_CR0).ok()?,
+                vmx::vmread(vmcs::CR0_GUEST_HOST_MASK).ok()?,
+                vmx::vmread(vmcs::CR0_READ_SHADOW).ok()?,
+            ),
+            cr3: vmx::vmread(vmcs::GUEST_CR3).ok()?,
+            cr4,
+            efer: vmx::vmread(vmcs::GUEST_IA32_EFER).ok()?,
+            rflags: vmx::vmread(vmcs::GUEST_RFLAGS).ok()?,
+            cpl: (vmx::vmread(vmcs::GUEST_CS_SELECTOR).ok()? & 3) as u8,
+            physical_bits: max_physical_address_bits()?,
+            page_1g: cpu::cpuid(0x8000_0001, 0).edx & (1 << 26) != 0,
+            pkru,
+            pkrs: if cr4 & (1 << 24) != 0 {
+                cpu::rdmsr(0x6e1) as u32
+            } else {
+                0
+            },
+        })
+    }
+}
+
+/// Resolves one byte, retaining inaccessible L0 backing as a distinct failure.
+fn l1_operand_physical(linear: u64, state: DataAccess, write: bool) -> Result<u64, DataFault> {
+    let physical = paging::translate_data(linear, state, write, access_l1_paging_word)?;
+    if physical >= IDENTITY_MAP_LIMIT {
+        return Err(DataFault::Backing(physical));
+    }
+    Ok(physical)
+}
+
+/// Reads an already range-checked word, including a discontiguous page crossing.
+fn read_l1_operand_word(linear: u64, state: DataAccess) -> Result<u64, DataFault> {
+    let mut value = 0;
+    for index in 0..8 {
+        let physical = l1_operand_physical(linear + index, state, false)?;
+        // SAFETY: the checked walk grants a read and resolves the byte inside
+        // this BSP smoke backend's identity map; L1 is stopped during access.
+        value |= u64::from(unsafe { ptr::read_volatile(physical as *const u8) }) << (index * 8);
+    }
+    Ok(value)
+}
+
+/// Checks all destination pages before any payload store, avoiding partial m64
+/// writes when the second page faults. The stopped BSP is the only L1 CPU;
+/// enabling SMP requires synchronization with concurrent page-table updates.
+fn write_l1_linear_u64(linear: u64, value: u64) -> Result<(), DataFault> {
+    let state = l1_data_access().ok_or(DataFault::InvalidState)?;
+    let linear = state.operand_range(linear, 8)?;
+    for index in 0..8 {
+        l1_operand_physical(linear + index, state, true)?;
+    }
+    for index in 0..8 {
+        let physical = l1_operand_physical(linear + index, state, true)?;
+        // SAFETY: both passes use the same stopped BSP page tables; every byte
+        // is writable and inside the identity map before the first store.
+        unsafe { ptr::write_volatile(physical as *mut u8, (value >> (index * 8)) as u8) };
+    }
+    Ok(())
+}
+
+/// Accesses one aligned guest paging word, optionally setting architectural A/D.
+fn access_l1_paging_word(physical: u64, update: u64) -> Option<u64> {
     if physical.checked_add(7)? >= IDENTITY_MAP_LIMIT || !physical.is_multiple_of(8) {
         return None;
     }
-    // SAFETY: trusted L1 supplies paging structures in identity-mapped RAM.
-    Some(unsafe { ptr::read_volatile(physical as *const u64) })
+    // SAFETY: trusted L1 supplies paging structures in identity-mapped RAM;
+    // L1 is stopped on this sole virtualized BSP. No other CPU updates these
+    // words. The walker requests only A/D bits, never a mapping replacement.
+    unsafe {
+        let value = ptr::read_volatile(physical as *const u64);
+        if update != 0 {
+            ptr::write_volatile(physical as *mut u64, value | update);
+        }
+        Some(value | update)
+    }
+}
+
+/// Delivers the precise synchronous operand exception without advancing RIP.
+fn inject_l1_operand_fault(
+    fault: DataFault,
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let (vector, error) = match fault {
+        DataFault::Address => {
+            // SAFETY: carrier exit information identifies the faulting L1
+            // instruction. Long mode ignores segment limits, but SS retains
+            // its distinct noncanonical-address #SS(0) exception.
+            let information = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) };
+            let Ok(information) = information else {
+                stop_unexpected_exit(
+                    b"operand segment unavailable",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            };
+            (if (information >> 15) & 7 == 2 { 12 } else { 13 }, 0)
+        }
+        DataFault::Page { linear, error } => {
+            // SAFETY: CR2 is not switched by VMX and L0 does not use it. Publish
+            // the faulting L1 address immediately before injecting its #PF;
+            // no intervening L0 data access may fault in a valid private map.
+            unsafe {
+                core::arch::asm!("mov cr2, {linear}", linear = in(reg) linear, options(nostack, preserves_flags));
+            }
+            (14, u64::from(error))
+        }
+        DataFault::InvalidState | DataFault::Backing(_) => {
+            // A missing L0 physical mapping is not an architectural guest #PF.
+            // Keep this fixed-map backend limitation visible until platform
+            // map integration, rather than fabricating a nonpresent guest PTE.
+            stop_unexpected_exit(
+                b"L0 operand backing/context unavailable",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    };
+    // SAFETY: this BSP owns the current carrier; the hardware-exception event
+    // has an error code and preserves the faulting RIP and guest VMX flags.
+    let injected = unsafe {
+        vmx::vmwrite(vmcs::VM_ENTRY_EXCEPTION_ERROR_CODE, error) == VmxStatus::Success
+            && vmx::vmwrite(
+                vmcs::VM_ENTRY_INTR_INFO_FIELD,
+                (1 << 31) | (1 << 11) | (3 << 8) | vector,
+            ) == VmxStatus::Success
+    };
+    if !injected {
+        stop_unexpected_exit(
+            b"injecting L1 operand fault failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
 }
 
 /// Returns the physical-address width exposed unchanged to L1 by CPUID.
