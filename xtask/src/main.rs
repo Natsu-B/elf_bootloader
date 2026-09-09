@@ -4926,6 +4926,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn windows_pci_profile_defaults_to_firmware_layout_without_fallback() {
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/windows/windows-test.sh");
+        let check = |profile: Option<&str>, mode: &str| {
+            let mut command = Command::new("bash");
+            command
+                .arg(&runner)
+                .arg(mode)
+                .env_remove("WINDOWS_PCI_PROFILE");
+            if let Some(profile) = profile {
+                command.env("WINDOWS_PCI_PROFILE", profile);
+            }
+            command
+                .output()
+                .expect("run read-only PCI argument selection")
+        };
+        for profile in [None, Some(""), Some("firmware-default")] {
+            let result = check(profile, "print-pci-args");
+            assert!(result.status.success());
+            assert!(result.stdout.is_empty());
+        }
+        let fixture = check(Some("q35-smoke-1g"), "print-pci-args");
+        assert!(fixture.status.success());
+        assert_eq!(fixture.stdout, b"-global\0q35-pcihost.pci-hole64-size=1G\0-fw_cfg\0name=opt/ovmf/X-PciMmio64Mb,string=1024\0");
+        for profile in [
+            "silent-fallback",
+            "firmware-default\n",
+            "q35-smoke-1g extra",
+        ] {
+            for mode in [
+                "print-pci-args",
+                "monitor",
+                "monitor-hyperv",
+                "trusted-kvm-hyperv",
+            ] {
+                let result = check(Some(profile), mode);
+                assert!(!result.status.success());
+                assert!(result.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains("WINDOWS_PCI_PROFILE must be")
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn windows_poweroff_timeout_is_bounded_and_decimal() {
         let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/x86_64/windows/windows-test.sh");

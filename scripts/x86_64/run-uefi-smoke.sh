@@ -688,7 +688,7 @@ pci_args=()
 case "$pci_profile" in
     firmware-default) ;;
     q35-smoke-1g)
-        # Same bounded QEMU-only aperture as the existing Windows runner.
+        # Same explicit bounded QEMU-only fixture as the Windows runner.
         # Explicit A/B fixture, never a platform-derived EPT or a fallback.
         pci_args=(-global q35-pcihost.pci-hole64-size=1G
             -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024) ;;

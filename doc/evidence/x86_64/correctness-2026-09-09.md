@@ -2226,3 +2226,24 @@ three Direct host feature configurations.
 No AP is enabled by this change. Windows/Hyper-V, root NMI and S3 work and
 the two timing-sensitive Direct failures remain unverified/unresolved.
 No physical hardware was tested. Outer KVM is reference evidence only.
+
+## Windows PCI regression preparation — normal q35 layout by default
+
+Confirmed at `f95bb80`: `windows-test.sh` still unconditionally passed a 1 GiB
+PCI aperture and OVMF 1024 MiB override, even though the active Direct carrier
+already uses the checked platform map. The runner now defaults to
+`WINDOWS_PCI_PROFILE=firmware-default` with neither override. The old layout
+remains the explicit `q35-smoke-1g` A/B fixture, matching the existing UEFI
+runner. Invalid profiles fail before building or modifying test state; no
+fallback is possible. Each boot records its selected PCI profile separately
+from its Direct/reference provenance.
+
+Changed symbols: Windows `configure_pci_profile`, `run_windows`, `usage` and
+the read-only `print-pci-args` CLI; xtask
+`windows_pci_profile_defaults_to_firmware_layout_without_fallback`. The UEFI
+runner's old cross-reference comment was corrected, without behavior change.
+`nix develop --accept-flake-config --command bash -c 'cargo fmt && cargo xtest -p xtask'`:
+**34 host PASS, 0 FAIL**, `/tmp/x86-windows-pci-host.log`. The test exercises the
+actual array builder, exact default/fixture arguments and rejection before
+normal/Hyper-V/outer-reference runs. Windows QEMU revalidation follows this
+commit; this host check does not establish Windows boot or physical readiness.

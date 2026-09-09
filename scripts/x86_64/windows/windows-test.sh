@@ -334,6 +334,20 @@ valid_poweroff_timeout() {
     [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$1 <= 1800))
 }
 
+configure_pci_profile() {
+    # Sets the caller's local profile/array before any disk or firmware writes.
+    pci_profile=${WINDOWS_PCI_PROFILE:-firmware-default}
+    pci_args=()
+    case "$pci_profile" in
+        firmware-default) ;;
+        q35-smoke-1g)
+            # Explicit old QEMU A/B fixture, never an automatic fallback.
+            pci_args=(-global q35-pcihost.pci-hole64-size=1G
+                -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024) ;;
+        *) die 'WINDOWS_PCI_PROFILE must be firmware-default or q35-smoke-1g' ;;
+    esac
+}
+
 run_windows() {
     local mode=$1
     local s4_phase=${2:-}
@@ -356,8 +370,10 @@ run_windows() {
     local is_physical_test=0 physical_state='' physical_started=0 physical_probe_started=-1
     local physical_desktop_probe_sent=0
     local is_direct=0 diagnostics_failure_captured=0
-    local -a media_args network_args=(-netdev user,id=net0)
+    local pci_profile
+    local -a pci_args media_args network_args=(-netdev user,id=net0)
 
+    configure_pci_profile
     valid_poweroff_timeout "$poweroff_timeout_seconds" || die 'poweroff timeout must be 1..1800 seconds'
 
     [[ "$mode" == check-physical-status ]] && is_physical_test=1
@@ -417,6 +433,7 @@ run_windows() {
     [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'WINDOWS_SMP must be a positive integer'
     printf 'Windows x86 test: backend=%s mode=%s environment=QEMU/KVM (not physical hardware)\n' \
         "$backend_label" "$mode"
+    printf 'Windows x86 test: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
@@ -794,15 +811,12 @@ run_windows() {
     exec 9<>"$monitor_fifo"
     monitor_fd_open=1
 
-    # ponytail: keep q35 PCI MMIO inside the current 8 GiB EPT; bare-metal
-    # launch must derive RAM/MMIO ranges from firmware resources.
     "$qemu" \
         -machine q35,accel=kvm,smm=on \
         -global ICH9-LPC.disable_s3=1 \
         -global "ICH9-LPC.disable_s4=$disable_s4" \
-        -global q35-pcihost.pci-hole64-size=1G \
+        "${pci_args[@]}" \
         -cpu "$cpu" \
-        -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=1024 \
         -smp "$smp" \
         -m "$memory" \
         -nodefaults \
@@ -1190,6 +1204,7 @@ check_wsl_soak() {
 usage() {
     printf 'usage: %s download|verify|download-wsl|verify-wsl|check-wsl-soak|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-wsl-soak|trusted-kvm-s4\n' "$0"
     printf '       %s check-physical-status (disposable QEMU eval SelfTest only)\n' "$0"
+    printf '       WINDOWS_PCI_PROFILE=firmware-default (default) or q35-smoke-1g (explicit QEMU A/B fixture)\n'
 }
 
 case ${1:-} in
@@ -1200,6 +1215,11 @@ case ${1:-} in
     check-wsl-soak) check_wsl_soak ;;
     check-physical-status) run_windows check-physical-status ;;
     physical-test-command) physical_test_command ;;
+    print-pci-args)
+        (($# == 1)) || die 'print-pci-args takes no arguments'
+        configure_pci_profile
+        if ((${#pci_args[@]})); then printf '%s\0' "${pci_args[@]}"; fi
+        ;;
     check-poweroff-timeout)
         (($# == 2)) || die 'check-poweroff-timeout requires SECONDS'
         valid_poweroff_timeout "$2"
