@@ -2876,3 +2876,42 @@ The isolated `0505598` 4,096-cycle run still **FAILs** at the unchanged
 and no concurrent project benchmark/Windows test or debugger pause was used.
 `/tmp/x86-repeat-vmwrite-4096-default.log`. Do not substitute the separate
 historical 600-second state-lifetime run for this default-bound failure.
+
+The separate frozen `0505598` 600-second state-lifetime comparison completes
+**PASS**, 4,096 cycles at guest time 318.407711, followed by normal poweroff.
+`/tmp/x86-repeat-vmwrite-4096-historical-bound.log`. This run overlapped host
+compilation/regression work and is not a controlled speedup measurement.
+
+## Keep an empty carrier MSR load disarmed
+
+All carrier VM_ENTRY_MSR_LOAD_COUNT writers were traced: initialization sets
+zero; `reflect_l2_vmexit` arms a nonempty per-CPU host mirror; the first
+subsequent carrier exit clears it in `complete_reflected_msr_load`, before L1
+dispatch can attempt another nested entry. `prepare_host_load` rejects any
+outstanding owner/count even when the requested list is empty. An empty host
+reflection therefore no longer redundantly writes zero count/address. The
+address is architecturally ignored at count zero. The separate Direct L2
+entry mirror is unchanged, as are nonempty ordering, failure and abort paths.
+
+The existing CPU-state host test now checks pending-owner/count combinations,
+unchanged rejection, repeated empty preparation, retained payload and another
+CPU's independent state. Native MSR tests cover alternating nonempty/empty
+host loads and actual reflected execution, not merely metadata assertions.
+All five package checks **344 PASS, 0 FAIL**, debug build PASS, standard QEMU
+**9 PASS, 0 FAIL** (7 KVM, 2 TCG), release nested **15 PASS, 5 FAIL / 20**;
+all **14 Direct PASS**, the same five reference differences.
+`/tmp/x86-empty-host-msr-regression.log`. No new cached field, allocation,
+global lock, capability or AArch64 implementation change is introduced.
+
+Alternating three-pair A/B against frozen `0505598`, unchanged immutable UKIs
+and benchmark settings: **18 PASS, 0 FAIL**, artifact hashes unchanged. No
+other project QEMU was running during this A/B. Baseline/optimized ticks:
+
+* CPUID: 289850/287177, 289762/281951, 288409/283460; median **-2.17%**.
+* VMCALL: 905245/893746, 908366/897678, 908806/894820; median **-1.49%**.
+* PM timer IN: 343328/337288, 343461/338913, 342879/335442; median **-1.76%**.
+
+These small measured reductions are QEMU/KVM guest TSC results, not a
+physical-L0 performance claim. `/tmp/x86-empty-host-msr-ab-batch.log`,
+`/tmp/x86-idle-guest-ab.LflVd8`. Original-bound timing regressions remain
+required; no timeout change is part of the implementation.

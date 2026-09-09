@@ -4746,18 +4746,26 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
     if write_reflected_l1_state(run, l1_msrs.pat, l1_msrs.efer).is_none() {
         stop_nested_exit(b"reflecting L1 host state failed", run.direct, registers);
     }
-    for (field, value) in [
-        (vmcs::VM_ENTRY_MSR_LOAD_ADDR, host_address),
-        (vmcs::VM_ENTRY_MSR_LOAD_COUNT, u64::from(host_count)),
-    ] {
-        // SAFETY: the owned carrier is current. The stable per-CPU mirror is
-        // published only after its complete copy; no lock spans hardware entry.
-        if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
-            stop_nested_exit(
-                b"publishing reflected host MSR list failed",
-                run.direct,
-                registers,
-            );
+    // The private carrier starts with count=0. The only nonzero writer is
+    // this block; complete_reflected_msr_load clears it on the first L1 exit,
+    // before dispatch can attempt another nested entry. prepare_host_load
+    // rejects an outstanding owner/count even for an empty list. Thus an empty
+    // reflection cannot leave an earlier load armed; its address is ignored.
+    // This does NOT apply to the Direct VMCS's separate L2 entry mirror.
+    if host_count != 0 {
+        for (field, value) in [
+            (vmcs::VM_ENTRY_MSR_LOAD_ADDR, host_address),
+            (vmcs::VM_ENTRY_MSR_LOAD_COUNT, u64::from(host_count)),
+        ] {
+            // SAFETY: the owned carrier is current. The stable per-CPU mirror is
+            // published only after its complete copy; no lock spans hardware entry.
+            if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
+                stop_nested_exit(
+                    b"publishing reflected host MSR list failed",
+                    run.direct,
+                    registers,
+                );
+            }
         }
     }
 
@@ -6721,6 +6729,28 @@ mod tests {
             first.prepare_entry(super::MsrList::new(0x3000, 1, 48).unwrap()),
             None
         );
+        let owner = super::VmcsPhys::new(0x2000).unwrap();
+        let empty = super::MsrList::new(u64::MAX, 0, 48).unwrap();
+        first.host_load[0] = super::MsrEntry::new(0x277, 0x0606);
+        for (pending_owner, pending_count) in [(Some(owner), 0), (None, 1), (Some(owner), 1)] {
+            first.host_owner = pending_owner;
+            first.host_count = pending_count;
+            assert_eq!(first.prepare_host_load(empty, owner), None);
+            assert_eq!(first.host_owner, pending_owner);
+            assert_eq!(first.host_count, pending_count);
+        }
+        // Models completion's metadata cleanup; native MSR tests also verify
+        // actual carrier entries with alternating nonempty/empty host lists.
+        first.host_owner = None;
+        first.host_count = 0;
+        for _ in 0..3 {
+            assert_eq!(first.prepare_host_load(empty, owner), Some((0, 0)));
+            assert_eq!(first.host_owner, None);
+            assert_eq!(first.host_count, 0);
+            assert_eq!(first.host_load[0], super::MsrEntry::new(0x277, 0x0606));
+        }
+        assert_eq!(second.host_owner, None);
+        assert_eq!(second.host_count, 0);
         assert_ne!(first.entry.as_ptr(), second.entry.as_ptr());
         assert!(core::mem::size_of::<super::CpuMonitor>() <= super::CPU_STATE_PAGES * 4096);
         let limits = super::host_validation::Limits {
