@@ -1465,3 +1465,69 @@ clobber-arm marker are present. Guest completion time is 323.355 seconds.
 This supplies the missing Direct profile result, but does not rewrite the
 earlier full-suite infrastructure failure into a clean suite run. The unmodified
 invalid-guest-state and memslot RW timing failures remain unresolved.
+
+## Platform map increment: ACPI ECAM and APIC resources
+
+The missing QEMU ECAM interval above is now obtained from its actual MCFG,
+not inferred from q35. New `x86_uefi_loader/src/platform_acpi.rs` reuses the
+previous RSDP/root/header scanner and its MSDM regression, moved from
+`physical_preflight.rs`. `Tables` retains only an MSDM presence boolean and the
+allowlisted MCFG/MADT addresses. `resource_payload` refuses any other signature
+before a full-payload read, including MSDM. Firmware tables remain unchanged.
+
+`parse_mcfg` / `mcfg_window` validate checksums, table/revision/reserved-field
+layout, bounded allocation count, MiB-aligned bus windows, bus ordering,
+physical width, overflow and overlapping segment/bus or physical ranges.
+The CPU-relative base remains relative to **bus zero**: a nonzero starting bus
+adds its own MiB offset, matching the
+[Linux ECAM resource calculation](https://raw.githubusercontent.com/torvalds/linux/master/drivers/acpi/pci_mcfg.c).
+`parse_madt` validates subtable extents, IOAPIC layouts/duplicate IDs, page
+alignment/width, and a single 64-bit LAPIC override. The override replaces the
+header's LAPIC address, per the
+[ACPI MADT specification](https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html#local-apic-address-override-structure).
+Other MADT entries remain untouched; this limited inventory is not a claim
+that every possible platform-specific resource has been discovered.
+
+`platform_resources.rs::collect_with_acpi` checks the added intervals against
+the complete live GCD map before freeing its descriptor buffer. ACPI cannot
+convert GCD system/persistent/reliable/unaccepted RAM to MMIO. Reserved/absent
+GCD ranges may gain an explicit ACPI MMIO description; enclosing GCD MMIO
+apertures are unioned without duplication. `MmioMap::insert` also checks the
+current captured physical width when a range originated in a wider context.
+`physical_preflight.rs::inventory` passes the combined map into
+`platform_ept_audit.rs::AuditStorage::inspect`; `main.rs` wires the moved parser
+only into preflight. The shell gate and its `xtask` host regression now require
+ordered MCFG/MADT and combined-source evidence, with honest incomplete markers.
+
+Six added host tests cover MCFG start-bus/high-address/last-page behavior,
+malformed/overlapping MCFG tables, MADT override/address discovery and negative
+subtables, 32/64-bit root traversal with header-only MSDM and duplicate-table
+rejection, and ACPI-versus-GCD RAM/width conflicts. No external crate, runtime
+heap allocation, firmware identity modification or new unsafe block was added.
+
+Validation:
+
+* Nix `cargo xtest -p x86_uefi_loader` / `-p xtask`: **93 PASS, 0 FAIL**,
+  `/tmp/x86-acpi-mmio-host-first.log`. The header-only fixture refinement is
+  retested in the subsequent commands, with no MSDM payload constructed.
+* Nix `cargo xtest -p x86_uefi_loader`, `cargo xbuild x86 --release`, then the
+  same explicit 4G/default-q35 preflight command recorded for GCD above:
+  **PASS**, `/tmp/x86-acpi-mmio-high-first.log`. MCFG/MADT produce three ACPI
+  MMIO resources. The checked union has eight intervals and now includes
+  `[0xe0000000, 0xf0000000)` in the low aperture; high `[56 TiB, 64 TiB)` remains.
+  The EPT has **38 tables / 17,240 leaves**, exactly 128 additional 2 MiB leaves
+  for ECAM compared with the GCD-only capture.
+* All five required Nix `cargo xtest -p` packages: **186 PASS, 0 FAIL**
+  (nested 29, HAL 54, loader 60, guest 10, xtask 33). Nix `cargo xbuild x86`,
+  `cargo fmt --check`, and `cargo xrun x86 --release` also pass; the latter is
+  **9 PASS, 0 FAIL**, seven QEMU/KVM and two TCG.
+  `/tmp/x86-acpi-mmio-final-checks.log`.
+* `git diff --check` passes. No AArch64 production path changed and the user
+  `AGENTS.md` edit remains unstaged. No physical machine or Windows was tested.
+
+The active Direct carrier and HOST_CR3 still use their fixed maps. PCI root
+aperture/BAR protocol cross-checks, active map integration and the later
+architectural milestones remain pending. Markers still state
+`mmio_complete=0 direct_vmx_ready=0`; these non-VMX preflight results are not
+Direct high-BAR Linux boot or physical-readiness evidence. Outer KVM is reference
+evidence only.

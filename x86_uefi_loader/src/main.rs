@@ -48,6 +48,8 @@ mod physical_chainload;
 #[cfg(feature = "physical-preflight")]
 mod physical_preflight;
 #[cfg(feature = "physical-preflight")]
+mod platform_acpi;
+#[cfg(feature = "physical-preflight")]
 mod platform_ept_audit;
 #[cfg(feature = "physical-preflight")]
 mod platform_resources;

@@ -3260,13 +3260,14 @@ mod tests {
         let skip =
             "thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0\n";
         let gcd = concat!(
-            "thin-hv: preflight GCD MMIO index=0 start=0x00000000fec00000 end=0x00000000fec01000 ept_type=UC\n",
-            "thin-hv: preflight GCD MMIO index=1 start=0x0000008000000000 end=0x0000008000001000 ept_type=UC\n",
-            "thin-hv: preflight GCD PASS descriptors=3 mmio_ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
+            "thin-hv: preflight ACPI MMIO mcfg=1 madt=1 ranges=3 mmio_complete=0 direct_vmx_ready=0\n",
+            "thin-hv: preflight platform MMIO index=0 start=0x00000000fec00000 end=0x00000000fec01000 ept_type=UC\n",
+            "thin-hv: preflight platform MMIO index=1 start=0x0000008000000000 end=0x0000008000001000 ept_type=UC\n",
+            "thin-hv: preflight MMIO PASS source=gcd+acpi descriptors=3 mmio_ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
         );
         let pass = |tables: &str, leaves: &str| {
             format!(
-                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
+                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
             )
         };
         let kvm = format!("{vmx_present}{gcd}{}", pass("12", "3456"));
@@ -3325,7 +3326,11 @@ mod tests {
         for (from, to) in [
             ("private_pages=288", "private_pages=287"),
             ("mmio_complete=0", "mmio_complete=1"),
-            ("scope=uefi-memory-map+gcd", "scope=qemu-fallback"),
+            ("scope=uefi-memory-map+gcd+acpi", "scope=qemu-fallback"),
+            (
+                "scope=uefi-memory-map+gcd+acpi",
+                "scope=uefi-memory-map+gcd",
+            ),
             ("leaves=3456", "leaves=3456 extra=1"),
         ] {
             assert!(!check("kvm", &kvm.replace(from, to)));
@@ -3339,8 +3344,12 @@ mod tests {
         for (accel, valid) in [("kvm", &kvm), ("tcg", &tcg)] {
             for (from, to) in [
                 ("descriptors=3", "descriptors=0"),
-                ("descriptors=3", "descriptors=1"),
                 ("descriptors=3", "descriptors=4097"),
+                ("mcfg=1", "mcfg=0"),
+                ("madt=1", "madt=0"),
+                ("ranges=3", "ranges=0"),
+                ("ranges=3", "ranges=129"),
+                ("source=gcd+acpi", "source=gcd"),
                 ("mmio_ranges=2", "mmio_ranges=1"),
                 ("index=1", "index=0"),
                 ("index=1", "index=01"),
@@ -3348,7 +3357,7 @@ mod tests {
                 ("0x0000008000001000", "0x0000008000001001"),
                 ("0x0000008000001000", "0x0010000000001000"),
                 ("ept_type=UC", "ept_type=WB"),
-                ("GCD PASS", "GCD unavailable"),
+                ("MMIO PASS", "MMIO unavailable"),
             ] {
                 assert!(
                     !check(accel, &valid.replace(from, to)),

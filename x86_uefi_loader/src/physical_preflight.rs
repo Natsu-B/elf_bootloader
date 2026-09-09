@@ -2,6 +2,7 @@
 
 use crate::SerialPort;
 use crate::chainload::Error;
+use crate::platform_acpi;
 use crate::platform_ept_audit;
 use crate::platform_resources;
 use crate::platform_snapshot;
@@ -13,11 +14,6 @@ use core::fmt::Write;
 use core::mem;
 use r_efi::efi;
 use x86_64_hal::platform_memory::PhysicalWidth;
-
-/// Table inventory bounds; exceeding them is an explicit unsupported layout.
-const MAX_TABLE_ENTRIES: usize = 4096;
-const MAX_ACPI_BYTES: usize = 1024 * 1024;
-const ACPI_HEADER_BYTES: usize = 36;
 
 /// Collects an inventory and returns to firmware without retaining a runtime.
 pub(crate) fn run(
@@ -65,10 +61,22 @@ fn inventory(system_table: *mut efi::SystemTable, serial: &mut SerialPort) -> Re
                     region.attributes
                 );
             }
-            inventory_tables(system_table, map, serial)?;
+            let tables = inventory_tables(system_table, map, serial)?;
             let width = PhysicalWidth::new(cpu.physical_bits())
                 .map_err(|_| malformed("GCD physical-address width"))?;
-            let mmio = platform_resources::collect(system_table, map, width, serial)?;
+            let acpi = match &tables {
+                Some(tables) => tables.mmio(map, width)?,
+                None => platform_resources::MmioMap::empty(width)?,
+            };
+            let _ = writeln!(
+                serial,
+                "thin-hv: preflight ACPI MMIO mcfg={} madt={} ranges={} mmio_complete=0 direct_vmx_ready=0",
+                u8::from(tables.as_ref().is_some_and(|tables| tables.mcfg.is_some())),
+                u8::from(tables.as_ref().is_some_and(|tables| tables.madt.is_some())),
+                acpi.ranges().len()
+            );
+            let mmio =
+                platform_resources::collect(system_table, map, width, acpi.ranges(), serial)?;
             storage.inspect(cpu, map, mmio.ranges(), serial)
         })
     })
@@ -79,7 +87,7 @@ fn inventory_tables(
     system_table: *mut efi::SystemTable,
     map: &MemoryMap<'_>,
     serial: &mut SerialPort,
-) -> Result<(), Error> {
+) -> Result<Option<platform_acpi::Tables>, Error> {
     let system = map.system_table(system_table)?;
     inventory_runtime(system.runtime_services, map, serial)?;
     let entries = map.configuration_tables(system_table)?;
@@ -120,20 +128,22 @@ fn inventory_tables(
             address.unwrap_or(0)
         );
     }
-    if let Some(rsdp) = acpi2.or(acpi1) {
-        let present = scan_acpi(rsdp, map)?;
+    let tables = if let Some(rsdp) = acpi2.or(acpi1) {
+        let tables = platform_acpi::discover(rsdp, map)?;
         let _ = writeln!(
             serial,
             "thin-hv: preflight MSDM={} payload=not-read",
-            if present { "present" } else { "absent" }
+            if tables.msdm { "present" } else { "absent" }
         );
+        Some(tables)
     } else {
         let _ = writeln!(
             serial,
             "thin-hv: preflight MSDM=unavailable reason=no-acpi-system-table payload=not-read"
         );
-    }
-    Ok(())
+        None
+    };
+    Ok(tables)
 }
 
 /// Reports Runtime Services entry-point availability without calling any entry.
@@ -196,150 +206,4 @@ fn inventory_runtime(
         );
     }
     Ok(())
-}
-
-/// Validates RSDP and root pointers, but reads only 36 bytes of each child table.
-fn scan_acpi(address: u64, map: &MemoryMap<'_>) -> Result<bool, Error> {
-    let prefix = map
-        .firmware_bytes(address, 20)
-        .ok_or_else(|| malformed("ACPI RSDP range"))?;
-    if prefix.get(..8) != Some(&b"RSD PTR "[..]) || !checksum_valid(prefix) {
-        return Err(malformed("ACPI RSDP signature/checksum"));
-    }
-    let (root_address, width) = if prefix[15] >= 2 {
-        let rsdp = map
-            .firmware_bytes(address, 36)
-            .ok_or_else(|| malformed("ACPI extended RSDP range"))?;
-        let length = read_u32(rsdp, 20).ok_or_else(|| malformed("ACPI RSDP length"))? as usize;
-        if !(36..=4096).contains(&length)
-            || !map
-                .firmware_bytes(address, length)
-                .is_some_and(checksum_valid)
-        {
-            return Err(malformed("ACPI RSDP extended checksum/length"));
-        }
-        let xsdt = read_u64(rsdp, 24).ok_or_else(|| malformed("ACPI XSDT pointer"))?;
-        if xsdt != 0 {
-            (xsdt, 8)
-        } else {
-            (
-                u64::from(read_u32(prefix, 16).ok_or_else(|| malformed("ACPI RSDT pointer"))?),
-                4,
-            )
-        }
-    } else {
-        (
-            u64::from(read_u32(prefix, 16).ok_or_else(|| malformed("ACPI RSDT pointer"))?),
-            4,
-        )
-    };
-    let header = map
-        .firmware_bytes(root_address, ACPI_HEADER_BYTES)
-        .ok_or_else(|| malformed("ACPI root header range"))?;
-    let length = table_length(header)?;
-    let root = map
-        .firmware_bytes(root_address, length)
-        .ok_or_else(|| malformed("ACPI root table range"))?;
-    scan_root(
-        root,
-        width,
-        |address| {
-            map.firmware_bytes(address, ACPI_HEADER_BYTES)?
-                .try_into()
-                .ok()
-        },
-        |address, length| map.readable(address, length),
-    )
-}
-
-/// Parses root entries with a header-only reader, keeping MSDM payload opaque.
-fn scan_root(
-    root: &[u8],
-    width: usize,
-    mut read_header: impl FnMut(u64) -> Option<[u8; ACPI_HEADER_BYTES]>,
-    range_readable: impl Fn(u64, usize) -> bool,
-) -> Result<bool, Error> {
-    if !matches!(width, 4 | 8)
-        || root.len() < ACPI_HEADER_BYTES
-        || table_length(root)? != root.len()
-        || root.get(..4)
-            != Some(if width == 8 {
-                &b"XSDT"[..]
-            } else {
-                &b"RSDT"[..]
-            })
-        || !(root.len() - ACPI_HEADER_BYTES).is_multiple_of(width)
-        || (root.len() - ACPI_HEADER_BYTES) / width > MAX_TABLE_ENTRIES
-        || !checksum_valid(root)
-    {
-        return Err(malformed("ACPI root signature/length/checksum"));
-    }
-    let mut found = false;
-    for offset in (ACPI_HEADER_BYTES..root.len()).step_by(width) {
-        let address = if width == 8 {
-            read_u64(root, offset)
-        } else {
-            read_u32(root, offset).map(u64::from)
-        }
-        .filter(|address| *address != 0)
-        .ok_or_else(|| malformed("ACPI child pointer"))?;
-        let header = read_header(address).ok_or_else(|| malformed("ACPI child header range"))?;
-        let length = table_length(&header)?;
-        if !range_readable(address, length) {
-            return Err(malformed("ACPI child table range"));
-        }
-        found |= header[..4] == *b"MSDM";
-        // Intentionally do not checksum/dump a child table: its payload can
-        // contain the OEM Windows product key. Presence uses the header only.
-    }
-    Ok(found)
-}
-
-/// Checks a bounded standard ACPI header without reading the table payload.
-fn table_length(header: &[u8]) -> Result<usize, Error> {
-    let length = read_u32(header, 4).ok_or_else(|| malformed("ACPI table length"))? as usize;
-    if header.len() < ACPI_HEADER_BYTES || !(ACPI_HEADER_BYTES..=MAX_ACPI_BYTES).contains(&length) {
-        return Err(malformed("ACPI table length bound"));
-    }
-    Ok(length)
-}
-
-/// Applies the ACPI byte-sum checksum only to RSDP and pointer-only roots.
-fn checksum_valid(bytes: &[u8]) -> bool {
-    bytes.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)) == 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preflight_msdm_discovery_reads_headers_only() {
-        let mut root = [0_u8; 44];
-        root[..4].copy_from_slice(b"XSDT");
-        root[4..8].copy_from_slice(&44_u32.to_le_bytes());
-        root[36..].copy_from_slice(&0x1000_u64.to_le_bytes());
-        root[9] = 0_u8.wrapping_sub(root.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)));
-        let mut header = [0_u8; ACPI_HEADER_BYTES];
-        header[..4].copy_from_slice(b"MSDM");
-        header[4..8].copy_from_slice(&128_u32.to_le_bytes());
-        let mut reads = 0;
-        let found = scan_root(
-            &root,
-            8,
-            |address| {
-                assert_eq!(address, 0x1000);
-                reads += 1;
-                Some(header)
-            },
-            |address, length| address == 0x1000 && length == 128,
-        )
-        .unwrap();
-        assert!(found);
-        assert_eq!(reads, 1);
-        assert!(scan_root(&root, 8, |_| Some(header), |_, _| false).is_err());
-        assert!(scan_root(&root, 8, |_| None, |_, _| true).is_err());
-        root[9] ^= 1;
-        assert!(scan_root(&root, 8, |_| Some(header), |_, _| true).is_err());
-    }
 }

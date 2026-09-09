@@ -1,6 +1,6 @@
 //! Disposable EPT construction from the actual read-only preflight snapshot.
 //!
-//! This validates UEFI memory plus captured GCD MMIO ranges. It does not prove
+//! This validates UEFI memory plus captured GCD/ACPI MMIO ranges. It does not prove
 //! complete PCI/APIC aperture coverage, publish an EPTP, enable VMX, or leave
 //! any allocation resident.
 
@@ -143,7 +143,7 @@ impl AuditStorage {
             .map_err(|error| report(serial, "EPT construction", error))?;
         let _ = writeln!(
             serial,
-            "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",
+            "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",
             tables.table_pages(),
             tables.leaf_count(),
             TOTAL_PAGES
