@@ -812,6 +812,7 @@ unsafe fn host_field_boundaries() -> Result<()> {
                 vmx::vmwrite(vmcs::HOST_CS_SELECTOR, 0),
             )?;
             let priority = (|| {
+                msr_list_boundaries(physical_bits as u8)?;
                 equal(
                     "host-check-resume-priority-flags",
                     rejected_entry(true)?,
@@ -869,6 +870,61 @@ unsafe fn host_field_boundaries() -> Result<()> {
         field_equal("host-check-restored-efer", vmcs::HOST_IA32_EFER, saved_efer)?;
     }
     result
+}
+
+/// Checks list controls before any list memory can be touched. The current
+/// clear VMCS has HOST_CS=0 as an independent guard even if a negative control
+/// is mistakenly accepted. All list fields are restored on assertion failure.
+unsafe fn msr_list_boundaries(physical_bits: u8) -> Result<()> {
+    for (address_field, count_field) in [
+        (vmcs::VM_ENTRY_MSR_LOAD_ADDR, vmcs::VM_ENTRY_MSR_LOAD_COUNT),
+        (vmcs::VM_EXIT_MSR_STORE_ADDR, vmcs::VM_EXIT_MSR_STORE_COUNT),
+        (vmcs::VM_EXIT_MSR_LOAD_ADDR, vmcs::VM_EXIT_MSR_LOAD_COUNT),
+    ] {
+        // SAFETY: this CPU exclusively owns the clear/current VMCS. HOST_CS=0
+        // prevents guest state or MSR loading for every case including count=0.
+        // The addresses below are never dereferenced by either test or CPU.
+        unsafe {
+            let address = read_field("msr-list-save-address", address_field)?;
+            let count = read_field("msr-list-save-count", count_field)?;
+            equal("msr-list-initial-count", count, 0)?;
+            let result = (|| {
+                for (address, count) in [
+                    (1, 1),
+                    ((1_u64 << physical_bits) - 16, 2),
+                    (u64::MAX - 15, 2),
+                    (0, u64::from(u32::MAX)),
+                ] {
+                    success("msr-list-bad-address", vmx::vmwrite(address_field, address))?;
+                    success("msr-list-bad-count", vmx::vmwrite(count_field, count))?;
+                    for (resume, error) in [(false, 7), (true, 5)] {
+                        equal("msr-list-flags", rejected_entry(resume)?, FAIL_VALID)?;
+                        field_equal("msr-list-error", vmcs::VM_INSTRUCTION_ERROR, error)?;
+                        field_equal("msr-list-address-retained", address_field, address)?;
+                        field_equal("msr-list-count-retained", count_field, count)?;
+                    }
+                }
+                success("msr-list-empty-count", vmx::vmwrite(count_field, 0))?;
+                success(
+                    "msr-list-ignored-address",
+                    vmx::vmwrite(address_field, u64::MAX),
+                )?;
+                equal("msr-list-empty-flags", rejected_entry(false)?, FAIL_VALID)?;
+                // The invalid original host selector, not an ignored list
+                // address, must determine this VMfailValid error.
+                field_equal("msr-list-empty-host-error", vmcs::VM_INSTRUCTION_ERROR, 8)
+            })();
+            success("msr-list-restore-count", vmx::vmwrite(count_field, count))?;
+            success(
+                "msr-list-restore-address",
+                vmx::vmwrite(address_field, address),
+            )?;
+            field_equal("msr-list-restored-count", count_field, count)?;
+            field_equal("msr-list-restored-address", address_field, address)?;
+            result?;
+        }
+    }
+    Ok(())
 }
 
 /// # Safety
@@ -1379,7 +1435,7 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 fx_cpuid=6 fx_xsetbv=12 fx_entry=41 fx_irq=3 ymm_rounds={}",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds={}",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,

@@ -550,3 +550,55 @@ This is a tested prerequisite, not completed nonempty MSR-list support. The
 list runtime and its VM-entry-failure/VMX-abort semantics are still under work.
 Windows/Hyper-V and physical hardware were not tested in this prerequisite;
 outer-KVM evidence remains reference-only.
+
+## Step 5: original MSR-list control validation
+
+Confirmed: zeroing Direct exit-list fields before entry could hide L1's invalid
+list controls; nonzero counts previously reached a monitor stop. Invalid list
+metadata now takes the architectural early-failure path, before any list memory
+access. Valid nonempty list execution is still a separate pending part of step 5.
+
+* `nested_vmx/src/msr_list.rs`: bounded `List`, 16-byte `Entry` and operation-
+  specific format checks. Full-range validation distinguishes count, alignment,
+  overflow and physical-width errors; count zero ignores the address, and
+  physical zero is not categorically rejected. Entry contents are not confused
+  with early control failures. Three new host tests cover the boundaries.
+* `nested_vmx/src/lib.rs`: `MsrMirrorMetadata::checked_lists` reuses that checker
+  for both original exit ranges, with existing metadata-test coverage extended.
+* `arch_hal/x86_64_hal/src/vmcs.rs`: named encodings for all three list addresses.
+* `arch_hal/x86_64_hal/src/vmx.rs`: `reject_control_entry` and shared
+  `reject_entry_field` generate hardware VM_INSTRUCTION_ERROR, without attempting
+  to write the read-only error field. A verified reserved primary control bit
+  guarantees failure before guest/MSR loading; the original field is restored.
+  VMRESUME launch-state failure still has priority over error 7.
+* `x86_uefi_loader/src/vmx_smoke.rs`: `checked_direct_msr_lists` reads original
+  metadata, retaining the distinction between L0 read/invariant failure and
+  L1-invalid controls. `handle_l1_vmentry` restores original patch fields and
+  selects the appropriate early control/host rejection without stopping for
+  malformed list controls. No capability bits changed.
+* `x86_guest_uefi_test/src/nested_contract.rs`: `msr_list_boundaries` checks
+  alignment, full-range physical overflow and excessive counts for each list,
+  plus launch-state priority and ignored empty-list addresses. HOST_CS=0 is an
+  independent safety guard, so a failed assertion cannot launch arbitrary L2
+  state or dereference test addresses. All fields are restored on failure.
+* `scripts/x86_64/run-uefi-smoke.sh`, `xtask/src/main.rs`: strict coverage gates
+  now require `msr_invalid=12 msr_priority=12 msr_ignored=3` and `fx_entry=68`.
+  Missing/decreased counts are negative runner-test cases.
+
+Validation through the existing Nix/cargo framework:
+
+* Five package tests: **157 PASS, 0 FAIL** (nested 19, HAL 51, loader 45,
+  guest 10, xtask 32). Logs: `/tmp/x86-correctness-step5-list-policy.log`,
+  `...-list-hal.log`, `...-list-loader.log`, `...-list-guest.log`,
+  `...-list-xtask.log`.
+* `env LINUX_KVM_CYCLES=1 LINUX_KVM_TIMEOUT_SECONDS=600 cargo xrun x86 --nested
+  --release`: **6 PASS, 2 FAIL**, process exit 1;
+  `/tmp/x86-correctness-step5-list-nested-first.log`. All added Direct cases
+  pass, including the deliberately faulting root-MSR/XSTATE fixture. The only
+  failures remain both reference native partial-store assertions.
+* `cargo xbuild x86`: **PASS**; `/tmp/x86-correctness-step5-list-xbuild.log`.
+* The same release suite with `LINUX_KVM_CYCLES=4096` was started for the next
+  verification record: `/tmp/x86-correctness-step5-list-nested-final.log`.
+  Its completion is not claimed by this intermediate record.
+
+No Windows/Hyper-V, S3 or physical-hardware qualification was performed here.

@@ -610,13 +610,49 @@ pub unsafe fn reject_host_entry(resume: bool) -> Option<VmxStatus> {
     // SAFETY: current VMCS ownership is the caller's invariant. HOST_CS is a
     // writable 16-bit field; a null selector is unconditionally invalid for
     // host state on VM entry outside SMM, even with invalid controls/guest state.
+    unsafe { reject_entry_field(resume, crate::vmcs::HOST_CS_SELECTOR, 0) }
+}
+
+/// Records invalid original controls before Direct patching can hide them.
+/// Launch-state errors retain priority over control error 7. No guest or MSR
+/// state can load, and the original primary controls are always restored.
+///
+/// # Safety
+///
+/// The caller is outside SMM at CPL0 in VMX root and owns a valid current VMCS
+/// with all L1-visible fields materialized. Use only for invalid original
+/// controls. The mandatory VMX capability MSRs must be readable on this CPU.
+pub unsafe fn reject_control_entry(resume: bool) -> Option<VmxStatus> {
+    // SAFETY: the caller establishes VMX and exclusive current-VMCS ownership.
+    // BASIC selects an available control MSR. Verify bit0 cannot be one before
+    // forcing it; this guarantees early rejection even on a future processor.
     unsafe {
-        let original = vmread(crate::vmcs::HOST_CS_SELECTOR).ok()?;
-        if vmwrite(crate::vmcs::HOST_CS_SELECTOR, 0) != VmxStatus::Success {
+        let basic = VmxBasic::from_msr(crate::cpu::rdmsr(IA32_VMX_BASIC));
+        let caps = crate::cpu::rdmsr(if basic.true_controls {
+            IA32_VMX_TRUE_PROCBASED_CTLS
+        } else {
+            IA32_VMX_PROCBASED_CTLS
+        });
+        if caps & (1 << 32) != 0 {
+            return None;
+        }
+        let original = vmread(crate::vmcs::CPU_BASED_VM_EXEC_CONTROL).ok()?;
+        reject_entry_field(resume, crate::vmcs::CPU_BASED_VM_EXEC_CONTROL, original | 1)
+    }
+}
+
+/// Executes only with a field/value pair proven to force an early rejection.
+unsafe fn reject_entry_field(resume: bool, field: u32, value: u64) -> Option<VmxStatus> {
+    // SAFETY: the two callers prove that this writable field/value pair must
+    // fail before guest loading, and establish exclusive current VMCS ownership.
+    // Successful restoration leaves the hardware instruction-error field intact.
+    unsafe {
+        let original = vmread(field).ok()?;
+        if vmwrite(field, value) != VmxStatus::Success {
             return None;
         }
         let status = vm_entry_instruction(resume);
-        if vmwrite(crate::vmcs::HOST_CS_SELECTOR, original) != VmxStatus::Success {
+        if vmwrite(field, original) != VmxStatus::Success {
             return None;
         }
         Some(status)

@@ -8,6 +8,7 @@
 //! trusted L1 hypervisor.
 
 pub mod host_validation;
+pub mod msr_list;
 
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
@@ -646,6 +647,22 @@ impl MsrMirrorMetadata {
     pub const fn exit_load(self) -> (u64, u32) {
         (self.load_address, self.load_count)
     }
+
+    /// Validates both complete original physical ranges before mirror setup.
+    pub const fn checked_lists(
+        self,
+        physical_bits: u8,
+    ) -> Result<(msr_list::List, msr_list::List), msr_list::Error> {
+        let store = match msr_list::List::new(self.store_address, self.store_count, physical_bits) {
+            Ok(list) => list,
+            Err(error) => return Err(error),
+        };
+        let load = match msr_list::List::new(self.load_address, self.load_count, physical_bits) {
+            Ok(list) => list,
+            Err(error) => return Err(error),
+        };
+        Ok((store, load))
+    }
 }
 
 /// VMCS fields that direct-VMCS entry must save and replace.
@@ -1152,6 +1169,23 @@ mod tests {
         let metadata = MsrMirrorMetadata::new(0x1000, 512, 0x2000, 512).unwrap();
         assert_eq!(metadata.exit_store(), (0x1000, 512));
         assert_eq!(metadata.exit_load(), (0x2000, 512));
+        assert_eq!(metadata.checked_lists(32).unwrap().0.count(), 512);
+        assert_eq!(metadata.checked_lists(32).unwrap().1.address(), 0x2000);
+        assert_eq!(
+            MsrMirrorMetadata::new(1, 0, u64::MAX, 0)
+                .unwrap()
+                .checked_lists(32)
+                .unwrap()
+                .1
+                .address(),
+            u64::MAX
+        );
+        assert_eq!(
+            MsrMirrorMetadata::new(0, 0, (1 << 32) - 16, 2)
+                .unwrap()
+                .checked_lists(32),
+            Err(msr_list::Error::Address)
+        );
         assert_eq!(MsrMirrorMetadata::new(0, 513, 0, 0), None);
         assert_eq!(MsrMirrorMetadata::new(0, 0, 0, 513), None);
     }

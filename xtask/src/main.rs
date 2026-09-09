@@ -3445,7 +3445,7 @@ mod tests {
                     + (vpid_types & 11).count_ones();
                 let count = 14 - shadow + invept + invvpid + readonly + descriptors;
                 let pass = format!(
-                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 fx_cpuid=6 fx_xsetbv=12 fx_entry=41 fx_irq=3 ymm_rounds=4\n"
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds=4\n"
                 );
                 let diagnostics = "thin-hv: native L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores=0\nthin-hv: native L1 original host validation PASS invalid=34 priority=2 restored=1\n";
                 let valid = format!("{provenance}{start}{diagnostics}{pass}{terminal}");
@@ -3507,9 +3507,13 @@ mod tests {
                     valid.replace("host_invalid=34", "host_invalid=33"),
                     valid.replace("host_priority=2", "host_priority=0"),
                     valid.replace("host_restore=1", "host_restore=0"),
+                    valid.replace(" msr_invalid=12", ""),
+                    valid.replace("msr_invalid=12", "msr_invalid=11"),
+                    valid.replace("msr_priority=12", "msr_priority=0"),
+                    valid.replace("msr_ignored=3", "msr_ignored=2"),
                     valid.replace("fx_cpuid=6", "fx_cpuid=0"),
                     valid.replace("fx_xsetbv=12", "fx_xsetbv=11"),
-                    valid.replace("fx_entry=41", "fx_entry=40"),
+                    valid.replace("fx_entry=68", "fx_entry=67"),
                     valid.replace("fx_irq=3", "fx_irq=0"),
                     valid.replace("ymm_rounds=4", "ymm_rounds=1"),
                     valid.replace("ospke_toggles=4", "ospke_toggles=0"),

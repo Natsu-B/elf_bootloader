@@ -3019,17 +3019,30 @@ fn handle_l1_vmentry(
             registers,
         );
     };
-    match host_validation::validate(host_limits, exit_controls, |field| {
+    let Some(msr_controls) = checked_direct_msr_lists(&saved_direct, host_limits.physical_bits)
+    else {
+        stop_unexpected_exit(
+            b"reading original MSR-list controls failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let host_check = host_validation::validate(host_limits, exit_controls, |field| {
         direct_patch_value(&saved_direct, field)
-    }) {
-        Ok(()) => {}
-        Err(host_validation::Error::Field(_) | host_validation::Error::AddressSpaceSize) => {
+    });
+    match (msr_controls, host_check) {
+        (Ok(()), Ok(())) => {}
+        (Err(_), _)
+        | (_, Err(host_validation::Error::Field(_) | host_validation::Error::AddressSpaceSize)) => {
             // Restore originals before asking hardware to record a guaranteed
             // failed entry: otherwise L0's zeroed MSR-list counts could hide an
             // invalid-control error which has priority over invalid host state.
             if !restore_direct_vmcs(&saved_direct) {
                 stop_unexpected_exit(
-                    b"materializing invalid L1 host state failed",
+                    b"materializing rejected L1 entry failed",
                     reason,
                     qualification,
                     guest_rip,
@@ -3040,11 +3053,17 @@ fn handle_l1_vmentry(
             *DIRECT_PATCH_VALUES.lock() = None;
             *DIRECT_ENTRY_POLICY.lock() = None;
             // SAFETY: the BSP owns this current direct VMCS, outside SMM; all
-            // original fields are materialized. The helper forces HOST_CS=0,
-            // guaranteeing an early VMfail without guest/MSR loading, then
-            // restores the selector. Capture the error before selecting carrier.
+            // original fields are materialized. A proven-invalid control or
+            // HOST_CS=0 guarantees early VMfail without guest/MSR loading.
+            // Hardware preserves launch-state/control/host error priority; the
+            // helper restores its guard field before carrier selection.
             let result = unsafe {
-                match vmx::reject_host_entry(instruction == VmEntryInstruction::Vmresume) {
+                let status = if msr_controls.is_err() {
+                    vmx::reject_control_entry(instruction == VmEntryInstruction::Vmresume)
+                } else {
+                    vmx::reject_host_entry(instruction == VmEntryInstruction::Vmresume)
+                };
+                match status {
                     Some(VmxStatus::FailInvalid) => Some(VmInstructionResult::VmfailInvalid),
                     Some(VmxStatus::FailValid) => vmx::vmread(vmcs::VM_INSTRUCTION_ERROR)
                         .ok()
@@ -3055,7 +3074,7 @@ fn handle_l1_vmentry(
             };
             let Some(result) = result else {
                 stop_unexpected_exit(
-                    b"recording invalid L1 host state failed",
+                    b"recording rejected L1 entry failed",
                     reason,
                     qualification,
                     guest_rip,
@@ -3068,7 +3087,7 @@ fn handle_l1_vmentry(
             // before changing L1 flags/RIP; completion reads the preserved error.
             if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
                 stop_unexpected_exit(
-                    b"restoring carrier after host rejection failed",
+                    b"restoring carrier after entry rejection failed",
                     reason,
                     qualification,
                     guest_rip,
@@ -3086,7 +3105,7 @@ fn handle_l1_vmentry(
             );
             return VMEXIT_ACTION_RESUME;
         }
-        Err(host_validation::Error::Limits | host_validation::Error::Missing(_)) => {
+        (_, Err(host_validation::Error::Limits | host_validation::Error::Missing(_))) => {
             stop_unexpected_exit(
                 b"invalid L0 host validation metadata",
                 reason,
@@ -3212,6 +3231,42 @@ fn handle_l1_vmentry(
         VmEntryInstruction::Vmlaunch => VMEXIT_ACTION_VMLAUNCH,
         VmEntryInstruction::Vmresume => VMEXIT_ACTION_VMRESUME,
     }
+}
+
+/// Validates original MSR-list control ranges before Direct fields are patched.
+/// The outer Option reports an L0 VMREAD/manifest invariant failure; an inner
+/// error is L1's invalid controls and must produce architectural error 7.
+fn checked_direct_msr_lists(
+    saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
+    physical_bits: u8,
+) -> Option<Result<(), nested_vmx::msr_list::Error>> {
+    use nested_vmx::MsrMirrorMetadata;
+    use nested_vmx::msr_list::Error;
+    use nested_vmx::msr_list::List;
+    if !(12..=52).contains(&physical_bits) {
+        return None;
+    }
+    let store_address = direct_patch_value(saved, VmcsField::VmExitMsrStoreAddress)?;
+    let store_count =
+        u32::try_from(direct_patch_value(saved, VmcsField::VmExitMsrStoreCount)?).ok()?;
+    let load_address = direct_patch_value(saved, VmcsField::VmExitMsrLoadAddress)?;
+    let load_count =
+        u32::try_from(direct_patch_value(saved, VmcsField::VmExitMsrLoadCount)?).ok()?;
+    // SAFETY: the owning BSP selected L1's live Direct VMCS. These mandatory
+    // controls have not been patched; VMREAD never dereferences list contents.
+    let (entry_address, entry_count) = unsafe {
+        (
+            vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_ADDR).ok()?,
+            u32::try_from(vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT).ok()?).ok()?,
+        )
+    };
+    Some((|| {
+        let metadata = MsrMirrorMetadata::new(store_address, store_count, load_address, load_count)
+            .ok_or(Error::Count)?;
+        metadata.checked_lists(physical_bits)?;
+        List::new(entry_address, entry_count, physical_bits)?;
+        Ok(())
+    })())
 }
 
 /// Captures CPU limits and the stopped L1's mode while its carrier is current.
