@@ -322,7 +322,7 @@ pub(super) fn in_vmx(base: u64, serial: &mut Serial) -> Result<u64> {
         // run every remaining case before reporting a reference-backend failure.
         let _ = writeln!(
             serial,
-            "thin-hv: L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores={partial_stores}"
+            "thin-hv: native L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores={partial_stores}"
         );
         Ok(partial_stores)
     })

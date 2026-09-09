@@ -360,3 +360,147 @@ These remain QEMU/KVM and host results only. CET VM-exit capability remains
 hidden; conditional policy tests are not a claim of a running CET nested guest.
 Windows/Hyper-V, S3, per-pCPU ownership, platform-map wiring and physical hardware
 are not newly qualified by this step.
+
+## Step 4: protect live guest extended state from L0
+
+Confirmed against `b6001f7`: the exit stub saved GPRs but called compiled Rust
+without saving its x87/SSE register footprint. It also treated future CR2
+switching as desirable, although VMX does not switch CR2 between L1 and L2.
+
+Changed files and major symbols:
+
+* `arch_hal/x86_64_hal/src/host_state.rs`: `HostXstate`,
+  `HOST_XSTATE_MXCSR_OFFSET`, `populate`, `HostEnvironment::vmcs_fields` and
+  the per-instance ownership/layout test.
+* `x86_uefi_loader/src/vmx_smoke.rs`: private CR4 preparation,
+  `vmexit_entry`, `vmexit_dispatch`, `nested_vmentry_failed`,
+  `clobber_host_xmm`, `halt_with_guest_xstate`, `leave_vmx`,
+  `leave_failed_launch`, terminal handlers and CR2/reflection documentation.
+* `x86_uefi_loader/Cargo.toml`: explicit QEMU-only `host-xstate-test` feature.
+* `x86_guest_uefi_test/src/l1_extended.rs`: aligned register images, a naked
+  seed/execute/capture/restore probe, defined-byte comparison and layout test.
+* `x86_guest_uefi_test/src/l1_xstate.rs`: legacy/AVX/interrupt state checks and
+  FP preservation around all valid and faulting XSETBV probes.
+* `x86_guest_uefi_test/src/nested_contract.rs`: state-checked rejected entries,
+  complete coverage marker and unambiguous native-guest diagnostic prefix.
+* `x86_guest_uefi_test/src/l1_memory.rs`: the same native-guest prefix change.
+* `scripts/x86_64/run-uefi-smoke.sh`: strict extended-state coverage and
+  separately identified `host-xstate` contract profile.
+* `scripts/x86_64/run-linux-kvm-test.sh`: explicit Direct-only
+  `LINUX_KVM_HOST_XSTATE_TEST=1`, requiring the armed marker exactly once.
+* `xtask/src/main.rs`: reuse the host-fixture builder for the new image,
+  linked-image ISA audit and its unit test, native/Linux clobber profiles,
+  separate evidence filenames and transcript regression checks.
+
+### Architectural contract
+
+The existing per-CPU host allocation has a disjoint unused region in its GDT/TSS
+page. At offset 256 it now owns a 64-byte-aligned 512-byte FXSAVE64 image and
+private MXCSR value. No allocation or global XSTATE lock was added. VMCS
+HOST_GS_BASE selects this instance; the existing patch-manifest completeness
+test also covers this nonzero base on direct L2 exits. This is a per-instance
+scratch foundation, **not implementation of physical SMP/AP ownership**.
+
+Before each Rust entry, including an immediate nested-entry failure and the
+terminal carrier-resume failure, the assembly saves live x87/MMX, XMM0–15 and
+MXCSR. FNINIT and private MXCSR establish masked FP state for L0. The stub
+restores the saved live state before entering L1 or L2. On an L2 exit it restores
+the **L2 exit's state**, not an older L1 snapshot. Post-exit terminal paths
+restore after diagnostics and retain private maps/tables/GS. Only initial
+launch failure restores firmware controls before freeing inactive allocations.
+Genuine root faults still fail closed with the private snapshot retained.
+
+L0 does not change XCR0/XSS for its own work: the only running XCR0 write is the
+validated emulation of L1 XSETBV. Consequently CPUID leaf 0D still sees the live
+guest's enabled-state configuration. A legacy save is necessary even with
+XCR0.SSE clear: this does not disable SSE register use. L0 deliberately uses no
+AVX/AVX-512/AMX/opmask or XSAVE/XRSTOR instructions. A compilation guard and
+decoded linked-image audit reject those paths, including dependency code.
+The guest fixture independently checks all sixteen YMM registers where AVX is
+advertised. ZMM/AMX/CET execution is not newly qualified by this test.
+
+CR2 is never restored from a stale L1 snapshot. L0's ordinary path cannot change
+it; the intentional L1 #PF injector does, and genuine root #PF never resumes.
+The native probe checks CR2 through CPUID, XSETBV, interrupt and failed-entry
+paths; the existing real/long-mode KVM probe continues testing L2 CR2.
+L0 does not write PKRU, PKRS, XSS, DR0–3, DR6 or PMU state. Its private CR4 clears
+PKE/PKS, preventing guest PKRS from denying private supervisor-page accesses;
+the temporary PKRU read in the operand walker restores private CR4. VMX-managed
+DR7/DEBUGCTL, PAT/EFER and PERF_GLOBAL_CTRL behavior is not replaced by an
+arbitrary software context switch. No new capability bit is advertised.
+
+Intel's [system-programming description of OSFXSR](https://cdrdv2-public.intel.com/835754/253668-sdm-vol-3a.pdf)
+defines its role in saving/restoring XMM/MXCSR. Intel also explicitly permits
+conservative XSAVE init tracking: XINUSE may remain set for an init-valued
+component; it is not a promise to detect every init value.
+See the [XSAVE tracking description](https://cdrdv2-public.intel.com/812380/252046-sdm-change-document.pdf).
+
+### Regression coverage and current results
+
+The native fixture now requires `fx_cpuid=6 fx_xsetbv=12 fx_entry=41 fx_irq=3`
+and `ymm_rounds=4` when AVX is available (`0` otherwise). This includes the five
+architectural XSETBV exceptions and 41 failed VMX entries, with live non-default
+x87/MXCSR and distinct values in every XMM register. STI;HLT windows use the
+unmodified live firmware timer/IDT and clear IF before capture; all three Direct
+profiles observed ten external-interrupt exits in the 4096-cycle suite's native
+part. The QEMU-only monitor deliberately clears every XMM register on every
+dispatch and failed-entry Rust path. Production images contain no such clobber.
+
+An additional transcript bug was found during review: the old native guest
+diagnostics used the same `thin-hv: L1` prefix rejected as resident-monitor
+evidence on reference backends. Rename those two guest diagnostics to
+`thin-hv: native L1`, and include them in transcript unit fixtures. Backend
+guards and the strict no-partial-store assertion are **not weakened**.
+
+* Five package-specific host runs: **154 PASS, 0 FAIL** (HAL 51, guest 10,
+  loader 45, nested_vmx 16, xtask 32), through `nix develop` and `cargo xtest -p`.
+  Logs: `/tmp/x86-correctness-step4-<package>.log`.
+* Release nested suite with `LINUX_KVM_CYCLES=4096
+  LINUX_KVM_TIMEOUT_SECONDS=600 cargo xrun x86 --nested --release` through
+  `nix develop --accept-flake-config --command`: **6 PASS, 2 FAIL**, exit 1.
+  `/tmp/x86-correctness-step4-nested-final.log`. Direct native, read-only VMCS
+  and clobber contracts PASS; reference/Direct/Direct-clobber Linux each finish
+  all 4096 cycles and S5 poweroff. Only the two known reference partial-store
+  assertions FAIL. No timeout was increased and no selftest source was changed.
+* After the native diagnostic-prefix/precondition checks, the same release
+  suite with `LINUX_KVM_CYCLES=1`: **6 PASS, 2 FAIL**, the same reference-only
+  failures; `/tmp/x86-correctness-step4-nested-recheck.log`.
+* Initial explicit Direct clobber/native run: **PASS**;
+  `/tmp/x86-correctness-step4-native-first.log`. The first one-cycle full suite
+  was **4 PASS, 3 FAIL**: the two known reference failures plus a duplicate CR
+  in the test-only armed marker rejected by the strict profile gate. Correct
+  the marker, not the gate. `/tmp/x86-correctness-step4-suite-first.log`.
+  The subsequent explicit interrupt/clobber suite was **6 PASS, 2 FAIL**;
+  `/tmp/x86-correctness-step4-suite-irq.log`.
+* `cargo xrun x86 --release` through `nix develop`: **9 QEMU runs PASS, 0 FAIL**.
+  `/tmp/x86-correctness-step4-smoke.log`. Seven are QEMU/KVM (Direct smoke,
+  expected root-exception stop, three reference source/target selections,
+  physical-chainload fixture, physical-preflight); two are QEMU/TCG (VMX-absent
+  preflight and the five-case physical-chainload policy harness). The expected
+  root #UD diagnostic is a fixture PASS, not a production exception recovery
+  claim. None of these runs boots physical Windows.
+* Original pinned `xcr0_cpuid_test` via `run-linux-selftest.sh` with
+  `LINUX_SELFTEST_BACKEND=direct-vmx`: **PASS**, process exit 0 / assertions 1.
+  `/tmp/x86-correctness-step4-xcr0_cpuid_test-direct-vmx.log`.
+* Original pinned `vmx_exception_with_invalid_guest_state`, same runner and
+  backend with the unchanged comparison bound
+  `LINUX_SELFTEST_TIMEOUT_SECONDS=600`: **FAIL**, QEMU status 124, PASS marker
+  missing after the periodic-signal phase began. Source/timing are unchanged;
+  this is not fixed by the FP bracket.
+  `/tmp/x86-correctness-step4-vmx_exception_with_invalid_guest_state-direct-vmx.log`.
+  Both upstream ELFs are the existing
+  `/tmp/thin-hv-kvm-selftests-7.1.5.MUloxc/out/x86/<test>` artifacts; their runner
+  variables are `LINUX_SELFTEST_NAME` and `LINUX_SELFTEST_ELF`.
+* Direct native contract with
+  `X86_UEFI_CPU=host,+vmx,-hypervisor,kvm=off,avx=off,avx2=off`: **PASS**,
+  including the separate `--check-nested-contract-log direct-vmx native` gate
+  and `ymm_rounds=0`; `/tmp/x86-correctness-step4-no-avx.log`.
+* `cargo xbuild x86`: **PASS**, including the baseline linked-ISA audit for
+  normal and both host fixtures; `/tmp/x86-correctness-step4-xbuild.log`.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**;
+  `/tmp/x86-correctness-step4-fmt-check.log`. No AArch64 production path changed.
+
+All results above are host or QEMU/KVM results, not physical hardware. Windows
+Hyper-V has not been retested in this step. The earlier Direct periodic-signal
+invalid-state timeout, platform-map/AP/NMI/S3 work and nonempty MSR lists remain
+open until their own validation, regardless of the state-preservation PASS.

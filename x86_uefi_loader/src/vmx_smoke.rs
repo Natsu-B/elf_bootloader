@@ -1,5 +1,10 @@
 //! One-vCPU VMXON/VMLAUNCH/VMCALL validation.
 
+// The exit stub protects x87/SSE, not AVX/AVX-512/AMX. A linked-image ISA check
+// in xtask also covers dependencies and explicit per-function target features.
+#[cfg(target_feature = "avx")]
+compile_error!("Direct L0 requires a baseline, non-AVX compilation target");
+
 use crate::SerialPort;
 use crate::runtime_variables;
 use core::ffi::c_void;
@@ -884,7 +889,20 @@ fn run_direct_monitor(
         if cpu::cpuid(1, 0).ecx & (1 << 26) == 0 {
             return Err(Error::Capability("XSAVE", 0));
         }
-        let host_cr4 = fixed_cr4 | CR4_OSXSAVE;
+        let legacy_features = (1 << 24) | (1 << 25) | (1 << 26);
+        if cpu::cpuid(1, 0).edx & legacy_features != legacy_features
+            || fixed_cr0 & ((1 << 2) | (1 << 3)) != 0
+        {
+            return Err(Error::Capability("UEFI x87/SSE environment", fixed_cr0));
+        }
+        let entry_cr4 = fixed_cr4 | CR4_OSXSAVE;
+        // No guest protection-key register is changed. Private supervisor maps
+        // must not inherit L1's PKRS restrictions; OSFXSR makes FXSAVE64 usable
+        // even when L1 has cleared its own OSFXSR or XCR0.SSE.
+        let host_cr4 = (entry_cr4 | (1 << 9)) & !((1 << 22) | (1 << 24));
+        if host_cr4 & cr4_fixed0 != cr4_fixed0 || host_cr4 & !cr4_fixed1 != 0 {
+            return Err(Error::Capability("private host CR4", host_cr4));
+        }
         ORIGINAL_CR0.store(original_cr0, Ordering::Relaxed);
         ORIGINAL_CR4.store(original_cr4, Ordering::Relaxed);
         // SAFETY: the original controls were saved and normalized with the VMX
@@ -892,7 +910,7 @@ fn run_direct_monitor(
         // recoverable fallible operation intervenes before VMXON's restore path.
         unsafe {
             cpu::write_cr0(fixed_cr0);
-            cpu::write_cr4(host_cr4);
+            cpu::write_cr4(entry_cr4);
         }
         // SAFETY: CPUID advertised XSAVE and host CR4.OSXSAVE is now set. XCR0 is
         // restored before the original CR4 is restored.
@@ -906,6 +924,8 @@ fn run_direct_monitor(
             restore_control_registers();
             return Err(Error::Instruction("VMXON", vmxon_status, u64::MAX));
         }
+        #[cfg(feature = "host-xstate-test")]
+        serial.write_bytes(b"thin-hv: host xstate clobber fixture armed\n");
 
         let variable_overlay =
             match runtime_variables::install(system_table, profile, image_base, image_size) {
@@ -976,6 +996,7 @@ fn leave_failed_launch(serial: &mut SerialPort) {
             core::hint::spin_loop();
         }
     }
+    restore_control_registers();
 }
 
 /// Loads the staged test/Linux image, or Windows from another filesystem.
@@ -1830,9 +1851,19 @@ extern "C" fn guest_entry() -> ! {
 }
 
 /// Hardware VM-exit target for the smoke VMCS.
+// SAFETY: hardware enters at CPL0 with private HOST_CR0.EM/TS=0, OSFXSR=1,
+// HOST_GS_BASE pointing at this CPU's aligned, exclusively owned HostXstate,
+// and the reserved host stack. GS scratch remains live on immediate VMfail.
+// Every Rust call is bracketed by FXSAVE64/FXRSTOR64; no guest XCR0/XSS change
+// is made here. FNINIT and private MXCSR mask guest FP exceptions inside L0.
+// Restoring the live exit state on L2 reflection preserves VMX's *shared*
+// extended-state semantics, rather than restoring a stale L1 snapshot.
 #[unsafe(naked)]
 extern "sysv64" fn vmexit_entry() -> ! {
     core::arch::naked_asm!(
+        "fxsave64 gs:[0]",
+        "fninit",
+        "ldmxcsr gs:[{mxcsr}]",
         "push r15",
         "push r14",
         "push r13",
@@ -1850,6 +1881,7 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "push rax",
         "mov rdi, rsp",
         "call {dispatch}",
+        "fxrstor64 gs:[0]",
         "cmp rax, {vmlaunch_action}",
         "je 2f",
         "cmp rax, {vmresume_action}",
@@ -1871,6 +1903,9 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "pop r15",
         "3:",
         "vmresume",
+        "fxsave64 gs:[0]",
+        "fninit",
+        "ldmxcsr gs:[{mxcsr}]",
         "pushfq",
         "push r15",
         "push r14",
@@ -1928,6 +1963,9 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "pop r15",
         "vmresume",
         "5:",
+        "fxsave64 gs:[0]",
+        "fninit",
+        "ldmxcsr gs:[{mxcsr}]",
         "pushfq",
         "push r15",
         "push r14",
@@ -1948,6 +1986,7 @@ extern "sysv64" fn vmexit_entry() -> ! {
         "lea rdi, [rsp + 8]",
         "mov rsi, [rsp + 128]",
         "call {entry_failed}",
+        "fxrstor64 gs:[0]",
         "add rsp, 8",
         "pop rax",
         "pop rbx",
@@ -1971,11 +2010,14 @@ extern "sysv64" fn vmexit_entry() -> ! {
         resume_failed = sym vmresume_failed,
         vmlaunch_action = const VMEXIT_ACTION_VMLAUNCH,
         vmresume_action = const VMEXIT_ACTION_VMRESUME,
+        mxcsr = const host_state::HOST_XSTATE_MXCSR_OFFSET,
     );
 }
 
 /// Handles one VM exit and returns only when the guest can be resumed.
 unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64 {
+    #[cfg(feature = "host-xstate-test")]
+    clobber_host_xmm();
     // SAFETY: `vmexit_entry` passes its live, uniquely owned stack frame.
     let registers = unsafe { &mut *registers };
     let nested_run = NESTED_RUN.lock().take();
@@ -3355,8 +3397,10 @@ fn reflect_l2_vmexit(run: &NestedRun, registers: &GuestRegisters) {
         stop_nested_exit(b"reflecting L1 host state failed", run.direct, registers);
     }
 
-    // ponytail: CR2 remains shared with the trusted one-vCPU L1. Add explicit
-    // switching before faulting L2 workloads require independent CR2 state.
+    // VMX does not switch CR2 or XSTATE between L1 and L2. The exit stub protects
+    // the live extended state from L0; it must not restore an older L1 image.
+    // L0 does not touch CR2 except to deliver an intentional L1 #PF. Genuine
+    // root page faults never resume, so no stale snapshot may erase guest CR2.
 }
 
 /// Stops after recovering L2's exit diagnostics only on an error path.
@@ -3467,6 +3511,8 @@ fn write_reflected_l1_state(run: &NestedRun, l1_pat: u64, l1_efer: u64) -> Optio
 
 /// Completes an immediate direct VM-entry failure and resumes VMCS01.
 unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters, rflags: u64) {
+    #[cfg(feature = "host-xstate-test")]
+    clobber_host_xmm();
     // SAFETY: `vmexit_entry` passes its live, uniquely owned saved-GPR frame.
     let registers = unsafe { &*registers };
     let Some(run) = NESTED_RUN.lock().take() else {
@@ -4679,9 +4725,7 @@ fn finish_vmcall(reason: u64) -> ! {
         write_raw_vmx_status(&mut serial, vmxoff);
     }
     write_raw_newline(&mut serial);
-    loop {
-        core::hint::spin_loop();
-    }
+    halt_with_guest_xstate()
 }
 
 /// Reports an exit that this smoke monitor cannot reflect or handle.
@@ -4716,9 +4760,7 @@ fn stop_unexpected_exit(
     serial.write_bytes(b"thin-hv: VMXOFF status=");
     write_raw_vmx_status(&mut serial, vmxoff);
     write_raw_newline(&mut serial);
-    loop {
-        core::hint::spin_loop();
-    }
+    halt_with_guest_xstate()
 }
 
 /// Reports a VMRESUME architectural failure reached from the assembly stub.
@@ -4762,8 +4804,38 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
     serial.write_bytes(b"thin-hv: VMXOFF status=");
     write_raw_vmx_status(&mut serial, vmxoff);
     write_raw_newline(&mut serial);
-    loop {
-        core::hint::spin_loop();
+    halt_with_guest_xstate()
+}
+
+/// Final post-exit action: retain private maps/tables and restore the last live
+/// guest FP state after all diagnostics. Never used on initial launch failure,
+/// where firmware still owns GS and no exit snapshot exists.
+// SAFETY: only post-VM-exit terminal paths call this. HOST_GS_BASE and its
+// reserved writable scratch remain installed even after VMXOFF; CR0.EM/TS=0
+// and CR4.OSFXSR=1 remain private. No Rust runs after restoring guest registers.
+#[unsafe(naked)]
+extern "sysv64" fn halt_with_guest_xstate() -> ! {
+    core::arch::naked_asm!("fxrstor64 gs:[0]", "cli", "2:", "hlt", "jmp 2b");
+}
+
+/// Test-only deliberate corruption after the assembly stub saved live XSTATE.
+#[cfg(feature = "host-xstate-test")]
+extern "sysv64" fn clobber_host_xmm() {
+    // SAFETY: called only inside an exit's saved-state bracket with OSFXSR=1
+    // and masked private MXCSR. All clobbers are declared; no AVX instruction
+    // or guest memory is used. The outer stub restores all sixteen registers.
+    unsafe {
+        core::arch::asm!(
+            "pxor xmm0, xmm0", "pxor xmm1, xmm1", "pxor xmm2, xmm2", "pxor xmm3, xmm3",
+            "pxor xmm4, xmm4", "pxor xmm5, xmm5", "pxor xmm6, xmm6", "pxor xmm7, xmm7",
+            "pxor xmm8, xmm8", "pxor xmm9, xmm9", "pxor xmm10, xmm10", "pxor xmm11, xmm11",
+            "pxor xmm12, xmm12", "pxor xmm13, xmm13", "pxor xmm14, xmm14", "pxor xmm15, xmm15",
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+            out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+            options(nomem, nostack, preserves_flags),
+        );
     }
 }
 
@@ -4790,13 +4862,12 @@ fn write_raw_newline(serial: &mut SerialPort) {
     serial.write_byte(b'\n');
 }
 
-/// Leaves VMX operation and restores the pre-smoke control registers on success.
+/// Leaves VMX operation, retaining the private host environment on terminal
+/// post-exit paths. Only initial launch failure may restore firmware controls.
 fn leave_vmx() -> VmxStatus {
-    let status = unsafe { vmx::vmxoff() };
-    if status == VmxStatus::Success {
-        restore_control_registers();
-    }
-    status
+    // SAFETY: the owning BSP enabled VMXON and has not left VMX. On failure all
+    // callers retain the allocation; this does not free or restore host state.
+    unsafe { vmx::vmxoff() }
 }
 
 #[cfg(test)]

@@ -373,6 +373,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("physical-preflight")
             || arg.contains("physical-policy")
             || arg.contains("host-exception-test")
+            || arg.contains("host-xstate-test")
             || arg.contains("nested-contract")
     }) {
         return Err(
@@ -420,6 +421,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         .join("bin")
         .join("x86_64")
         .join("x86-uefi-loader.efi");
+    verify_monitor_isa(&artifact)?;
     let monitor_destination = workspace
         .join("bin")
         .join("x86_64")
@@ -571,7 +573,9 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             )
         })?;
     }
-    build_x86_host_exception_fixture(args, &workspace, &artifact)?;
+    for fixture in ["host-exception", "host-xstate"] {
+        build_x86_host_fixture(args, &workspace, &artifact, fixture)?;
+    }
     let status = Command::new("cargo")
         .args([
             "build",
@@ -606,38 +610,44 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
     Ok(destination.to_string_lossy().into_owned())
 }
 
-/// Builds a deliberately faulting QEMU-only fixture without replacing normal images.
-fn build_x86_host_exception_fixture(
+/// Builds QEMU-only host fixtures without replacing normal backend images.
+fn build_x86_host_fixture(
     args: &[String],
     workspace: &Path,
     artifact: &Path,
+    fixture: &str,
 ) -> Result<(), String> {
-    eprintln!("\n--- Building test-only Direct-VMX root-exception fixture ---");
+    eprintln!("\n--- Building test-only Direct-VMX {fixture} fixture ---");
     let status = Command::new("cargo")
         .args(["build", "-p", "x86_uefi_loader", "--bin", "x86-uefi-loader"])
         .args(["--target", "x86_64-unknown-uefi"])
         .args(args)
-        .args(["--no-default-features", "--features", "host-exception-test"])
+        .args([
+            "--no-default-features",
+            "--features",
+            &format!("{fixture}-test"),
+        ])
         .env("XTASK_BUILD", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|error| format!("Failed to build host-exception fixture: {error}"))?;
+        .map_err(|error| format!("Failed to build {fixture} fixture: {error}"))?;
     if !status.success() {
         return Err(format!(
-            "host-exception fixture build failed with status: {status}"
+            "{fixture} fixture build failed with status: {status}"
         ));
     }
     let stage = workspace.join("bin/x86_64");
-    let monitor = stage.join("x86-uefi-host-exception-monitor.efi");
+    verify_monitor_isa(artifact)?;
+    let monitor = stage.join(format!("x86-uefi-{fixture}-monitor.efi"));
     for destination in [
-        stage.join("x86-uefi-host-exception-loader.efi"),
+        stage.join(format!("x86-uefi-{fixture}-loader.efi")),
         monitor.clone(),
     ] {
         fs::copy(artifact, &destination).map_err(|error| {
             format!(
-                "Failed to copy host-exception fixture to {}: {error}",
+                "Failed to copy {fixture} fixture to {}: {error}",
                 destination.display()
             )
         })?;
@@ -646,10 +656,10 @@ fn build_x86_host_exception_fixture(
         .arg("--subsystem=efi-rtd")
         .arg(&monitor)
         .status()
-        .map_err(|error| format!("Failed to convert host-exception runtime image: {error}"))?;
+        .map_err(|error| format!("Failed to convert {fixture} runtime image: {error}"))?;
     if !status.success() {
         return Err(format!(
-            "host-exception runtime conversion failed with status: {status}"
+            "{fixture} runtime conversion failed with status: {status}"
         ));
     }
     Ok(())
@@ -659,6 +669,58 @@ const VMX_MNEMONICS: [&str; 17] = [
     "vmcall", "vmclear", "vmlaunch", "vmresume", "vmptrld", "vmptrst", "vmread", "vmreadl",
     "vmreadq", "vmwrite", "vmwritel", "vmwriteq", "vmxoff", "vmxon", "invept", "invvpid", "vmfunc",
 ];
+
+/// Reject instructions that escape the exit stub's legacy FP/SIMD bracket.
+/// Input uses objdump's no-raw-bytes format, so operands/symbols are not decoded
+/// as mnemonics. This covers linked dependencies and target_feature functions.
+fn unpreserved_monitor_instruction(disassembly: &str) -> Option<&str> {
+    disassembly
+        .lines()
+        .filter_map(|line| {
+            let (address, decoded) = line.trim().split_once(':')?;
+            if address.is_empty() || !address.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            decoded.split_ascii_whitespace().next()
+        })
+        .find(|mnemonic| {
+            (mnemonic.starts_with('v') && !VMX_MNEMONICS.contains(mnemonic))
+                || mnemonic.starts_with('k')
+                || mnemonic.starts_with("tile")
+                || mnemonic.starts_with("xsave")
+                || mnemonic.starts_with("xrstor")
+                || matches!(*mnemonic, "ldtilecfg" | "wrpkru" | "(bad)")
+        })
+}
+
+fn verify_monitor_isa(artifact: &Path) -> Result<(), String> {
+    let output = Command::new("objdump")
+        .args(["-d", "--no-show-raw-insn"])
+        .arg(artifact)
+        .output()
+        .map_err(|error| format!("Failed to audit {}: {error}", artifact.display()))?;
+    if !output.status.success() {
+        return Err(format!("Monitor ISA disassembly failed: {}", output.status));
+    }
+    let decoded = String::from_utf8_lossy(&output.stdout);
+    if let Some(instruction) = unpreserved_monitor_instruction(&decoded) {
+        return Err(format!(
+            "Monitor {} uses unpreserved instruction {instruction}",
+            artifact.display()
+        ));
+    }
+    if !decoded.contains("fxsave64") || !decoded.contains("fxrstor64") {
+        return Err(format!(
+            "Monitor {} lacks its FP save/restore bracket",
+            artifact.display()
+        ));
+    }
+    eprintln!(
+        "Monitor ISA: PASS baseline x87/SSE with FXSAVE64/FXRSTOR64 ({})",
+        artifact.display()
+    );
+    Ok(())
+}
 
 fn decoded_vmx_mnemonic(disassembly: &str) -> Option<&str> {
     disassembly
@@ -749,6 +811,7 @@ fn run_x86_nested() -> Result<(), String> {
         ("direct-vmx", "native"),
         ("outer-kvm", "readonly-vmcs"),
         ("direct-vmx", "readonly-vmcs"),
+        ("direct-vmx", "host-xstate"),
     ] {
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
@@ -758,7 +821,12 @@ fn run_x86_nested() -> Result<(), String> {
                 continue;
             }
         }
-        let (loader, monitor) = if backend == "direct-vmx" {
+        let (loader, monitor) = if cpu_profile == "host-xstate" {
+            (
+                "x86-uefi-host-xstate-loader.efi",
+                "bin/x86_64/x86-uefi-host-xstate-monitor.efi",
+            )
+        } else if backend == "direct-vmx" {
             ("x86-uefi-loader.efi", "bin/x86_64/x86-uefi-monitor.efi")
         } else {
             ("x86-uefi-kvm-loader.efi", "")
@@ -827,7 +895,7 @@ fn run_x86_nested() -> Result<(), String> {
             failures.push(format!("Failed to preserve {evidence}: {error}"));
         }
     }
-    for backend in ["outer-kvm", "direct-vmx"] {
+    for (backend, host_xstate) in [("outer-kvm", "0"), ("direct-vmx", "0"), ("direct-vmx", "1")] {
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -836,9 +904,12 @@ fn run_x86_nested() -> Result<(), String> {
                 continue;
             }
         }
-        eprintln!("\n--- Nested Linux state/lifetime backend={backend} environment=QEMU/kvm ---");
+        eprintln!(
+            "\n--- Nested Linux state/lifetime backend={backend} host_xstate={host_xstate} environment=QEMU/kvm ---"
+        );
         let result = Command::new("./scripts/x86_64/run-linux-kvm-test.sh")
             .env("LINUX_KVM_BACKEND", backend)
+            .env("LINUX_KVM_HOST_XSTATE_TEST", host_xstate)
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
             .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
             .stdin(Stdio::null())
@@ -846,10 +917,19 @@ fn run_x86_nested() -> Result<(), String> {
             .stderr(Stdio::inherit())
             .status();
         match result {
-            Ok(status) if status.success() => eprintln!("nested Linux: PASS backend={backend}"),
-            other => failures.push(format!("nested Linux backend={backend}: {other:?}")),
+            Ok(status) if status.success() => {
+                eprintln!("nested Linux: PASS backend={backend} host_xstate={host_xstate}")
+            }
+            other => failures.push(format!(
+                "nested Linux backend={backend} host_xstate={host_xstate}: {other:?}"
+            )),
         }
-        let evidence = format!("bin/x86_64/nested-linux-{backend}.log");
+        let suffix = if host_xstate == "1" {
+            "-host-xstate"
+        } else {
+            ""
+        };
+        let evidence = format!("bin/x86_64/nested-linux-{backend}{suffix}.log");
         if let Err(error) = fs::copy("bin/x86_64/serial.log", &evidence) {
             failures.push(format!("Failed to preserve {evidence}: {error}"));
         }
@@ -2824,6 +2904,31 @@ mod tests {
         assert_eq!(decoded_vmx_mnemonic("1000 <nested_vmx::vmxon>:"), None);
     }
 
+    #[test]
+    fn monitor_isa_rejects_unpreserved_extended_state() {
+        assert!(super::unpreserved_monitor_instruction(
+            "1000 <vmovdqu>:\n 1000: fxsave64 %gs:0\n 1008: movaps %xmm15,%xmm0\n 1010: vmlaunch\n 1013: fxrstor64 %gs:0\n"
+        ).is_none());
+        for instruction in [
+            "vzeroupper",
+            "vpxor",
+            "vmovaps",
+            "kmovw",
+            "tilezero",
+            "ldtilecfg",
+            "xsave64",
+            "xrstors",
+            "wrpkru",
+            "(bad)",
+        ] {
+            let decoded = format!(" 1000: {instruction} %xmm0,%xmm0\n");
+            assert_eq!(
+                super::unpreserved_monitor_instruction(&decoded),
+                Some(instruction)
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn x86_backend_gate_rejects_missing_mixed_or_resident_provenance() {
@@ -3340,14 +3445,29 @@ mod tests {
                     + (vpid_types & 11).count_ones();
                 let count = 14 - shadow + invept + invvpid + readonly + descriptors;
                 let pass = format!(
-                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1\n"
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 fx_cpuid=6 fx_xsetbv=12 fx_entry=41 fx_irq=3 ymm_rounds=4\n"
                 );
-                let valid = format!("{provenance}{start}{pass}{terminal}");
+                let diagnostics = "thin-hv: native L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores=0\nthin-hv: native L1 original host validation PASS invalid=34 priority=2 restored=1\n";
+                let valid = format!("{provenance}{start}{diagnostics}{pass}{terminal}");
                 if ept_types & 2 == 0 || vpid_types & 4 == 0 {
                     assert!(!check(backend, &valid));
                     continue;
                 }
                 assert!(check(backend, &valid));
+                let clobber_log = valid.replace(
+                    start,
+                    &format!("thin-hv: host xstate clobber fixture armed\n{start}"),
+                );
+                assert_eq!(
+                    check_profile(backend, "host-xstate", &clobber_log),
+                    backend == "direct-vmx"
+                );
+                assert!(!check_profile(backend, "host-xstate", &valid));
+                assert!(!check(backend, &clobber_log));
+                assert!(check(
+                    backend,
+                    &valid.replace("ymm_rounds=4", "ymm_rounds=0")
+                ));
                 assert!(check(
                     backend,
                     &valid.replace("pku=1 ospke_toggles=4", "pku=0 ospke_toggles=0")
@@ -3387,6 +3507,11 @@ mod tests {
                     valid.replace("host_invalid=34", "host_invalid=33"),
                     valid.replace("host_priority=2", "host_priority=0"),
                     valid.replace("host_restore=1", "host_restore=0"),
+                    valid.replace("fx_cpuid=6", "fx_cpuid=0"),
+                    valid.replace("fx_xsetbv=12", "fx_xsetbv=11"),
+                    valid.replace("fx_entry=41", "fx_entry=40"),
+                    valid.replace("fx_irq=3", "fx_irq=0"),
+                    valid.replace("ymm_rounds=4", "ymm_rounds=1"),
                     valid.replace("ospke_toggles=4", "ospke_toggles=0"),
                     valid.replace("pku=1", "pku=0"),
                     valid.replace("invalidation_success=", "invalidation_success=9"),
@@ -3433,6 +3558,27 @@ mod tests {
         let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
         let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/x86_64/run-linux-kvm-test.sh");
+        for (backend, flag, diagnostic) in [
+            (
+                "direct-vmx",
+                "bad",
+                "LINUX_KVM_HOST_XSTATE_TEST must be 0 or 1",
+            ),
+            (
+                "outer-kvm",
+                "1",
+                "host XSTATE fixture requires project Direct L0",
+            ),
+        ] {
+            let rejected = Command::new("bash")
+                .arg(&runner)
+                .env("LINUX_KVM_BACKEND", backend)
+                .env("LINUX_KVM_HOST_XSTATE_TEST", flag)
+                .output()
+                .unwrap();
+            assert!(!rejected.status.success());
+            assert!(String::from_utf8_lossy(&rejected.stderr).contains(diagnostic));
+        }
         let check = |backend: &str, count: &str, contents: &str| {
             fs::write(&log.0, contents).unwrap();
             Command::new("bash")

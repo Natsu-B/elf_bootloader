@@ -4,6 +4,7 @@
 
 use super::Result;
 use super::equal;
+use super::l1_extended;
 use super::l1_fault;
 use core::arch::asm;
 use x86_64_hal::cpu;
@@ -11,16 +12,24 @@ use x86_64_hal::xstate;
 
 /// Does not call Rust while the faulting RIP is live. ECX and EDX:EAX deliberately
 /// retain high input bits in separate tests of architectural operand truncation.
-fn probe(index: u64, value: u64, high_bits: u64) -> (u64, u64) {
+fn probe(index: u64, value: u64, high_bits: u64) -> Result<(u64, u64)> {
+    let before = l1_extended::seed();
+    let mut after = l1_extended::Image::zeroed();
+    let mut saved = l1_extended::Image::zeroed();
     let record = l1_fault::probe(|record| {
         // SAFETY: the single-CPU fixture installed live #GP/#UD gates, disabled IF,
         // and published this stack record. The ISR accepts only label 2's RIP and
         // returns to label 3 without altering input GPRs, XSTATE or any other RIP.
+        // The three disjoint aligned images live through this bracket; firmware
+        // has OSFXSR set and EM/TS clear even when this test clears OSXSAVE.
         unsafe {
             asm!(
                 "lea r8, [rip + 2f]", "mov [r10], r8",
                 "lea r8, [rip + 3f]", "mov [r10 + 8], r8",
+                "fxsave64 [r9]", "fxrstor64 [rdi]",
                 "2:", "xsetbv", "3:",
+                "fxsave64 [rsi]", "fxrstor64 [r9]",
+                in("rdi") &before, in("rsi") &mut after, in("r9") &mut saved,
                 in("r10") record,
                 in("rcx") index,
                 in("rax") u64::from(value as u32) | high_bits,
@@ -30,7 +39,8 @@ fn probe(index: u64, value: u64, high_bits: u64) -> (u64, u64) {
             );
         }
     });
-    (record.vector, record.error)
+    l1_extended::verify(&before, &after, false)?;
+    Ok((record.vector, record.error))
 }
 
 fn enabled_area_size(xcr0: u64) -> Result<()> {
@@ -119,13 +129,22 @@ fn protection_keys(cr4: u64) -> Result<()> {
 }
 
 /// Runs before VMXON in L1, so CPUID/XSETBV exercise the project L0 interception,
-/// not KVM's L2 emulation. No asynchronous handler calls firmware or uses SIMD.
+/// not KVM's L2 emulation. Fault probes keep IF clear; explicit STI/HLT checks
+/// retain the copied firmware timer gates and restore IF=0 before capture.
 pub(super) fn run() -> Result<()> {
     l1_fault::with_handler(run_with_handler)
 }
 
 fn run_with_handler() -> Result<()> {
     let leaf1 = cpu::cpuid(1, 0);
+    let legacy = (1 << 24) | (1 << 25) | (1 << 26);
+    equal(
+        "l1-extended-features",
+        u64::from(leaf1.edx & legacy),
+        u64::from(legacy),
+    )?;
+    equal("l1-extended-cr0", cpu::read_cr0() & 0xc, 0)?;
+    equal("l1-extended-osfxsr", cpu::read_cr4() & (1 << 9), 1 << 9)?;
     equal(
         "l1-xstate-available",
         u64::from(leaf1.ecx & xstate::CPUID_XSAVE != 0),
@@ -167,18 +186,42 @@ fn run_with_handler() -> Result<()> {
         }
         protection_keys(cr4 | xstate::CR4_OSXSAVE)?;
         for value in [1, 3, xcr0] {
-            equal("l1-xsetbv-valid", probe(0, value, 0).0, u64::MAX)?;
+            equal("l1-xsetbv-valid", probe(0, value, 0)?.0, u64::MAX)?;
             // SAFETY: OSXSAVE remains enabled after the toggle loop.
             equal("l1-xsetbv-value", unsafe { cpu::xgetbv(0) }, value)?;
             enabled_area_size(value)?;
+            // SAFETY: the fixture is CPL0 with IF clear and firmware FXSR/SSE2
+            // enabled. Both CPUIDs preserve XCR0; the tested write repeats the
+            // already accepted value. In particular value=1 disables XCR0.SSE,
+            // but must not permit L0 to corrupt the still-usable XMM registers.
+            unsafe {
+                l1_extended::check(l1_extended::Operation::Cpuid, false)?;
+                l1_extended::check(l1_extended::Operation::CpuidD, false)?;
+                l1_extended::check(l1_extended::Operation::Xsetbv(value), false)?;
+                // The copied firmware IDT/timer remain live. STI;HLT opens a
+                // bounded interrupt window with sentinels live, then clears IF.
+                l1_extended::check(l1_extended::Operation::Interrupt, false)?;
+            }
+        }
+        if leaf1.ecx & (1 << 28) != 0 && supported & 7 == 7 {
+            // SAFETY: AVX and its x87/SSE prerequisites were advertised. IF is
+            // clear; all fallible checks pass through original-XCR0 cleanup.
+            unsafe {
+                cpu::xsetbv(0, 7);
+                l1_extended::check(l1_extended::Operation::Cpuid, true)?;
+                l1_extended::check(l1_extended::Operation::CpuidD, true)?;
+                l1_extended::check(l1_extended::Operation::Xsetbv(7), true)?;
+                l1_extended::check(l1_extended::Operation::Interrupt, true)?;
+                cpu::xsetbv(0, xcr0);
+            }
         }
         equal(
             "l1-xsetbv-high-operands",
-            probe(1 << 32, xcr0, 0xabcd_1234_0000_0000).0,
+            probe(1 << 32, xcr0, 0xabcd_1234_0000_0000)?.0,
             u64::MAX,
         )?;
         for (index, value) in [(1, xcr0), (0, 0), (0, 5), (0, xcr0 | (1 << reserved))] {
-            let (vector, error) = probe(index, value, 0);
+            let (vector, error) = probe(index, value, 0)?;
             equal("l1-xsetbv-gp-vector", vector, 13)?;
             equal("l1-xsetbv-gp-error", error, 0)?;
             // SAFETY: OSXSAVE is enabled; the fault must not have modified XCR0.
@@ -187,7 +230,7 @@ fn run_with_handler() -> Result<()> {
         // SAFETY: clearing only OSXSAVE is valid; the private fixture #UD gate
         // must observe the unchanged XSETBV RIP, then return to its continuation.
         unsafe { cpu::write_cr4(cr4 & !xstate::CR4_OSXSAVE) };
-        let fault = probe(1, 0, 0);
+        let fault = probe(1, 0, 0)?;
         // SAFETY: re-enable the already established XSAVE facility for XGETBV.
         unsafe { cpu::write_cr4(cr4 | xstate::CR4_OSXSAVE) };
         equal("l1-xsetbv-ud-priority", fault.0, 6)?;

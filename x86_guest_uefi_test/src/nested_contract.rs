@@ -12,6 +12,7 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+mod l1_extended;
 mod l1_fault;
 mod l1_memory;
 mod l1_xstate;
@@ -475,23 +476,19 @@ unsafe fn rejected_invalidation(vpid: bool) -> u64 {
 /// VMX root operation is active and the current VMCS is absent or test-owned.
 /// VMRESUME must target clear launch state; VMLAUNCH must have no current VMCS
 /// or the explicitly reserved primary control bit set. No entry can succeed.
-unsafe fn rejected_entry(resume: bool) -> u64 {
-    let carry: u8;
-    let zero: u8;
+unsafe fn rejected_entry(resume: bool) -> Result<u64> {
     // SAFETY: the caller establishes an architectural pre-entry failure. Neither
     // instruction can install guest/host state, and there are no memory operands.
     unsafe {
-        if resume {
-            asm!("vmresume", "setc {carry}", "setz {zero}",
-                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
-                options(nostack));
-        } else {
-            asm!("vmlaunch", "setc {carry}", "setz {zero}",
-                carry = lateout(reg_byte) carry, zero = lateout(reg_byte) zero,
-                options(nostack));
-        }
+        l1_extended::check(
+            if resume {
+                l1_extended::Operation::Resume
+            } else {
+                l1_extended::Operation::Launch
+            },
+            false,
+        )
     }
-    u64::from(carry) | (u64::from(zero) << 1)
 }
 
 /// Tests revision and shadow-header policy while preserving the active VMCS.
@@ -609,13 +606,13 @@ unsafe fn entry_boundaries(capabilities: &Prerequisites) -> Result<()> {
         ] {
             success("entry-control-field", vmx::vmwrite(field, value))?;
         }
-        equal("resume-clear-flags", rejected_entry(true), FAIL_VALID)?;
+        equal("resume-clear-flags", rejected_entry(true)?, FAIL_VALID)?;
         field_equal("resume-clear-error", vmcs::VM_INSTRUCTION_ERROR, 5)?;
-        equal("launch-controls-flags", rejected_entry(false), FAIL_VALID)?;
+        equal("launch-controls-flags", rejected_entry(false)?, FAIL_VALID)?;
         field_equal("launch-controls-error", vmcs::VM_INSTRUCTION_ERROR, 7)?;
         equal(
             "resume-after-failed-launch-flags",
-            rejected_entry(true),
+            rejected_entry(true)?,
             FAIL_VALID,
         )?;
         field_equal(
@@ -817,7 +814,7 @@ unsafe fn host_field_boundaries() -> Result<()> {
             let priority = (|| {
                 equal(
                     "host-check-resume-priority-flags",
-                    rejected_entry(true),
+                    rejected_entry(true)?,
                     FAIL_VALID,
                 )?;
                 field_equal(
@@ -831,7 +828,7 @@ unsafe fn host_field_boundaries() -> Result<()> {
                 )?;
                 equal(
                     "host-check-control-priority-flags",
-                    rejected_entry(false),
+                    rejected_entry(false)?,
                     FAIL_VALID,
                 )?;
                 field_equal(
@@ -887,7 +884,7 @@ unsafe fn reject_host_field(field: u32, value: u64) -> Result<()> {
         let result = (|| {
             equal(
                 "host-check-vmlaunch-flags",
-                rejected_entry(false),
+                rejected_entry(false)?,
                 FAIL_VALID,
             )?;
             field_equal("host-check-vmlaunch-error", vmcs::VM_INSTRUCTION_ERROR, 8)?;
@@ -1079,12 +1076,12 @@ unsafe fn instructions(
         )?;
         equal(
             "launch-no-current-flags",
-            rejected_entry(false),
+            rejected_entry(false)?,
             FAIL_INVALID,
         )?;
         equal(
             "resume-no-current-flags",
-            rejected_entry(true),
+            rejected_entry(true)?,
             FAIL_INVALID,
         )?;
     }
@@ -1109,7 +1106,7 @@ unsafe fn instructions(
     }
     let _ = writeln!(
         serial,
-        "thin-hv: L1 original host validation PASS invalid=34 priority=2 restored=1"
+        "thin-hv: native L1 original host validation PASS invalid=34 priority=2 restored=1"
     );
     // SAFETY: first is current and owned; the reserved/read-only fields and
     // VMXON pointer exercise defined VMfailValid paths. Physical value 1 is held
@@ -1382,13 +1379,14 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 fx_cpuid=6 fx_xsetbv=12 fx_entry=41 fx_irq=3 ymm_rounds={}",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,
                 capabilities.invvpid_types, capabilities.invalidation_successes(),
                 capabilities.descriptor_failures(), u8::from(capabilities.pku),
-                u8::from(capabilities.pku) * 4).is_ok() {
+                u8::from(capabilities.pku) * 4,
+                u8::from(cpu::cpuid(1, 0).ecx & (1 << 28) != 0 && cpu::cpuid(0xd, 0).eax & 7 == 7) * 4).is_ok() {
                 efi::Status::SUCCESS
             } else { efi::Status::DEVICE_ERROR }
         }

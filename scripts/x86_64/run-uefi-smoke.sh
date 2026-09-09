@@ -53,11 +53,11 @@ check_backend_log() {
 # Hardware-backed instruction assertions must precede a successful guest return.
 # Optional capability checks remain explicit in the evidence, never implied PASS.
 check_nested_contract_log() {
-    local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 expected_backends
+    local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 clobber=0 expected_backends
     local valid invept invvpid readonly shadow ept_types vpid_types success descriptors pku ospke_toggles bit expected_success expected_descriptors LC_ALL=C
-    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04]) operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1$'
+    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04]) operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 fx_cpuid=6 fx_xsetbv=12 fx_entry=41 fx_irq=3 ymm_rounds=[04]$'
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
-    case "$cpu_profile" in native|readonly-vmcs) ;; *) return 1 ;; esac
+    case "$cpu_profile" in native|readonly-vmcs) ;; host-xstate) [[ "$backend" == direct-vmx ]] || return 1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
     [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 262144)) || return 1
@@ -100,6 +100,10 @@ check_nested_contract_log() {
             continue
         fi
         case "$line" in
+            'thin-hv: host xstate clobber fixture armed')
+                [[ "$cpu_profile" == host-xstate ]] && ((phase == 0 && clobber == 0)) || return 1
+                clobber=1
+                ;;
             'thin-hv: backend='*)
                 ((phase == 0 && backends < expected_backends)) || return 1
                 backends=$((backends + 1))
@@ -111,6 +115,7 @@ check_nested_contract_log() {
             'thin-hv: nested contract START')
                 ((phase == 0 && backends == expected_backends)) || return 1
                 [[ "$backend" != direct-vmx || "$private" == 1 ]] || return 1
+                [[ "$cpu_profile" != host-xstate || "$clobber" == 1 ]] || return 1
                 phase=1
                 ;;
             'thin-hv: vmx guest PASS start_image_status=0x0000000000000000')

@@ -63,6 +63,9 @@ fi
 backend=${LINUX_KVM_BACKEND:-direct-vmx}
 cycles=${LINUX_KVM_CYCLES:-64}
 timeout_seconds=${LINUX_KVM_TIMEOUT_SECONDS:-300}
+host_xstate_test=${LINUX_KVM_HOST_XSTATE_TEST:-0}
+[[ "$host_xstate_test" =~ ^[01]$ ]] || die 'LINUX_KVM_HOST_XSTATE_TEST must be 0 or 1'
+[[ "$host_xstate_test" == 0 || "$backend" == direct-vmx ]] || die 'host XSTATE fixture requires project Direct L0'
 validate_cycles "$cycles" || die 'LINUX_KVM_CYCLES must be an integer in 1..4096 without leading zeros'
 [[ "$timeout_seconds" =~ ^[1-9][0-9]{0,3}$ ]] && ((10#$timeout_seconds <= 3600)) \
     || die 'LINUX_KVM_TIMEOUT_SECONDS must be an integer in 1..3600 without leading zeros'
@@ -79,6 +82,10 @@ case "$backend" in
         ;;
     *) die 'LINUX_KVM_BACKEND must be direct-vmx or outer-kvm; no backend fallback exists' ;;
 esac
+if ((host_xstate_test)); then
+    loader="$repo_root/bin/x86_64/x86-uefi-host-xstate-loader.efi"
+    monitor="$repo_root/bin/x86_64/x86-uefi-host-xstate-monitor.efi"
+fi
 output="$repo_root/bin/x86_64/linux-l1-kvm-$backend.efi"
 serial_log="$repo_root/bin/x86_64/serial.log"
 
@@ -113,5 +120,9 @@ env \
     scripts/x86_64/run-uefi-smoke.sh "$loader" "$output"
 
 check_log "$backend" "$cycles" "$serial_log" || die 'lifecycle evidence rejected'
+if ((host_xstate_test)); then
+    [[ $(grep -Fxc $'thin-hv: host xstate clobber fixture armed\r' "$serial_log") == 1 ]] \
+        || die 'host XSTATE clobber fixture did not run exactly once'
+fi
 printf 'x86 Linux KVM lifecycle: PASS backend=%s role=%s cycles=%s environment=QEMU/kvm (not physical hardware)\n' \
     "$backend" "$role" "$cycles"

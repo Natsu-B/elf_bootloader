@@ -21,6 +21,8 @@ physical-chainload = []
 physical-preflight = ["dep:x86_64_hal", "x86_64_hal/vmx"]
 # Dedicated QEMU fault fixture; never copy this image onto a physical ESP.
 host-exception-test = ["direct-vmx"]
+# Deliberately clobbers L0 SIMD registers after saving guest state; QEMU only.
+host-xstate-test = ["direct-vmx"]
 
 [dependencies]
 mutex = { path = "../mutex", optional = true }

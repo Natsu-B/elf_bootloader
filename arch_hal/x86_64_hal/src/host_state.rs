@@ -10,7 +10,8 @@
 //! forwarding implementation or evidence of physical-machine daily-use support.
 //! No heap, firmware service, lock, stack unwinding, or XSAVE state is used by
 //! the exception entry. Host CR4.CET must be clear: shadow stacks are not owned
-//! by this module. FS/GS-based TLS is likewise not part of the host ABI.
+//! by this module. FS-based TLS is not part of the host ABI; GS addresses the
+//! owning CPU's legacy extended-state scratch, not firmware or guest TLS.
 //!
 //! Layouts follow Intel SDM Volume 3A, "64-Bit Mode TSS" and "64-Bit IDT Gate
 //! Descriptors", and Volume 3C, "Checks on Host Segment and Descriptor-Table
@@ -43,6 +44,19 @@ pub const HOST_TSS_SELECTOR: u16 = 24;
 
 const TSS_OFFSET: usize = 64;
 const TSS_BYTES: usize = 104;
+const XSTATE_OFFSET: usize = 256;
+/// GS-relative offset of the monitor's masked, round-to-nearest MXCSR value.
+pub const HOST_XSTATE_MXCSR_OFFSET: usize = core::mem::offset_of!(HostXstate, monitor_mxcsr);
+
+/// Per-CPU save area for L0's baseline x87/SSE register use. This is not an
+/// L1/L2 context switch: each exit saves the live context and restores that same
+/// context, including on reflection. L0 must not execute AVX or touch other
+/// XSAVE components without extending its preservation contract.
+#[repr(C, align(64))]
+struct HostXstate {
+    guest_fx: [u8; 512],
+    monitor_mxcsr: u32,
+}
 const IDT_OFFSET: usize = HOST_PAGE_BYTES;
 const IDT_GATE_BYTES: usize = 16;
 const IDT_ENTRIES: usize = 256;
@@ -56,7 +70,11 @@ const EXCEPTION_MESSAGE: &[u8] = b"thin-hv: host exception FAIL: stopped\r\n";
 static EXCEPTION_MESSAGE_BYTES: [u8; EXCEPTION_MESSAGE.len()] =
     *b"thin-hv: host exception FAIL: stopped\r\n";
 
-const _: () = assert!(TSS_OFFSET + TSS_BYTES <= HOST_PAGE_BYTES);
+const _: () = assert!(TSS_OFFSET + TSS_BYTES <= XSTATE_OFFSET);
+const _: () = assert!(XSTATE_OFFSET % core::mem::align_of::<HostXstate>() == 0);
+const _: () = assert!(XSTATE_OFFSET + core::mem::size_of::<HostXstate>() <= HOST_PAGE_BYTES);
+const _: () = assert!(core::mem::offset_of!(HostXstate, guest_fx) == 0);
+const _: () = assert!(HOST_XSTATE_MXCSR_OFFSET == 512);
 const _: () = assert!(IDT_GATE_BYTES * IDT_ENTRIES == HOST_PAGE_BYTES);
 const _: () = assert!(IST_STACKS_OFFSET + IST_COUNT * IST_STACK_BYTES == HOST_ENVIRONMENT_BYTES);
 
@@ -247,6 +265,8 @@ const fn vector_ist(vector: usize) -> u8 {
 
 fn populate(storage: &mut [u8], layout: Layout, gates: [[u8; IDT_GATE_BYTES]; IST_COUNT]) {
     storage.fill(0);
+    let mxcsr = XSTATE_OFFSET + HOST_XSTATE_MXCSR_OFFSET;
+    storage[mxcsr..mxcsr + 4].copy_from_slice(&0x1f80_u32.to_le_bytes());
     storage[8..16].copy_from_slice(&CODE_DESCRIPTOR.to_le_bytes());
     storage[16..24].copy_from_slice(&DATA_DESCRIPTOR.to_le_bytes());
     let tss = tss_descriptor(layout.base + TSS_OFFSET as u64);
@@ -358,8 +378,11 @@ impl<'storage> HostEnvironment<'storage> {
     /// Returns all selector, descriptor/base, SYSENTER and RSP host VMCS fields.
     ///
     /// The owner additionally supplies HOST_CR0/CR3/CR4, HOST_RIP, and the host
-    /// MSR fields required by its controls. FS/GS bases are zero and SYSENTER_CS
-    /// is disabled; its otherwise-unused target and stack still belong to L0.
+    /// MSR fields required by its controls. FS base is zero; GS addresses this
+    /// CPU's 64-byte-aligned FXSAVE64 scratch followed by a private MXCSR value.
+    /// The VM-exit stub must save before using FP/SIMD and restore before entry;
+    /// HOST_CR0.EM/TS must be clear and HOST_CR4.OSFXSR set. SYSENTER_CS is
+    /// disabled; its otherwise-unused target and stack still belong to L0.
     #[must_use]
     pub fn vmcs_fields(&self) -> [(u32, u64); 16] {
         [
@@ -371,7 +394,7 @@ impl<'storage> HostEnvironment<'storage> {
             (vmcs::HOST_GS_SELECTOR, 0),
             (vmcs::HOST_TR_SELECTOR, u64::from(HOST_TSS_SELECTOR)),
             (vmcs::HOST_FS_BASE, 0),
-            (vmcs::HOST_GS_BASE, 0),
+            (vmcs::HOST_GS_BASE, self.layout.base + XSTATE_OFFSET as u64),
             (vmcs::HOST_TR_BASE, self.layout.base + TSS_OFFSET as u64),
             (vmcs::HOST_GDTR_BASE, self.layout.base),
             (vmcs::HOST_IDTR_BASE, self.layout.base + IDT_OFFSET as u64),
@@ -633,7 +656,18 @@ mod tests {
         assert_eq!(get(vmcs::HOST_RSP), first_stack.vmexit_rsp());
         assert_eq!(get(vmcs::HOST_RSP) & 15, 8);
         assert_eq!(get(vmcs::HOST_FS_BASE), 0);
-        assert_eq!(get(vmcs::HOST_GS_BASE), 0);
+        let scratch = get(vmcs::HOST_GS_BASE);
+        assert_eq!(scratch, first.storage_range().0 + XSTATE_OFFSET as u64);
+        assert_eq!(scratch & 63, 0);
+        assert_ne!(
+            scratch,
+            second
+                .vmcs_fields()
+                .into_iter()
+                .find(|(field, _)| *field == vmcs::HOST_GS_BASE)
+                .unwrap()
+                .1
+        );
         assert_eq!(get(vmcs::HOST_IA32_SYSENTER_CS), 0);
         assert_eq!(
             get(vmcs::HOST_IA32_SYSENTER_EIP),
@@ -644,6 +678,17 @@ mod tests {
                 .required_image_addresses()
                 .into_iter()
                 .all(|address| canonical(address, 48))
+        );
+        // The borrow is no longer used; no hardware observes these test pages.
+        assert!(
+            first_storage.0[XSTATE_OFFSET..XSTATE_OFFSET + 512]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        let mxcsr = XSTATE_OFFSET + HOST_XSTATE_MXCSR_OFFSET;
+        assert_eq!(
+            &first_storage.0[mxcsr..mxcsr + 4],
+            &0x1f80_u32.to_le_bytes()
         );
     }
 }
