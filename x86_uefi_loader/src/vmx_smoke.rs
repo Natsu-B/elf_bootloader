@@ -11,6 +11,7 @@ use crate::platform_acpi;
 use crate::platform_resources;
 use crate::platform_resources::MmioMap;
 use crate::platform_snapshot;
+use crate::resident_image;
 use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
@@ -82,6 +83,8 @@ use x86_64_hal::xstate::XsetbvFault;
 
 /// Pages allocated as one reserved monitor block.
 const MONITOR_PAGES: usize = CPU_STATE_FIRST_PAGE as usize + CPU_STATE_PAGES;
+/// Shared boot guard pages are outside the private payload, not VMXON storage.
+const MONITOR_ALLOCATION_PAGES: usize = MONITOR_PAGES + 2;
 /// Exclusive, bounded platform EPT arena; no incomplete EPTP is published.
 const EPT_FIRST_PAGE: u64 = 2;
 const EPT_PAGES: usize = 256;
@@ -691,6 +694,8 @@ struct CpuRuntimeState {
     mmio: MmioMap,
     /// Absent only for host policy tests, which never execute physical access.
     window: Option<ept::HostWindow>,
+    /// Explicit L1-visible bootstrap storage, not the private PE's copied statics.
+    bootstrap: Option<GuestBootstrap>,
     entry: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
     entry_count: u32,
     exit_capture: [MsrEntry; 2],
@@ -711,6 +716,7 @@ impl CpuRuntimeState {
         private: [(u64, u64); 2],
         mmio: MmioMap,
         window: Option<ept::HostWindow>,
+        bootstrap: Option<GuestBootstrap>,
     ) -> Self {
         Self {
             vpids: VpidNamespace::new(),
@@ -720,6 +726,7 @@ impl CpuRuntimeState {
             private,
             mmio,
             window,
+            bootstrap,
             entry: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
             entry_count: 0,
             exit_capture: [MsrEntry::new(0x1d9, 0), MsrEntry::new(0x38f, 0)],
@@ -1044,7 +1051,7 @@ pub(crate) enum Error {
     Instruction(&'static str, VmxStatus, u64),
     /// One VMCS field could not be written.
     Vmwrite(u32, VmxStatus, u64),
-    /// The smoke-only 8 GiB EPT cannot cover the allocated block or code.
+    /// An address cannot be owned by the private low-canonical host map.
     OutsideIdentityMap(u64),
     /// A UEFI service used to load the nested payload failed.
     Firmware(&'static str, usize),
@@ -1052,6 +1059,8 @@ pub(crate) enum Error {
     HostState(host_state::Error),
     /// The platform inventory or complete EPT construction was rejected.
     Platform(chainload::Error),
+    /// The already loaded project image cannot be copied safely.
+    Resident(resident_image::Error),
 }
 
 impl Error {
@@ -1078,12 +1087,13 @@ impl fmt::Display for Error {
                 "VMWRITE field={field:#x} status={status:?} vm_instruction_error={vm_error:#x}"
             ),
             Self::OutsideIdentityMap(address) => {
-                write!(formatter, "smoke EPT does not cover {address:#x}")
+                write!(formatter, "private host map cannot own {address:#x}")
             }
             Self::Firmware(service, status) => {
                 write!(formatter, "{service} status={status:#x}")
             }
             Self::HostState(error) => write!(formatter, "private host state {error:?}"),
+            Self::Resident(error) => write!(formatter, "resident image {error:?}"),
         }
     }
 }
@@ -1095,30 +1105,309 @@ pub(crate) fn run(
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
-    let parent_device = unsafe { (*loaded_image).device_handle };
-
-    if unsafe { (*loaded_image).image_code_type } != efi::RUNTIME_SERVICES_CODE {
+    if loaded_image.is_null() {
+        return Err(Error::Firmware(
+            "LoadedImage interface",
+            efi::Status::COMPROMISED_DATA.as_usize(),
+        ));
+    }
+    // SAFETY: HandleProtocol returned the non-null, live protocol for this
+    // executing image. Copy only metadata while Boot Services are still live.
+    let (parent_device, code_type) = unsafe {
+        (
+            (*loaded_image).device_handle,
+            (*loaded_image).image_code_type,
+        )
+    };
+    if code_type != efi::RUNTIME_SERVICES_CODE {
         let _ = writeln!(serial, "thin-hv: loading runtime monitor");
         return start_runtime_monitor(parent_image, parent_device, system_table);
     }
     let _ = writeln!(serial, "thin-hv: runtime monitor active");
-    // ponytail: a firmware-loaded runtime PE is enough for the current QEMU
-    // path; use a self-relocated resident core before Windows or bare metal.
-
-    run_direct_monitor(loaded_image, system_table, serial)
+    start_resident_core(loaded_image, system_table, serial)
 }
 
-fn run_direct_monitor(
+/// Only these three addresses intentionally cross from L0 into the retained
+/// firmware runtime image. That image owns L1's bootstrap and legacy test hooks.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GuestBootstrap {
+    entry: u64,
+    marker: u64,
+    status: u64,
+}
+
+/// Scalar ABI boundary: no private-copy strings, references or vtables escape.
+#[repr(C)]
+struct ResidentHandoff {
+    system_table: *mut efi::SystemTable,
+    image_base: u64,
+    image_size: u64,
+    monitor_allocation: u64,
+    bootstrap: GuestBootstrap,
+}
+
+/// Owns one pre-entry allocation through all validation and cleanup errors.
+/// Both callers below return only before guest entry and after any VMX teardown;
+/// successful entry never returns, so no live private backing can be released.
+fn with_runtime_pages<T>(
+    system_table: *mut efi::SystemTable,
+    kind: u32,
+    pages: usize,
+    limit: u64,
+    prepare: impl FnOnce(u64) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut allocation = limit - 1;
+    // SAFETY: both call sites supply bounded nonzero page counts and a checked
+    // physical/canonical limit. Boot Services are live; this output describes
+    // new exclusive runtime pages, not a registered firmware PE image.
+    let status = unsafe {
+        ((*(*system_table).boot_services).allocate_pages)(
+            efi::ALLOCATE_MAX_ADDRESS,
+            kind,
+            pages,
+            &mut allocation,
+        )
+    };
+    if status.is_error() {
+        return Err(Error::Allocate(status.as_usize()));
+    }
+    let result = prepare(allocation);
+    // SAFETY: preparation returns only before guest entry and after VMXOFF plus
+    // CPU restoration. No VMCS, host root, or firmware PE relocation metadata
+    // retains this exact allocation. Errors contain no pointers into its pages.
+    let status = unsafe { ((*(*system_table).boot_services).free_pages)(allocation, pages) };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "FreePages resident allocation",
+            status.as_usize(),
+        ));
+    }
+    result
+}
+
+/// Firmware authenticates/loads the source normally; only L0's copy is kept out
+/// of firmware PE relocation registration. No firmware identity is rewritten.
+fn start_resident_core(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
-    if loaded_image.is_null() {
+    let (guest, profile) = runtime_handoff(loaded_image).ok_or(Error::Firmware(
+        "runtime guest-image handoff",
+        efi::Status::INVALID_PARAMETER.as_usize(),
+    ))?;
+    // SAFETY: run validated this live protocol for the executing runtime image.
+    let (source, size, data_type) = unsafe {
+        (
+            (*loaded_image).image_base as u64,
+            (*loaded_image).image_size,
+            (*loaded_image).image_data_type,
+        )
+    };
+    let pages = resident_image::image_pages(source, size).map_err(Error::Resident)?;
+    if data_type != efi::RUNTIME_SERVICES_DATA {
         return Err(Error::Firmware(
-            "runtime LoadedImage interface",
-            efi::Status::INVALID_PARAMETER.as_usize(),
+            "bootstrap requires runtime image data",
+            efi::Status::UNSUPPORTED.as_usize(),
         ));
     }
+    GUEST_IMAGE.store(guest, Ordering::Release);
+    SYSTEM_TABLE.store(system_table, Ordering::Release);
+    GUEST_RAN.store(0, Ordering::Release);
+    GUEST_STATUS.store(usize::MAX, Ordering::Release);
+    let width =
+        max_physical_address_bits().ok_or(Error::Capability("resident physical width", 0))?;
+    let limit = (1_u64 << width).min(IDENTITY_MAP_LIMIT);
+    // SAFETY: efi_main established CPUID.VMX and this BSP runs at CPL0 before
+    // entry. BASIC's narrower limit applies only to the VMX storage allocation.
+    let basic = vmx::VmxBasic::from_msr(unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) });
+    let vmx_limit = limit.min(if basic.physical_address_width_32 {
+        1 << 32
+    } else {
+        u64::MAX
+    });
+    with_runtime_pages(
+        system_table,
+        efi::RUNTIME_SERVICES_CODE,
+        pages + 2,
+        limit,
+        |allocation| {
+            with_runtime_pages(
+                system_table,
+                efi::RUNTIME_SERVICES_DATA,
+                MONITOR_ALLOCATION_PAGES,
+                vmx_limit,
+                |monitor_allocation| {
+                    // All runtime allocations precede legacy test-hook installation. OVMF
+                    // republishes its MAT when runtime memory changes; installing earlier
+                    // would lose the original image's narrowly scoped executable fixup.
+                    // Hooks remain in that registered image, never in the private L0 copy.
+                    let overlay = runtime_variables::install(system_table, profile, source, size)
+                        .map_err(|status| {
+                        Error::Firmware("install variable overlay", status.as_usize())
+                    })?;
+                    let _ = writeln!(
+                        serial,
+                        "thin-hv: variable overlay profile={} mat_patches={}",
+                        profile.0,
+                        overlay.memory_attribute_patch_count()
+                    );
+                    let result = (|| {
+                        let guarded =
+                            resident_image::GuardedAllocation::new(allocation, pages, limit)
+                                .map_err(Error::Resident)?;
+                        let destination = guarded.payload;
+                        resident_image::image_pages(destination, size).map_err(Error::Resident)?;
+                        let (entry, bootstrap) = platform_snapshot::with_snapshot(
+                            system_table,
+                            serial,
+                            |cpu, map, _serial| {
+                                let reject = || {
+                                    platform_snapshot::malformed(
+                                        "resident code allocation/PE validation",
+                                    )
+                                };
+                                if !cpu.identity_range_supported(
+                                    guarded.base,
+                                    (guarded.end - guarded.base) as usize,
+                                ) || !map.readable(source, size as usize)
+                                    || (source < guarded.end && guarded.base < source + size)
+                                {
+                                    return Err(reject());
+                                }
+                                let mtrrs =
+                                    cpu.mtrrs().map_err(|_| reject())?.ok_or_else(reject)?;
+                                for address in
+                                    (guarded.base..guarded.end).step_by(PAGE_SIZE as usize)
+                                {
+                                    let region = (0..map.count())
+                                        .filter_map(|index| map.region(index))
+                                        .find(|region| {
+                                            region.start <= address
+                                                && region.end().is_some_and(|limit| {
+                                                    address + PAGE_SIZE <= limit
+                                                })
+                                        });
+                                    if !region.is_some_and(|region| {
+                                        region.kind == efi::RUNTIME_SERVICES_CODE
+                                            && region.attributes
+                                                & (efi::MEMORY_RUNTIME | efi::MEMORY_WB)
+                                                == (efi::MEMORY_RUNTIME | efi::MEMORY_WB)
+                                            && region.attributes
+                                                & (efi::MEMORY_RP
+                                                    | efi::MEMORY_RO
+                                                    | efi::MEMORY_WP
+                                                    | efi::MEMORY_XP)
+                                                == 0
+                                    }) || mtrrs.memory_type(address).map_err(|_| reject())?
+                                        != platform_memory::MemoryType::WriteBack
+                                    {
+                                        return Err(reject());
+                                    }
+                                }
+                                // No firmware call, callback dispatch, lock or static write
+                                // occurs while the source PE is borrowed. Overlay/bootstrap
+                                // initialization is complete; VMX and guest execution have not
+                                // begun. Only stack temporaries and disjoint output are written.
+                                let source_bytes = map
+                                    .firmware_bytes(source, size as usize)
+                                    .ok_or_else(reject)?;
+                                let pe = resident_image::LoadedPe::parse(source_bytes, source)
+                                    .map_err(|_| reject())?;
+                                let entry = pe
+                                    .entry(destination, resident_entry as usize as u64)
+                                    .map_err(|_| reject())?;
+                                let bootstrap = GuestBootstrap {
+                                    entry: pe
+                                        .entry(source, guest_entry as usize as u64)
+                                        .map_err(|_| reject())?,
+                                    marker: ptr::addr_of!(GUEST_RAN) as u64,
+                                    status: ptr::addr_of!(GUEST_STATUS) as u64,
+                                };
+                                if !pe.bootstrap_word(bootstrap.marker)
+                                    || !pe.bootstrap_word(bootstrap.status)
+                                    || bootstrap.marker == bootstrap.status
+                                {
+                                    return Err(reject());
+                                }
+                                // SAFETY: the complete nonzero, aligned allocation is disjoint
+                                // from the source, uniquely owned writable/executable WB runtime
+                                // RAM under firmware paging. No CPU or firmware image metadata
+                                // references the destination. The mutable borrow ends before
+                                // calling copied code; runtime execution retains all its pages.
+                                let output = unsafe {
+                                    core::slice::from_raw_parts_mut(
+                                        guarded.base as *mut u8,
+                                        (guarded.end - guarded.base) as usize,
+                                    )
+                                };
+                                output.fill(0);
+                                pe.copy_to(
+                                    &mut output
+                                        [PAGE_SIZE as usize..PAGE_SIZE as usize + size as usize],
+                                    destination,
+                                )
+                                .map_err(|_| reject())?;
+                                Ok((entry, bootstrap))
+                            },
+                        )
+                        .map_err(Error::Platform)?;
+                        let _ = writeln!(
+                            serial,
+                            "thin-hv: resident image PASS source={source:#018x} private={destination:#018x} bytes={size:#x} firmware_relocation=excluded bootstrap=firmware-runtime boot_guards=2"
+                        );
+                        let handoff = ResidentHandoff {
+                            system_table,
+                            image_base: destination,
+                            image_size: size,
+                            monitor_allocation,
+                            bootstrap,
+                        };
+                        // CPUID serializes this CPU's instruction stream after copying code.
+                        let _ = cpu::cpuid(0, 0);
+                        // SAFETY: entry is the validated executable RVA of resident_entry,
+                        // rebased into our complete loaded AMD64 PE copy. Its exact C ABI
+                        // consumes this live handoff only before VM entry. This allocation
+                        // remains owned until it returns with VMX disabled, or forever after
+                        // successful entry. Only a scalar status returns; no borrowed
+                        // copied-image error, string or vtable escapes through it.
+                        let status = unsafe {
+                            let entry: extern "C" fn(&ResidentHandoff) -> usize =
+                                core::mem::transmute(entry as usize);
+                            entry(&handoff)
+                        };
+                        Err(Error::Firmware("resident VMX entry returned", status))
+                    })();
+                    // Rollback runs in the original image with its original statics. It
+                    // precedes FreePages, which may replace the MAT whose edits it restores.
+                    overlay.rollback().map_err(|status| {
+                        Error::Firmware("restore variable overlay", status.as_usize())
+                    })?;
+                    result
+                },
+            )
+        },
+    )
+}
+
+/// Executed exclusively from the independent PE; no borrowed error escapes it.
+extern "C" fn resident_entry(handoff: &ResidentHandoff) -> usize {
+    let mut serial = SerialPort;
+    match run_direct_monitor(handoff, &mut serial) {
+        Ok(()) => efi::Status::SUCCESS.as_usize(),
+        Err(error) => {
+            let _ = writeln!(serial, "thin-hv: resident VMX launch FAIL: {error}");
+            efi::Status::ABORTED.as_usize()
+        }
+    }
+}
+
+fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Result<(), Error> {
+    let system_table = handoff.system_table;
+    let image_base = handoff.image_base;
+    let image_size = handoff.image_size;
+    let image_end = image_base + image_size;
     // SAFETY: efi_main checked CPUID.VMX before dispatching this backend, and
     // the x86-64 UEFI application still executes at CPL0 before ExitBootServices.
     let vmx_basic_raw = unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) };
@@ -1169,39 +1458,10 @@ fn run_direct_monitor(
         return Err(Error::Capability("nested EPT/VPID", ept_capability));
     }
 
-    let (guest_image, profile) = runtime_handoff(loaded_image).ok_or(Error::Firmware(
-        "runtime guest-image handoff",
-        efi::Status::INVALID_PARAMETER.as_usize(),
-    ))?;
-    GUEST_IMAGE.store(guest_image, Ordering::Release);
-    SYSTEM_TABLE.store(system_table, Ordering::Release);
-
-    // SAFETY: run() obtained this live LoadedImage protocol from firmware and
-    // selected its runtime image. The interface is non-null and remains valid
-    // while this image executes; only these scalar metadata fields are copied.
-    let (image_base, image_size, image_data_type) = unsafe {
-        (
-            (*loaded_image).image_base as usize as u64,
-            (*loaded_image).image_size,
-            (*loaded_image).image_data_type,
-        )
-    };
-    let image_end = image_base
-        .checked_add(image_size)
-        .ok_or(Error::OutsideIdentityMap(image_base))?;
     let _ = writeln!(
         serial,
         "thin-hv: runtime image base={image_base:#018x} end={image_end:#018x}"
     );
-    if image_base >= IDENTITY_MAP_LIMIT || image_end > IDENTITY_MAP_LIMIT {
-        return Err(Error::OutsideIdentityMap(image_end));
-    }
-    if image_data_type != efi::RUNTIME_SERVICES_DATA {
-        return Err(Error::Firmware(
-            "diagnostics require runtime image data",
-            efi::Status::UNSUPPORTED.as_usize(),
-        ));
-    }
     publish_diagnostics(image_base, image_end, serial)?;
 
     // SAFETY: the caller established CPUID.VMX and this application is at CPL0,
@@ -1213,265 +1473,215 @@ fn run_direct_monitor(
 
     let physical_bits = max_physical_address_bits()
         .ok_or(Error::Capability("monitor physical-address width", 0))?;
-    let mut block =
+    let allocation_limit =
         (1_u64 << physical_bits)
             .min(IDENTITY_MAP_LIMIT)
             .min(if basic.physical_address_width_32 {
                 1 << 32
             } else {
                 u64::MAX
-            })
-            - 1;
-    // SAFETY: the firmware supplied system_table to this running UEFI image;
-    // Boot Services are still live, and block is a writable max-address/output
-    // argument for this allocation of runtime-owned pages.
-    let status = unsafe {
-        ((*(*system_table).boot_services).allocate_pages)(
-            efi::ALLOCATE_MAX_ADDRESS,
-            efi::RUNTIME_SERVICES_DATA,
-            MONITOR_PAGES,
-            &mut block,
-        )
-    };
-    if status.is_error() {
-        return Err(Error::Allocate(status.as_usize()));
-    }
-    let result = (|| {
-        if block == 0 || block % PAGE_SIZE != 0 {
-            return Err(Error::Firmware(
-                "AllocatePages monitor address",
-                efi::Status::COMPROMISED_DATA.as_usize(),
-            ));
-        }
-        let block_end = block
-            .checked_add(MONITOR_PAGES as u64 * PAGE_SIZE)
-            .ok_or(Error::OutsideIdentityMap(block))?;
-        if block_end > IDENTITY_MAP_LIMIT {
-            return Err(Error::OutsideIdentityMap(block_end));
-        }
-        let physical_bits = max_physical_address_bits()
-            .ok_or(Error::Capability("monitor physical-address width", 0))?;
-        if block_end > 1_u64 << physical_bits
-            || (basic.physical_address_width_32 && block_end > 1_u64 << 32)
-        {
-            return Err(Error::OutsideIdentityMap(block_end));
-        }
-        let ram = validate_monitor_allocation(system_table, block)?;
-        // Resolve fallible typed addresses before changing CR0/CR4. Any rejection
-        // therefore returns through allocation cleanup without a CPU-state restore.
-        let vmxon = VmxonPhys::new(block).ok_or(Error::Firmware(
-            "VMXON page address",
-            efi::Status::COMPROMISED_DATA.as_usize(),
-        ))?;
-        let vmcs = VmcsPhys::new(block + PAGE_SIZE).ok_or(Error::Firmware(
-            "VMCS page address",
-            efi::Status::COMPROMISED_DATA.as_usize(),
-        ))?;
-        for address in [
-            guest_entry as usize as u64,
-            vmexit_entry as usize as u64,
-            cpu::read_cr3(),
-        ] {
-            if address >= IDENTITY_MAP_LIMIT {
-                return Err(Error::OutsideIdentityMap(address));
-            }
-        }
-        let _ = writeln!(
-            serial,
-            "thin-hv: monitor block={block:#018x} end={block_end:#018x}"
-        );
-
-        // SAFETY: AllocatePages returned this exclusive runtime allocation; its
-        // nonzero base, page alignment and complete byte range were checked above.
-        unsafe { ptr::write_bytes(block as *mut u8, 0, MONITOR_PAGES * PAGE_SIZE as usize) };
-        // SAFETY: the checked allocation contains disjoint VMXON, VMCS, invalid
-        // revision and MSR-bitmap pages. No CPU uses them yet; all writes remain
-        // inside their pages. The extra page's low revision bit is inverted, so
-        // it can never become a current hardware VMCS, even with shadowing.
-        unsafe {
-            ptr::write_volatile(block as *mut u32, basic.revision_id);
-            ptr::write_volatile((block + PAGE_SIZE) as *mut u32, basic.revision_id);
-            ptr::write_volatile(
-                (block + ERROR_REVISION_PAGE * PAGE_SIZE) as *mut u32,
-                basic.revision_id ^ 1,
-            );
-            initialize_l1_msr_bitmap(block + MSR_BITMAP_PAGE * PAGE_SIZE);
-        }
-
-        let maps = build_carrier_maps(system_table, block, &ram, serial)?;
-
-        let original_cr0 = cpu::read_cr0();
-        let original_cr4 = cpu::read_cr4();
-        if original_cr4 & CR4_LA57 != 0 {
-            return Err(Error::Capability("CR4.LA57", original_cr4));
-        }
-        if original_cr4 & CR4_CET != 0 {
-            return Err(Error::Capability(
-                "CR4.CET host shadow stacks",
-                original_cr4,
-            ));
-        }
-        let host_stack = HostStack::new(block + HOST_STACK_PAGE * PAGE_SIZE, 4 * PAGE_SIZE)
-            .map_err(Error::HostState)?;
-        // SAFETY: these exclusive host-environment pages lie inside the checked
-        // runtime block, before the disjoint invalid-revision page.
-        // The ordinary host stack is disjoint and also runtime-owned. HOST_CR3 maps
-        // the entire block supervisor-writable and the retained PE executable. No
-        // CPU/VMCS uses this storage yet; CR4.CET/LA57 were rejected above. After a
-        // successful entry all terminal paths retain the pages and never return to
-        // firmware. Immediate VMfail does not install these host descriptor fields.
-        let mut host_environment = unsafe {
-            HostEnvironment::initialize(
-                core::slice::from_raw_parts_mut(
-                    (block + HOST_ENVIRONMENT_FIRST_PAGE * PAGE_SIZE) as *mut u8,
-                    host_state::HOST_ENVIRONMENT_BYTES,
-                ),
-                host_stack,
-                48,
-            )
-        }
-        .map_err(Error::HostState)?;
-        let msr_state = ptr::NonNull::new(
-            (block + CPU_STATE_FIRST_PAGE * PAGE_SIZE) as *mut SpinLock<CpuRuntimeState>,
-        )
-        .ok_or(Error::Firmware(
-            "CPU runtime state address",
-            efi::Status::COMPROMISED_DATA.as_usize(),
-        ))?;
-        // SAFETY: the checked runtime allocation includes this disjoint,
-        // page-aligned final arena with enough space for the complete lock and
-        // state. No CPU or VMCS references it yet. The object never moves; all
-        // post-entry terminal paths retain its pages and private HOST_CR3 map.
-        unsafe {
-            msr_state.as_ptr().write(SpinLock::new(CpuRuntimeState::new(
-                ram,
-                basic,
-                [(block, block_end), (image_base, image_end)],
-                maps.mmio,
-                Some(maps.window),
-            )));
-            host_environment.bind_monitor_data(msr_state.cast());
-        }
-        for address in host_environment.required_image_addresses() {
-            if address < image_base || address >= image_end {
-                return Err(Error::OutsideIdentityMap(address));
-            }
-        }
-        let _ = writeln!(serial, "thin-hv: private host state PASS");
-        // SAFETY: CPUID.VMX establishes these four architectural fixed-bit MSRs;
-        // all reads occur at CPL0 before control-register changes or VMXON.
-        let (cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1) = unsafe {
-            (
-                cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0),
-                cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1),
-                cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0),
-                cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1),
-            )
-        };
-        let fixed_cr0 = (original_cr0 | cr0_fixed0) & cr0_fixed1;
-        let fixed_cr4 = (original_cr4 | (1 << 13) | cr4_fixed0) & cr4_fixed1;
-        if cpu::cpuid(1, 0).ecx & (1 << 26) == 0 {
-            return Err(Error::Capability("XSAVE", 0));
-        }
-        let legacy_features = (1 << 24) | (1 << 25) | (1 << 26);
-        if cpu::cpuid(1, 0).edx & legacy_features != legacy_features
-            || fixed_cr0 & ((1 << 2) | (1 << 3)) != 0
-        {
-            return Err(Error::Capability("UEFI x87/SSE environment", fixed_cr0));
-        }
-        let entry_cr4 = fixed_cr4 | CR4_OSXSAVE;
-        // No guest protection-key register is changed. Private supervisor maps
-        // must not inherit L1's PKRS restrictions; OSFXSR makes FXSAVE64 usable
-        // even when L1 has cleared its own OSFXSR or XCR0.SSE.
-        let host_cr4 = (entry_cr4 | (1 << 9)) & !((1 << 22) | (1 << 24));
-        if host_cr4 & cr4_fixed0 != cr4_fixed0 || host_cr4 & !cr4_fixed1 != 0 {
-            return Err(Error::Capability("private host CR4", host_cr4));
-        }
-        ORIGINAL_CR0.store(original_cr0, Ordering::Relaxed);
-        ORIGINAL_CR4.store(original_cr4, Ordering::Relaxed);
-        if feature_control & 1 == 0 {
-            // SAFETY: this BSP read unlocked FEATURE_CONTROL at CPL0. All
-            // platform-map/allocation/host-state validation has now succeeded;
-            // initialize this one-way VMX permission only immediately before use.
-            unsafe { cpu::wrmsr(cpu::IA32_FEATURE_CONTROL, feature_control | 0b101) };
-        }
-        // SAFETY: the original controls were saved and normalized with the VMX
-        // fixed-bit MSRs; CPUID advertised XSAVE before OSXSAVE is enabled. No
-        // recoverable fallible operation intervenes before VMXON's restore path.
-        unsafe {
-            cpu::write_cr0(fixed_cr0);
-            cpu::write_cr4(entry_cr4);
-        }
-        // SAFETY: CPUID advertised XSAVE and host CR4.OSXSAVE is now set. XCR0 is
-        // restored before the original CR4 is restored.
-        ORIGINAL_XCR0.store(unsafe { cpu::xgetbv(0) }, Ordering::Relaxed);
-
-        // SAFETY: the checked, aligned runtime VMXON page contains this CPU's
-        // revision ID. FEATURE_CONTROL permits VMX outside SMX and CR0/CR4 have
-        // been normalized; failure restores the saved controls before cleanup.
-        let vmxon_status = unsafe { vmx::vmxon(vmxon) };
-        if vmxon_status != VmxStatus::Success {
-            restore_control_registers();
-            return Err(Error::Instruction("VMXON", vmxon_status, u64::MAX));
-        }
-        #[cfg(feature = "host-xstate-test")]
-        serial.write_bytes(b"thin-hv: host xstate clobber fixture armed\n");
-
-        let variable_overlay =
-            match runtime_variables::install(system_table, profile, image_base, image_size) {
-                Ok(overlay) => overlay,
-                Err(status) => {
-                    leave_failed_launch(serial);
-                    return Err(Error::Firmware(
-                        "install variable overlay",
-                        status.as_usize(),
-                    ));
-                }
-            };
-        let _ = writeln!(
-            serial,
-            "thin-hv: variable overlay profile={} mat_patches={}",
-            profile.0,
-            variable_overlay.memory_attribute_patch_count()
-        );
-
-        let result = configure_and_launch(
-            vmcs,
-            maps.eptp,
-            block + MSR_BITMAP_PAGE * PAGE_SIZE,
-            fixed_cr0,
-            fixed_cr4,
-            original_cr4,
-            host_cr4,
-            maps.host_cr3,
-            maps.host_pat,
-            &host_environment,
-            block + (GUEST_STACK_PAGE + GUEST_STACK_PAGES) * PAGE_SIZE - 8,
-            basic.true_controls,
-        );
-
-        // This is reached only when VM entry failed.
-        let overlay_rollback = variable_overlay.rollback();
-        leave_failed_launch(serial);
-        match overlay_rollback {
-            Ok(()) => result,
-            Err(status) => Err(Error::Firmware(
-                "restore variable overlay",
-                status.as_usize(),
-            )),
-        }
-    })();
-    // SAFETY: this closure returns only before a successful VM entry; all paths
-    // that enabled VMX have left it and restored controls before returning.
-    // Therefore no installed host table/stack or live VMCS references the block,
-    // and firmware Boot Services are still live. Post-entry paths never return.
-    let release = unsafe { ((*(*system_table).boot_services).free_pages)(block, MONITOR_PAGES) };
-    if release.is_error() {
+            });
+    let allocation = handoff.monitor_allocation;
+    let guarded =
+        resident_image::GuardedAllocation::new(allocation, MONITOR_PAGES, allocation_limit)
+            .map_err(Error::Resident)?;
+    let block = guarded.payload;
+    let block_end = guarded.payload_end;
+    let ram = validate_monitor_allocation(system_table, allocation)?;
+    if !ram.allows_ram_access(handoff.bootstrap.entry, 1, false)
+        || !ram.allows_ram_access(handoff.bootstrap.marker, 8, true)
+        || !ram.allows_ram_access(handoff.bootstrap.status, 8, true)
+    {
         return Err(Error::Firmware(
-            "FreePages monitor block",
-            release.as_usize(),
+            "L1 bootstrap RAM ownership",
+            efi::Status::UNSUPPORTED.as_usize(),
         ));
     }
+    // Resolve fallible typed addresses before changing CR0/CR4. Any rejection
+    // therefore returns through allocation cleanup without a CPU-state restore.
+    let vmxon = VmxonPhys::new(block).ok_or(Error::Firmware(
+        "VMXON page address",
+        efi::Status::COMPROMISED_DATA.as_usize(),
+    ))?;
+    let vmcs = VmcsPhys::new(block + PAGE_SIZE).ok_or(Error::Firmware(
+        "VMCS page address",
+        efi::Status::COMPROMISED_DATA.as_usize(),
+    ))?;
+    for address in [
+        handoff.bootstrap.entry,
+        vmexit_entry as usize as u64,
+        cpu::read_cr3(),
+    ] {
+        if address >= IDENTITY_MAP_LIMIT {
+            return Err(Error::OutsideIdentityMap(address));
+        }
+    }
+    let _ = writeln!(
+        serial,
+        "thin-hv: monitor block={block:#018x} end={block_end:#018x}"
+    );
+
+    // SAFETY: AllocatePages returned this exclusive runtime allocation; its
+    // nonzero base, page alignment and complete byte range were checked above.
+    unsafe {
+        ptr::write_bytes(
+            allocation as *mut u8,
+            0,
+            MONITOR_ALLOCATION_PAGES * PAGE_SIZE as usize,
+        )
+    };
+    // SAFETY: the checked allocation contains disjoint VMXON, VMCS, invalid
+    // revision and MSR-bitmap pages. No CPU uses them yet; all writes remain
+    // inside their pages. The extra page's low revision bit is inverted, so
+    // it can never become a current hardware VMCS, even with shadowing.
+    unsafe {
+        ptr::write_volatile(block as *mut u32, basic.revision_id);
+        ptr::write_volatile((block + PAGE_SIZE) as *mut u32, basic.revision_id);
+        ptr::write_volatile(
+            (block + ERROR_REVISION_PAGE * PAGE_SIZE) as *mut u32,
+            basic.revision_id ^ 1,
+        );
+        initialize_l1_msr_bitmap(block + MSR_BITMAP_PAGE * PAGE_SIZE);
+    }
+
+    let maps = build_carrier_maps(system_table, block, (image_base, image_end), &ram, serial)?;
+
+    let original_cr0 = cpu::read_cr0();
+    let original_cr4 = cpu::read_cr4();
+    if original_cr4 & CR4_LA57 != 0 {
+        return Err(Error::Capability("CR4.LA57", original_cr4));
+    }
+    if original_cr4 & CR4_CET != 0 {
+        return Err(Error::Capability(
+            "CR4.CET host shadow stacks",
+            original_cr4,
+        ));
+    }
+    let host_stack = HostStack::new(block + HOST_STACK_PAGE * PAGE_SIZE, 4 * PAGE_SIZE)
+        .map_err(Error::HostState)?;
+    // SAFETY: these exclusive host-environment pages lie inside the checked
+    // runtime block, before the disjoint invalid-revision page.
+    // The ordinary host stack is disjoint and also runtime-owned. HOST_CR3 maps
+    // the entire block supervisor-writable and the retained PE executable. No
+    // CPU/VMCS uses this storage yet; CR4.CET/LA57 were rejected above. After a
+    // successful entry all terminal paths retain the pages and never return to
+    // firmware. Immediate VMfail does not install these host descriptor fields.
+    let mut host_environment = unsafe {
+        HostEnvironment::initialize(
+            core::slice::from_raw_parts_mut(
+                (block + HOST_ENVIRONMENT_FIRST_PAGE * PAGE_SIZE) as *mut u8,
+                host_state::HOST_ENVIRONMENT_BYTES,
+            ),
+            host_stack,
+            48,
+        )
+    }
+    .map_err(Error::HostState)?;
+    let msr_state = ptr::NonNull::new(
+        (block + CPU_STATE_FIRST_PAGE * PAGE_SIZE) as *mut SpinLock<CpuRuntimeState>,
+    )
+    .ok_or(Error::Firmware(
+        "CPU runtime state address",
+        efi::Status::COMPROMISED_DATA.as_usize(),
+    ))?;
+    // SAFETY: the checked runtime allocation includes this disjoint,
+    // page-aligned final arena with enough space for the complete lock and
+    // state. No CPU or VMCS references it yet. The object never moves; all
+    // post-entry terminal paths retain its pages and private HOST_CR3 map.
+    unsafe {
+        msr_state.as_ptr().write(SpinLock::new(CpuRuntimeState::new(
+            ram,
+            basic,
+            [(block, block_end), (image_base, image_end)],
+            maps.mmio,
+            Some(maps.window),
+            Some(handoff.bootstrap),
+        )));
+        host_environment.bind_monitor_data(msr_state.cast());
+    }
+    for address in host_environment.required_image_addresses() {
+        if address < image_base || address >= image_end {
+            return Err(Error::OutsideIdentityMap(address));
+        }
+    }
+    let _ = writeln!(serial, "thin-hv: private host state PASS");
+    // SAFETY: CPUID.VMX establishes these four architectural fixed-bit MSRs;
+    // all reads occur at CPL0 before control-register changes or VMXON.
+    let (cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1) = unsafe {
+        (
+            cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0),
+            cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1),
+            cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0),
+            cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1),
+        )
+    };
+    let fixed_cr0 = (original_cr0 | cr0_fixed0) & cr0_fixed1;
+    let fixed_cr4 = (original_cr4 | (1 << 13) | cr4_fixed0) & cr4_fixed1;
+    if cpu::cpuid(1, 0).ecx & (1 << 26) == 0 {
+        return Err(Error::Capability("XSAVE", 0));
+    }
+    let legacy_features = (1 << 24) | (1 << 25) | (1 << 26);
+    if cpu::cpuid(1, 0).edx & legacy_features != legacy_features
+        || fixed_cr0 & ((1 << 2) | (1 << 3)) != 0
+    {
+        return Err(Error::Capability("UEFI x87/SSE environment", fixed_cr0));
+    }
+    let entry_cr4 = fixed_cr4 | CR4_OSXSAVE;
+    // No guest protection-key register is changed. Private supervisor maps
+    // must not inherit L1's PKRS restrictions; OSFXSR makes FXSAVE64 usable
+    // even when L1 has cleared its own OSFXSR or XCR0.SSE.
+    let host_cr4 = (entry_cr4 | (1 << 9)) & !((1 << 22) | (1 << 24));
+    if host_cr4 & cr4_fixed0 != cr4_fixed0 || host_cr4 & !cr4_fixed1 != 0 {
+        return Err(Error::Capability("private host CR4", host_cr4));
+    }
+    ORIGINAL_CR0.store(original_cr0, Ordering::Relaxed);
+    ORIGINAL_CR4.store(original_cr4, Ordering::Relaxed);
+    if feature_control & 1 == 0 {
+        // SAFETY: this BSP read unlocked FEATURE_CONTROL at CPL0. All
+        // platform-map/allocation/host-state validation has now succeeded;
+        // initialize this one-way VMX permission only immediately before use.
+        unsafe { cpu::wrmsr(cpu::IA32_FEATURE_CONTROL, feature_control | 0b101) };
+    }
+    // SAFETY: the original controls were saved and normalized with the VMX
+    // fixed-bit MSRs; CPUID advertised XSAVE before OSXSAVE is enabled. No
+    // recoverable fallible operation intervenes before VMXON's restore path.
+    unsafe {
+        cpu::write_cr0(fixed_cr0);
+        cpu::write_cr4(entry_cr4);
+    }
+    // SAFETY: CPUID advertised XSAVE and host CR4.OSXSAVE is now set. XCR0 is
+    // restored before the original CR4 is restored.
+    ORIGINAL_XCR0.store(unsafe { cpu::xgetbv(0) }, Ordering::Relaxed);
+
+    // SAFETY: the checked, aligned runtime VMXON page contains this CPU's
+    // revision ID. FEATURE_CONTROL permits VMX outside SMX and CR0/CR4 have
+    // been normalized; failure restores the saved controls before cleanup.
+    let vmxon_status = unsafe { vmx::vmxon(vmxon) };
+    if vmxon_status != VmxStatus::Success {
+        restore_control_registers();
+        return Err(Error::Instruction("VMXON", vmxon_status, u64::MAX));
+    }
+    #[cfg(feature = "host-xstate-test")]
+    serial.write_bytes(b"thin-hv: host xstate clobber fixture armed\n");
+
+    let result = configure_and_launch(
+        vmcs,
+        maps.eptp,
+        block + MSR_BITMAP_PAGE * PAGE_SIZE,
+        fixed_cr0,
+        fixed_cr4,
+        original_cr4,
+        host_cr4,
+        maps.host_cr3,
+        maps.host_pat,
+        &host_environment,
+        handoff.bootstrap.entry,
+        block + (GUEST_STACK_PAGE + GUEST_STACK_PAGES) * PAGE_SIZE - 8,
+        basic.true_controls,
+    );
+
+    // This is reached only when VM entry failed.
+    leave_failed_launch(serial);
     result
 }
 
@@ -1827,6 +2037,7 @@ struct CarrierMaps {
 fn build_carrier_maps(
     system_table: *mut efi::SystemTable,
     block: u64,
+    image: (u64, u64),
     ram: &FirmwareMap<205>,
     serial: &mut SerialPort,
 ) -> Result<CarrierMaps, Error> {
@@ -1853,14 +2064,14 @@ fn build_carrier_maps(
             .ok_or_else(|| reject("carrier EPT unavailable"))?)
             .map_err(|_| reject("carrier EPT page capabilities"))?;
         let base = block + EPT_FIRST_PAGE * PAGE_SIZE;
-        let end = base + EPT_PAGES as u64 * PAGE_SIZE;
         let host_base = block + HOST_TABLE_FIRST_PAGE * PAGE_SIZE;
-        let host_end = host_base + HOST_TABLE_PAGES as u64 * PAGE_SIZE;
         let private = [
-            PhysicalRange::new(base, end, width)
-                .map_err(|_| reject("carrier EPT private range"))?,
-            PhysicalRange::new(host_base, host_end, width)
-                .map_err(|_| reject("carrier host private range"))?,
+            PhysicalRange::new(block, block + GUEST_STACK_PAGE * PAGE_SIZE, width)
+                .map_err(|_| reject("carrier private prefix"))?,
+            PhysicalRange::new(host_base, block + MONITOR_PAGES as u64 * PAGE_SIZE, width)
+                .map_err(|_| reject("carrier private suffix"))?,
+            PhysicalRange::new(image.0, image.1, width)
+                .map_err(|_| reject("carrier private image"))?,
         ];
         // This post-AllocatePages map includes the complete retained monitor.
         // Intervening discovery calls allocate/free temporary RAM pools only;
@@ -1890,8 +2101,8 @@ fn build_carrier_maps(
                 reject("carrier platform host construction")
             })?;
         let _ = writeln!(serial,
-            "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables={} leaves={} private_pages={} host_map=platform-ram bootstrap=shared-runtime physical_ready=0",
-            built.table_pages(), built.leaf_count(), EPT_PAGES);
+            "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables={} leaves={} private_pages={} host_map=platform-ram bootstrap=firmware-runtime l0_image=private-copy physical_ready=0",
+            built.table_pages(), built.leaf_count(), MONITOR_PAGES as u64 - GUEST_STACK_PAGES + (image.1 - image.0) / PAGE_SIZE);
         let _ = writeln!(serial,
             "thin-hv: direct platform HOST PASS tables={} leaves={} private_pages={} mmio_window=uc physical_ready=0",
             host.table_pages(), host.leaf_count(), HOST_TABLE_PAGES);
@@ -1961,13 +2172,13 @@ fn validate_monitor_allocation(
 /// Requires unique writable runtime RAM with WB capability; the carrier builder
 /// separately checks effective MTRRs before publishing either platform root.
 fn monitor_allocation_is_wb(regions: &[FirmwareDescriptor], base: u64) -> bool {
-    let Some(end) = base.checked_add(MONITOR_PAGES as u64 * PAGE_SIZE) else {
+    let Some(end) = base.checked_add(MONITOR_ALLOCATION_PAGES as u64 * PAGE_SIZE) else {
         return false;
     };
     if base == 0 || !base.is_multiple_of(PAGE_SIZE) || end > IDENTITY_MAP_LIMIT {
         return false;
     }
-    let mut covered = [0_u8; MONITOR_PAGES];
+    let mut covered = [0_u8; MONITOR_ALLOCATION_PAGES];
     for region in regions {
         let Some(region_end) = region
             .number_of_pages
@@ -2011,6 +2222,7 @@ fn configure_and_launch(
     host_cr3: u64,
     host_pat: u64,
     host_environment: &HostEnvironment<'_>,
+    guest_rip: u64,
     guest_rsp: u64,
     true_controls: bool,
 ) -> Result<(), Error> {
@@ -2134,12 +2346,10 @@ fn configure_and_launch(
         write_vmcs(field, value)?;
     }
 
-    write_guest_state(host_cr0, guest_cr4_hardware, guest_rsp)?;
+    write_guest_state(host_cr0, guest_cr4_hardware, guest_rsp, guest_rip)?;
     write_host_state(host_cr0, host_cr3, host_cr4, host_pat, host_environment)?;
     log_guest_state();
 
-    GUEST_RAN.store(0, Ordering::Release);
-    GUEST_STATUS.store(usize::MAX, Ordering::Release);
     *L1_VCPU_STATE.lock() = VcpuState::new();
     *CARRIER_PATCH_VALUES.lock() = None;
     *DIRECT_PATCH_VALUES.lock() = None;
@@ -2154,7 +2364,7 @@ fn configure_and_launch(
 }
 
 /// Writes current long-mode state as the initial guest state.
-fn write_guest_state(cr0: u64, cr4: u64, stack: u64) -> Result<(), Error> {
+fn write_guest_state(cr0: u64, cr4: u64, stack: u64, entry: u64) -> Result<(), Error> {
     let gdtr = cpu::sgdt();
     let idtr = cpu::sidt();
     let es = guest_segment(cpu::read_es(), 0);
@@ -2210,7 +2420,7 @@ fn write_guest_state(cr0: u64, cr4: u64, stack: u64) -> Result<(), Error> {
         (vmcs::GUEST_IDTR_BASE, idtr.base),
         (vmcs::GUEST_DR7, cpu::read_dr7()),
         (vmcs::GUEST_RSP, stack),
-        (vmcs::GUEST_RIP, guest_entry as usize as u64),
+        (vmcs::GUEST_RIP, entry),
         (vmcs::GUEST_RFLAGS, 2),
         (vmcs::GUEST_PENDING_DBG_EXCEPTIONS, 0),
         (vmcs::GUEST_INTERRUPTIBILITY_INFO, 0),
@@ -5777,8 +5987,21 @@ fn log_vmexit(reason: u64, qualification: u64, guest_rip: u64, instruction_len: 
 /// Completes the bounded smoke test after the guest's VMCALL.
 fn finish_vmcall(reason: u64) -> ! {
     record_diagnostic(DiagnosticEvent::GuestReturned);
-    let marker = GUEST_RAN.load(Ordering::Acquire);
-    let guest_status = GUEST_STATUS.load(Ordering::Acquire);
+    let (marker, guest_status) = with_cpu_runtime(|state| state.bootstrap)
+        .flatten()
+        .map(|bootstrap| {
+            // SAFETY: pre-entry PE/firmware validation proved these distinct aligned
+            // atomics belong to retained, writable L1 bootstrap data, mapped by the
+            // private RAM root. L1 is stopped on this CPU. Load shared results, never
+            // the unrelated copied L0 statics; no borrow survives this expression.
+            unsafe {
+                (
+                    (*(bootstrap.marker as *const AtomicU64)).load(Ordering::Acquire),
+                    (*(bootstrap.status as *const AtomicUsize)).load(Ordering::Acquire),
+                )
+            }
+        })
+        .unwrap_or((0, usize::MAX));
     #[cfg(feature = "host-exception-test")]
     if reason & 0xffff == EXIT_REASON_VMCALL
         && marker == GUEST_MARKER
@@ -5842,6 +6065,27 @@ fn stop_unexpected_exit(
     write_raw_field(&mut serial, b"rbx", registers.rbx);
     write_raw_field(&mut serial, b"rcx", registers.rcx);
     write_raw_field(&mut serial, b"rdx", registers.rdx);
+    if reason & 0xffff == 48 {
+        // SAFETY: the current VMCS just reported an EPT violation. Its GPA is
+        // architecturally defined; GLA is valid only when qualification bit 7
+        // is set. Read addresses only, never guest or firmware payload bytes.
+        let (physical, linear) = unsafe {
+            (
+                vmcs_read(vmcs::GUEST_PHYSICAL_ADDRESS).ok(),
+                (qualification & (1 << 7) != 0)
+                    .then(|| vmcs_read(vmcs::GUEST_LINEAR_ADDRESS).ok())
+                    .flatten(),
+            )
+        };
+        if let Some(address) = physical {
+            write_raw_field(&mut serial, b"ept_gpa", address);
+        }
+        if let Some(address) = linear {
+            write_raw_field(&mut serial, b"ept_gla", address);
+        }
+        write_raw_field(&mut serial, b"rsi", registers.rsi);
+        write_raw_field(&mut serial, b"rdi", registers.rdi);
+    }
     write_raw_newline(&mut serial);
     let vmxoff = leave_vmx();
     serial.write_bytes(b"thin-hv: VMXOFF status=");
@@ -6012,7 +6256,7 @@ mod tests {
         let mut region = FirmwareDescriptor {
             memory_type: efi::RUNTIME_SERVICES_DATA,
             physical_start: base,
-            number_of_pages: super::MONITOR_PAGES as u64,
+            number_of_pages: super::MONITOR_ALLOCATION_PAGES as u64,
             attributes: efi::MEMORY_WB,
         };
         assert!(super::monitor_allocation_is_wb(&[region], base));
@@ -6106,6 +6350,7 @@ mod tests {
             [(block, end), (high, high + 4096)],
             mmio,
             None,
+            None,
         );
         assert!(state.allows_vmx_region(high + 4096));
         state.basic.physical_address_width_32 = true;
@@ -6173,6 +6418,7 @@ mod tests {
                 super::vmx::VmxBasic::from_msr(0),
                 [(0x3000, 0x4000), (0x5000, 0x5101)],
                 mmio,
+                None,
                 None,
             )
         };

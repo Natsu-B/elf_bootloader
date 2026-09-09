@@ -1846,3 +1846,109 @@ current QEMU run needs direct measurement; it is not yet asserted as the cause
 of either KVM timing failure or the old Windows watchdog. Bootstrap separation
 and an independently owned L0 code copy remain architectural work, not merely a
 variable-overlay switch.
+
+## Step 10c: independent resident L0 image and explicit L1 bootstrap
+
+The runtime-image lifetime concern above was confirmed, not merely inferred.
+At `bab204b`, an HMP diagnostic read eight DIR64 slots in the project monitor
+before Linux startup and after its UEFI virtual-address transition. **8/8 changed
+by `0xfffffffe7fc00000`**, although HOST_CR3 remained physical/identity-addressed.
+Only eight-byte project pointer slots were captured, not firmware payloads.
+The accompanying default-q35/4-GiB Direct lifecycle completed **1024 cycles**.
+`/tmp/x86-runtime-relocation-probe.log`, `/tmp/x86-runtime-relocation-linux.log`.
+Pausing for these reads makes this diagnostic unsuitable as a timing benchmark.
+This establishes a code-pointer lifetime bug, not the cause of the two upstream
+timing failures or the old Windows watchdog.
+
+Changed files and principal symbols:
+
+* `x86_uefi_loader/src/resident_image.rs`: `LoadedPe`, `image_pages`, and
+  `GuardedAllocation`. The bounded, heap-free copier accepts this project's
+  already authenticated/loaded AMD64 PE32+ virtual layout, not an arbitrary
+  on-disk executable. It validates all sections and DIR64 relocations before
+  publishing a destination: header/size bounds, overflow, executable entries,
+  unsupported imports/TLS, unsupported/overlapping/self-modifying relocations,
+  external pointers, capacity and source/destination overlap. One-past-image
+  pointers and upward/downward rebasing are supported. Four host tests cover
+  these cases and the shared guard/private-payload boundaries.
+* `x86_uefi_loader/src/vmx_smoke.rs`: `start_resident_core`,
+  `with_runtime_pages`, `ResidentHandoff`, `resident_entry`, `GuestBootstrap`,
+  `run_direct_monitor`, `build_carrier_maps`, `configure_and_launch`,
+  `write_guest_state`, `finish_vmcall`, allocation validation and cold EPT-fault
+  diagnostics. Firmware authenticates the source normally. L0 executes a
+  separate RuntimeServicesCode allocation that is **not registered as a runtime
+  PE**, so firmware cannot relocate its pointers for L1. The original runtime
+  image owns the explicit guest trampoline/result atomics and legacy research
+  overlay only. VMCS host callbacks, descriptors, diagnostics and VMX globals
+  resolve into the private copy. Initial-entry failures restore VMX/CPU state,
+  report errors while copied strings remain valid, return only a scalar status,
+  roll back the original overlay, and release both owned allocations.
+* `x86_uefi_loader/src/main.rs`: the private image module.
+* `scripts/x86_64/run-uefi-smoke.sh`, `xtask/src/main.rs`: require ordered,
+  bounded resident/EPT/HOST records; reject overlapping/out-of-width copies,
+  missing guards, insufficient private-page counts, shared-image/fixed-map
+  claims and malformed records. Existing package filters and test kinds remain.
+
+The active EPT now excludes the whole private PE and the VMX/host block except
+its explicit L1 stack. This includes VMXON, carrier/error VMCS, EPT/HOST tables,
+MSR bitmap, host stack, GDT/IDT/TSS/IST and per-CPU data. The shared firmware
+bootstrap is no longer mistaken for L0-private code. Four extra zeroed pages
+(one before/after each allocation) remain L1-visible boot guards; they are not
+VMXON or other private payload. No protection against a malicious trusted L1,
+full physical readiness, or SMP is claimed.
+
+### Failures diagnosed during integration, not committed as working states
+
+1. Excluding all private pages initially broke the four Direct Linux cases:
+   **7 PASS, 9 FAIL / 16** (five failures are the existing reference discrepancies).
+   Native Direct cases passed. Precise cold GPA/GLA logging identified a read
+   at the first VMXON byte, with RSI at that address. Matching the installed
+   7.1.5 `System.map` located RIP at `copy_bootdata+0x47`, RDI at
+   `boot_command_line+0x1e8`. The pinned Linux `arch/x86/kernel/head64.c` copies
+   fixed `COMMAND_LINE_SIZE` (2048) bytes even when the EFI command-line buffer
+   is shorter. Its allocation ended immediately before the new L0 reservation.
+   Shared, zeroed page bookends cover that bounded read; **private pages were
+   not remapped** and the kernel/test was not modified. The guard is explicitly
+   not a workaround for arbitrary scans or future unexplained EPT faults.
+   Logs: `/tmp/x86-resident-copy-nested-first.log`,
+   `/tmp/x86-resident-private-ept-diagnostic.log`.
+2. Linux then passed that boundary but faulted on an NX legacy SetVariable hook
+   after `SetVirtualAddressMap`. Runtime allocations made after overlay setup
+   caused OVMF to republish its MAT, losing the old image's existing test-only
+   attribute adjustment. Both runtime allocations now precede original-image
+   overlay installation. No additional runtime allocation occurs in copied L0
+   preparation. Rollback precedes freeing those allocations. This ordering fix
+   preserves the legacy backend; it does not install an overlay in a physical
+   no-overlay path. `/tmp/x86-resident-boot-guards.log` (FAIL),
+   `/tmp/x86-resident-overlay-order.log` (64-cycle Direct PASS).
+
+### Completed validation
+
+All commands below used `nix develop --accept-flake-config --command`:
+
+* `cargo fmt`, `cargo fmt --check`, all five requested `cargo xtest -p` packages:
+  **261 PASS, 0 FAIL** = nested_vmx 29 + x86_64_hal 59 + x86_uefi_loader 130 +
+  x86_guest_uefi_test 10 + xtask 33. `cargo xbuild x86`: **PASS**.
+* `cargo xrun x86 --release`: **9 PASS, 0 FAIL** (7 QEMU/KVM, including the
+  expected private root-exception fixture, and 2 QEMU TCG cases).
+* `cargo xrun x86 --nested --release`: **11 PASS, 5 FAIL / 16**, exit **1**.
+  **All ten Direct cases PASS**, including native/readonly/live-XSTATE,
+  non-empty MSR lists, architectural MSR aborts, and 2/4/12-GiB Linux lifecycle
+  runs with default high PCI apertures. The five outer-KVM contract differences
+  are unchanged and are not waived. `/tmp/x86-resident-core-validation.log`.
+* Existing Linux runner with `LINUX_KVM_BACKEND=direct-vmx`,
+  `LINUX_KVM_CYCLES=1024`, `LINUX_KVM_MEMORY=4G`,
+  `X86_UEFI_PCI_PROFILE=firmware-default`, `X86_UEFI_REQUIRE_HIGH_PCI=1`:
+  **PASS**, including all lifecycle/state checks and S5 poweroff. During this
+  run HMP sampled the same eight DIR64 RVAs in both copies before/after the UEFI
+  transition: **private 8/8 unchanged**, **original 8/8 converted**, all original
+  deltas `0xfffffffe7fc00000`. Only 256 bytes of project pointers were captured;
+  this paused experiment is not timing qualification.
+  `/tmp/x86-resident-relocation-probe.log`,
+  `/tmp/x86-resident-relocation-linux.log`; runner and probe exit **0**.
+
+No Direct Windows, Hyper-V/WSL2, S3 or physical-machine retest is included in
+this step. The original firmware/Windows installation was not touched. The two
+timing-sensitive Direct selftest failures remain open pending a new frozen-code
+replay. Physical selection/no-overlay, full pCPU/AP ownership, root NMI and S3
+lifecycle work remain. Outer-KVM results are reference evidence only.

@@ -435,8 +435,10 @@ check_preflight_ept_log() {
 # Independent of terminal exception/abort verdicts: those fixtures must still
 # prove that the real Direct carrier consumed a complete platform EPT.
 check_direct_platform_log() {
-    local log=$1 high=$2 line count=0 hosts=0 high_bar=0 bytes transcript
-    local pattern='^thin-hv: direct platform EPT PASS source=uefi\+mtrr\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 host_map=platform-ram bootstrap=shared-runtime physical_ready=0$'
+    local log=$1 high=$2 line count=0 hosts=0 residents=0 image_pages=0 high_bar=0 bytes transcript
+    local source_base private_base image_size
+    local resident_pattern='^thin-hv: resident image PASS source=0x([0-9a-f]{16}) private=0x([0-9a-f]{16}) bytes=0x([0-9a-f]{1,7}) firmware_relocation=excluded bootstrap=firmware-runtime boot_guards=2$'
+    local pattern='^thin-hv: direct platform EPT PASS source=uefi\+mtrr\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=([1-9][0-9]{0,4}) host_map=platform-ram bootstrap=firmware-runtime l0_image=private-copy physical_ready=0$'
     local host_pattern='^thin-hv: direct platform HOST PASS tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 mmio_window=uc physical_ready=0$'
     [[ "$high" == 0 || "$high" == 1 ]] || return 1
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -445,9 +447,20 @@ check_direct_platform_log() {
     if IFS= read -r -d '' -n 2097153 transcript <"$log"; then return 1; fi
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
-        if [[ "$line" =~ $pattern ]]; then
-            ((hosts == count)) || return 1
+        if [[ "$line" =~ $resident_pattern ]]; then
+            ((residents == count && hosts == count)) || return 1
+            [[ ${BASH_REMATCH[1]} < 0000800000000000 && ${BASH_REMATCH[2]} < 0000800000000000 ]] || return 1
+            source_base=$((16#${BASH_REMATCH[1]})) private_base=$((16#${BASH_REMATCH[2]})) image_size=$((16#${BASH_REMATCH[3]}))
+            ((source_base > 0 && private_base > 0 && source_base % 4096 == 0 && private_base % 4096 == 0)) || return 1
+            ((image_size > 0 && image_size <= 16777216 && image_size % 4096 == 0)) || return 1
+            ((source_base + image_size <= 140737488355328 && private_base + image_size <= 140737488355328)) || return 1
+            ((source_base + image_size <= private_base || private_base + image_size <= source_base)) || return 1
+            image_pages=$((image_size / 4096))
+            ((residents += 1))
+        elif [[ "$line" =~ $pattern ]]; then
+            ((hosts == count && residents == count + 1)) || return 1
             ((BASH_REMATCH[1] <= 256)) || return 1
+            ((BASH_REMATCH[3] >= 512 + image_pages && BASH_REMATCH[3] <= 65536)) || return 1
             if ((${#BASH_REMATCH[2]} == 20)) && [[ ${BASH_REMATCH[2]} > 18446744073709551615 ]]; then return 1; fi
             ((count += 1))
             ((count <= 64)) || return 1 # bounded reset/reboot transcripts
@@ -455,7 +468,7 @@ check_direct_platform_log() {
             ((count == hosts + 1 && BASH_REMATCH[1] <= 256)) || return 1
             if ((${#BASH_REMATCH[2]} == 20)) && [[ ${BASH_REMATCH[2]} > 18446744073709551615 ]]; then return 1; fi
             ((hosts += 1))
-        elif [[ "$line" == 'thin-hv: direct platform EPT '* || "$line" == 'thin-hv: direct platform HOST '* ]]; then
+        elif [[ "$line" == 'thin-hv: direct platform EPT '* || "$line" == 'thin-hv: direct platform HOST '* || "$line" == 'thin-hv: resident image '* ]]; then
             return 1
         elif [[ "$line" == 'thin-hv: preflight PCI MMIO '* ]]; then
             [[ "$line" =~ ' highest_bar_end=0x'([0-9a-f]{16})' mmio_complete=0 direct_vmx_ready=0'$ ]] || return 1
@@ -463,7 +476,7 @@ check_direct_platform_log() {
             if [[ ${BASH_REMATCH[1]} > 0000000200000000 ]]; then high_bar=1; fi
         fi
     done <<<"$transcript"
-    ((count > 0 && hosts == count && (high == 0 || high_bar == 1)))
+    ((count > 0 && hosts == count && residents == count && (high == 0 || high_bar == 1)))
 }
 
 # Validate the complete ordered transcript, not just the final fixture marker.

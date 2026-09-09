@@ -3405,7 +3405,7 @@ mod tests {
                 .unwrap()
                 .success()
         };
-        let direct = "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables=38 leaves=17240 private_pages=256 host_map=platform-ram bootstrap=shared-runtime physical_ready=0\nthin-hv: direct platform HOST PASS tables=30 leaves=12000 private_pages=256 mmio_window=uc physical_ready=0\n";
+        let direct = "thin-hv: resident image PASS source=0x000000007fa00000 private=0x000000007fb00000 bytes=0x40000 firmware_relocation=excluded bootstrap=firmware-runtime boot_guards=2\nthin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables=38 leaves=17240 private_pages=601 host_map=platform-ram bootstrap=firmware-runtime l0_image=private-copy physical_ready=0\nthin-hv: direct platform HOST PASS tables=30 leaves=12000 private_pages=256 mmio_window=uc physical_ready=0\n";
         assert!(check_direct("0", direct));
         assert!(!check_direct("1", direct));
         assert!(check_direct("1", &format!("{gcd}{direct}")));
@@ -3426,6 +3426,10 @@ mod tests {
         assert!(!check_direct("0", records[1]));
         assert!(!check_direct(
             "0",
+            &format!("{}\n{}\n", records[1], records[2])
+        ));
+        assert!(!check_direct(
+            "0",
             &format!("{}\n{}\n", records[1], records[0])
         ));
         assert!(!check_direct("0", &format!("{direct}{}\n", records[1])));
@@ -3438,6 +3442,19 @@ mod tests {
             ("HOST PASS", "HOST FAIL"),
             ("leaves=17240", "leaves=18446744073709551616"),
             ("private_pages=256", "private_pages=0"),
+            ("private_pages=601", "private_pages=575"),
+            ("private_pages=601", "private_pages=65537"),
+            ("private=0x000000007fb00000", "private=0x000000007fa01000"),
+            ("private=0x000000007fb00000", "private=0xffff800000000000"),
+            ("private=0x000000007fb00000", "private=0x0000000000000000"),
+            ("bytes=0x40000", "bytes=0x40001"),
+            ("bytes=0x40000", "bytes=0x1001000"),
+            (
+                "firmware_relocation=excluded",
+                "firmware_relocation=registered",
+            ),
+            ("l0_image=private-copy", "l0_image=shared-runtime"),
+            ("boot_guards=2", "boot_guards=0"),
             ("source=uefi+mtrr+gcd+acpi+pci", "source=q35-smoke"),
             ("physical_ready=0", "physical_ready=1"),
             ("EPT PASS", "EPT FAIL"),

@@ -54,6 +54,8 @@ mod platform_resources;
 mod platform_snapshot;
 
 #[cfg(feature = "direct-vmx")]
+mod resident_image;
+#[cfg(feature = "direct-vmx")]
 mod runtime_variables;
 #[cfg(feature = "trusted-outer-kvm")]
 mod trusted_outer_kvm;
