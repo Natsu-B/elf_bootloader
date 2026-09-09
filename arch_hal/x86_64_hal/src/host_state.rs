@@ -5,8 +5,9 @@
 //! The backing storage must remain reserved at the same linear addresses while
 //! any CPU or VMCS can reference it. Each physical CPU needs its own instance.
 //!
-//! Every IDT vector currently stops the monitor, including an NMI received in
-//! root mode. This is a visible fail-closed exception environment, not an NMI
+//! Every unexpected exception stops the monitor, including a root-mode NMI.
+//! Only an explicitly armed RDMSR #GP(0) has a bounded recovery continuation.
+//! This is a visible fail-closed exception environment, not an NMI
 //! forwarding implementation or evidence of physical-machine daily-use support.
 //! No heap, firmware service, lock, stack unwinding, or XSAVE state is used by
 //! the exception entry. Host CR4.CET must be clear: shadow stacks are not owned
@@ -56,7 +57,13 @@ pub const HOST_XSTATE_MXCSR_OFFSET: usize = core::mem::offset_of!(HostXstate, mo
 struct HostXstate {
     guest_fx: [u8; 512],
     monitor_mxcsr: u32,
+    msr_fault_rip: u64,
+    msr_resume_rip: u64,
+    msr_faulted: u64,
 }
+const MSR_FAULT_RIP: usize = core::mem::offset_of!(HostXstate, msr_fault_rip);
+const MSR_RESUME_RIP: usize = core::mem::offset_of!(HostXstate, msr_resume_rip);
+const MSR_FAULTED: usize = core::mem::offset_of!(HostXstate, msr_faulted);
 const IDT_OFFSET: usize = HOST_PAGE_BYTES;
 const IDT_GATE_BYTES: usize = 16;
 const IDT_ENTRIES: usize = 256;
@@ -339,7 +346,16 @@ impl<'storage> HostEnvironment<'storage> {
             .checked_add(EXCEPTION_MESSAGE_BYTES.len() as u64)
             .ok_or(Error::Overflow)?;
         check_range(message, message_end, linear_bits)?;
+        let gp_entry = general_protection as *const () as usize as u64;
+        if (layout.base..layout.end).contains(&gp_entry)
+            || (host_stack.base..host_stack.end).contains(&gp_entry)
+        {
+            return Err(Error::HandlerOverlap);
+        }
+        let gp_gate = idt_gate(gp_entry, vector_ist(13), linear_bits)?;
         populate(storage, layout, gates);
+        let gp_offset = IDT_OFFSET + 13 * IDT_GATE_BYTES;
+        storage[gp_offset..gp_offset + IDT_GATE_BYTES].copy_from_slice(&gp_gate);
         // The caller publishes VMCS pointers only after the complete table image.
         compiler_fence(Ordering::Release);
         Ok(Self {
@@ -362,16 +378,17 @@ impl<'storage> HostEnvironment<'storage> {
             .map(|top| (top - IST_STACK_BYTES as u64, top))
     }
 
-    /// Returns handler entry, first message byte and last message byte addresses.
+    /// Returns fatal handler, first/last message byte and guarded #GP entry addresses.
     ///
-    /// All three must belong to the retained runtime image and its HOST_CR3 map.
+    /// All must belong to the retained runtime image and its HOST_CR3 map.
     #[must_use]
-    pub fn required_image_addresses(&self) -> [u64; 3] {
+    pub fn required_image_addresses(&self) -> [u64; 4] {
         let message = EXCEPTION_MESSAGE_BYTES.as_ptr() as usize as u64;
         [
             self.layout.exception_entry,
             message,
             message + EXCEPTION_MESSAGE_BYTES.len() as u64 - 1,
+            general_protection as *const () as usize as u64,
         ]
     }
 
@@ -404,6 +421,90 @@ impl<'storage> HostEnvironment<'storage> {
             (vmcs::HOST_RSP, self.layout.host_stack.vmexit_rsp()),
         ]
     }
+}
+
+/// Reads an MSR, recovering only this instruction's architectural #GP(0).
+///
+/// This does not validate VMX MSR-list format or model-specific list exclusions.
+/// A successful ordinary RDMSR alone does not establish that hardware may use
+/// that MSR in a VM-entry/exit list, or that it remains readable after L2 runs.
+///
+/// # Safety
+///
+/// The calling CPU must run at CPL0 in this initialized private host environment:
+/// HOST_GS_BASE names its uniquely owned scratch, this module's IDT/TSS/IST and
+/// code are live in HOST_CR3, IF is clear, and CR4.CET is clear. No nested probe
+/// or CPU migration is allowed. The caller must allow any read side effects of
+/// the selected MSR; this function neither writes MSRs nor changes CR2/XSTATE.
+pub unsafe fn try_rdmsr(index: u32) -> Option<u64> {
+    let low: u32;
+    let high: u32;
+    let faulted: u64;
+    // SAFETY: the caller guarantees private per-CPU GS/IDT/IST ownership and
+    // non-reentrancy. Only label 2's RDMSR is armed; the #GP gate checks its RIP,
+    // ring-zero CS and zero error code, then resumes at label 3 without changing
+    // GPRs. Every return disarms the probe before Rust observes the result.
+    unsafe {
+        core::arch::asm!(
+            "cmp qword ptr gs:[{armed}], 0",
+            "jne {fatal}",
+            "lea rax, [rip + 3f]",
+            "mov gs:[{resume}], rax",
+            "mov qword ptr gs:[{failed}], 0",
+            "lea rax, [rip + 2f]",
+            "mov gs:[{armed}], rax",
+            "2:",
+            "rdmsr",
+            "3:",
+            "mov qword ptr gs:[{armed}], 0",
+            "mov {faulted}, gs:[{failed}]",
+            armed = const MSR_FAULT_RIP,
+            resume = const MSR_RESUME_RIP,
+            failed = const MSR_FAULTED,
+            fatal = sym exception_stop,
+            in("ecx") index,
+            out("eax") low,
+            out("edx") high,
+            faulted = out(reg) faulted,
+        );
+    }
+    (faulted == 0).then_some(u64::from(low) | (u64::from(high) << 32))
+}
+
+/// Recovers an exact armed RDMSR fault; every other root #GP remains fatal.
+// SAFETY: a 64-bit CPL0 interrupt gate uses the CPU-owned IST4, with error code,
+// RIP, CS, RFLAGS, old RSP and SS at offsets 0..40. GS remains private; this gate
+// neither swaps GS nor calls Rust nor touches FP state. Two saved GPRs shift
+// the error/RIP/CS slots to 16/24/32. IRETQ restores the original stack and flags.
+#[unsafe(naked)]
+extern "C" fn general_protection() -> ! {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "cmp qword ptr [rsp + 16], 0",
+        "jne {fatal}",
+        "cmp qword ptr [rsp + 32], {cs}",
+        "jne {fatal}",
+        "mov rax, gs:[{armed}]",
+        "test rax, rax",
+        "jz {fatal}",
+        "cmp rax, [rsp + 24]",
+        "jne {fatal}",
+        "mov rcx, gs:[{resume}]",
+        "test rcx, rcx",
+        "jz {fatal}",
+        "mov qword ptr gs:[{failed}], 1",
+        "mov [rsp + 24], rcx",
+        "pop rcx",
+        "pop rax",
+        "add rsp, 8",
+        "iretq",
+        cs = const HOST_CODE_SELECTOR,
+        armed = const MSR_FAULT_RIP,
+        resume = const MSR_RESUME_RIP,
+        failed = const MSR_FAULTED,
+        fatal = sym exception_stop,
+    );
 }
 
 /// Fatal-only entry, deliberately independent of Rust stack frames and TLS.
@@ -689,6 +790,21 @@ mod tests {
         assert_eq!(
             &first_storage.0[mxcsr..mxcsr + 4],
             &0x1f80_u32.to_le_bytes()
+        );
+        for offset in [MSR_FAULT_RIP, MSR_RESUME_RIP, MSR_FAULTED] {
+            assert_eq!(offset & 7, 0);
+            assert!(offset >= HOST_XSTATE_MXCSR_OFFSET + 4);
+            assert_eq!(word(&first_storage.0[XSTATE_OFFSET + offset..][..8]), 0);
+        }
+        let offset = IDT_OFFSET + 13 * IDT_GATE_BYTES;
+        assert_eq!(
+            &first_storage.0[offset..offset + IDT_GATE_BYTES],
+            &idt_gate(general_protection as *const () as usize as u64, 4, 48).unwrap()
+        );
+        let offset = IDT_OFFSET + 14 * IDT_GATE_BYTES;
+        assert_eq!(
+            &first_storage.0[offset..offset + IDT_GATE_BYTES],
+            &idt_gate(exception_stop as *const () as usize as u64, 4, 48).unwrap()
         );
     }
 }

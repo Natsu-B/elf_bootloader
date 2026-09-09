@@ -2430,9 +2430,22 @@ unsafe fn initialize_l1_msr_bitmap(bitmap: u64) {
 
 /// Returns one masked VMX capability without touching absent optional MSRs.
 fn l1_vmx_capability(msr: u32) -> Option<u64> {
+    #[cfg(feature = "host-xstate-test")]
+    if msr == vmx::IA32_VMX_BASIC {
+        // SAFETY: capability emulation runs inside the owning CPU's private
+        // GS/IDT/IST and saved-XSTATE bracket, with IF clear. This reserved MSR
+        // deliberately faults; the next valid capability read must still work.
+        // No WRMSR, guest-state change, or hot-path logging is introduced.
+        if unsafe { host_state::try_rdmsr(u32::MAX) }.is_some() {
+            return None;
+        }
+    }
     let hardware = match msr {
         vmx::IA32_VMX_VMFUNC | vmx::IA32_VMX_PROCBASED_CTLS3 => 0,
-        _ => unsafe { cpu::rdmsr(msr) },
+        // SAFETY: this is a read-only VMX capability access in the owning
+        // CPU's private GS/IDT/IST, at CPL0 with IF clear. An absent model-
+        // specific register returns None and the caller injects L1 #GP(0).
+        _ => unsafe { host_state::try_rdmsr(msr) }?,
     };
     restrict_vmx_capability(msr, hardware)
 }

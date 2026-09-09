@@ -504,3 +504,49 @@ All results above are host or QEMU/KVM results, not physical hardware. Windows
 Hyper-V has not been retested in this step. The earlier Direct periodic-signal
 invalid-state timeout, platform-map/AP/NMI/S3 work and nonempty MSR lists remain
 open until their own validation, regardless of the state-preservation PASS.
+
+## Step 5 prerequisite: guarded root RDMSR
+
+The capability-read fallback still executed raw RDMSR. An absent model-specific
+MSR could therefore fault in L0 while preparing L1's capability response. MSR-list
+handling also needs a way to distinguish an unreadable MSR from a monitor fault;
+ordinary RDMSR success is **not** proof that hardware MSR-list use is legal.
+
+* `arch_hal/x86_64_hal/src/host_state.rs`: `HostXstate` now owns three initially
+  zero recovery words per CPU. `try_rdmsr` arms exactly one instruction and always
+  disarms before returning. Its private #GP gate accepts only #GP(0), the private
+  ring-zero CS and the armed RIP, preserving GPRs/CR2/FP state and using IST4.
+  All other #GPs, root #UDs and NMIs remain fail-closed. The gate is included in
+  retained-image checks; descriptor storage size does not increase.
+* `x86_uefi_loader/src/vmx_smoke.rs`: `l1_vmx_capability` uses the guarded access.
+  Absent MSRs follow the existing L1 #GP injection path without RIP advancement.
+  The explicit host-XSTATE fixture probes reserved MSR `0xffffffff` before each
+  VMX_BASIC read, requiring recovery followed by a successful valid read. This
+  runs inside the existing FP-preservation bracket, with no hot serial logging.
+
+Validation, all through `nix develop --accept-flake-config --command`:
+
+* `cargo xtest -p x86_64_hal`: **51 PASS, 0 FAIL**;
+  `/tmp/x86-correctness-step5-hal-guard.log`.
+* `cargo xtest -p x86_uefi_loader`: **45 PASS, 0 FAIL**;
+  `/tmp/x86-correctness-step5-guard-loader.log`.
+* `cargo xtest -p x86_guest_uefi_test`: **10 PASS, 0 FAIL**;
+  `/tmp/x86-correctness-step5-guard-guest.log`.
+* `cargo xtest -p xtask`: **32 PASS, 0 FAIL**;
+  `/tmp/x86-correctness-step5-guard-xtask.log`.
+* `env LINUX_KVM_CYCLES=1 LINUX_KVM_TIMEOUT_SECONDS=600 cargo xrun x86 --nested
+  --release`: **6 PASS, 2 FAIL**, process exit 1;
+  `/tmp/x86-correctness-step5-guard-nested.log`. All three Direct native cases
+  and all three Linux cases pass. Both reference native cases retain the known
+  crossing-page partial-store failure. No assertion was weakened.
+* `cargo xrun x86 --release`: **9 QEMU runs PASS, 0 FAIL**, process exit 0;
+  `/tmp/x86-correctness-step5-guard-smoke.log`. Seven KVM and two TCG cases,
+  including the expected fatal root #UD fixture, as in step 4.
+* `cargo xbuild x86`, `cargo fmt`, `cargo fmt --check`, `git diff --check`:
+  **PASS**; build/format logs are `/tmp/x86-correctness-step5-build-guard.log`
+  and `/tmp/x86-correctness-step5-guard-fmt.log`.
+
+This is a tested prerequisite, not completed nonempty MSR-list support. The
+list runtime and its VM-entry-failure/VMX-abort semantics are still under work.
+Windows/Hyper-V and physical hardware were not tested in this prerequisite;
+outer-KVM evidence remains reference-only.
