@@ -35,6 +35,8 @@ pub(crate) fn malformed(context: &'static str) -> Error {
 pub(crate) struct CpuSnapshot {
     physical_bits: u8,
     cr4: u64,
+    pat: Option<u64>,
+    host_pages: platform_memory::PageCapabilities,
     ept_caps: Option<u64>,
     mtrr: Option<MtrrSnapshot>,
 }
@@ -62,6 +64,13 @@ impl CpuSnapshot {
     /// Returns the captured EPT/VPID capability only when EPT itself is allowed.
     pub(crate) fn ept_caps(&self) -> Option<u64> {
         self.ept_caps
+    }
+
+    /// Encodes private host RAM/window leaves under the captured, unchanged PAT.
+    pub(crate) fn host_paging(&self) -> Result<x86_64_hal::ept::HostPagingPolicy, Error> {
+        let pat = self.pat.ok_or_else(|| malformed("host PAT unavailable"))?;
+        x86_64_hal::ept::HostPagingPolicy::new(pat, self.host_pages)
+            .map_err(|_| malformed("host PAT encoding"))
     }
 
     /// Borrows a validated HAL MTRR policy without any further CPU/MSR reads.
@@ -271,12 +280,13 @@ fn capture_cpu(serial: &mut SerialPort) -> Result<CpuSnapshot, Error> {
         "thin-hv: preflight CR0={:#018x} CR3={:#018x} CR4={:#018x}",
         cr0, cr3, cr4
     );
-    if features.edx & (1 << 16) != 0 {
+    let pat = if features.edx & (1 << 16) != 0 {
         // SAFETY: CPUID.PAT advertises IA32_PAT; RDMSR does not change it.
-        unsafe { log_msr(serial, "IA32_PAT", cpu::IA32_PAT) };
+        Some(unsafe { log_msr(serial, "IA32_PAT", cpu::IA32_PAT) })
     } else {
         let _ = writeln!(serial, "thin-hv: preflight IA32_PAT=unavailable");
-    }
+        None
+    };
     let mtrr = if features.edx & (1 << 12) != 0 {
         // SAFETY: CPUID.MTRR advertises MTRRCAP and MTRR_DEF_TYPE.
         let (capability, default_type) = unsafe {
@@ -331,6 +341,11 @@ fn capture_cpu(serial: &mut SerialPort) -> Result<CpuSnapshot, Error> {
     Ok(CpuSnapshot {
         physical_bits,
         cr4,
+        pat,
+        host_pages: platform_memory::PageCapabilities::from_host_cpuid(
+            features.edx,
+            cpu::cpuid(0x8000_0001, 0).edx,
+        ),
         ept_caps,
         mtrr,
     })
@@ -813,6 +828,8 @@ mod tests {
         let mut cpu = CpuSnapshot {
             physical_bits: 52,
             cr4: 0,
+            pat: None,
+            host_pages: platform_memory::PageCapabilities::from_host_cpuid(0, 0),
             ept_caps: None,
             mtrr: None,
         };
@@ -830,6 +847,11 @@ mod tests {
         cpu.physical_bits = 36;
         assert!(cpu.identity_range_supported((1 << 36) - 4096, 4096));
         assert!(!cpu.identity_range_supported((1 << 36) - 4096, 4097));
+        assert!(cpu.host_paging().is_err());
+        cpu.pat = Some(6);
+        assert!(cpu.host_paging().is_ok());
+        cpu.pat = Some(2);
+        assert!(cpu.host_paging().is_err());
     }
 
     #[test]
@@ -837,6 +859,8 @@ mod tests {
         let mut cpu = CpuSnapshot {
             physical_bits: 36,
             cr4: 0,
+            pat: None,
+            host_pages: platform_memory::PageCapabilities::from_host_cpuid(0, 0),
             ept_caps: None,
             mtrr: None,
         };

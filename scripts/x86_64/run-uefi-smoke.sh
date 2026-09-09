@@ -431,8 +431,9 @@ check_preflight_ept_log() {
 # Independent of terminal exception/abort verdicts: those fixtures must still
 # prove that the real Direct carrier consumed a complete platform EPT.
 check_direct_platform_log() {
-    local log=$1 high=$2 line count=0 high_bar=0 bytes transcript
-    local pattern='^thin-hv: direct platform EPT PASS source=uefi\+mtrr\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 host_map=fixed-8g bootstrap=shared-runtime physical_ready=0$'
+    local log=$1 high=$2 line count=0 hosts=0 high_bar=0 bytes transcript
+    local pattern='^thin-hv: direct platform EPT PASS source=uefi\+mtrr\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 host_map=platform-ram bootstrap=shared-runtime physical_ready=0$'
+    local host_pattern='^thin-hv: direct platform HOST PASS tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 mmio_window=uc physical_ready=0$'
     [[ "$high" == 0 || "$high" == 1 ]] || return 1
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
@@ -441,11 +442,16 @@ check_direct_platform_log() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
         if [[ "$line" =~ $pattern ]]; then
+            ((hosts == count)) || return 1
             ((BASH_REMATCH[1] <= 256)) || return 1
             if ((${#BASH_REMATCH[2]} == 20)) && [[ ${BASH_REMATCH[2]} > 18446744073709551615 ]]; then return 1; fi
             ((count += 1))
             ((count <= 64)) || return 1 # bounded reset/reboot transcripts
-        elif [[ "$line" == 'thin-hv: direct platform EPT '* ]]; then
+        elif [[ "$line" =~ $host_pattern ]]; then
+            ((count == hosts + 1 && BASH_REMATCH[1] <= 256)) || return 1
+            if ((${#BASH_REMATCH[2]} == 20)) && [[ ${BASH_REMATCH[2]} > 18446744073709551615 ]]; then return 1; fi
+            ((hosts += 1))
+        elif [[ "$line" == 'thin-hv: direct platform EPT '* || "$line" == 'thin-hv: direct platform HOST '* ]]; then
             return 1
         elif [[ "$line" == 'thin-hv: preflight PCI MMIO '* ]]; then
             [[ "$line" =~ ' highest_bar_end=0x'([0-9a-f]{16})' mmio_complete=0 direct_vmx_ready=0'$ ]] || return 1
@@ -453,7 +459,7 @@ check_direct_platform_log() {
             if [[ ${BASH_REMATCH[1]} > 0000000200000000 ]]; then high_bar=1; fi
         fi
     done <<<"$transcript"
-    ((count > 0 && (high == 0 || high_bar == 1)))
+    ((count > 0 && hosts == count && (high == 0 || high_bar == 1)))
 }
 
 # Validate the complete ordered transcript, not just the final fixture marker.

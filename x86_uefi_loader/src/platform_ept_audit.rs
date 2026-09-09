@@ -141,6 +141,12 @@ impl AuditStorage {
             .ok_or_else(|| report(serial, "EPT arena", ept::BuildError::Storage))?;
         let tables = ept::build_platform_identity(&plan, pages, physical)
             .map_err(|error| report(serial, "EPT construction", error))?;
+        let host_pages = ept::required_host_pages(&plan, cpu.host_paging()?)
+            .map_err(|error| report(serial, "host map sizing", error))?;
+        let _ = writeln!(
+            serial,
+            "thin-hv: preflight HOST sizing PASS tables={host_pages} mmio_window=uc activated=0 direct_vmx_ready=0"
+        );
         let _ = writeln!(
             serial,
             "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi+pci tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",

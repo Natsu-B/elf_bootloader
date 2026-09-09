@@ -64,7 +64,7 @@ backend=${LINUX_KVM_BACKEND:-direct-vmx}
 cycles=${LINUX_KVM_CYCLES:-64}
 timeout_seconds=${LINUX_KVM_TIMEOUT_SECONDS:-300}
 memory=${LINUX_KVM_MEMORY:-2G}
-case "$memory" in 2G|4G) ;; *) die 'LINUX_KVM_MEMORY must be 2G or 4G' ;; esac
+case "$memory" in 2G|4G|12G) ;; *) die 'LINUX_KVM_MEMORY must be 2G, 4G or 12G' ;; esac
 host_xstate_test=${LINUX_KVM_HOST_XSTATE_TEST:-0}
 [[ "$host_xstate_test" =~ ^[01]$ ]] || die 'LINUX_KVM_HOST_XSTATE_TEST must be 0 or 1'
 [[ "$host_xstate_test" == 0 || "$backend" == direct-vmx ]] || die 'host XSTATE fixture requires project Direct L0'

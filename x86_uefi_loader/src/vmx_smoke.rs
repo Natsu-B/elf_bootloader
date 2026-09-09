@@ -9,6 +9,7 @@ use crate::SerialPort;
 use crate::chainload;
 use crate::platform_acpi;
 use crate::platform_resources;
+use crate::platform_resources::MmioMap;
 use crate::platform_snapshot;
 use crate::runtime_variables;
 use core::ffi::c_void;
@@ -55,6 +56,7 @@ use nested_vmx::vpid::Namespace as VpidNamespace;
 use r_efi::efi;
 use uefi_variable_overlay::ProfileId;
 use x86_64_hal::addr::EptPhys;
+use x86_64_hal::addr::HostPhys;
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
 use x86_64_hal::cpu;
@@ -91,14 +93,11 @@ const HOST_STACK_PAGE: u64 = MSR_BITMAP_PAGE + 1;
 const GUEST_STACK_PAGE: u64 = HOST_STACK_PAGE + 4;
 /// Linux's EFI path uses more than the 128 KiB stack needed by small payloads.
 const GUEST_STACK_PAGES: u64 = 64;
-/// PML4 page for the L0-owned eight-gibibyte identity map.
-const HOST_PML4_PAGE: u64 = GUEST_STACK_PAGE + GUEST_STACK_PAGES;
-/// PDPT page for the L0-owned eight-gibibyte identity map.
-const HOST_PDPT_PAGE: u64 = HOST_PML4_PAGE + 1;
-/// First of eight L0-owned page directories.
-const HOST_PD_FIRST_PAGE: u64 = HOST_PDPT_PAGE + 1;
+/// Private platform RAM tables and one CPU-owned temporary MMIO window.
+const HOST_TABLE_FIRST_PAGE: u64 = GUEST_STACK_PAGE + GUEST_STACK_PAGES;
+const HOST_TABLE_PAGES: usize = 256;
 /// Private GDT/TSS, IDT and four independent IST stacks, after the host tables.
-const HOST_ENVIRONMENT_FIRST_PAGE: u64 = HOST_PD_FIRST_PAGE + 8;
+const HOST_ENVIRONMENT_FIRST_PAGE: u64 = HOST_TABLE_FIRST_PAGE + HOST_TABLE_PAGES as u64;
 /// Inactive, deliberately invalid-revision page used only to record VMX error 11.
 const ERROR_REVISION_PAGE: u64 =
     HOST_ENVIRONMENT_FIRST_PAGE + host_state::HOST_ENVIRONMENT_PAGES as u64;
@@ -107,8 +106,9 @@ const CPU_STATE_FIRST_PAGE: u64 = ERROR_REVISION_PAGE + 1;
 const CPU_STATE_PAGES: usize = core::mem::size_of::<SpinLock<CpuRuntimeState>>().div_ceil(4096);
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
-/// Upper bound of the smoke monitor's identity-mapped physical space.
-const IDENTITY_MAP_LIMIT: u64 = 1 << 33;
+/// Low-canonical identity limit of the private four-level HOST_CR3. Actual
+/// coverage still requires validated RAM; this is never a blanket mapping.
+const IDENTITY_MAP_LIMIT: u64 = 1 << 47;
 /// VMCALL basic exit reason.
 const EXIT_REASON_VMCALL: u64 = 18;
 /// CPUID basic exit reason.
@@ -628,7 +628,8 @@ fn log_diagnostic_summary(serial: &mut SerialPort) {
     write_raw_newline(serial);
 }
 
-const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == HOST_ENVIRONMENT_FIRST_PAGE);
+const _: () =
+    assert!(HOST_TABLE_FIRST_PAGE + HOST_TABLE_PAGES as u64 == HOST_ENVIRONMENT_FIRST_PAGE);
 const _: () = assert!(ERROR_REVISION_PAGE + 1 == CPU_STATE_FIRST_PAGE);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
@@ -685,7 +686,11 @@ struct CpuRuntimeState {
     vpids: VpidNamespace,
     exit_snapshot: Option<ExitSnapshot>,
     ram: FirmwareMap<205>,
+    basic: vmx::VmxBasic,
     private: [(u64, u64); 2],
+    mmio: MmioMap,
+    /// Absent only for host policy tests, which never execute physical access.
+    window: Option<ept::HostWindow>,
     entry: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
     entry_count: u32,
     exit_capture: [MsrEntry; 2],
@@ -700,12 +705,21 @@ struct CpuRuntimeState {
 
 impl CpuRuntimeState {
     /// Initial state is overwritten by a carrier snapshot before nested entry.
-    fn new(ram: FirmwareMap<205>, private: [(u64, u64); 2]) -> Self {
+    fn new(
+        ram: FirmwareMap<205>,
+        basic: vmx::VmxBasic,
+        private: [(u64, u64); 2],
+        mmio: MmioMap,
+        window: Option<ept::HostWindow>,
+    ) -> Self {
         Self {
             vpids: VpidNamespace::new(),
             exit_snapshot: None,
             ram,
+            basic,
             private,
+            mmio,
+            window,
             entry: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
             entry_count: 0,
             exit_capture: [MsrEntry::new(0x1d9, 0), MsrEntry::new(0x38f, 0)],
@@ -733,6 +747,131 @@ impl CpuRuntimeState {
             && self.ram.allows_ram_access(address, bytes, write)
     }
 
+    /// Validates only this CPU's two allocated VMCS roles, never an arbitrary
+    /// private address and never a guest VMCS merely because it lies in RAM.
+    fn private_vmcs(&self, address: u64) -> Option<VmcsPhys> {
+        let (base, limit) = self.private[0];
+        let end = address.checked_add(PAGE_SIZE)?;
+        if ![1, ERROR_REVISION_PAGE]
+            .into_iter()
+            .any(|page| base.checked_add(page * PAGE_SIZE) == Some(address))
+            || end > limit
+            || end > IDENTITY_MAP_LIMIT
+            || !self.ram.allows_ram_access(address, PAGE_SIZE, true)
+        {
+            return None;
+        }
+        VmcsPhys::new(address)
+    }
+
+    /// BASIC's 32-bit VMX-region restriction is independent of CPUID MAXPHYADDR.
+    /// Lists use the architectural physical width instead, so do not apply this
+    /// narrower rule to ordinary operands or MSR lists.
+    fn allows_vmx_region(&self, address: u64) -> bool {
+        (!self.basic.physical_address_width_32 || address < 1 << 32)
+            && address.is_multiple_of(PAGE_SIZE)
+            && self.allows_list_access(address, PAGE_SIZE, true)
+    }
+
+    /// Guest operands may use the explicit L1 stack within the retained block,
+    /// but never any other monitor data, paging structure or runtime PE page.
+    fn allows_operand_ram(&self, address: u64, bytes: u64, write: bool) -> bool {
+        let Some(end) = address.checked_add(bytes) else {
+            return false;
+        };
+        let stack = self.private[0].0.checked_add(GUEST_STACK_PAGE * PAGE_SIZE);
+        let stack_end = stack.and_then(|start| start.checked_add(GUEST_STACK_PAGES * PAGE_SIZE));
+        let guest_stack = stack.zip(stack_end).is_some_and(|(start, limit)| {
+            limit <= self.private[0].1 && start <= address && end <= limit
+        });
+        (self.allows_list_access(address, bytes, write) || guest_stack)
+            && end <= IDENTITY_MAP_LIMIT
+            && self.ram.allows_ram_access(address, bytes, write)
+    }
+
+    /// No speculative physical dereference: MMIO must be in the validated UC
+    /// inventory and outside every monitor allocation. Holes remain backing
+    /// failures, distinct from the guest's architectural paging exceptions.
+    fn operand_backing(&self, address: u64, write: bool) -> Option<bool> {
+        if self.allows_operand_ram(address, 1, write) {
+            return Some(false);
+        }
+        let end = address.checked_add(1)?;
+        (self
+            .private
+            .iter()
+            .all(|&(start, limit)| end <= start || limit <= address)
+            && self
+                .mmio
+                .ranges()
+                .iter()
+                .any(|range| range.start() <= address && end <= range.end()))
+        .then_some(true)
+    }
+
+    /// One checked byte access. The short per-CPU lock serializes the scratch
+    /// PTE; no callback, allocation, nested entry or guest execution intervenes.
+    fn operand_byte(&mut self, physical: u64, value: Option<u8>) -> Option<u8> {
+        let mmio = self.operand_backing(physical, value.is_some())?;
+        let window = if mmio { Some(self.window?) } else { None };
+        let address = if let Some(window) = window {
+            let entry = window.entry(HostPhys::new(physical & !4095)?).ok()?;
+            // SAFETY: this CPU owns the retained WB host table arena and its
+            // only scratch PTE. No Rust table borrow survives construction; IF
+            // is clear and the CPU-state lock excludes concurrent window use.
+            // The selected page is validated UC MMIO, never a RAM cache alias.
+            unsafe {
+                ptr::write_volatile(window.pte_address() as *mut u64, entry);
+                core::arch::asm!("invlpg [{address}]", address = in(reg) ept::HostWindow::VIRTUAL_BASE, options(nostack, preserves_flags));
+            }
+            ept::HostWindow::VIRTUAL_BASE + (physical & 4095)
+        } else {
+            physical
+        };
+        let result;
+        // SAFETY: coverage, width, RAM permissions/ownership or the active UC
+        // window were checked above. The sole L1 CPU is stopped. Integer-address
+        // assembly also permits legitimate RAM at PA zero without a Rust null
+        // dereference. Exactly one byte is accessed, with no implicit SIMD use.
+        unsafe {
+            if let Some(value) = value {
+                core::arch::asm!("mov byte ptr [{address}], {value}", address = in(reg) address, value = in(reg_byte) value, options(nostack, preserves_flags));
+                result = value;
+            } else {
+                core::arch::asm!("mov {value}, byte ptr [{address}]", address = in(reg) address, value = out(reg_byte) result, options(nostack, preserves_flags));
+            }
+        }
+        if let Some(window) = window {
+            // SAFETY: the same CPU still exclusively owns this installed PTE;
+            // clear it and evict the translation before releasing the lock.
+            unsafe {
+                ptr::write_volatile(window.pte_address() as *mut u64, 0);
+                core::arch::asm!("invlpg [{address}]", address = in(reg) ept::HostWindow::VIRTUAL_BASE, options(nostack, preserves_flags));
+            }
+        }
+        Some(result)
+    }
+
+    /// Page tables must be RAM, never MMIO. A/D updates use the same checked
+    /// ownership/permissions as payload accesses, with no host-null pointer UB.
+    fn paging_word(&self, physical: u64, update: u64) -> Option<u64> {
+        if !physical.is_multiple_of(8) || !self.allows_operand_ram(physical, 8, update != 0) {
+            return None;
+        }
+        // SAFETY: the complete aligned word is accessible foreign RAM and L1
+        // is stopped on this only virtualized CPU. The walker supplies only
+        // architectural A/D bits. Assembly handles RAM at physical zero too.
+        unsafe {
+            let mut value: u64;
+            core::arch::asm!("mov {value}, [{address}]", value = out(reg) value, address = in(reg) physical, options(nostack, preserves_flags));
+            if update != 0 {
+                value |= update;
+                core::arch::asm!("mov [{address}], {value}", address = in(reg) physical, value = in(reg) value, options(nostack, preserves_flags));
+            }
+            Some(value)
+        }
+    }
+
     /// Captures ordinary RAM without performing a guest-visible MSR write.
     /// Hardware still checks contents/value faults at the actual entry stage.
     fn prepare_entry(&mut self, list: MsrList) -> Option<(u64, u32)> {
@@ -750,7 +889,7 @@ impl CpuRuntimeState {
             // This BSP is the only running L1 CPU and is stopped; the source is
             // not MMIO or any Rust-owned monitor object. The private destination
             // is not published to hardware until the loop and lock complete.
-            self.entry[index as usize] = unsafe { ptr::read_volatile(source as *const MsrEntry) };
+            self.entry[index as usize] = unsafe { read_physical_msr_entry(source) };
         }
         self.entry_count = list.count();
         Some((self.entry.as_ptr() as usize as u64, self.entry_count))
@@ -790,7 +929,7 @@ impl CpuRuntimeState {
         // SAFETY: List and the complete RAM/ownership check establish alignment,
         // initialized foreign RAM and current host-map coverage. No other guest
         // CPU runs; the source cannot alias any Rust-owned monitor object.
-        Some(unsafe { ptr::read_volatile(source as *const MsrEntry) })
+        Some(unsafe { read_physical_msr_entry(source) })
     }
 
     /// Stores only the value half, preserving L1's index and reserved word.
@@ -852,6 +991,28 @@ impl CpuRuntimeState {
             self.store_value(list, index, value)?;
         }
         Some(Ok(()))
+    }
+}
+
+/// Reads two aligned words without forming a Rust pointer at physical zero.
+///
+/// # Safety
+/// The caller must prove complete readable, identity-mapped foreign RAM for the
+/// aligned 16-byte record, with no running guest CPU or Rust-owned object alias.
+unsafe fn read_physical_msr_entry(address: u64) -> MsrEntry {
+    let index: u64;
+    let value: u64;
+    // SAFETY: the caller validated both complete words and stopped their only
+    // guest owner. These scalar loads preserve reserved bits and use no SIMD.
+    unsafe {
+        core::arch::asm!("mov {index}, [{address}]", "mov {value}, [{address} + 8]",
+            address = in(reg) address, index = out(reg) index, value = out(reg) value,
+            options(nostack, preserves_flags));
+    }
+    MsrEntry {
+        index: index as u32,
+        reserved: (index >> 32) as u32,
+        value,
     }
 }
 
@@ -1046,14 +1207,21 @@ fn run_direct_monitor(
     // SAFETY: the caller established CPUID.VMX and this application is at CPL0,
     // where the architectural VMX feature-control MSR can be read.
     let feature_control = unsafe { cpu::rdmsr(cpu::IA32_FEATURE_CONTROL) };
-    if feature_control & 1 == 0 {
-        // SAFETY: unlocked IA32_FEATURE_CONTROL may be initialized exactly once at CPL0.
-        unsafe { cpu::wrmsr(cpu::IA32_FEATURE_CONTROL, feature_control | 0b101) };
-    } else if feature_control & (1 << 2) == 0 {
+    if feature_control & 1 != 0 && feature_control & (1 << 2) == 0 {
         return Err(Error::Capability("VMX outside SMX", feature_control));
     }
 
-    let mut block = IDENTITY_MAP_LIMIT - 1;
+    let physical_bits = max_physical_address_bits()
+        .ok_or(Error::Capability("monitor physical-address width", 0))?;
+    let mut block =
+        (1_u64 << physical_bits)
+            .min(IDENTITY_MAP_LIMIT)
+            .min(if basic.physical_address_width_32 {
+                1 << 32
+            } else {
+                u64::MAX
+            })
+            - 1;
     // SAFETY: the firmware supplied system_table to this running UEFI image;
     // Boot Services are still live, and block is a writable max-address/output
     // argument for this allocation of runtime-owned pages.
@@ -1130,9 +1298,7 @@ fn run_direct_monitor(
             initialize_l1_msr_bitmap(block + MSR_BITMAP_PAGE * PAGE_SIZE);
         }
 
-        let ept_pointer = build_carrier_ept(system_table, block, &ram, serial)?;
-        // SAFETY: the ten host paging-structure pages are exclusive, aligned and zeroed.
-        let host_cr3 = unsafe { build_host_identity_8g(block) };
+        let maps = build_carrier_maps(system_table, block, &ram, serial)?;
 
         let original_cr0 = cpu::read_cr0();
         let original_cr4 = cpu::read_cr4();
@@ -1179,7 +1345,10 @@ fn run_direct_monitor(
         unsafe {
             msr_state.as_ptr().write(SpinLock::new(CpuRuntimeState::new(
                 ram,
+                basic,
                 [(block, block_end), (image_base, image_end)],
+                maps.mmio,
+                Some(maps.window),
             )));
             host_environment.bind_monitor_data(msr_state.cast());
         }
@@ -1220,6 +1389,12 @@ fn run_direct_monitor(
         }
         ORIGINAL_CR0.store(original_cr0, Ordering::Relaxed);
         ORIGINAL_CR4.store(original_cr4, Ordering::Relaxed);
+        if feature_control & 1 == 0 {
+            // SAFETY: this BSP read unlocked FEATURE_CONTROL at CPL0. All
+            // platform-map/allocation/host-state validation has now succeeded;
+            // initialize this one-way VMX permission only immediately before use.
+            unsafe { cpu::wrmsr(cpu::IA32_FEATURE_CONTROL, feature_control | 0b101) };
+        }
         // SAFETY: the original controls were saved and normalized with the VMX
         // fixed-bit MSRs; CPUID advertised XSAVE before OSXSAVE is enabled. No
         // recoverable fallible operation intervenes before VMXON's restore path.
@@ -1262,13 +1437,14 @@ fn run_direct_monitor(
 
         let result = configure_and_launch(
             vmcs,
-            ept_pointer,
+            maps.eptp,
             block + MSR_BITMAP_PAGE * PAGE_SIZE,
             fixed_cr0,
             fixed_cr4,
             original_cr4,
             host_cr4,
-            host_cr3,
+            maps.host_cr3,
+            maps.host_pat,
             &host_environment,
             block + (GUEST_STACK_PAGE + GUEST_STACK_PAGES) * PAGE_SIZE - 8,
             basic.true_controls,
@@ -1637,14 +1813,23 @@ fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
     let _ = unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
-/// Checks the live runtime allocation against a bounded firmware memory map.
-/// No VMX instruction executes until this complete platform EPT is returned.
-fn build_carrier_ept(
+/// Fully validated roots and CPU-owned access metadata, without retained borrows
+/// into temporary firmware buffers or the now hardware-owned paging arenas.
+struct CarrierMaps {
+    eptp: u64,
+    host_cr3: u64,
+    host_pat: u64,
+    window: ept::HostWindow,
+    mmio: MmioMap,
+}
+
+/// No root is published until both complete platform maps and cleanup succeed.
+fn build_carrier_maps(
     system_table: *mut efi::SystemTable,
     block: u64,
     ram: &FirmwareMap<205>,
     serial: &mut SerialPort,
-) -> Result<u64, Error> {
+) -> Result<CarrierMaps, Error> {
     platform_snapshot::with_snapshot(system_table, serial, |cpu, map, serial| {
         let reject = |stage: &'static str| chainload::Error::Firmware(stage, efi::Status::UNSUPPORTED.as_usize());
         let width = ram.physical_width();
@@ -1669,8 +1854,14 @@ fn build_carrier_ept(
             .map_err(|_| reject("carrier EPT page capabilities"))?;
         let base = block + EPT_FIRST_PAGE * PAGE_SIZE;
         let end = base + EPT_PAGES as u64 * PAGE_SIZE;
-        let private = [PhysicalRange::new(base, end, width)
-            .map_err(|_| reject("carrier EPT private range"))?];
+        let host_base = block + HOST_TABLE_FIRST_PAGE * PAGE_SIZE;
+        let host_end = host_base + HOST_TABLE_PAGES as u64 * PAGE_SIZE;
+        let private = [
+            PhysicalRange::new(base, end, width)
+                .map_err(|_| reject("carrier EPT private range"))?,
+            PhysicalRange::new(host_base, host_end, width)
+                .map_err(|_| reject("carrier host private range"))?,
+        ];
         // This post-AllocatePages map includes the complete retained monitor.
         // Intervening discovery calls allocate/free temporary RAM pools only;
         // they do not change physical RAM extents or cache attributes.
@@ -1686,10 +1877,25 @@ fn build_carrier_ept(
             let _ = writeln!(serial, "thin-hv: direct platform EPT FAIL error={error:?}");
             reject("carrier platform EPT construction")
         })?;
+        let host_policy = cpu.host_paging()?;
+        let host_physical = HostPhys::new(host_base).ok_or_else(|| reject("carrier host address"))?;
+        // SAFETY: this disjoint page-aligned arena is exclusively allocated WB
+        // runtime RAM. No CPU uses either root yet. The builder's borrows end
+        // before any hardware walk or scratch-PTE update, and all backing stays
+        // resident after successful launch, including terminal error paths.
+        let host_pages = unsafe { core::slice::from_raw_parts_mut(host_base as *mut ept::EptPage, HOST_TABLE_PAGES) };
+        let host = ept::build_host_identity(&plan, host_pages, host_physical, host_policy)
+            .map_err(|error| {
+                let _ = writeln!(serial, "thin-hv: direct platform HOST FAIL error={error:?}");
+                reject("carrier platform host construction")
+            })?;
         let _ = writeln!(serial,
-            "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables={} leaves={} private_pages={} host_map=fixed-8g bootstrap=shared-runtime physical_ready=0",
+            "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables={} leaves={} private_pages={} host_map=platform-ram bootstrap=shared-runtime physical_ready=0",
             built.table_pages(), built.leaf_count(), EPT_PAGES);
-        Ok(built.eptp())
+        let _ = writeln!(serial,
+            "thin-hv: direct platform HOST PASS tables={} leaves={} private_pages={} mmio_window=uc physical_ready=0",
+            host.table_pages(), host.leaf_count(), HOST_TABLE_PAGES);
+        Ok(CarrierMaps { eptp: built.eptp(), host_cr3: host.cr3(), host_pat: host.pat(), window: host.window(), mmio })
     }).map_err(Error::Platform)
 }
 
@@ -1753,8 +1959,7 @@ fn validate_monitor_allocation(
 }
 
 /// Requires unique writable runtime RAM with WB capability; the carrier builder
-/// separately checks effective MTRRs before publishing the EPTP. The temporary
-/// HOST_CR3 limit remains explicit until its platform-derived replacement.
+/// separately checks effective MTRRs before publishing either platform root.
 fn monitor_allocation_is_wb(regions: &[FirmwareDescriptor], base: u64) -> bool {
     let Some(end) = base.checked_add(MONITOR_PAGES as u64 * PAGE_SIZE) else {
         return false;
@@ -1793,43 +1998,6 @@ fn monitor_allocation_is_wb(regions: &[FirmwareDescriptor], base: u64) -> bool {
     covered.iter().all(|&count| count == 1)
 }
 
-/// Builds the L0-owned page tables used after firmware memory is reclaimed.
-///
-/// # Safety
-///
-/// `block` must point to the exclusive, zeroed `MONITOR_PAGES` allocation.
-unsafe fn build_host_identity_8g(block: u64) -> u64 {
-    const PRESENT_WRITE: u64 = 0b11;
-    const LARGE_PAGE: u64 = 1 << 7;
-
-    let pml4 = block + HOST_PML4_PAGE * PAGE_SIZE;
-    let pdpt = block + HOST_PDPT_PAGE * PAGE_SIZE;
-    // SAFETY: the caller provides the exclusive ten-page table area.
-    unsafe { ptr::write_volatile(pml4 as *mut u64, pdpt | PRESENT_WRITE) };
-    for directory in 0_u64..8 {
-        let pd = block + (HOST_PD_FIRST_PAGE + directory) * PAGE_SIZE;
-        // SAFETY: each index is within its exclusive 512-entry page.
-        unsafe {
-            ptr::write_volatile(
-                (pdpt as *mut u64).add(directory as usize),
-                pd | PRESENT_WRITE,
-            );
-        }
-        for entry in 0_u64..512 {
-            let physical = (directory * 512 + entry) << 21;
-            // ponytail: 2 MiB RWX leaves cover the trusted 8 GiB smoke map;
-            // split and protect only when enforcing an untrusted-L1 boundary.
-            unsafe {
-                ptr::write_volatile(
-                    (pd as *mut u64).add(entry as usize),
-                    physical | PRESENT_WRITE | LARGE_PAGE,
-                );
-            }
-        }
-    }
-    pml4
-}
-
 /// Configures the current VMCS and launches the non-root marker.
 #[allow(clippy::too_many_arguments)]
 fn configure_and_launch(
@@ -1841,6 +2009,7 @@ fn configure_and_launch(
     guest_cr4_shadow: u64,
     host_cr4: u64,
     host_cr3: u64,
+    host_pat: u64,
     host_environment: &HostEnvironment<'_>,
     guest_rsp: u64,
     true_controls: bool,
@@ -1966,7 +2135,7 @@ fn configure_and_launch(
     }
 
     write_guest_state(host_cr0, guest_cr4_hardware, guest_rsp)?;
-    write_host_state(host_cr0, host_cr3, host_cr4, host_environment)?;
+    write_host_state(host_cr0, host_cr3, host_cr4, host_pat, host_environment)?;
     log_guest_state();
 
     GUEST_RAN.store(0, Ordering::Release);
@@ -2070,6 +2239,7 @@ fn write_host_state(
     cr0: u64,
     cr3: u64,
     cr4: u64,
+    pat: u64,
     environment: &HostEnvironment<'_>,
 ) -> Result<(), Error> {
     // The same owned fields are cached by the Direct-VMCS patch manifest, so
@@ -2079,7 +2249,7 @@ fn write_host_state(
     }
     // SAFETY: UEFI entered on an x86-64 CPU with architectural PAT/EFER support;
     // these read-only captures run at CPL0 before the first VM entry.
-    let (pat, efer) = unsafe { (cpu::rdmsr(cpu::IA32_PAT), cpu::rdmsr(cpu::IA32_EFER)) };
+    let efer = unsafe { cpu::rdmsr(cpu::IA32_EFER) };
     for (field, value) in [
         (vmcs::HOST_CR0, cr0),
         (vmcs::HOST_CR3, cr3),
@@ -3123,7 +3293,7 @@ fn handle_l1_vmptrld(
             registers,
         );
     }
-    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+    let Some(carrier) = validate_private_vmcs_address(carrier_address) else {
         stop_unexpected_exit(
             b"invalid VMPTRLD carrier",
             reason,
@@ -3198,12 +3368,16 @@ fn handle_l1_vmptrld(
     // reading its architectural header does not access the opaque VMCS body.
     // The monitor's secondary-control capability gate establishes this MSR,
     // and the VM-exit handler runs at CPL0.
-    let (revision, secondary_capability) = unsafe {
-        (
-            ptr::read_volatile(region.get() as *const u32),
-            cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2),
-        )
-    };
+    let revision: u32;
+    // SAFETY: validate_l1_vmcs_address proved the complete aligned foreign RAM
+    // page and excluded L0-owned storage. Integer-address assembly also supports
+    // physical zero. The owning L1 is stopped and only the revision word is read.
+    unsafe {
+        core::arch::asm!("mov {revision:e}, [{address}]", revision = out(reg) revision, address = in(reg) region.get(), options(nostack, preserves_flags));
+    }
+    // SAFETY: the monitor's secondary-controls capability gate established this
+    // MSR and this VM-exit handler executes at CPL0.
+    let secondary_capability = unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) };
     let Some(l1_secondary_capability) =
         restrict_vmx_capability(vmx::IA32_VMX_PROCBASED_CTLS2, secondary_capability)
     else {
@@ -3366,7 +3540,7 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+    let Some(carrier) = validate_private_vmcs_address(carrier_address) else {
         stop_unexpected_exit(
             b"invalid VMLAUNCH carrier",
             reason,
@@ -4066,7 +4240,7 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         return false;
     }
-    let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+    let Some(carrier) = validate_private_vmcs_address(carrier_address) else {
         return false;
     };
     if carrier == direct
@@ -4613,7 +4787,7 @@ fn handle_l1_vmcs_access(
                 registers,
             );
         }
-        let Some(carrier) = validate_l1_vmcs_address(carrier_address) else {
+        let Some(carrier) = validate_private_vmcs_address(carrier_address) else {
             stop_unexpected_exit(
                 b"invalid VMCS-access carrier",
                 reason,
@@ -4972,7 +5146,7 @@ fn with_l1_current_vmcs<T>(current: Option<VmcsPhys>, operation: impl FnOnce() -
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         return None;
     }
-    let carrier = validate_l1_vmcs_address(carrier_address)?;
+    let carrier = validate_private_vmcs_address(carrier_address)?;
     if let Some(current) = current {
         if current == carrier {
             return None;
@@ -5023,12 +5197,12 @@ fn publish_l1_instruction_error(error: u32) -> Option<()> {
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         return None;
     }
-    let carrier = validate_l1_vmcs_address(carrier_address)?;
+    let carrier = validate_private_vmcs_address(carrier_address)?;
     // run_direct_monitor reserves VMXON as page 0 and carrier as page 1 of the
     // same live runtime allocation. Per-pCPU bring-up must retain this ownership
     // relationship or pass the owning CPU's VMXON address explicitly.
     let vmxon = VmxonPhys::new(carrier.get().checked_sub(PAGE_SIZE)?)?;
-    let invalid_revision = validate_l1_vmcs_address(
+    let invalid_revision = validate_private_vmcs_address(
         vmxon
             .get()
             .checked_add(ERROR_REVISION_PAGE.checked_mul(PAGE_SIZE)?)?,
@@ -5148,12 +5322,16 @@ fn vmx_control_registers_valid(cr0: u64, cr4: u64) -> bool {
 
 /// Validates one direct VMCS physical operand without inspecting its header.
 fn validate_l1_vmcs_address(address: u64) -> Option<VmcsPhys> {
-    let bits = max_physical_address_bits()?;
-    let end = address.checked_add(PAGE_SIZE)?;
-    if end > 1_u64 << bits || end > IDENTITY_MAP_LIMIT {
+    if with_cpu_runtime(|state| state.allows_vmx_region(address)) != Some(true) {
         return None;
     }
     VmcsPhys::new(address)
+}
+
+/// Only the owning CPU's allocated carrier and deliberate error-recording VMCS
+/// are valid private operands. Guest VMX operands must use the disjoint L1 check.
+fn validate_private_vmcs_address(address: u64) -> Option<VmcsPhys> {
+    with_cpu_runtime(|state| state.private_vmcs(address))?
 }
 
 /// Reads an m64 operand through L1's current long-mode page tables.
@@ -5220,24 +5398,36 @@ fn l1_data_access() -> Option<DataAccess> {
 }
 
 /// Resolves one byte, retaining inaccessible L0 backing as a distinct failure.
-fn l1_operand_physical(linear: u64, state: DataAccess, write: bool) -> Result<u64, DataFault> {
-    let physical = paging::translate_data(linear, state, write, access_l1_paging_word)?;
-    if physical >= IDENTITY_MAP_LIMIT {
-        return Err(DataFault::Backing(physical));
-    }
+fn l1_operand_physical(
+    runtime: &CpuRuntimeState,
+    linear: u64,
+    state: DataAccess,
+    write: bool,
+) -> Result<u64, DataFault> {
+    let physical = paging::translate_data(linear, state, write, |address, update| {
+        runtime.paging_word(address, update)
+    })?;
+    runtime
+        .operand_backing(physical, write)
+        .ok_or(DataFault::Backing(physical))?;
     Ok(physical)
 }
 
 /// Reads an already range-checked word, including a discontiguous page crossing.
 fn read_l1_operand_word(linear: u64, state: DataAccess) -> Result<u64, DataFault> {
-    let mut value = 0;
-    for index in 0..8 {
-        let physical = l1_operand_physical(linear + index, state, false)?;
-        // SAFETY: the checked walk grants a read and resolves the byte inside
-        // this BSP smoke backend's identity map; L1 is stopped during access.
-        value |= u64::from(unsafe { ptr::read_volatile(physical as *const u8) }) << (index * 8);
-    }
-    Ok(value)
+    with_cpu_runtime(|runtime| {
+        let mut value = 0;
+        for index in 0..8 {
+            let physical = l1_operand_physical(runtime, linear + index, state, false)?;
+            value |= u64::from(
+                runtime
+                    .operand_byte(physical, None)
+                    .ok_or(DataFault::Backing(physical))?,
+            ) << (index * 8);
+        }
+        Ok(value)
+    })
+    .ok_or(DataFault::InvalidState)?
 }
 
 /// Checks all destination pages before any payload store, avoiding partial m64
@@ -5246,33 +5436,19 @@ fn read_l1_operand_word(linear: u64, state: DataAccess) -> Result<u64, DataFault
 fn write_l1_linear_u64(linear: u64, value: u64) -> Result<(), DataFault> {
     let state = l1_data_access().ok_or(DataFault::InvalidState)?;
     let linear = state.operand_range(linear, 8)?;
-    for index in 0..8 {
-        l1_operand_physical(linear + index, state, true)?;
-    }
-    for index in 0..8 {
-        let physical = l1_operand_physical(linear + index, state, true)?;
-        // SAFETY: both passes use the same stopped BSP page tables; every byte
-        // is writable and inside the identity map before the first store.
-        unsafe { ptr::write_volatile(physical as *mut u8, (value >> (index * 8)) as u8) };
-    }
-    Ok(())
-}
-
-/// Accesses one aligned guest paging word, optionally setting architectural A/D.
-fn access_l1_paging_word(physical: u64, update: u64) -> Option<u64> {
-    if physical.checked_add(7)? >= IDENTITY_MAP_LIMIT || !physical.is_multiple_of(8) {
-        return None;
-    }
-    // SAFETY: trusted L1 supplies paging structures in identity-mapped RAM;
-    // L1 is stopped on this sole virtualized BSP. No other CPU updates these
-    // words. The walker requests only A/D bits, never a mapping replacement.
-    unsafe {
-        let value = ptr::read_volatile(physical as *const u64);
-        if update != 0 {
-            ptr::write_volatile(physical as *mut u64, value | update);
+    with_cpu_runtime(|runtime| {
+        let mut addresses = [0; 8];
+        for (index, physical) in addresses.iter_mut().enumerate() {
+            *physical = l1_operand_physical(runtime, linear + index as u64, state, true)?;
         }
-        Some(value | update)
-    }
+        for (index, physical) in addresses.into_iter().enumerate() {
+            runtime
+                .operand_byte(physical, Some((value >> (index * 8)) as u8))
+                .ok_or(DataFault::Backing(physical))?;
+        }
+        Ok(())
+    })
+    .ok_or(DataFault::InvalidState)?
 }
 
 /// Delivers the precise synchronous operand exception without advancing RIP.
@@ -5313,8 +5489,8 @@ fn inject_l1_operand_fault(
         }
         DataFault::InvalidState | DataFault::Backing(_) => {
             // A missing L0 physical mapping is not an architectural guest #PF.
-            // Keep this fixed-map backend limitation visible until platform
-            // map integration, rather than fabricating a nonpresent guest PTE.
+            // Unknown physical holes/private backing or an invalid L0 context
+            // remain distinct from a fabricated nonpresent guest page-table entry.
             stop_unexpected_exit(
                 b"L0 operand backing/context unavailable",
                 reason,
@@ -5367,18 +5543,18 @@ fn max_physical_address_bits() -> Option<u8> {
 
 /// Validates the VMXON GPA and its direct-hardware revision identifier.
 fn validate_l1_vmxon_region(address: u64) -> Option<VmxonPhys> {
-    let bits = max_physical_address_bits()?;
-    let physical_limit = 1_u64 << bits;
-    if address.checked_add(PAGE_SIZE)? > physical_limit
-        || address.checked_add(PAGE_SIZE)? > IDENTITY_MAP_LIMIT
-    {
-        return None;
-    }
+    let expected = with_cpu_runtime(|state| {
+        state
+            .allows_vmx_region(address)
+            .then_some(state.basic.revision_id)
+    })??;
     let region = VmxonPhys::new(address)?;
-    // SAFETY: the checks above cover the four-byte header in the trusted
-    // identity-mapped VMXON page.
-    let revision = unsafe { ptr::read_volatile(address as *const u32) };
-    let expected = vmx::VmxBasic::from_msr(unsafe { cpu::rdmsr(vmx::IA32_VMX_BASIC) }).revision_id;
+    let revision: u32;
+    // SAFETY: the entire aligned region is validated foreign RAM. This integer
+    // address load permits a valid VMXON page at zero without a Rust null pointer.
+    unsafe {
+        core::arch::asm!("mov {revision:e}, [{address}]", revision = out(reg) revision, address = in(reg) address, options(nostack, preserves_flags));
+    }
     (revision == expected).then_some(region)
 }
 
@@ -5808,7 +5984,7 @@ mod tests {
         }
         region.physical_start = 1 << 32;
         assert!(super::monitor_allocation_is_wb(&[region], 1 << 32));
-        for base in [1 << 31, 6 << 30] {
+        for base in [1 << 31, 6 << 30, 16 << 30, 1 << 40] {
             region.physical_start = base;
             assert!(super::monitor_allocation_is_wb(&[region], base));
         }
@@ -5818,6 +5994,109 @@ mod tests {
             super::CPU_STATE_FIRST_PAGE + super::CPU_STATE_PAGES as u64,
             super::MONITOR_PAGES as u64
         );
+    }
+
+    #[test]
+    fn physical_backing_keeps_holes_mmio_and_monitor_pages_out_of_ram_accesses() {
+        let width = super::PhysicalWidth::new(48).unwrap();
+        let block = 0x100000;
+        let end = block + super::MONITOR_PAGES as u64 * 4096;
+        let high = 16 << 30;
+        let ram = super::FirmwareMap::new(
+            &[
+                super::FirmwareDescriptor {
+                    memory_type: 7,
+                    physical_start: 0,
+                    number_of_pages: 2,
+                    attributes: 8,
+                },
+                super::FirmwareDescriptor {
+                    memory_type: 6,
+                    physical_start: block,
+                    number_of_pages: super::MONITOR_PAGES as u64,
+                    attributes: 8 | (1 << 63),
+                },
+                super::FirmwareDescriptor {
+                    memory_type: 7,
+                    physical_start: high,
+                    number_of_pages: 2,
+                    attributes: 8,
+                },
+                super::FirmwareDescriptor {
+                    memory_type: 9,
+                    physical_start: high + 8192,
+                    number_of_pages: 1,
+                    attributes: 8 | 0x20000,
+                },
+                super::FirmwareDescriptor {
+                    memory_type: 7,
+                    physical_start: high + 12288,
+                    number_of_pages: 1,
+                    attributes: 8 | 0x2000,
+                },
+            ],
+            width,
+        )
+        .unwrap();
+        let mut mmio = super::MmioMap::empty(width).unwrap();
+        let device = 56 << 40;
+        mmio.insert(
+            super::PhysicalRange::new(device, device + 4096, width).unwrap(),
+            width,
+        )
+        .unwrap();
+        let mut state = super::CpuRuntimeState::new(
+            ram,
+            super::vmx::VmxBasic::from_msr(0),
+            [(block, end), (high, high + 4096)],
+            mmio,
+            None,
+        );
+        assert!(state.allows_vmx_region(high + 4096));
+        state.basic.physical_address_width_32 = true;
+        assert!(!state.allows_vmx_region(high + 4096));
+        assert!(state.allows_list_access(high + 4096, 4096, true));
+        assert!(state.allows_vmx_region(0));
+        assert!(!state.allows_vmx_region(1));
+        for page in [1, super::ERROR_REVISION_PAGE] {
+            let address = block + page * 4096;
+            assert!(state.private_vmcs(address).is_some());
+            assert!(!state.allows_list_access(address, 4096, true));
+        }
+        for address in [
+            block,
+            block + super::EPT_FIRST_PAGE * 4096,
+            high + 4096,
+            end,
+            u64::MAX,
+        ] {
+            assert!(state.private_vmcs(address).is_none());
+        }
+        for write in [false, true] {
+            assert_eq!(state.operand_backing(0, write), Some(false));
+            assert_eq!(state.operand_backing(high + 4096, write), Some(false));
+            assert_eq!(state.operand_backing(device, write), Some(true));
+            for address in [
+                8192,
+                block,
+                end - 1,
+                high,
+                high + 12288,
+                device + 4096,
+                u64::MAX,
+            ] {
+                assert_eq!(state.operand_backing(address, write), None, "{address:#x}");
+            }
+            let stack = block + super::GUEST_STACK_PAGE * 4096;
+            assert!(state.allows_operand_ram(stack, super::GUEST_STACK_PAGES * 4096, write));
+            assert!(!state.allows_operand_ram(stack - 1, 2, write));
+            assert!(!state.allows_list_access(stack, 16, write));
+            assert!(!state.allows_list_access(device, 8, write));
+            assert!(!state.allows_operand_ram(high + 8191, 2, true));
+        }
+        assert_eq!(state.operand_backing(high + 8192, false), Some(false));
+        assert_eq!(state.operand_backing(high + 8192, true), None);
+        assert_eq!(state.paging_word(device, 0), None);
     }
 
     #[test]
@@ -5833,7 +6112,14 @@ mod tests {
                 super::PhysicalWidth::new(48).unwrap(),
             )
             .unwrap();
-            super::CpuRuntimeState::new(ram, [(0x3000, 0x4000), (0x5000, 0x5101)])
+            let mmio = super::MmioMap::empty(ram.physical_width()).unwrap();
+            super::CpuRuntimeState::new(
+                ram,
+                super::vmx::VmxBasic::from_msr(0),
+                [(0x3000, 0x4000), (0x5000, 0x5101)],
+                mmio,
+                None,
+            )
         };
         let mut first = make();
         let second = make();

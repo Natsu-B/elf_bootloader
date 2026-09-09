@@ -1706,3 +1706,75 @@ canonical/physical boundaries, malformed PAT, scratch PTE, ownership/cache and
 capacity failures). `/tmp/x86-host-platform-window-tests.log`. The initial test
 fixture omitted EFI_MEMORY_RUNTIME and correctly failed with RuntimeAttribute;
 the fixture was corrected, not the validator. No AArch64 implementation changed.
+
+### Active platform HOST_CR3 and checked guest physical backing
+
+`vmx_smoke::build_carrier_maps` now constructs both roots from the same validated
+UEFI/MTRR/GCD/ACPI/PCI inventory. The fixed eight-GiB host builder is removed.
+Two separate 256-page EPT/HOST arenas are excluded from the carrier EPT; host RAM
+mappings include retained monitor storage and readable firmware RAM, not the
+guest PCI apertures. Allocation respects MAXPHYADDR, the low-canonical four-level
+limit and BASIC's independent 32-bit VMX-region restriction. Unlocked feature
+control is initialized only after platform/host validation, immediately before
+VMX use. `CpuSnapshot::host_paging` retains captured PAT and independent CPUID
+large-page support; `write_host_state` installs that exact PAT with HOST_CR3.
+Preflight additionally sizes (does not activate) the host map.
+
+`CpuRuntimeState` owns MMIO/window metadata and the captured BASIC contract.
+RAM operands, paging A/D updates, VMXON/VMCS headers and MSR lists now check actual
+RAM coverage/permissions and ownership before dereferencing physical backing.
+The L1 bootstrap stack is the explicit exception inside the monitor allocation;
+the rest of its private storage cannot be accessed by these operand helpers.
+Integer-address scalar assembly avoids Rust null-pointer dereferences for valid
+RAM at physical zero, including MSR entries. Page-crossing stores retain their
+complete first validation pass. The optional strong-UC MMIO scratch mapping is
+per-CPU, serialized by the existing short CPU-state lock and removed/INVLPG'd
+before return; no entire guest PCI aperture is copied into HOST_CR3. Its live
+device-access branch still requires a focused QEMU fixture; host tests validate
+the backing classification and PTE encoding, not actual device transactions.
+
+L0 carrier/error-recording VMCS validation is now explicitly separate from L1
+VMCS ownership. The first integration replay exposed the old helper's mixed
+callers: adding L1 exclusions rejected L0's own carrier. That run was **1 PASS,
+14 FAIL** (nine new Direct failures plus the five known reference failures),
+`/tmp/x86-host-platform-nested-first.log`. The complete caller audit and ownership
+regression test fixed it; no failed intermediate implementation was committed.
+The subsequent 15-case replay was **10 PASS, 5 FAIL**, all Direct passing,
+`/tmp/x86-host-platform-nested-owner-fixed.log`.
+
+Final available validation for this increment:
+
+* Under `nix develop --accept-flake-config --command`: `cargo fmt`,
+  `cargo fmt --check`, all five required package-filtered `cargo xtest` commands,
+  `cargo xbuild x86`, `cargo xrun x86 --release`, and
+  `cargo xrun x86 --nested --release` ran sequentially in
+  `/tmp/x86-host-platform-final-checks.log`.
+* Host tests: **253 PASS, 0 FAIL** (nested 29, HAL 59, loader 122, guest 10,
+  xtask 33). Debug x86 build/format: **PASS**. Standard QEMU: **9 PASS, 0 FAIL**
+  (seven KVM including the expected root-exception fixture, two TCG).
+* Nested now includes mandatory default-layout Direct Linux **12 GiB** as well
+  as 4 GiB high-PCI cases: **11 PASS, 5 FAIL** across 16 cases. All ten Direct
+  cases pass; reference Linux passes and the same five reference contracts fail.
+  The overall nested command still exits **1**.
+* The final BASIC-width audit also fixed VMXON/VMCLEAR's missing independent
+  32-bit-region check, with pure regression coverage preserving high-address
+  RAM/MSR-list access. Afterward `cargo fmt`, loader tests (**122 PASS**),
+  `cargo xbuild x86` and the complete release nested suite (**11 PASS, 5 FAIL**,
+  all ten Direct PASS) were repeated in
+  `/tmp/x86-host-platform-region-width-final.log`.
+* Standalone initial 12-GiB Direct Linux lifecycle: **64 cycles PASS**,
+  `/tmp/x86-host-platform-linux-12g-first.log`, using
+  `LINUX_KVM_BACKEND=direct-vmx LINUX_KVM_MEMORY=12G LINUX_KVM_CYCLES=64
+  X86_UEFI_PCI_PROFILE=firmware-default X86_UEFI_REQUIRE_HIGH_PCI=1
+  scripts/x86_64/run-linux-kvm-test.sh` under Nix. Active roots were EPT 40 tables /
+  18046 leaves and HOST 24 tables / 9621 leaves. This establishes the 12-GiB
+  configuration, not that every high RAM page has independently been exercised.
+
+The runner requires ordered paired EPT/HOST completion markers, rejects the old
+fixed-8g marker, malformed counts, missing/duplicate/out-of-order roots and
+non-UC windows; high-PCI cases still require an actual BAR above 8 GiB. There is
+no fallback to outer KVM. Remaining physical blockers include shared runtime
+bootstrap/overlay, full private-page reservation, post-launch MTRR/UEFI memory
+permission lifecycle, AP ownership, root NMI and S3 re-entry. The previous two
+timing-sensitive Direct KVM failures await replay at this new increment. No
+Windows/Hyper-V/WSL2 or physical hardware was tested; outer-KVM is reference only.

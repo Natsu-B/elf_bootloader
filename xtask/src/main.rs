@@ -970,6 +970,7 @@ fn run_x86_nested() -> Result<(), String> {
         ("direct-vmx", "0", "2G"),
         ("direct-vmx", "1", "2G"),
         ("direct-vmx", "0", "4G"),
+        ("direct-vmx", "0", "12G"),
     ] {
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
@@ -989,7 +990,7 @@ fn run_x86_nested() -> Result<(), String> {
             .env("X86_UEFI_PCI_PROFILE", "firmware-default")
             .env(
                 "X86_UEFI_REQUIRE_HIGH_PCI",
-                if memory == "4G" { "1" } else { "0" },
+                if memory == "2G" { "0" } else { "1" },
             )
             .env("X86_UEFI_MSR_ABORT_TEST", "0")
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
@@ -1006,7 +1007,9 @@ fn run_x86_nested() -> Result<(), String> {
                 "nested Linux backend={backend} host_xstate={host_xstate} memory={memory}: {other:?}"
             )),
         }
-        let suffix = if memory == "4G" {
+        let suffix = if memory == "12G" {
+            "-high-pci-12g"
+        } else if memory == "4G" {
             "-high-pci-4g"
         } else if host_xstate == "1" {
             "-host-xstate"
@@ -3402,7 +3405,7 @@ mod tests {
                 .unwrap()
                 .success()
         };
-        let direct = "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables=38 leaves=17240 private_pages=256 host_map=fixed-8g bootstrap=shared-runtime physical_ready=0\n";
+        let direct = "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables=38 leaves=17240 private_pages=256 host_map=platform-ram bootstrap=shared-runtime physical_ready=0\nthin-hv: direct platform HOST PASS tables=30 leaves=12000 private_pages=256 mmio_window=uc physical_ready=0\n";
         assert!(check_direct("0", direct));
         assert!(!check_direct("1", direct));
         assert!(check_direct("1", &format!("{gcd}{direct}")));
@@ -3418,9 +3421,21 @@ mod tests {
         ));
         assert!(check_direct("0", &direct.repeat(64)));
         assert!(!check_direct("0", &direct.repeat(65)));
+        let records: Vec<_> = direct.lines().collect();
+        assert!(!check_direct("0", records[0]));
+        assert!(!check_direct("0", records[1]));
+        assert!(!check_direct(
+            "0",
+            &format!("{}\n{}\n", records[1], records[0])
+        ));
+        assert!(!check_direct("0", &format!("{direct}{}\n", records[1])));
         for (from, to) in [
             ("tables=38", "tables=0"),
             ("tables=38", "tables=257"),
+            ("tables=30", "tables=257"),
+            ("host_map=platform-ram", "host_map=fixed-8g"),
+            ("mmio_window=uc", "mmio_window=wb"),
+            ("HOST PASS", "HOST FAIL"),
             ("leaves=17240", "leaves=18446744073709551616"),
             ("private_pages=256", "private_pages=0"),
             ("source=uefi+mtrr+gcd+acpi+pci", "source=q35-smoke"),
