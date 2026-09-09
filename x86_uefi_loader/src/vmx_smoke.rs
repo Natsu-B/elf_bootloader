@@ -2575,6 +2575,8 @@ fn require(instruction: &'static str, status: VmxStatus) -> Result<(), Error> {
 }
 
 fn vm_instruction_error() -> u64 {
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) }.unwrap_or(u64::MAX)
 }
 
@@ -2844,11 +2846,19 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
             registers,
         );
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
 
     // VM-entry event fields persist in the VMCS after delivery.
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let clear_event = unsafe { vmcs_write(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
     if clear_event != VmxStatus::Success {
         stop_unexpected_exit(
@@ -2862,6 +2872,8 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_EXTERNAL_INTERRUPT {
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         let interruption = unsafe { vmcs_read(vmcs::VM_EXIT_INTR_INFO) }.unwrap_or(0);
         let Ok(acknowledged) = acknowledged_external_interrupt(interruption) else {
             stop_unexpected_exit(
@@ -2876,6 +2888,8 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
         let prepared = if let Some(interruption) = acknowledged {
             guest_accepts_external_interrupt() == Some(true)
                 && set_carrier_interrupt_controls(true, false, false)
+                // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+                // private GS and the current resident VMCS remain live during the access.
                 && (unsafe { vmcs_write(vmcs::VM_ENTRY_INTR_INFO_FIELD, interruption) })
                     == VmxStatus::Success
         } else {
@@ -3083,6 +3097,8 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
         let fixed = (value | CR4_VMX_ENABLE | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
             & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
         for (field, field_value) in [(vmcs::GUEST_CR4, fixed), (vmcs::CR4_READ_SHADOW, value)] {
+            // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+            // private GS and the current resident VMCS remain live during the access.
             let status = unsafe { vmcs_write(field, field_value) };
             if status != VmxStatus::Success {
                 stop_unexpected_exit(
@@ -3198,8 +3214,14 @@ fn acknowledged_external_interrupt(interruption: u64) -> Result<Option<u64>, ()>
 
 /// Reports whether L1 can accept an external interrupt on the next VM entry.
 fn guest_accepts_external_interrupt() -> Option<bool> {
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let rflags = unsafe { vmcs_read(vmcs::GUEST_RFLAGS) }.ok()?;
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let interruptibility = unsafe { vmcs_read(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.ok()?;
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let activity = unsafe { vmcs_read(vmcs::GUEST_ACTIVITY_STATE) }.ok()?;
     if activity > 1 {
         return None;
@@ -3226,10 +3248,14 @@ fn set_carrier_interrupt_controls(external: bool, acknowledge: bool, window: boo
             external,
         ),
     ] {
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         let Ok(value) = (unsafe { vmcs_read(field) }) else {
             return false;
         };
         let value = if enabled { value | mask } else { value & !mask };
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
             return false;
         }
@@ -3279,11 +3305,15 @@ fn handle_l1_vmxon(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3301,6 +3331,8 @@ fn handle_l1_vmxon(
         );
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr0 = unsafe { vmcs_read(vmcs::GUEST_CR0) }.unwrap_or(0);
     if !vmx_control_registers_valid(cr0, cr4_shadow) {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3361,11 +3393,15 @@ fn handle_l1_vmxoff(
     registers: &GuestRegisters,
 ) {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3416,11 +3452,15 @@ fn handle_l1_vmclear(
     registers: &GuestRegisters,
 ) {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3459,6 +3499,8 @@ fn handle_l1_vmclear(
     }
 
     let mut carrier = u64::MAX;
+    // SAFETY: this CPU is at CPL0 in VMX root; the pointer destination is
+    // an aligned, exclusively borrowed u64 local on its live private stack.
     if unsafe { vmx::vmptrst(&mut carrier) } != VmxStatus::Success || carrier == region.get() {
         // ponytail: the trusted L1 allocator and reserved runtime block are
         // disjoint; stop on a carrier collision instead of virtualizing it.
@@ -3517,6 +3559,8 @@ fn handle_l1_vmptrld(
     registers: &GuestRegisters,
 ) {
     let mut carrier_address = u64::MAX;
+    // SAFETY: this CPU is at CPL0 in VMX root; the pointer destination is
+    // an aligned, exclusively borrowed u64 local on its live private stack.
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"saving VMPTRLD carrier failed",
@@ -3539,11 +3583,15 @@ fn handle_l1_vmptrld(
     };
 
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3684,11 +3732,15 @@ fn handle_l1_vmptrst(
     registers: &GuestRegisters,
 ) {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3731,11 +3783,15 @@ fn handle_l1_vmentry(
     registers: &GuestRegisters,
 ) -> u64 {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return VMEXIT_ACTION_RESUME;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -3764,6 +3820,8 @@ fn handle_l1_vmentry(
     };
 
     let mut carrier_address = u64::MAX;
+    // SAFETY: this CPU is at CPL0 in VMX root; the pointer destination is
+    // an aligned, exclusively borrowed u64 local on its live private stack.
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"saving VMLAUNCH carrier failed",
@@ -3829,6 +3887,8 @@ fn handle_l1_vmentry(
         Some(values)
     };
     let l1_interruptibility =
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         unsafe { vmcs_read(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
     // SAFETY: the owning CPU's carrier is still current. These are the stopped
     // L1's saved MSRs, not the private host values installed for Rust execution.
@@ -3861,6 +3921,8 @@ fn handle_l1_vmentry(
         );
     }
 
+    // SAFETY: this owner CPU remains in VMX root with private GS live. The
+    // checked, aligned VMCS backing is resident and not active on another CPU.
     if unsafe { vmcs_load(current.address()) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"selecting L1 VMCS for VMLAUNCH failed",
@@ -4139,6 +4201,8 @@ fn l1_direct_controls_supported(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()])
     // SAFETY: this CPU owns the current stopped Direct VMCS. Its execution
     // controls are never patched by L0; hardware returns the original L1 word.
     let primary =
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         u32::try_from(unsafe { vmcs_read(vmcs::CPU_BASED_VM_EXEC_CONTROL) }.ok()?).ok()?;
     for (field, legacy, true_msr) in [
         (
@@ -4242,6 +4306,8 @@ unsafe fn capture_host_validation_limits(physical_bits: u8) -> host_validation::
 fn read_direct_patch_fields() -> Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]> {
     let mut values = [0; DIRECT_VMCS_PATCH_MANIFEST.len()];
     for (value, patch) in values.iter_mut().zip(DIRECT_VMCS_PATCH_MANIFEST) {
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         *value = unsafe { vmcs_read(patch.field as u32) }.ok()?;
     }
     Some(values)
@@ -4325,6 +4391,8 @@ fn patch_direct_vmcs(
         if saved_direct[index] == value {
             continue;
         }
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         if unsafe { vmcs_write(patch.field as u32, value) } != VmxStatus::Success {
             return false;
         }
@@ -4335,6 +4403,8 @@ fn patch_direct_vmcs(
 /// Restores every L1-visible field before exposing a retained direct VMCS.
 fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
     for (value, patch) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST) {
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         if unsafe { vmcs_write(patch.field as u32, *value) } != VmxStatus::Success {
             return false;
         }
@@ -4486,6 +4556,8 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
     }
 
     let mut carrier_address = u64::MAX;
+    // SAFETY: this CPU is at CPL0 in VMX root; the pointer destination is
+    // an aligned, exclusively borrowed u64 local on its live private stack.
     if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
         return false;
     }
@@ -4493,8 +4565,12 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
         return false;
     };
     if carrier == direct
+        // SAFETY: this owner CPU remains in VMX root with private GS live. The
+        // checked, aligned VMCS backing is resident and not active on another CPU.
         || unsafe { vmcs_load(direct) } != VmxStatus::Success
         || !restore_direct_vmcs(&values)
+        // SAFETY: this owner CPU remains in VMX root with private GS live. The
+        // checked, aligned VMCS backing is resident and not active on another CPU.
         || unsafe { vmcs_load(carrier) } != VmxStatus::Success
     {
         return false;
@@ -4507,6 +4583,8 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
 /// Reflects a hardware L2 exit through VMCS01 into Linux KVM's host RIP.
 fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
     let mut current = u64::MAX;
+    // SAFETY: this CPU is at CPL0 in VMX root; the pointer destination is
+    // an aligned, exclusively borrowed u64 local on its live private stack.
     if unsafe { vmx::vmptrst(&mut current) } != VmxStatus::Success || current != run.direct.get() {
         stop_nested_exit(b"unexpected direct VMCS on L2 exit", run.direct, registers);
     }
@@ -4571,6 +4649,8 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
         Some(Err(())) => nested_vmx_abort(run.direct, 1, registers),
         None => stop_nested_exit(b"unsupported exit MSR-list backing", run.direct, registers),
     };
+    // SAFETY: this owner CPU remains in VMX root with private GS live. The
+    // checked, aligned VMCS backing is resident and not active on another CPU.
     if unsafe { vmcs_load(run.carrier) } != VmxStatus::Success {
         stop_nested_exit(
             b"restoring carrier after L2 exit failed",
@@ -4684,12 +4764,22 @@ fn nested_vmx_abort(direct: VmcsPhys, code: u32, registers: &GuestRegisters) -> 
 
 /// Stops after recovering L2's exit diagnostics only on an error path.
 fn stop_nested_exit(message: &'static [u8], direct: VmcsPhys, registers: &GuestRegisters) -> ! {
+    // SAFETY: this owner CPU remains in VMX root with private GS live. The
+    // checked, aligned VMCS backing is resident and not active on another CPU.
     if unsafe { vmcs_load(direct) } != VmxStatus::Success {
         stop_unexpected_exit(message, u64::MAX, u64::MAX, u64::MAX, u64::MAX, registers);
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let reason = unsafe { vmcs_read(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
     stop_unexpected_exit(
         message,
@@ -4803,6 +4893,8 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
     let result = if rflags & 1 != 0 {
         VmInstructionResult::VmfailInvalid
     } else if rflags & (1 << 6) != 0 {
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         let Some(error) = (unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) })
             .ok()
             .and_then(|value| u32::try_from(value).ok())
@@ -4827,6 +4919,8 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
             registers,
         );
     };
+    // SAFETY: this owner CPU remains in VMX root with private GS live. The
+    // checked, aligned VMCS backing is resident and not active on another CPU.
     if unsafe { vmcs_load(run.carrier) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"restoring carrier after VMLAUNCH failure failed",
@@ -4857,11 +4951,15 @@ fn handle_l1_vmcs_access(
     registers: &mut GuestRegisters,
 ) {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
@@ -4879,6 +4977,8 @@ fn handle_l1_vmcs_access(
         return;
     };
 
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let Some(instruction_info) = (unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) })
         .ok()
         .and_then(|value| u32::try_from(value).ok())
@@ -5047,6 +5147,8 @@ fn handle_l1_vmcs_access(
             record_diagnostic(DiagnosticEvent::L1VmreadHardware(field));
         }
         let mut carrier_address = u64::MAX;
+        // SAFETY: this CPU is at CPL0 in VMX root; the pointer destination is
+        // an aligned, exclusively borrowed u64 local on its live private stack.
         if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
             stop_unexpected_exit(
                 b"saving VMCS-access carrier failed",
@@ -5068,6 +5170,8 @@ fn handle_l1_vmcs_access(
             );
         };
         if carrier == current.address()
+            // SAFETY: this owner CPU remains in VMX root with private GS live. The
+            // checked, aligned VMCS backing is resident and not active on another CPU.
             || unsafe { vmcs_load(current.address()) } != VmxStatus::Success
         {
             stop_unexpected_exit(
@@ -5081,20 +5185,28 @@ fn handle_l1_vmcs_access(
         }
 
         let (status, read_value) = if let Some(value) = write_value {
+            // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+            // private GS and the current resident VMCS remain live during the access.
             (unsafe { vmcs_write(field, value) }, None)
         } else {
+            // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+            // private GS and the current resident VMCS remain live during the access.
             match unsafe { vmcs_read(field) } {
                 Ok(value) => (VmxStatus::Success, Some(value)),
                 Err(status) => (status, None),
             }
         };
         let hardware_error = if status == VmxStatus::FailValid {
+            // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+            // private GS and the current resident VMCS remain live during the access.
             (unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) })
                 .ok()
                 .and_then(|value| u32::try_from(value).ok())
         } else {
             None
         };
+        // SAFETY: this owner CPU remains in VMX root with private GS live. The
+        // checked, aligned VMCS backing is resident and not active on another CPU.
         if unsafe { vmcs_load(carrier) } != VmxStatus::Success {
             stop_unexpected_exit(
                 b"restoring VMCS-access carrier failed",
@@ -5187,21 +5299,31 @@ fn handle_l1_invept(
     registers: &GuestRegisters,
 ) {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
 
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let instruction_info = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) }
         .ok()
         .and_then(|value| u32::try_from(value).ok());
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let fs_base = unsafe { vmcs_read(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let gs_base = unsafe { vmcs_read(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
     let operands = instruction_info.and_then(|information| {
         let kind = guest_gpr(registers, ((information >> 28) & 0xf) as u8)?;
@@ -5288,21 +5410,31 @@ fn handle_l1_invvpid(
     registers: &GuestRegisters,
 ) {
     let state = *current_cpu().vcpu.lock();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
 
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let instruction_info = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) }
         .ok()
         .and_then(|value| u32::try_from(value).ok());
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let fs_base = unsafe { vmcs_read(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let gs_base = unsafe { vmcs_read(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
     let operands = instruction_info.and_then(|information| {
         let kind = guest_gpr(registers, ((information >> 28) & 0xf) as u8)?;
@@ -5914,6 +6046,8 @@ fn complete_vmx_instruction(
     // architectural side effect. Error publication and RIP advancement remain
     // unconditional, and changed flags still take the hardware error path.
     if completed != rflags
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         && unsafe { vmcs_write(vmcs::GUEST_RFLAGS, completed) } != VmxStatus::Success
     {
         stop_unexpected_exit(
@@ -5935,6 +6069,8 @@ fn guest_gpr(registers: &GuestRegisters, index: u8) -> Option<u64> {
         1 => registers.rcx,
         2 => registers.rdx,
         3 => registers.rbx,
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         4 => unsafe { vmcs_read(vmcs::GUEST_RSP) }.ok()?,
         5 => registers.rbp,
         6 => registers.rsi,
@@ -5958,6 +6094,8 @@ fn set_guest_gpr(registers: &mut GuestRegisters, index: u8, value: u64) -> bool 
         1 => registers.rcx = value,
         2 => registers.rdx = value,
         3 => registers.rbx = value,
+        // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+        // private GS and the current resident VMCS remain live during the access.
         4 => return unsafe { vmcs_write(vmcs::GUEST_RSP, value) } == VmxStatus::Success,
         5 => registers.rbp = value,
         6 => registers.rsi = value,
@@ -6057,6 +6195,8 @@ fn advance_guest_rip(
             registers,
         );
     };
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let status = unsafe { vmcs_write(vmcs::GUEST_RIP, next_rip) };
     if status != VmxStatus::Success {
         stop_unexpected_exit(
@@ -6151,6 +6291,8 @@ fn stop_unexpected_exit(
     registers: &GuestRegisters,
 ) -> ! {
     let vm_error = vm_instruction_error();
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let instruction_info = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) }.unwrap_or(u64::MAX);
     let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;
@@ -6213,9 +6355,17 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
     } else {
         u64::MAX
     };
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let reason = unsafe { vmcs_read(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
+    // private GS and the current resident VMCS remain live during the access.
     let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
     let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;

@@ -3303,3 +3303,218 @@ support this bounded optimization, not physical-machine or Windows speed
 claims. No test timeout, original upstream test or capability was changed.
 Full timing-sensitive Linux, S3 and Windows follow-up remains separate from
 these completed checks. AP/root-NMI/S3 lifecycle gaps are not fixed here.
+
+### Completed 61-case upstream KVM unit matrices (frozen `f01e1a5`)
+
+Both full matrices finish with the original 61-entry manifest and per-case
+limits, including all upstream APIC/NMI repetitions and the 5400-second FEP
+limit. These long-lived jobs deliberately retain their original commit;
+their results are not silently relabeled as the later performance commit.
+
+| Backend | Complete PASS | FAIL | PARTIAL | SKIP | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Direct-VMX / project L0 | 49 | 1 | 6 | 5 | 61 |
+| Outer-KVM / reference | 50 | 0 | 6 | 5 | 61 |
+
+Both strict runners exit **1**: PARTIAL and SKIP are nonpassing, not waived.
+Shared PARTIAL cases are xapic (one x2APIC check unavailable in the intentional
+xAPIC profile), emulator (MOVBE), memory (pcommit), PMU (unavailable), VMware
+backdoors (PMU-dependent check), and LA57 (six upstream skips for KVM SYSENTER
+errata/unavailable PEBS and Intel PT). Shared SKIPs are PKS, PMU LBR, PMU PEBS,
+TSX control and CET. Capability-dependent checks remain in the transcript.
+
+The Direct-only failure is `access-reduced-maxphyaddr`: 2,899,975 accesses,
+three PTE-value mismatches, guest exit 3. Two see extra A/D bits and one an
+extra A bit after faulting repeated accesses with PTE bit 36 set. The reference
+executes the same 2,899,975 accesses with zero failures. Both report host width
+46 and requested guest width 36. This difference needs further isolation;
+it is not dismissed as an upstream skip or proven to be caused by L0's operand
+walker. Normal `access` and `access_fep` pass on both backends. L2 NMI, SMP,
+LA57 and S3 tests are not evidence of physical pCPU ownership, root-mode NMI
+forwarding or the project monitor's own S3 resume lifecycle.
+
+For each backend, the existing runner command was:
+
+```sh
+LINUX_KUNIT_BACKEND="$backend" LINUX_KUNIT_CASE=all \
+LINUX_L2_KUNIT_DIR=/tmp/thin-hv-kvm-unit-tests-20260908/x86 \
+LINUX_L2_QEMU=/nix/store/dz3ivvcn2916ac16l95vzgshikxrbicr-qemu-host-cpu-only-for-vm-tests-10.1.5/bin/qemu-system-x86_64 \
+nix develop --accept-flake-config --command bash scripts/x86_64/run-linux-kunit-test.sh
+```
+
+Working directory `/tmp/x86-runtime-ownership-kunit-validation`;
+`/tmp/x86-runtime-ownership-kunit-all-batch.log` and per-backend
+`/tmp/x86-runtime-ownership-kunit-all-{direct-vmx,outer-kvm}{,-serial}.log`.
+Outer KVM remains reference evidence only. A separate final-commit Direct
+matrix was started after both of these completed; it is not counted here.
+
+### Deferred-write Windows follow-up (`3e44b3c`)
+
+The fixed-image, no-variable-overlay/default-q35 Windows pair completes:
+**normal boot and final poweroff PASS; Direct Hyper-V FAIL** at the original
+600-second limit. Live screen: firmware logo/spinner. Final screen: `Please
+wait`, no visible bugcheck. There is one monitor lifetime. Final bounded
+diagnostics report 4,167,901 entries/reflections, zero nested-entry failures,
+13,458,996 VMPTRLDs, 718,162,895 VMREADs and 153,625,270 VMWRITEs. Compared
+with the preceding 4607886 run, fewer VMCS selections are observable, but the
+workload phases/counts differ and Hyper-V still has not completed boot.
+No Windows performance/WSL2 readiness claim follows from those counters.
+
+Invocation: `VALIDATION_REPO=/tmp/x86-deferred-windows-validation`
+`WINDOWS_MATRIX_SERIAL=1 nix develop --accept-flake-config --command bash`
+`/tmp/x86-idle-guest-windows.sh`, after building release images in that same
+frozen worktree. `/tmp/x86-deferred-windows-batch.log`,
+`/tmp/x86-idle-guest-windows.FKa7Hc`. All runner/image hashes, qcow checks and
+seed comparisons pass. The live screenshot did not pause the CPU; the final
+counter capture occurs after the unchanged failure deadline. Physical OEM
+Windows, keys and activation data remain untouched; no physical test occurred.
+
+### Reduced-MAXPHYADDR reference isolation: intermittent on both A/D settings
+
+The first full reference PASS does **not** establish a Direct-only defect.
+Six additional reference boots use the same pinned `access_test.flat`, CPU
+profile, original arguments, classifier and 600-second guest limit. Only the
+reference L1's `kvm_intel.eptad` parameter differs. Each diagnostic init checks
+`/sys/module/kvm_intel/parameters/eptad` and records the actual Y/N before
+running the unchanged test. These are test-only init copies, not production
+source or a change to Direct's advertised capabilities.
+
+| Reference EPT A/D | Repeat 1 | Repeat 2 | Repeat 3 |
+| --- | --- | --- | --- |
+| Enabled, actual Y | FAIL, one extra PTE A/D update | PASS | PASS |
+| Disabled, actual N | FAIL, one extra PTE A/D update | PASS | PASS |
+
+**4 PASS, 2 FAIL**, each executing 2,899,975 accesses; all input/UKI hashes
+remain unchanged. This reproduces the same failure class without project VMX
+and rules out EPT A/D availability alone as a sufficient explanation. It does
+not waive the Direct failure, establish its entire root cause, or justify
+enabling an untested capability. The first full Direct/reference counts above
+remain their actual results. No original test or acceptance condition changed.
+
+`nix develop --accept-flake-config --command bash /tmp/x86-reduced-phys-eptad-reference.sh`
+uses existing `build-linux-uki.sh`, `run-uefi-smoke.sh` and
+`run-linux-kunit-test.sh --check-log` from the frozen reference worktree.
+`/tmp/x86-reduced-phys-eptad-reference.CMEFbj`,
+`/tmp/x86-deferred-ad-and-daily-batch.log`.
+
+### Deferred-write original Linux timing, S3 and VM-exit follow-up (`3e44b3c`)
+
+The seven original selftests plus S3 again finish **5 PASS, 3 FAIL**: xcr0,
+large-page splitting, NX huge pages, memslot modification and guest page-table
+tests pass. Memslot performance retains its original alarm failure; invalid
+guest state reaches its original 600-second guest limit; S3 still loses the
+monitor's VMX interception on resume. No bounds or capability checks were
+weakened. `/tmp/x86-idle-guest-linux.3Jbtnf`.
+
+All **24 VM-exit benchmark cases PASS** (12 Direct, 12 reference). The subsequent
+**4096-cycle/default-300-second Direct test FAILS**, with complete successful
+cycle records 1..3609 followed by timeout/missing final marker. This does not
+supersede the fixed-image A/B above as an isolated performance comparison:
+the full KVM unit and full selftest matrices also ran on the host.
+`/tmp/x86-idle-full-vmexit.oFbcgf`, `/tmp/x86-deferred-linux-batch.log`.
+Commands use `VALIDATION_REPO=/tmp/x86-deferred-linux-validation` with the same
+existing `/tmp/x86-idle-guest-linux-regressions.sh` and
+`/tmp/x86-idle-full-vmexit.sh` Nix invocations recorded above. Both scripts
+return 1 for their preserved failures; the combined batch also returns 1.
+
+### Actual Linux L2 OS and reboot/soak follow-up (`3e44b3c`)
+
+Existing `run-linux-l2-os-test.sh` and `run-linux-soak-test.sh` run on both
+backends with default q35 PCI layout and unchanged coverage/deadlines:
+**4 PASS, 0 FAIL**. Each OS test performs six complete Linux L2 boots,
+alternating one/two L2 vCPUs, with CPU/memory hashes, disk persistence across
+recreation, network packets and clean child poweroff. Each soak test performs
+1000 L2 probes per L1 boot, 128-MiB CPU/memory/disk verification, 80 hashes,
+network checks and one complete L1 reboot followed by readback/poweroff.
+
+Direct retains one L1 CPU; reference soak uses its existing two-L1-CPU profile.
+These are functional tests, not matched SMP/performance evidence. The Direct
+Linux scripts use their existing research-chainload mode; separate physical-
+UEFI/no-overlay Linux and Windows coverage is identified elsewhere. Reboot
+from firmware is not the still-broken S3 resume path. No physical hardware or
+Windows L2 workload is qualified by this Linux result.
+
+`nix develop --accept-flake-config --command bash /tmp/x86-deferred-daily-use.sh`
+invokes the existing runners from `/tmp/x86-deferred-linux-validation`, setting
+`LINUX_L2_OS_BACKEND`/`LINUX_SOAK_BACKEND` per case and the same pinned L2 QEMU.
+`/tmp/x86-deferred-daily-use.z13ce8`, `/tmp/x86-deferred-ad-and-daily-batch.log`.
+The combined diagnostic/daily-use batch exits 1 solely for the two reference
+MAXPHYADDR diagnostic failures, not for these four daily-use cases.
+
+Three fresh Direct `access-reduced-maxphyaddr` replays also finish: **0 PASS,
+3 FAIL**, with 2, 9 and 5 mismatches respectively among 2,899,975 accesses each.
+Every mismatch differs only in paging A/D bits (some are PDEs, not just PTEs).
+This is not fixed by the four-field deferred-write optimization, nor dismissed
+because the reference sometimes reproduces it. The current runner, original
+test ELF, CPU profile and 600-second guest limit are unchanged.
+`/tmp/x86-deferred-reduced-phys-batch.log`,
+`/tmp/x86-deferred-reduced-phys-{1,2,3}.log`; existing Nix command:
+`LINUX_KUNIT_BACKEND=direct-vmx LINUX_KUNIT_CASE=access-reduced-maxphyaddr`
+with the pinned `LINUX_L2_KUNIT_DIR`/`LINUX_L2_QEMU` and
+`bash scripts/x86_64/run-linux-kunit-test.sh`, repeated three times.
+
+### All 70 Linux selftests on the final runtime commit (`3e44b3c`)
+
+The complete pinned selftest list is rerun, not inferred from the earlier
+f01e1a5 batch: **56 PASS, 2 FAIL, 12 upstream SKIP / 70**. All 70 original ELF
+hashes are unchanged. Failures remain `memslot_perf_test` (142) and
+`vmx_exception_with_invalid_guest_state` (137 at its existing 600-second
+limit). The same twelve skipped tests and missing capabilities/topology are
+listed in the earlier full-matrix section; strict runner exit 1 retains them
+as nonpassing. There are no newly passing or failing classifications in this
+70-case comparison.
+
+`VALIDATION_REPO=/tmp/x86-deferred-selftests-validation MATRIX_BACKEND=direct-vmx`
+`nix develop --accept-flake-config --command bash /tmp/x86-runtime-all-selftests.sh`;
+`/tmp/x86-deferred-all-selftests.log`,
+`/tmp/x86-runtime-all-selftests-direct-vmx.0ppdrS`.
+The independently completed reference result remains 60 PASS, 0 FAIL,
+10 SKIP on its frozen reference source, not Direct evidence.
+
+Diff review from task start `3623b62` through `3e44b3c` finds 42 changed files,
+all within x86 HAL/loader/guest code, nested-VMX policy, x86 scripts, xtask/test
+manifest and this evidence record. No AArch64 production path changed. The
+user's four-line `AGENTS.md` change remains unstaged and outside our commits.
+
+### Windows status-only synthetic self-test and final safety-comment review
+
+The existing `windows-test.sh check-physical-status` completes **1 PASS,
+0 FAIL**, including its exact `hardware_queries=0` JSON, COM2 success marker
+and final Windows poweroff. This is a disposable QEMU evaluation-image
+PowerShell `-SelfTest`, **not a physical activation-status collection** and
+not Direct-VMX evidence. All three runner/script hashes remain unchanged;
+the child qcow2 check passes, and original seed image metadata and variable
+store hashes match before/after. The runner uses the default q35 profile,
+4 GiB and its existing two-CPU reference configuration.
+
+Command: `nix develop --accept-flake-config --command bash
+/tmp/x86-deferred-physical-status-selftest.sh`, which invokes the existing
+runner from the frozen `3e44b3c` worktree with a fresh test directory.
+Artifacts: `/tmp/x86-deferred-physical-status-selftest.log`,
+`/tmp/x86-deferred-status-selftest.uarUyY`. The existing host-only command
+`bash scripts/x86_64/windows/windows-test.sh check-wsl-soak` also passes;
+this static check is not a new Windows WSL/S4/soak execution.
+
+The final source review adds English `// SAFETY:` comments at 75 existing
+VMCS-access/VMPTRST sites in `vmx_smoke.rs`: CPL0/VMX-root execution, private
+GS lifetime, current/target VMCS residency and owner CPU, or aligned exclusive
+stack destinations. These sites include nested entry/failure/reflection,
+interrupt preparation, operand decoding, GPR/RIP updates and diagnostics.
+The diff consists of 150 added comment lines, with **no removed lines or
+non-comment source changes**. Long-running QEMU runs continue to use their
+unchanged frozen `3e44b3c` artifacts; this follow-up does not change runtime
+semantics or restart their limits.
+
+Added `unwrap`/`expect`/lint-suppression candidate review from task start finds
+178 matches, all inside host test modules, none in the added hardware paths.
+The remaining five short-window `unsafe` annotation candidates have longer
+existing SAFETY explanations immediately above their declarations; inspected
+PCI function-pointer conversions, atomic paging words, resident entry,
+host-environment construction and recorded VMfail operations retain them.
+This is a scoped source/diff review, not a proof of whole-monitor correctness.
+
+Validation: `nix develop --accept-flake-config --command bash -c 'cargo fmt &&
+cargo fmt --check && cargo xtest -p x86_uefi_loader && cargo xbuild x86 &&
+cargo fmt'`: **211 loader host PASS, 0 FAIL**, x86 build/monitor ISA checks
+PASS, formatting PASS; `git diff --check` PASS.
+`/tmp/x86-final-safety-comments-validation.log`.
