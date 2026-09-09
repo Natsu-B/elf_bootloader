@@ -1,7 +1,8 @@
 //! Disposable EPT construction from the actual read-only preflight snapshot.
 //!
-//! This validates UEFI-described ranges only. It does not discover all PCI/APIC
-//! apertures, publish an EPTP, enable VMX, or leave any allocation resident.
+//! This validates UEFI memory plus captured GCD MMIO ranges. It does not prove
+//! complete PCI/APIC aperture coverage, publish an EPTP, enable VMX, or leave
+//! any allocation resident.
 
 use crate::SerialPort;
 use crate::chainload;
@@ -83,6 +84,7 @@ impl AuditStorage {
         &mut self,
         cpu: &CpuSnapshot,
         map: &MemoryMap<'_>,
+        mmio: &[PhysicalRange],
         serial: &mut SerialPort,
     ) -> Result<(), Error> {
         let Some(capability) = cpu.ept_caps() else {
@@ -133,7 +135,7 @@ impl AuditStorage {
         let count =
             platform_memory::decode_uefi_map(map.bytes(), map.stride(), map.version(), descriptors)
                 .map_err(|error| report(serial, "UEFI map", error))?;
-        let plan = PlatformMap::new(&descriptors[..count], &private, &[], mtrrs, capabilities)
+        let plan = PlatformMap::new(&descriptors[..count], &private, mmio, mtrrs, capabilities)
             .map_err(|error| report(serial, "platform map", error))?;
         let physical = EptPhys::new(self.base)
             .ok_or_else(|| report(serial, "EPT arena", ept::BuildError::Storage))?;
@@ -141,7 +143,7 @@ impl AuditStorage {
             .map_err(|error| report(serial, "EPT construction", error))?;
         let _ = writeln!(
             serial,
-            "thin-hv: preflight EPT audit PASS scope=uefi-memory-map tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",
+            "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",
             tables.table_pages(),
             tables.leaf_count(),
             TOTAL_PAGES

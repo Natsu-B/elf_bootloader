@@ -3259,17 +3259,26 @@ mod tests {
         let vmx_present = "thin-hv: preflight VMX=1 direct_vmx_ready=0\n";
         let skip =
             "thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0\n";
+        let gcd = concat!(
+            "thin-hv: preflight GCD MMIO index=0 start=0x00000000fec00000 end=0x00000000fec01000 ept_type=UC\n",
+            "thin-hv: preflight GCD MMIO index=1 start=0x0000008000000000 end=0x0000008000001000 ept_type=UC\n",
+            "thin-hv: preflight GCD PASS descriptors=3 mmio_ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
+        );
         let pass = |tables: &str, leaves: &str| {
             format!(
-                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
+                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
             )
         };
-        let kvm = format!("{vmx_present}{}", pass("12", "3456"));
-        let tcg = format!("{vmx_absent}{skip}");
+        let kvm = format!("{vmx_present}{gcd}{}", pass("12", "3456"));
+        let tcg = format!("{vmx_absent}{gcd}{skip}");
         assert!(check("kvm", &kvm));
         assert!(check("tcg", &tcg));
-        assert!(check("kvm", &pass("1", "1")));
-        assert!(check("kvm", &pass("256", "18446744073709551615")));
+        assert!(check("kvm", &format!("{gcd}{}", pass("1", "1"))));
+        assert!(check(
+            "kvm",
+            &format!("{gcd}{}", pass("256", "18446744073709551615"))
+        ));
+        assert!(!check("kvm", &pass("1", "1")));
         assert!(check("kvm", &kvm.replace('\n', "\r\n")));
         assert!(check("tcg", &tcg.replace('\n', "\r\n")));
         assert!(check("kvm", kvm.trim_end_matches('\n')));
@@ -3280,7 +3289,7 @@ mod tests {
             assert!(!check(accel, &kvm));
         }
         for tables in ["0", "01", "-1", "257", "9999", "18446744073709551616"] {
-            assert!(!check("kvm", &pass(tables, "1")));
+            assert!(!check("kvm", &format!("{gcd}{}", pass(tables, "1"))));
         }
         for leaves in [
             "0",
@@ -3290,7 +3299,7 @@ mod tests {
             "18446744073709551616",
             "999999999999999999999",
         ] {
-            assert!(!check("kvm", &pass("1", leaves)));
+            assert!(!check("kvm", &format!("{gcd}{}", pass("1", leaves))));
         }
         for (accel, valid) in [("kvm", &kvm), ("tcg", &tcg)] {
             assert!(!check(accel, ""));
@@ -3316,7 +3325,7 @@ mod tests {
         for (from, to) in [
             ("private_pages=288", "private_pages=287"),
             ("mmio_complete=0", "mmio_complete=1"),
-            ("scope=uefi-memory-map", "scope=qemu-fallback"),
+            ("scope=uefi-memory-map+gcd", "scope=qemu-fallback"),
             ("leaves=3456", "leaves=3456 extra=1"),
         ] {
             assert!(!check("kvm", &kvm.replace(from, to)));
@@ -3327,6 +3336,28 @@ mod tests {
         ));
         assert!(!check("kvm", &format!("{kvm}{skip}")));
         assert!(!check("tcg", &format!("{tcg}{}", pass("1", "1"))));
+        for (accel, valid) in [("kvm", &kvm), ("tcg", &tcg)] {
+            for (from, to) in [
+                ("descriptors=3", "descriptors=0"),
+                ("descriptors=3", "descriptors=1"),
+                ("descriptors=3", "descriptors=4097"),
+                ("mmio_ranges=2", "mmio_ranges=1"),
+                ("index=1", "index=0"),
+                ("index=1", "index=01"),
+                ("0x0000008000001000", "0x0000008000000000"),
+                ("0x0000008000001000", "0x0000008000001001"),
+                ("0x0000008000001000", "0x0010000000001000"),
+                ("ept_type=UC", "ept_type=WB"),
+                ("GCD PASS", "GCD unavailable"),
+            ] {
+                assert!(
+                    !check(accel, &valid.replace(from, to)),
+                    "{accel}: {from} -> {to}"
+                );
+            }
+            assert!(!check(accel, &valid.replace(gcd, "")));
+            assert!(!check(accel, &format!("{valid}{gcd}")));
+        }
     }
 
     #[cfg(unix)]

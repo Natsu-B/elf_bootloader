@@ -340,7 +340,10 @@ check_host_exception_log() {
 # The application may legitimately skip elsewhere; that is not this KVM test's PASS.
 check_preflight_ept_log() {
     local accel=$1 log=$2 line transcript bytes passes=0 skips=0 vmx_markers=0 tables leaves
-    local pass_pattern='^thin-hv: preflight EPT audit PASS scope=uefi-memory-map tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=288 mmio_complete=0 direct_vmx_ready=0$'
+    local gcd=0 ranges=0 previous_end=0 start end
+    local pass_pattern='^thin-hv: preflight EPT audit PASS scope=uefi-memory-map\+gcd tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=288 mmio_complete=0 direct_vmx_ready=0$'
+    local gcd_pattern='^thin-hv: preflight GCD PASS descriptors=([1-9][0-9]{0,3}) mmio_ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
+    local range_pattern='^thin-hv: preflight GCD MMIO index=(0|[1-9][0-9]{0,2}) start=0x([0-9a-f]{16}) end=0x([0-9a-f]{16}) ept_type=UC$'
     [[ "$accel" == kvm || "$accel" == tcg ]] || return 1
     [[ -f "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
@@ -352,9 +355,25 @@ check_preflight_ept_log() {
     ((${#transcript} <= 262144)) || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
+        if [[ "$line" =~ $range_pattern ]]; then
+            ((gcd == 0 && passes == 0 && skips == 0 && ranges < 128)) || return 1
+            ((BASH_REMATCH[1] == ranges)) || return 1
+            # CPUID MAXPHYADDR never exceeds 52: reject before signed arithmetic.
+            [[ ${BASH_REMATCH[2]} < 0010000000000000 && ${BASH_REMATCH[3]} < 0010000000000001 ]] || return 1
+            start=$((16#${BASH_REMATCH[2]})); end=$((16#${BASH_REMATCH[3]}))
+            ((start < end && start % 4096 == 0 && end % 4096 == 0 && start >= previous_end)) || return 1
+            previous_end=$end
+            ((ranges += 1))
+            continue
+        fi
+        if [[ "$line" =~ $gcd_pattern ]]; then
+            ((gcd == 0 && passes == 0 && skips == 0 && BASH_REMATCH[1] <= 4096 && BASH_REMATCH[1] >= ranges && BASH_REMATCH[2] == ranges && ranges > 0)) || return 1
+            gcd=1
+            continue
+        fi
         if [[ "$line" =~ $pass_pattern ]]; then
             [[ "$accel" == kvm ]] || return 1
-            ((passes == 0 && skips == 0)) || return 1
+            ((passes == 0 && skips == 0 && gcd == 1)) || return 1
             tables=${BASH_REMATCH[1]}
             leaves=${BASH_REMATCH[2]}
             ((tables <= 256)) || return 1
@@ -368,7 +387,7 @@ check_preflight_ept_log() {
         case "$line" in
             'thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0')
                 [[ "$accel" == tcg ]] || return 1
-                ((skips == 0 && passes == 0)) || return 1
+                ((skips == 0 && passes == 0 && gcd == 1)) || return 1
                 skips=1
                 ;;
             'thin-hv: preflight VMX=0 direct_vmx_ready=0')
@@ -381,7 +400,7 @@ check_preflight_ept_log() {
                 ((vmx_markers == 0)) || return 1
                 vmx_markers=1
                 ;;
-            *'FAIL'* | *'panic'* | 'thin-hv: preflight EPT audit'* | \
+            *'FAIL'* | *'panic'* | 'thin-hv: preflight EPT audit'* | 'thin-hv: preflight GCD '* | \
             'thin-hv: preflight VMX='*) return 1 ;;
         esac
     done <<<"$transcript"

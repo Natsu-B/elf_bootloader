@@ -3,6 +3,7 @@
 use crate::SerialPort;
 use crate::chainload::Error;
 use crate::platform_ept_audit;
+use crate::platform_resources;
 use crate::platform_snapshot;
 use crate::platform_snapshot::MemoryMap;
 use crate::platform_snapshot::malformed;
@@ -10,8 +11,8 @@ use crate::platform_snapshot::read_u32;
 use crate::platform_snapshot::read_u64;
 use core::fmt::Write;
 use core::mem;
-use core::slice;
 use r_efi::efi;
+use x86_64_hal::platform_memory::PhysicalWidth;
 
 /// Table inventory bounds; exceeding them is an explicit unsupported layout.
 const MAX_TABLE_ENTRIES: usize = 4096;
@@ -65,7 +66,10 @@ fn inventory(system_table: *mut efi::SystemTable, serial: &mut SerialPort) -> Re
                 );
             }
             inventory_tables(system_table, map, serial)?;
-            storage.inspect(cpu, map, serial)
+            let width = PhysicalWidth::new(cpu.physical_bits())
+                .map_err(|_| malformed("GCD physical-address width"))?;
+            let mmio = platform_resources::collect(system_table, map, width, serial)?;
+            storage.inspect(cpu, map, mmio.ranges(), serial)
         })
     })
 }
@@ -76,47 +80,9 @@ fn inventory_tables(
     map: &MemoryMap<'_>,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
-    let address = system_table as usize as u64;
-    if !address.is_multiple_of(mem::align_of::<efi::SystemTable>() as u64)
-        || map
-            .firmware_bytes(address, mem::size_of::<efi::SystemTable>())
-            .is_none()
-    {
-        return Err(malformed("UEFI system table range"));
-    }
-    // SAFETY: The aligned, complete SystemTable lies in readable firmware RAM;
-    // the UEFI entry contract guarantees its initialized fields remain live.
-    let system = unsafe { &*system_table };
-    if system.hdr.signature != efi::SYSTEM_TABLE_SIGNATURE
-        || !(mem::size_of::<efi::SystemTable>()..=4096).contains(&(system.hdr.header_size as usize))
-        || map
-            .firmware_bytes(address, system.hdr.header_size as usize)
-            .is_none()
-    {
-        return Err(malformed("UEFI system table header"));
-    }
+    let system = map.system_table(system_table)?;
     inventory_runtime(system.runtime_services, map, serial)?;
-    let count = system.number_of_table_entries;
-    let table_bytes = count
-        .checked_mul(mem::size_of::<efi::ConfigurationTable>())
-        .ok_or_else(|| malformed("configuration table size"))?;
-    if count > MAX_TABLE_ENTRIES
-        || (count != 0
-            && (!(system.configuration_table as usize)
-                .is_multiple_of(mem::align_of::<efi::ConfigurationTable>())
-                || map
-                    .firmware_bytes(system.configuration_table as usize as u64, table_bytes)
-                    .is_none()))
-    {
-        return Err(malformed("configuration table range/count"));
-    }
-    let entries = if count == 0 {
-        &[][..]
-    } else {
-        // SAFETY: Count and alignment were checked and the complete initialized
-        // firmware array is in readable RAM, retained throughout this inventory.
-        unsafe { slice::from_raw_parts(system.configuration_table, count) }
-    };
+    let entries = map.configuration_tables(system_table)?;
     let mut acpi1 = None;
     let mut acpi2 = None;
     let mut smbios = None;

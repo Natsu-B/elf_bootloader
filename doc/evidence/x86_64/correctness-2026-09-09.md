@@ -1347,3 +1347,107 @@ Final pre-commit checks: Nix `cargo xbuild x86` **PASS**
 `git diff --check` **PASS**. The latest full 4096-cycle and isolated invalid-
 guest-state results still precede this performance increment; they remain to
 be rerun and are not claimed as current qualification here.
+
+### Post-performance long regressions (`f08b671`)
+
+The six unmodified pinned selftests were rerun, serialized, with
+`LINUX_SELFTEST_BACKEND=direct-vmx LINUX_SELFTEST_NAME=<name>
+LINUX_SELFTEST_ELF=<pinned ELF> nix develop --accept-flake-config --command
+./scripts/x86_64/run-linux-selftest.sh`. The ELF root remains
+`/tmp/thin-hv-kvm-selftests-7.1.5.MUloxc/out/` (architecture-specific executables
+under `x86/`). **5 PASS, 1 FAIL**: `xcr0_cpuid_test`,
+`dirty_log_page_splitting_test`, `nx_huge_pages_test`,
+`memslot_modification_stress_test`, and `kvm_page_table_test` pass.
+`vmx_exception_with_invalid_guest_state` still reaches its existing 600-second
+guest kill, **process exit 137**. No test source, alarm or runner timeout changed.
+Logs: `/tmp/x86-reflection-final-direct-<name>.log`; batch summary:
+`/tmp/x86-reflection-selftest-batch.log`.
+
+`LINUX_KVM_CYCLES=4096 LINUX_KVM_TIMEOUT_SECONDS=600 nix develop
+--accept-flake-config --command cargo xrun x86 --nested --release` completed with
+**8 PASS, 6 FAIL**, exit 1 (`/tmp/x86-reflection-final-nested-4096.log`).
+All six Direct native profiles pass. Reference Linux completes 4096 cycles
+at guest time 39.081 seconds; ordinary Direct Linux completes all 4096 at
+324.206 seconds. These are not CPU-isolated timing comparisons.
+The same five reference-only architectural differences remain failures.
+The sixth failure is **runner infrastructure, not a completed guest result**:
+editing the live Bash runner's preflight function while its last Direct XSTATE
+clobber guest ran invalidated the interpreter's later file offsets, producing
+`suspended_now: unbound variable`. The last fixture was interrupted before its
+PASS marker. This was an agent test-execution error; it must be replayed with
+the runner frozen, and cannot be counted as PASS or diagnosed as guest corruption.
+Source, runners and generated boot artifacts must stay fixed throughout a suite,
+even when an edit changes only a function not used by the active guest.
+
+## Platform map increment: read-only GCD MMIO discovery
+
+Confirmed the active Direct carrier still calls `build_identity_8g` and
+`build_host_identity_8g`; this increment **does not yet replace either**.
+It first validates the missing resource input through non-VMX preflight.
+The existing disposable `PlatformMap` / `build_platform_identity` audit now
+consumes MMIO obtained from PI `GetMemorySpaceMap`, alongside its captured UEFI
+memory map and MTRRs. The
+[PI DXE table ABI](https://uefi.org/specs/PI/1.9/V2_UEFI_System_Table.html) and
+[GCD service/descriptor semantics](https://uefi.org/specs/PI/1.9/V2_Services_DXE_Services.html)
+define this read-only discovery and caller-owned temporary pool buffer.
+
+Changed files/symbols:
+
+* `x86_uefi_loader/src/platform_resources.rs`: `collect`, `collect_mmio`,
+  `MmioMap`, checked DXE prefix and numeric GCD descriptor ABI. Validates
+  table/count/pointer bounds, unknown types, arithmetic/physical-width limits,
+  overlapping descriptors, UC capability/current-cache conflicts, and page
+  rounding across RAM ownership. At most 4096 descriptors and 128 merged MMIO
+  intervals; no new dependency or unbounded monitor allocation. Firmware-owned
+  buffer cleanup runs on every successful-call inspection result. Missing DXE
+  discovery is explicitly unsupported, never an empty-map success/fallback.
+* `platform_snapshot.rs`: `MemoryMap::system_table` and
+  `configuration_tables` reuse the prior preflight validation for both ACPI and
+  DXE consumers. `physical_preflight.rs::inventory` gathers the MMIO input;
+  `platform_ept_audit.rs::AuditStorage::inspect` materializes it without
+  publishing an EPTP. `main.rs` wires the module only into physical-preflight.
+* `scripts/x86_64/run-uefi-smoke.sh::check_preflight_ept_log` and
+  `xtask/src/main.rs::preflight_ept_gate_distinguishes_construction_from_capability_skip`
+  require complete ordered GCD evidence, bounded matching counts, sorted aligned
+  nonoverlapping ranges, UC and the honest incomplete/readiness markers before
+  accepting either EPT construction or TCG's no-VMX capability skip.
+
+Five added host tests cover ABI/header/count bounds, unordered high MMIO merging,
+physical-width/overflow boundaries, malformed/overlapping/cache-conflicting
+descriptors, subpage MMIO versus adjacent RAM, and output-capacity failure.
+Existing package filtering already includes the preflight feature, so
+`xtest.txt` needs no change. No ACPI/SMBIOS/MSDM payload or identity is changed
+or logged, no Runtime Services hook is installed, and no project VMX executes.
+
+Validation:
+
+* Required five `cargo xtest -p` packages under Nix: **180 PASS, 0 FAIL**
+  (nested 29, HAL 54, loader 54, guest 10, xtask 33). Nix `cargo xbuild x86`
+  and `cargo fmt --check` **PASS**. `/tmp/x86-gcd-final-checks.log`.
+  The earlier affected-package-only run passes 87 tests
+  (`/tmp/x86-gcd-host-first.log`).
+* Nix `cargo xbuild x86 --release` **PASS**. Then
+  `X86_UEFI_BACKEND=physical-preflight X86_UEFI_ACCEL=kvm
+  X86_UEFI_CPU=host,+vmx,-hypervisor X86_UEFI_MEMORY=4G
+  X86_UEFI_PCI_PROFILE=firmware-default X86_UEFI_TIMEOUT_SECONDS=30
+  scripts/x86_64/run-uefi-smoke.sh bin/x86_64/x86-uefi-preflight.efi`
+  under Nix **PASS**. `/tmp/x86-gcd-preflight-high-first.log`.
+  This is the default q35 PCI layout, not `q35-smoke-1g`: 47 GCD descriptors,
+  eight merged MMIO intervals, including **[56 TiB, 64 TiB)**; the disposable
+  EPT uses 38 tables and 17,112 leaves. Its 288 private audit pages are excluded.
+* Nix `cargo xrun x86 --release`: **9 PASS, 0 FAIL** (seven QEMU/KVM, two TCG),
+  `/tmp/x86-gcd-smoke.log`. Default-size KVM preflight constructs 35 EPT tables /
+  15,192 leaves. TCG collects GCD resources but correctly skips EPT for absent
+  VMX. Existing Direct/reference and physical-chainload policy fixtures pass.
+* `git diff --check` **PASS**; only x86/test/documentation paths changed, apart
+  from the untouched pre-existing user `AGENTS.md` edit. No generated artifacts
+  are staged. No physical machine or Windows/Hyper-V/WSL2 was tested.
+
+This is deliberately **not complete MMIO discovery**: the same QEMU firmware
+reports `[0xe0000000, 0xf0000000)` as reserved UEFI memory, not GCD MMIO.
+PCI ECAM must therefore be discovered/checked through MCFG/PCI firmware data;
+GCD alone cannot establish complete device coverage. Markers retain
+`mmio_complete=0 direct_vmx_ready=0`. A successful disposable preflight is not a
+successful Direct Linux high-BAR boot. Active EPT/HOST_CR3 integration, bootstrap
+separation, pCPU/AP ownership, root NMI, S3 and Windows remain pending.
+Outer-KVM remains reference evidence only.

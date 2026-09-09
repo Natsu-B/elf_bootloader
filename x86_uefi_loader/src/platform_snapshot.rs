@@ -631,6 +631,62 @@ impl<'a> MemoryMap<'a> {
         // The firmware owns these immutable tables while our UEFI app is active.
         Some(unsafe { slice::from_raw_parts(address as *const u8, length) })
     }
+
+    /// Validates the firmware-owned system table before borrowing typed fields.
+    pub(crate) fn system_table(
+        &self,
+        pointer: *mut efi::SystemTable,
+    ) -> Result<&efi::SystemTable, Error> {
+        let address = pointer as usize as u64;
+        if !address.is_multiple_of(mem::align_of::<efi::SystemTable>() as u64)
+            || self
+                .firmware_bytes(address, mem::size_of::<efi::SystemTable>())
+                .is_none()
+        {
+            return Err(malformed("UEFI system table range"));
+        }
+        // SAFETY: the aligned complete table lies in readable firmware RAM;
+        // the UEFI entry contract keeps its initialized fields live before EBS.
+        let system = unsafe { &*pointer };
+        if system.hdr.signature != efi::SYSTEM_TABLE_SIGNATURE
+            || !(mem::size_of::<efi::SystemTable>()..=4096)
+                .contains(&(system.hdr.header_size as usize))
+            || self
+                .firmware_bytes(address, system.hdr.header_size as usize)
+                .is_none()
+        {
+            return Err(malformed("UEFI system table header"));
+        }
+        Ok(system)
+    }
+
+    /// Shared bounded configuration-table traversal for ACPI and DXE consumers.
+    pub(crate) fn configuration_tables(
+        &self,
+        pointer: *mut efi::SystemTable,
+    ) -> Result<&[efi::ConfigurationTable], Error> {
+        let system = self.system_table(pointer)?;
+        let count = system.number_of_table_entries;
+        let bytes = count
+            .checked_mul(mem::size_of::<efi::ConfigurationTable>())
+            .ok_or_else(|| malformed("configuration table size"))?;
+        if count > 4096
+            || (count != 0
+                && (!(system.configuration_table as usize)
+                    .is_multiple_of(mem::align_of::<efi::ConfigurationTable>())
+                    || self
+                        .firmware_bytes(system.configuration_table as usize as u64, bytes)
+                        .is_none()))
+        {
+            return Err(malformed("configuration table range/count"));
+        }
+        if count == 0 {
+            return Ok(&[]);
+        }
+        // SAFETY: the checked count, alignment and complete readable RAM extent
+        // cover this initialized firmware-owned array for the snapshot lifetime.
+        Ok(unsafe { slice::from_raw_parts(system.configuration_table, count) })
+    }
 }
 
 /// Little-endian field readers never read beyond a validated byte slice.
