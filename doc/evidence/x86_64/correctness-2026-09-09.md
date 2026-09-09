@@ -10,6 +10,42 @@ This is an incremental implementation record, **not completion of the physical
 L0 architecture**. Outer-KVM results are reference evidence only. Original OEM
 Windows, activation data, firmware identities and physical storage are untouched.
 
+## Latest qualification summary
+
+Qualified runtime commit: `3e44b3c`; `34cb908` adds only safety comments and
+evidence. Subsequent changes in this record do not change the runtime.
+The finite available matrices below finished; failures and missing coverage
+remain explicit. Counts describe separate runs, not a deduplicated total.
+
+| Validation | Result | Environment / scope |
+| --- | --- | --- |
+| Five required packages | 350 PASS, 0 FAIL | Host unit tests; final source recheck. |
+| Build, formatting and ISA guard | PASS | `cargo xbuild x86`, `cargo fmt`, `cargo fmt --check`. |
+| Standard xrun, release and default/debug | 11 PASS, 0 FAIL each | 9 QEMU/KVM + 2 QEMU TCG each. |
+| Nested xrun, release and default/debug | 15 PASS, 5 FAIL each | All 14 Direct cases PASS each; five reference contract differences remain FAIL. |
+| Full Linux selftest inventory, Direct | 56 PASS, 2 FAIL, 12 SKIP / 70 | Frozen original upstream ELF inventory. |
+| Full Linux selftest inventory, reference | 60 PASS, 0 FAIL, 10 SKIP / 70 | Outer-KVM comparison only. |
+| Full KVM unit inventory, Direct | 49 PASS, 1 FAIL, 6 PARTIAL, 5 SKIP / 61 | Includes successful long forced-emulation access test. |
+| Full KVM unit inventory, reference | 50 PASS, 0 FAIL, 6 PARTIAL, 5 SKIP / 61 | Separate replays also reveal intermittent reference A/D failures. |
+| Linux L2 OS and reboot/soak | 4 PASS, 0 FAIL | Two runners, Direct and reference separately; not physical SMP. |
+| Original VM-exit benchmark inventory | 24 PASS, 0 FAIL | 12 Direct + 12 reference cases. |
+| Direct paired optimization A/B | 18 PASS, 0 FAIL | Median CPUID/VMCALL/PM-timer changes −6.57%/−3.70%/−4.23%; QEMU-only samples. |
+| Direct 4,096-cycle/default-bound probe | FAIL | 3,609 complete cycles before unchanged 300-second limit. |
+| Direct Linux S3 | FAIL | Post-resume VMX capability interception/lifecycle remains broken. |
+| Direct Windows normal boot | PASS | No overlay, original default q35 placement, disposable evaluation image. |
+| Direct Windows Hyper-V | FAIL | Original 600-second gate; separate 1,800-second diagnostic also FAIL. |
+| Windows status-script SelfTest | PASS | QEMU evaluation image, zero hardware/licensing queries. |
+| Physical machine / original OEM Windows | NOT TESTED | No physical-readiness, activation-survival or daily-use claim. |
+
+The remaining Direct failures are the original `memslot_perf_test` alarm,
+periodic-signal `vmx_exception_with_invalid_guest_state` timeout, reduced-
+MAXPHYADDR A/D mismatch, 4,096-cycle default-bound miss, S3 resume and Hyper-V
+startup. AP/INIT/SIPI ownership, root-NMI forwarding and S3 VMX reconstruction
+are still not implemented; the physical feature rejects multiple firmware-
+reported CPUs, including disabled APs.
+The motherboard's original Windows must not be used for qualification yet.
+Outer-KVM successes are reference evidence only, never a Direct fallback.
+
 ## Findings checked against the starting source
 
 | Requested finding | Source evidence and initial status |
@@ -3518,3 +3554,205 @@ cargo fmt --check && cargo xtest -p x86_uefi_loader && cargo xbuild x86 &&
 cargo fmt'`: **211 loader host PASS, 0 FAIL**, x86 build/monitor ISA checks
 PASS, formatting PASS; `git diff --check` PASS.
 `/tmp/x86-final-safety-comments-validation.log`.
+
+### Final default/debug xrun entrypoint regression (`34cb908`)
+
+Both existing non-`--release` entrypoints finish: `cargo xrun x86` has
+**11 PASS, 0 FAIL** (9 QEMU/KVM, 2 TCG); `cargo xrun x86 --nested` has
+**15 PASS, 5 FAIL / 20**, including **all 14 Direct cases PASS**. The same
+five outer-reference operand/PAT/VMX-abort differences remain failures,
+and the nested command exits 1. No timeout or marker gate was weakened.
+
+The Direct native/readonly/host-XSTATE/MSR contracts, no-overlay physical-UEFI
+fixture, two-visible-CPU rejection and six Linux variants pass. The Linux
+subrunner deliberately invokes its existing release UKI/monitor build even
+from this debug/default xtask entrypoint; these are not claimed as debug
+Linux monitor binaries. This run is separate from the required, previously
+completed release nested matrix.
+
+Executed `nix develop --accept-flake-config --command bash
+/tmp/x86-final-debug-matrix.sh`; the helper invokes exactly the two existing
+cargo commands above. `/tmp/x86-final-debug-matrix.log`,
+`/tmp/x86-final-debug-matrix.8WeBdJ/{standard,nested}.log`.
+The comment-only source commit leaves runtime behavior unchanged, and each
+long-running qualification still retains its independently frozen artifacts.
+
+### Extended Direct Hyper-V observation: diagnostic FAIL, not a new gate
+
+The separate 1,800-second observation also finishes **FAIL**, runner exit 1:
+the required Hyper-V success marker never arrives. Both the unpaused live
+capture and final capture show **Please wait**, without a visible bugcheck.
+There is one resident-image lifetime (two normal loader/monitor backend
+markers), and the strict v4 decoder accepts the bounded 1,344-byte record.
+This does not rule out guest-state corruption, interrupt/timer problems or
+an internal guest failure; it only establishes the observed screen and
+continued monitor activity. No DPC-watchdog stop code is observed in this run.
+
+Final counters: 13,495,002 Direct entries, 13,495,001 reflected exits,
+116,462,857 L1 exits/L0-only handled exits, **0 nested entry failures**,
+40,006,994 VMPTRLD attempts, 2,294,227,963 VMREADs, 482,328,872 VMWRITEs,
+28,075,097 reflected-state writes, 1,450,453 external-interrupt exits,
+933,047 interrupt-window exits, 6,762 INVEPT and 6,070 INVVPID.
+L2 RDMSR (11,142,797) and WRMSR (1,140,646) dominate the reason histogram.
+The capture ends in `nested-exit`, reason 31. Continued entries/exits are not
+proof of useful Windows progress or of correct interrupt delivery.
+
+`WINDOWS_HYPERV_TIMEOUT_SECONDS=1800` is used **only for this additional
+diagnosis**. The original 600-second regression remains FAIL; no production
+timeout, runner default or PASS gate changed. There is no Hyper-V/WSL2 success
+claim. The other settings remain physical-UEFI/no overlay, default q35,
+4 GiB, one L1 CPU and the existing 120-second final-poweroff bound.
+
+`nix develop --accept-flake-config --command bash
+/tmp/x86-deferred-hyperv-extended-diagnostic.sh` invokes the frozen `3e44b3c`
+`windows-test.sh monitor-hyperv` on a fresh child image. All four runner/EFI
+hash checks, child qcow2 check and original seed metadata/variable-store
+comparisons pass. No physical installation or activation data was accessed.
+`/tmp/x86-deferred-hyperv-extended-diagnostic.log`,
+`/tmp/x86-deferred-hyperv-diagnostic.LQBAMi/guest/monitor-hyperv-failure-diagnostics.8aRMJw/`,
+`/tmp/x86-deferred-hyperv-extended-final.png`.
+
+## Changed-file index for this implementation series
+
+All 42 tracked paths changed since `3623b62` are listed below. Major symbols
+and behavior are detailed in the corresponding chronological sections above;
+test-only helpers are distinguished from the runtime implementation. The
+user-owned `AGENTS.md` edit and generated `/tmp`/`bin`/`target` artifacts are
+not part of these commits.
+
+| File | Major symbols / change |
+| --- | --- |
+| `arch_hal/x86_64_hal/src/ept.rs` | `HostPagingPolicy`, `HostTables`, `HostWindow`, checked platform HOST_CR3 materialization. |
+| `arch_hal/x86_64_hal/src/host_state.rs` | `HostXstate`, `bind_monitor_data`, `monitor_data`, `try_rdmsr`, guarded `general_protection`. |
+| `arch_hal/x86_64_hal/src/lib.rs` | Export `xstate`. |
+| `arch_hal/x86_64_hal/src/paging.rs` | `DataAccess`, `DataFault`, `operand_range`, `translate_data`, permission/canonical checks. |
+| `arch_hal/x86_64_hal/src/platform_memory.rs` | `FirmwareMap`, `allows_ram_access`, firmware descriptor validation, `host_mappings`. |
+| `arch_hal/x86_64_hal/src/vmcs.rs` | VPID and entry/exit MSR-list address field encodings. |
+| `arch_hal/x86_64_hal/src/vmx.rs` | `VmcsAccessCounts`, original host/control entry rejection and error recording. |
+| `arch_hal/x86_64_hal/src/xstate.rs` | `visible_cr`, `leaf1_for_cr4`, `leaf7_for_cr4`, `XsetbvFault`, `validate_xsetbv`. |
+| `nested_vmx/src/exit_snapshot.rs` | `ExitSnapshot::{capture,read,queue_write,flush}`, exact owner/four-field write retirement. |
+| `nested_vmx/src/host_validation.rs` | `Limits`, `Error`, `validate` for original L1 host fields. |
+| `nested_vmx/src/lib.rs` | Control policy/provenance, MSR-list patch manifest, capability checks and 2 MiB policy. |
+| `nested_vmx/src/msr_list.rs` | `List`, `Entry`, `Operation`, bounded list shape/entry validation and exit-store sources. |
+| `nested_vmx/src/vpid.rs` | `Namespace::{acquire,release,owns,generation}`, CPU-owned nonzero VPID lease. |
+| `x86_uefi_loader/Cargo.toml` | `physical-direct-vmx` and QEMU-only `host-xstate-test` features; no new dependency. |
+| `x86_uefi_loader/src/chainload.rs` | Shared checked `unload_image` and explicit test-only other-filesystem loading. |
+| `x86_uefi_loader/src/main.rs` | Module/feature gates and distinct physical/no-overlay versus research markers. |
+| `x86_uefi_loader/src/physical_chainload.rs` | `load_selected`, `single_bsp`, `require_single_cpu`; reuse deterministic current ESP selection. |
+| `x86_uefi_loader/src/physical_preflight.rs` | `inventory`, `inventory_tables`; shared read-only firmware/resource inventory. |
+| `x86_uefi_loader/src/platform_acpi.rs` | `Tables`, MCFG/MADT resources, `tpm2_crb_range`; no firmware identity rewriting. |
+| `x86_uefi_loader/src/platform_aml.rs` | `Sdt`, `Inventory`, checked static SystemMemory operation-region discovery. |
+| `x86_uefi_loader/src/platform_ept_audit.rs` | `AuditStorage::inspect`, MMIO-inclusive EPT/HOST sizing without activation. |
+| `x86_uefi_loader/src/platform_pci.rs` | Resource descriptors, firmware root windows and nondestructive BAR cross-checks. |
+| `x86_uefi_loader/src/platform_resources.rs` | `GcdDescriptor`, `MmioMap`, `collect_mmio`, merged platform MMIO inventory. |
+| `x86_uefi_loader/src/platform_snapshot.rs` | Host paging capabilities and checked system/configuration-table backing. |
+| `x86_uefi_loader/src/resident_image.rs` | `LoadedPe`, `GuardedAllocation`, private PE/resident ownership and checked image lifecycle. |
+| `x86_uefi_loader/src/trusted_outer_kvm.rs` | Reuse shared test-backend filesystem helper; retain reference backend. |
+| `x86_uefi_loader/src/vmx_smoke.rs` | `CpuMonitor`, private resident bootstrap/maps, CPUID/XSETBV/operand dispatch, Direct host/MSR/provenance/VPID handling, extended-state brackets, VMCS telemetry, snapshots and reflection. |
+| `x86_guest_uefi_test/Cargo.toml` | Native MSR contract/abort fixture features. |
+| `x86_guest_uefi_test/src/l1_extended.rs` | Live CR2/FXSAVE image seeding and checks across L0/nested boundaries. |
+| `x86_guest_uefi_test/src/l1_fault.rs` | Scoped IDT, `FaultRecord`, exact probe-RIP #UD/#GP/#SS/#PF recovery. |
+| `x86_guest_uefi_test/src/l1_memory.rs` | Register/memory operand faults, page crossing, repeated writes and VMX lifecycle probes. |
+| `x86_guest_uefi_test/src/l1_xstate.rs` | OSXSAVE/OSPKE, XCR0, CPUID enabled-area size and architectural exception probes. |
+| `x86_guest_uefi_test/src/msr_contract.rs` | `entry_lists`, `exit_lists`, control/cache/VPID and deferred guest-write retirement contracts. |
+| `x86_guest_uefi_test/src/nested_contract.rs` | `status_flag_inputs`, host/control/MSR negative boundaries, VMXE ownership and allocation checks. |
+| `scripts/x86_64/decode-vmx-diagnostics.py` | Strict owner/extent/seqlock publication and v3/v4 reason/VMREAD counters. |
+| `scripts/x86_64/run-linux-kvm-test.sh` | Explicit backend/mode, 2/4/12 GiB, host-XSTATE and no-overlay same-ESP variants. |
+| `scripts/x86_64/run-uefi-smoke.sh` | Strict native/MSR/abort/platform/mode/ownership/runtime-rejection transcript gates. |
+| `scripts/x86_64/windows/windows-esp-offset.py` | `select_extent`, bounded unique ESP geometry and JSON validation. |
+| `scripts/x86_64/windows/windows-test.sh` | Bounded ESP copy, default PCI/no-overlay modes, failure detection, explicit `windows_smp`. |
+| `xtask/src/main.rs` | `build_x86_direct_variant`, `verify_monitor_isa`, regression matrix and strict gate unit tests. |
+| `xtest.txt` | Existing package-specific feature entries, including physical Direct loader coverage. |
+| `doc/evidence/x86_64/correctness-2026-09-09.md` | Commands, source findings, measured outcomes, limits and this index. |
+
+`runtime_variables.rs` and the pre-existing non-VMX selection foundations
+were inspected, not rewritten. The production physical feature excludes the
+overlay through loader feature gates and runtime selection; its existing
+research implementation remains available only in the explicit research path.
+
+## Completed final KVM unit matrix and host checks
+
+The frozen `3e44b3c` Direct matrix finishes all 61 selections: **49 PASS,
+1 FAIL, 6 PARTIAL, 5 SKIP**. The strict runner exits **1**, followed by normal
+guest poweroff; completion is not an all-PASS claim. `access_fep` finishes
+PASS within its pre-existing 5,400-second case bound. Ordinary `access`
+checks 19,169,286 accesses with zero failures. One HPET watchdog read-time
+warning (52,520 ns) appears during the long run; it is retained as an
+observation, not diagnosed as the cause of a failure.
+
+The only actual failure is `access-reduced-maxphyaddr`: one extra PTE A bit
+(`0x2000021`, expected `0x2000001`) among 2,899,975 accesses, exit 3.
+The six PARTIAL selections are `xapic`, `emulator`, `memory`, `pmu`,
+`vmware_backdoors`, `la57`; the five SKIPs are `pks`, `pmu_lbr`, `pmu_pebs`,
+`tsx-ctrl`, `cet`. These match the earlier frozen Direct classifications.
+Partial and skipped coverage is not promoted to PASS. The completed reference
+matrix remains **50 PASS, 0 FAIL, 6 PARTIAL, 5 SKIP**; the separate reference
+replays that intermittently reproduce reduced-MAXPHYADDR A/D mismatches are
+also retained above. Reference success never substitutes for a Direct result.
+
+Executed in the frozen worktree through Nix:
+
+```sh
+env LINUX_KUNIT_BACKEND=direct-vmx LINUX_KUNIT_CASE=all \
+  LINUX_L2_KUNIT_DIR=/tmp/thin-hv-kvm-unit-tests-20260908/x86 \
+  LINUX_L2_QEMU=/nix/store/dz3ivvcn2916ac16l95vzgshikxrbicr-qemu-host-cpu-only-for-vm-tests-10.1.5/bin/qemu-system-x86_64 \
+  bash scripts/x86_64/run-linux-kunit-test.sh
+```
+
+`/tmp/x86-deferred-kunit-all.log`,
+`/tmp/x86-deferred-kunit-all-direct-vmx-serial.log`,
+`/tmp/x86-deferred-kunit-all-qemu.log`. All case outcomes and final poweroff
+were collected before removing the now-unused frozen worktree.
+
+The final main-tree host/build check also completes, exit **0**:
+**350 PASS, 0 FAIL** (nested 32, HAL 59, loader 211 across its feature
+entries, guest 10, xtask 38), x86 build and monitor ISA checks PASS.
+Actual command:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'cargo fmt && cargo fmt --check && cargo xtest -p nested_vmx && cargo xtest -p x86_64_hal && cargo xtest -p x86_uefi_loader && cargo xtest -p x86_guest_uefi_test && cargo xtest -p xtask && cargo xbuild x86 && cargo fmt'
+```
+
+`/tmp/x86-final-all-host-build.log`. No requested package was omitted.
+The available finite QEMU matrices documented above have completed, including
+their failures; no Windows or Linux VM is left running for this qualification.
+This is **not** completion of AP bring-up, root-NMI forwarding, S3 VMX
+re-entry, Direct Hyper-V/WSL2 or physical-machine qualification.
+
+## Post-run temporary-artifact cleanup requested by the user
+
+After the runs finished, 25 clean, detached validation worktrees created by
+this task were removed with `git worktree remove` (no `--force`): approximately
+7.27 GiB of worktree files by their pre-removal allocated-size measurements.
+The main checkout/branch and the user's `AGENTS.md` change were not removed
+or modified. Each temporary HEAD and clean status was checked; active test
+references were checked, and the final KVM worktree was retained until its
+runner exited, QEMU powered off and its saved serial log compared equal.
+
+Useful `bin` logs/diagnostics from the first 24 copies were retained under
+`/tmp/x86-completed-worktree-evidence.ZyzUNS` (4.6 MiB). The final KVM serial
+and QEMU logs are retained at the paths above. Cleanup receipts and exact
+worktree HEADs are in `/tmp/x86-completed-worktrees-cleanup.log` and its
+dry-run log. Historical worktree/EFI paths in earlier sections consequently
+describe where the tests ran, not artifacts promised to remain on disk.
+Committed source can be recreated from the recorded commit; deleted generated
+binaries are rebuildable, not directly recoverable as those exact files.
+
+Six completed Windows cases also had 67 explicitly checked disposable items
+removed: child qcow2 images, copied TPM/variable stores, test ESPs/media and
+symlinks/locks. Their roots are the two new `x86-deferred-*` diagnostic/SelfTest
+directories and the two-case matrices `x86-idle-guest-windows.FKa7Hc` and
+`x86-idle-guest-windows.Za0O3f`. Completion status, qcow2 checks and backing
+relationships were verified first. Raw-image links were unlinked without
+following them into the shared source. The child disks/TPM states themselves
+cannot be recovered; new disposable cases can be made from the retained seed.
+All case logs, JSON counters, screenshots and integrity receipts remain.
+`/tmp/x86-completed-windows-{dry-run,cleanup}.log` records the exact paths.
+
+After cleanup, the original seed image metadata and firmware-variable hashes
+still match their recorded pre-run values. Reusable Windows/Linux installation
+and pinned upstream test assets, small reproduction scripts and evidence are
+retained. No unrelated `/tmp` directory, main workspace, original OEM Windows
+installation or Nix store was a cleanup target. `git worktree list` now contains
+only the main checkout. Observed free space after cleanup is 43 GiB; this is
+not an attribution of all concurrent filesystem-space changes to this cleanup.
