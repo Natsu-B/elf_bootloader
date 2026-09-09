@@ -2577,3 +2577,30 @@ Validation through `nix develop --accept-flake-config --command`:
 
 Logs: `/tmp/x86-exit-reasons-host.log`, `/tmp/x86-exit-reasons-regression.log`.
 No physical machine was tested; outer-KVM is reference evidence only.
+
+The frozen `f97d3b9` no-overlay Hyper-V run's early sample has 320,039
+actual L2 entries, zero failed entries, 234,598 L2 RDMSR exits and 1,742,152
+L1 VMREAD exits out of 2,875,100 total L1 exits. A bounded paused read of the
+owned 1,216-byte record was followed by confirmed `VM status: running`;
+this sampled run is diagnostic evidence, not a timing benchmark.
+`/tmp/x86-reasons-hyperv-early.bin`, matrix
+`/tmp/x86-exit-reasons-windows.F6kFDb`. Full run completion is recorded below
+when available; an early progressing counter is not a Hyper-V PASS.
+
+To identify which of those VMREADs actually require a hardware VMCS switch,
+ABI v4 appends 16 saturating miss counters (total 1,344 bytes): 15 explicitly
+selected exact field encodings and one `other` bucket. Counting occurs only
+after both original-patch and exit-snapshot lookups miss, before selecting the
+Direct VMCS. Writes, cache hits and L0's own VMREADs do not enter these bins;
+field *contents* are never captured. High aliases/unknown fields are not
+conflated with the selected full-width fields. Existing v2/v3 decoding stays
+available, with the same complete-extent/version/sequence checks.
+
+The same five package commands and debug/release/nested commands above were
+rerun: **342 host PASS, 0 FAIL** (loader 208, xtask 36, HAL 59, nested 29,
+guest 10), debug build PASS, standard QEMU **9 PASS, 0 FAIL**, release nested
+**15 PASS, 5 FAIL / 20**, including **14 Direct PASS** and the unchanged five
+reference failures. Python decoder: **12 PASS, 0 FAIL**; fmt/fmt-check,
+bash syntax and diff checks PASS. Logs `/tmp/x86-vmread-fields-host.log` and
+`/tmp/x86-vmread-fields-regression.log`. No architectural VMX operation,
+capability, timeout or guest-state policy was changed by this profiling step.

@@ -797,11 +797,11 @@ run_windows() {
         if ((stopped)) && command -v python3 >/dev/null && [[ -f "$decoder" ]]; then
             extent=$(python3 "$decoder" extent "$serial_log") || extent=
             read -r address bytes <<<"$extent"
-            if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 ) ]]; then
+            if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 || "$bytes" == 1344 ) ]]; then
                 quoted_record=${record//\\/\\\\}
                 quoted_record=${quoted_record//\"/\\\"}
                 # The decoder validated this unique monitor-owned publication.
-                # The VM is stopped; only the two compiled ABI extents above
+                # The VM is stopped; only the compiled ABI extents above
                 # are accepted, never an arbitrary log-supplied memory length.
                 if printf 'pmemsave %s %s "%s"\n' "$address" "$bytes" "$quoted_record" >&9 && \
                     [[ $(direct_monitor_state) == paused ]] && \

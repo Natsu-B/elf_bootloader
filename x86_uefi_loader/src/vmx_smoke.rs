@@ -281,9 +281,28 @@ impl FirmwareControls {
 /// Little-endian snapshot signature; only the published owned record is captured.
 const DIAGNOSTIC_MAGIC: u64 = u64::from_le_bytes(*b"THVSTAT1");
 /// Fixed snapshot ABI, independent of the Rust lock's private layout.
-const DIAGNOSTIC_VERSION: u64 = 3;
+const DIAGNOSTIC_VERSION: u64 = 4;
 /// Reasons 0..63 have separate bins; newer/unknown basic reasons share bin 64.
 const DIAGNOSTIC_REASON_BINS: usize = 65;
+/// Selected VMREAD miss encodings, in ABI order; other encodings share the last
+/// bin. Only encodings are classified, never the contents of a VMCS field.
+const DIAGNOSTIC_READ_FIELDS: [u32; 15] = [
+    vmcs::GUEST_RIP,
+    vmcs::GUEST_RSP,
+    vmcs::GUEST_RFLAGS,
+    vmcs::GUEST_INTERRUPTIBILITY_INFO,
+    vmcs::GUEST_CR0,
+    vmcs::GUEST_CR3,
+    vmcs::GUEST_CR4,
+    vmcs::GUEST_CS_AR_BYTES,
+    vmcs::GUEST_SS_AR_BYTES,
+    vmcs::GUEST_ACTIVITY_STATE,
+    vmcs::GUEST_IA32_EFER,
+    vmcs::GUEST_IA32_PAT,
+    vmcs::VM_ENTRY_INTR_INFO_FIELD,
+    vmcs::VM_INSTRUCTION_ERROR,
+    vmcs::VM_ENTRY_INSTRUCTION_LEN,
+];
 /// Scope value 1 means the current BSP-only QEMU Direct-VMX prototype.
 const DIAGNOSTIC_BSP_SCOPE: u64 = 1;
 
@@ -301,6 +320,7 @@ enum DiagnosticEvent {
     VmcsLoad,
     ReflectedStateWrite,
     VmcsAccessBatch(vmx::VmcsAccessCounts),
+    L1VmreadHardware(u32),
 }
 
 /// Movable value state for eventual per-pCPU ownership; all counters saturate.
@@ -332,6 +352,8 @@ struct ExitCounterValues {
     /// Actual hardware exits only, not reflected copies or entry-failure exits.
     l1_reasons: [u64; DIAGNOSTIC_REASON_BINS],
     l2_reasons: [u64; DIAGNOSTIC_REASON_BINS],
+    /// L1 VMREADs requiring direct-VMCS selection, excluding software hits.
+    l1_vmread_hardware: [u64; DIAGNOSTIC_READ_FIELDS.len() + 1],
 }
 
 impl ExitCounterValues {
@@ -356,6 +378,7 @@ impl ExitCounterValues {
             last_reason: u64::MAX,
             l1_reasons: [0; DIAGNOSTIC_REASON_BINS],
             l2_reasons: [0; DIAGNOSTIC_REASON_BINS],
+            l1_vmread_hardware: [0; DIAGNOSTIC_READ_FIELDS.len() + 1],
         }
     }
 
@@ -387,6 +410,14 @@ impl ExitCounterValues {
     /// phase/reason; operation telemetry must not obscure progress diagnostics.
     fn record(&mut self, event: DiagnosticEvent) {
         let (phase, reason) = match event {
+            DiagnosticEvent::L1VmreadHardware(field) => {
+                let bin = DIAGNOSTIC_READ_FIELDS
+                    .iter()
+                    .position(|&candidate| candidate == field)
+                    .unwrap_or(DIAGNOSTIC_READ_FIELDS.len());
+                diagnostic_increment(&mut self.l1_vmread_hardware[bin]);
+                return;
+            }
             DiagnosticEvent::L1Exit(reason) => {
                 diagnostic_increment(&mut self.l1_exits);
                 self.count_reason(reason, true);
@@ -477,7 +508,7 @@ fn diagnostic_next_sequence(previous: u64) -> Option<(u64, u64)> {
     Some((previous.checked_add(1)?, previous.checked_add(2)?))
 }
 
-/// ABI v3: the original 22-word prefix followed by two 65-word histograms.
+/// ABI v4: v3's 152 words followed by 16 L1 VMREAD hardware-miss counters.
 /// Sequence is word 3, counters start at 5. No guest address/data is recorded.
 /// Readers require magic/version/size/scope and a stable even sequence. Stop all
 /// QEMU vCPUs before copying this record; an odd/exhausted snapshot is not valid.
@@ -518,7 +549,7 @@ impl ExitDiagnostics {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 1216);
+const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 1344);
 
 /// No serial or allocation is permitted here: this is the bounded hot-path hook.
 fn record_diagnostic(event: DiagnosticEvent) {
@@ -5134,6 +5165,9 @@ fn handle_l1_vmcs_access(
     let (status, read_value, hardware_error) = if let Some(read_value) = shadowed {
         (VmxStatus::Success, read_value, None)
     } else {
+        if !write {
+            record_diagnostic(DiagnosticEvent::L1VmreadHardware(field));
+        }
         let mut carrier_address = u64::MAX;
         if unsafe { vmx::vmptrst(&mut carrier_address) } != VmxStatus::Success {
             stop_unexpected_exit(
@@ -6969,6 +7003,7 @@ mod tests {
             last_reason: u64::MAX,
             l1_reasons: [almost; super::DIAGNOSTIC_REASON_BINS],
             l2_reasons: [almost; super::DIAGNOSTIC_REASON_BINS],
+            l1_vmread_hardware: [almost; super::DIAGNOSTIC_READ_FIELDS.len() + 1],
         };
         for _ in 0..3 {
             for reason in [
@@ -7021,7 +7056,7 @@ mod tests {
 
     #[test]
     fn diagnostics_snapshot_layout_and_sequence_exhaustion_are_fail_closed() {
-        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 1216);
+        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 1344);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, sequence), 24);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, values), 40);
         assert_eq!(
@@ -7031,6 +7066,10 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ExitCounterValues, last_phase), 120);
         assert_eq!(core::mem::offset_of!(ExitCounterValues, l1_reasons), 136);
         assert_eq!(core::mem::offset_of!(ExitCounterValues, l2_reasons), 656);
+        assert_eq!(
+            core::mem::offset_of!(ExitCounterValues, l1_vmread_hardware),
+            1176
+        );
         assert_eq!(super::DIAGNOSTIC_MAGIC.to_le_bytes(), *b"THVSTAT1");
         assert_eq!(super::diagnostic_next_sequence(0), Some((1, 2)));
         assert_eq!(super::diagnostic_next_sequence(1), None);
@@ -7067,6 +7106,30 @@ mod tests {
         assert_eq!(values.l2_reasons[64], 3);
         assert_eq!(values.observed_l2_entries, 10);
         assert_eq!(values.reflected_l2_exits, 10);
+    }
+
+    #[test]
+    fn diagnostics_vmread_misses_use_exact_encodings_and_preserve_exit_phase() {
+        let mut values = ExitCounterValues::new();
+        values.record(DiagnosticEvent::L1Exit(super::EXIT_REASON_VMREAD));
+        for (bin, field) in super::DIAGNOSTIC_READ_FIELDS.into_iter().enumerate() {
+            values.record(DiagnosticEvent::L1VmreadHardware(field));
+            assert_eq!(values.l1_vmread_hardware[bin], 1);
+        }
+        for field in [
+            u32::MAX,
+            super::vmcs::GUEST_RIP + 1,
+            super::vmcs::GUEST_IA32_PAT + 1,
+        ] {
+            values.record(DiagnosticEvent::L1VmreadHardware(field));
+        }
+        assert_eq!(values.l1_vmread_hardware[15], 3);
+        values.l1_vmread_hardware[0] = u64::MAX;
+        values.record(DiagnosticEvent::L1VmreadHardware(super::vmcs::GUEST_RIP));
+        assert_eq!(values.l1_vmread_hardware[0], u64::MAX);
+        assert_eq!(values.last_phase, 1);
+        assert_eq!(values.last_reason, super::EXIT_REASON_VMREAD);
+        assert_eq!(values.vmread_attempts, 0);
     }
 
     #[test]

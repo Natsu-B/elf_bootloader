@@ -3,7 +3,7 @@
 
 The address command accepts one publication inside reserved CPU-owned storage
 (or the resident image for explicitly legacy publications),
-never a free-form physical address. Only ABI v2 (176 bytes) and v3 (1216 bytes)
+never a free-form physical address. Only ABI v2/v3/v4 (176/1216/1344 bytes)
 records are accepted, with matching publication/header versions and sizes;
 it does not inspect guest, firmware, crash, or licensing data.
 """
@@ -18,7 +18,7 @@ import unittest
 
 
 SIZE = 176
-SIZES = {2: SIZE, 3: 1216}
+SIZES = {2: SIZE, 3: 1216, 4: 1344}
 U64_MAX = (1 << 64) - 1
 PROTOTYPE_LIMIT = 1 << 47  # current private HOST_CR3 low-canonical address ceiling
 MAX_LOG_BYTES = 64 << 20
@@ -28,7 +28,13 @@ IMAGE = re.compile(r"thin-hv: runtime image base=0x([0-9a-f]{16}) end=0x([0-9a-f
 BLOCK = re.compile(r"thin-hv: monitor block=0x([0-9a-f]{16}) end=0x([0-9a-f]{16})")
 PUBLICATION = re.compile(
     r"thin-hv: vmx diagnostics address=0x([0-9a-f]{16}) "
-    r"size=(176|1216) version=([23]) scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
+    r"size=(176|1216|1344) version=([234]) scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
+)
+READ_FIELDS = (
+    "guest_rip", "guest_rsp", "guest_rflags", "guest_interruptibility",
+    "guest_cr0", "guest_cr3", "guest_cr4", "guest_cs_ar", "guest_ss_ar",
+    "guest_activity", "guest_efer", "guest_pat", "entry_intr_info",
+    "instruction_error", "entry_instruction_len", "other",
 )
 COUNTERS = (
     "l1_exits", "direct_entry_attempts", "observed_l2_entries",
@@ -155,11 +161,15 @@ def decode_record(data, address):
         "last_phase": {"value": words[20], "name": PHASES[words[20]]},
         "last_reason": None if words[21] == U64_MAX else words[21],
     }
-    if words[1] == 3:
+    if words[1] >= 3:
         result["exit_reasons"] = {
             layer: {str(index) if index < 64 else "64-plus": count
                     for index, count in enumerate(bins) if count}
             for layer, bins in (("l1", words[22:87]), ("l2", words[87:152]))
+        }
+    if words[1] == 4:
+        result["l1_vmread_hardware"] = {
+            field: count for field, count in zip(READ_FIELDS, words[152:168]) if count
         }
     return result
 
@@ -293,6 +303,25 @@ class DecoderTests(unittest.TestCase):
         self.assertEqual(publication(self.lines[:3] + [line], True), (0x100040, (0x100000, 0x101000), 1216, 3))
         for invalid in (line.replace("size=1216", "size=176"), line.replace("version=3", "version=2"),
                         line.replace("0000000000100040", "0000000000100f50")):
+            with self.assertRaises(InvalidRecord):
+                publication(self.lines[:3] + [invalid], True)
+
+    def test_v4_vmread_miss_counters_preserve_v3_and_require_exact_extent(self):
+        words = self.words + [0] * 146
+        words[1:3] = [4, SIZES[4]]
+        words[22 + 23] = 30
+        words[152], words[167] = 7, U64_MAX
+        data = struct.pack("<168Q", *words)
+        result = decode_record(data, 0x100040)
+        self.assertEqual(result["exit_reasons"], {"l1": {"23": 30}, "l2": {}})
+        self.assertEqual(result["l1_vmread_hardware"], {"guest_rip": 7, "other": U64_MAX})
+        line = self.lines[3].replace("size=176 version=2", "size=1344 version=4")
+        self.assertEqual(publication(self.lines[:3] + [line], True)[2:], (1344, 4))
+        for invalid in (data[:-8], data + b"\0", struct.pack("<152Q", *words[:152])):
+            with self.assertRaises(InvalidRecord):
+                decode_record(invalid, 0x100040)
+        for invalid in (line.replace("version=4", "version=3"),
+                        line.replace("0000000000100040", "0000000000100b00")):
             with self.assertRaises(InvalidRecord):
                 publication(self.lines[:3] + [invalid], True)
 
