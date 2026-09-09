@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Validate and decode only the BSP QEMU prototype's fixed VM-exit counters.
 
-The address command accepts one publication inside one resident monitor image,
+The address command accepts one publication inside reserved CPU-owned storage
+(or the resident image for explicitly legacy publications),
 never a free-form physical address. The decode command reads exactly 176 bytes;
 it does not inspect guest, firmware, crash, or licensing data.
 """
@@ -17,14 +18,15 @@ import unittest
 
 SIZE = 176
 U64_MAX = (1 << 64) - 1
-PROTOTYPE_LIMIT = 8 << 30
+PROTOTYPE_LIMIT = 1 << 47  # current private HOST_CR3 low-canonical address ceiling
 MAX_LOG_BYTES = 64 << 20
 MAX_LOG_LINE = 4096
 BACKEND = "thin-hv: backend=direct-vmx role=project-l0"
 IMAGE = re.compile(r"thin-hv: runtime image base=0x([0-9a-f]{16}) end=0x([0-9a-f]{16})")
+BLOCK = re.compile(r"thin-hv: monitor block=0x([0-9a-f]{16}) end=0x([0-9a-f]{16})")
 PUBLICATION = re.compile(
     r"thin-hv: vmx diagnostics address=0x([0-9a-f]{16}) "
-    r"size=176 version=2 scope=bsp-only environment=qemu-prototype"
+    r"size=176 version=2 scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
 )
 COUNTERS = (
     "l1_exits", "direct_entry_attempts", "observed_l2_entries",
@@ -46,9 +48,11 @@ class InvalidRecord(ValueError):
 
 
 def publication(lines):
-    """Return the one validated record address and its resident image bounds."""
+    """Return the one validated record address and its owning allocation bounds."""
     backend_count = 0
     image = None
+    block = None
+    owner = None
     address = None
     for raw in lines:
         line = raw.rstrip("\r\n")
@@ -64,18 +68,29 @@ def publication(lines):
             image = tuple(int(value, 16) for value in match.groups())
             if not (0 < image[0] < image[1] <= PROTOTYPE_LIMIT):
                 raise InvalidRecord("resident image outside the QEMU prototype map")
+        elif line.startswith("thin-hv: monitor block="):
+            match = BLOCK.fullmatch(line)
+            if match is None or image is None or block is not None:
+                raise InvalidRecord("invalid or unordered CPU allocation")
+            block = tuple(int(value, 16) for value in match.groups())
+            if (not (0 < block[0] < block[1] <= PROTOTYPE_LIMIT)
+                    or any(value % 4096 for value in block)
+                    or block[1] - block[0] > 16 << 20
+                    or (block[0] < image[1] and image[0] < block[1])):
+                raise InvalidRecord("invalid or overlapping CPU allocation bounds")
         elif line.startswith("thin-hv: vmx diagnostics "):
             match = PUBLICATION.fullmatch(line)
             if match is None or backend_count != 2 or image is None or address is not None:
                 raise InvalidRecord("invalid, unordered, or repeated diagnostics publication")
             address = int(match[1], 16)
-            if address % 8 or not (image[0] <= address and address + SIZE <= image[1]):
-                raise InvalidRecord("diagnostics record is not wholly inside the resident image")
+            owner = block if match[2] is not None else image
+            if owner is None or address % 8 or not (owner[0] <= address and address + SIZE <= owner[1]):
+                raise InvalidRecord("diagnostics record is not wholly inside its declared owner")
         elif "thin-hv: trusted outer KVM" in line:
             raise InvalidRecord("reference backend cannot publish Direct-VMX diagnostics")
     if backend_count != 2 or image is None or address is None:
         raise InvalidRecord("incomplete Direct-VMX diagnostics publication")
-    return address, image
+    return address, owner
 
 
 def regular_file(path):
@@ -184,7 +199,7 @@ class DecoderTests(unittest.TestCase):
 
     def test_prototype_bounds_and_publication_metadata(self):
         for line in (
-            self.lines[2].replace("0000000000101000", "0000000200000001"),
+            self.lines[2].replace("0000000000101000", "0000800000000001"),
             self.lines[2].replace("0000000000101000", "0000000000100000"),
         ):
             with self.assertRaises(InvalidRecord):
@@ -193,6 +208,25 @@ class DecoderTests(unittest.TestCase):
                                    ("scope=bsp-only", "scope=smp")):
             with self.assertRaises(InvalidRecord):
                 publication(self.lines[:3] + [self.lines[3].replace(field, replacement)])
+
+    def test_cpu_runtime_publication_owner_and_high_memory(self):
+        block = "thin-hv: monitor block=0x0000000200000000 end=0x0000000200002000"
+        record = self.lines[3].replace("0000000000100040", "0000000200001f50") + " storage=cpu-runtime"
+        valid = self.lines[:3] + [block, record]
+        self.assertEqual(publication(valid), (0x200001F50, (0x200000000, 0x200002000)))
+        for invalid in (
+            self.lines[:3] + [record],
+            self.lines[:3] + [record, block],
+            self.lines[:3] + [block, block, record],
+            self.lines[:3] + [block, self.lines[3] + " storage=cpu-runtime"],
+            self.lines[:3] + [block, record.removesuffix(" storage=cpu-runtime")],
+            self.lines[:3] + [block, record.replace("0000000200001f50", "0000000200001f58")],
+            self.lines[:3] + [block.replace("0000000200000000", "0000000200000001"), record],
+            self.lines[:3] + [block.replace("0000000200002000", "0000800000001000"), record],
+            self.lines[:3] + [block.replace("0000000200000000", "0000000000100000"), record],
+        ):
+            with self.assertRaises(InvalidRecord):
+                publication(invalid)
 
     def test_exact_size_magic_and_abi_fields(self):
         for data in (self.record()[:-1], self.record() + b"\0", b"NOTSTAT1" + self.record()[8:]):

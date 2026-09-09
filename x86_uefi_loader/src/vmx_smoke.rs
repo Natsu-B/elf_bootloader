@@ -19,7 +19,6 @@ use core::fmt;
 use core::fmt::Write;
 use core::ptr;
 use core::sync::atomic::AtomicPtr;
-use core::sync::atomic::AtomicU8;
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
@@ -107,7 +106,7 @@ const ERROR_REVISION_PAGE: u64 =
     HOST_ENVIRONMENT_FIRST_PAGE + host_state::HOST_ENVIRONMENT_PAGES as u64;
 /// CPU-owned MSR mirrors and VPID lease, separate from descriptors and stack.
 const CPU_STATE_FIRST_PAGE: u64 = ERROR_REVISION_PAGE + 1;
-const CPU_STATE_PAGES: usize = core::mem::size_of::<SpinLock<CpuRuntimeState>>().div_ceil(4096);
+const CPU_STATE_PAGES: usize = core::mem::size_of::<CpuMonitor>().div_ceil(4096);
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
 /// Low-canonical identity limit of the private four-level HOST_CR3. Actual
@@ -256,32 +255,28 @@ static GUEST_RAN: AtomicU64 = AtomicU64::new(0);
 static GUEST_STATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
 static GUEST_IMAGE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static SYSTEM_TABLE: AtomicPtr<efi::SystemTable> = AtomicPtr::new(ptr::null_mut());
-static ORIGINAL_CR0: AtomicU64 = AtomicU64::new(0);
-static ORIGINAL_CR4: AtomicU64 = AtomicU64::new(0);
-/// XCR0 restored when the bounded smoke leaves VMX operation.
-static ORIGINAL_XCR0: AtomicU64 = AtomicU64::new(0);
-/// Physical-address width exposed unchanged to the current one-vCPU L1.
-static MAX_PHYSICAL_ADDRESS_BITS: AtomicU8 = AtomicU8::new(0);
-/// BSP-only diagnostics in the runtime PE, not a shared-state solution for SMP.
-/// Move this record into the owning pCPU state before enabling additional CPUs.
-static EXIT_DIAGNOSTICS: SpinLock<ExitDiagnostics> = SpinLock::new(ExitDiagnostics::new());
-/// Nested VMX state for the current single-vCPU smoke run.
-// ponytail: replace this global state with per-pCPU `VcpuState` before SMP.
-static L1_VCPU_STATE: SpinLock<VcpuState> = SpinLock::new(VcpuState::new());
-/// Host fields of the immutable single-vCPU carrier VMCS.
-static CARRIER_PATCH_VALUES: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]>> =
-    SpinLock::new(None);
-/// L1-visible fields of the one direct VMCS retained with L0 host patches.
-// ponytail: materialize this single cached VMCS on pointer changes; add
-// per-VMCS storage only when the trusted single-vCPU path needs concurrency.
-static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_MANIFEST.len()])>> =
-    SpinLock::new(None);
-/// Validated direct-VMCS entry policy, invalidated by entry-affecting writes.
-static DIRECT_ENTRY_POLICY: SpinLock<Option<(VmcsPhys, u64)>> = SpinLock::new(None);
-/// State abandoned on the L0 stack while a direct L2 is running.
-// ponytail: one global direct run is sufficient for the current one-pCPU
-// probe; move this into per-pCPU storage before enabling SMP.
-static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
+
+/// Firmware controls retained only on the initial-entry call stack. Hardware
+/// VM exit never restores this old snapshot over the live guest's state.
+struct FirmwareControls {
+    cr0: u64,
+    cr4: u64,
+    xcr0: u64,
+}
+
+impl FirmwareControls {
+    /// Initial VMXON/entry failure only: no private host GS has been installed.
+    fn restore(&self) {
+        // SAFETY: this same CPU captured these exact controls before VMXON.
+        // CR4.OSXSAVE is still set here; restore XCR0 before CR4. VMXON failed
+        // or VMXOFF succeeded, and no guest has run on this returning path.
+        unsafe {
+            cpu::xsetbv(0, self.xcr0);
+            cpu::write_cr4(self.cr4);
+            cpu::write_cr0(self.cr0);
+        }
+    }
+}
 
 /// Little-endian snapshot signature; only this 176-byte record may be captured.
 const DIAGNOSTIC_MAGIC: u64 = u64::from_le_bytes(*b"THVSTAT1");
@@ -512,7 +507,7 @@ const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 176);
 
 /// No serial or allocation is permitted here: this is the bounded hot-path hook.
 fn record_diagnostic(event: DiagnosticEvent) {
-    EXIT_DIAGNOSTICS.lock().record(event);
+    current_cpu().diagnostics.lock().record(event);
 }
 
 /// Counts a real VMREAD, never a read from a software mirror.
@@ -569,36 +564,38 @@ unsafe fn vmcs_write_reflected(field: u32, value: u64) -> VmxStatus {
 
 /// Preserves existing cold diagnostic fields with a saturating counter.
 fn cpuid_exit_count() -> u64 {
-    EXIT_DIAGNOSTICS.lock().values.cpuid_exits
+    current_cpu().diagnostics.lock().values.cpuid_exits
 }
 
-/// Publishes only storage proven to belong to this runtime PE, before VMX entry.
+/// Publishes only this CPU's reserved metadata, before VMX entry. This explicit
+/// reference is used while firmware GS is still active, never current_cpu().
 fn publish_diagnostics(
-    image_base: u64,
-    image_end: u64,
+    monitor: &CpuMonitor,
+    block: u64,
+    block_end: u64,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
-    let mut diagnostics = EXIT_DIAGNOSTICS.lock();
+    let mut diagnostics = monitor.diagnostics.lock();
     *diagnostics = ExitDiagnostics::new();
     let address = ptr::from_ref(&*diagnostics) as usize as u64;
     let size = core::mem::size_of::<ExitDiagnostics>() as u64;
     let end = address
         .checked_add(size)
         .ok_or(Error::OutsideIdentityMap(address))?;
-    if address < image_base || end > image_end || end > IDENTITY_MAP_LIMIT {
+    if address < block || end > block_end || end > IDENTITY_MAP_LIMIT {
         return Err(Error::OutsideIdentityMap(end));
     }
     drop(diagnostics);
     let _ = writeln!(
         serial,
-        "thin-hv: vmx diagnostics address={address:#018x} size={size} version=2 scope=bsp-only environment=qemu-prototype"
+        "thin-hv: vmx diagnostics address={address:#018x} size={size} version=2 scope=bsp-only environment=qemu-prototype storage=cpu-runtime"
     );
     Ok(())
 }
 
 /// Emits a bounded summary only after the existing returning guest leaves VMX.
 fn log_diagnostic_summary(serial: &mut SerialPort) {
-    let diagnostics = EXIT_DIAGNOSTICS.lock();
+    let diagnostics = current_cpu().diagnostics.lock();
     let values = diagnostics.values;
     let sequence = diagnostics.sequence.load(Ordering::Acquire);
     drop(diagnostics);
@@ -691,9 +688,43 @@ struct NestedRun {
     outer_instruction_len: u64,
 }
 
-/// Per-CPU MSR mirrors and VPID lifetime state, selected through private GS.
-/// No mutable reference spans guest entry. Carrier/VMXON/other VMX globals
-/// remain BSP-only; this partial ownership conversion does not establish SMP.
+/// One immovable CPU-owned object, bound through that CPU's private host GS.
+/// Locks protect separate short metadata borrows, not a shared SMP instance.
+/// Diagnostics must remain separate: MSR-list processing can count VMCS accesses
+/// while holding runtime metadata. No guard may span hardware guest entry.
+///
+/// The backing allocation also owns this CPU's VMXON/carrier, host stack,
+/// GDT/IDT/TSS/IST, XSTATE scratch and private host page tables. BSP launch uses
+/// this object now; AP/INIT/SIPI support is still required before enabling SMP.
+#[repr(C, align(16))]
+struct CpuMonitor {
+    physical_bits: u8,
+    diagnostics: SpinLock<ExitDiagnostics>,
+    vcpu: SpinLock<VcpuState>,
+    carrier_patch: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]>>,
+    direct_patch: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_MANIFEST.len()])>>,
+    entry_policy: SpinLock<Option<(VmcsPhys, u64)>>,
+    nested_run: SpinLock<Option<NestedRun>>,
+    runtime: SpinLock<CpuRuntimeState>,
+}
+
+impl CpuMonitor {
+    fn new(runtime: CpuRuntimeState) -> Self {
+        Self {
+            physical_bits: runtime.ram.physical_width().bits(),
+            diagnostics: SpinLock::new(ExitDiagnostics::new()),
+            vcpu: SpinLock::new(VcpuState::new()),
+            carrier_patch: SpinLock::new(None),
+            direct_patch: SpinLock::new(None),
+            entry_policy: SpinLock::new(None),
+            nested_run: SpinLock::new(None),
+            runtime: SpinLock::new(runtime),
+        }
+    }
+}
+
+/// Per-CPU MSR mirrors, VPID lifetime and physical access metadata. No mutable
+/// reference spans guest entry or a call into another CPU's context.
 #[repr(C, align(16))]
 struct CpuRuntimeState {
     vpids: VpidNamespace,
@@ -1033,21 +1064,34 @@ unsafe fn read_physical_msr_entry(address: u64) -> MsrEntry {
     }
 }
 
-const _: () = assert!(core::mem::align_of::<SpinLock<CpuRuntimeState>>() <= 4096);
+const _: () = assert!(core::mem::align_of::<CpuMonitor>() <= 4096);
 const _: () = assert!(CPU_STATE_FIRST_PAGE as usize + CPU_STATE_PAGES == MONITOR_PAGES);
 
 /// Borrows only the current CPU's runtime metadata, never across hardware entry.
 /// The callback cannot return a reference derived from the short lock guard.
 fn with_cpu_runtime<T>(inspect: impl FnOnce(&mut CpuRuntimeState) -> T) -> Option<T> {
-    // SAFETY: only post-VM-exit paths call this helper. HOST_GS_BASE is private
-    // and bind_monitor_data points to this CPU's initialized, immovable runtime
-    // lock. No migration occurs, and terminal paths never free the backing.
-    let pointer = unsafe { host_state::monitor_data() }?.cast::<SpinLock<CpuRuntimeState>>();
-    // SAFETY: the pointer has the exact initialized type/alignment above. This
-    // shared reference accesses only the lock; a short guard owns each mutable
-    // metadata borrow, and no hardware entry occurs while the guard exists.
-    let mut state = unsafe { pointer.as_ref() }.try_lock()?;
+    let mut state = current_cpu().runtime.try_lock()?;
     Some(inspect(&mut state))
+}
+
+/// Post-VM-exit only. Never query private GS during firmware-side preparation.
+fn current_cpu() -> &'static CpuMonitor {
+    // SAFETY: VMCS HOST_GS_BASE installed this CPU's initialized HostXstate.
+    // Its bound monitor object is immovable, correctly aligned and retained on
+    // every terminal path. Only shared lock references escape this function;
+    // no CPU migration or guest-controlled GS base is used in VMX root.
+    let pointer = unsafe { host_state::monitor_data() };
+    if let Some(pointer) = pointer {
+        // SAFETY: bind_monitor_data receives exactly one live CpuMonitor for
+        // this host environment. Guest EPT excludes the complete allocation;
+        // construction finished before publication and backing is never freed
+        // after the first VM exit. Interior mutability is only through locks.
+        return unsafe { pointer.cast::<CpuMonitor>().as_ref() };
+    }
+    // A missing binding is an L0 lifetime invariant failure, never a guest bad
+    // operand or invalid VMCS. Avoid telemetry here: it needs the broken binding.
+    SerialPort.write_bytes(b"thin-hv: private CPU binding FAIL\n");
+    halt_with_guest_xstate()
 }
 
 /// Failure from the bounded VMX smoke launch.
@@ -1481,7 +1525,6 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
         serial,
         "thin-hv: runtime image base={image_base:#018x} end={image_end:#018x}"
     );
-    publish_diagnostics(image_base, image_end, serial)?;
 
     // SAFETY: the caller established CPUID.VMX and this application is at CPL0,
     // where the architectural VMX feature-control MSR can be read.
@@ -1596,19 +1639,17 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
         )
     }
     .map_err(Error::HostState)?;
-    let msr_state = ptr::NonNull::new(
-        (block + CPU_STATE_FIRST_PAGE * PAGE_SIZE) as *mut SpinLock<CpuRuntimeState>,
-    )
-    .ok_or(Error::Firmware(
-        "CPU runtime state address",
-        efi::Status::COMPROMISED_DATA.as_usize(),
-    ))?;
+    let monitor = ptr::NonNull::new((block + CPU_STATE_FIRST_PAGE * PAGE_SIZE) as *mut CpuMonitor)
+        .ok_or(Error::Firmware(
+            "CPU runtime state address",
+            efi::Status::COMPROMISED_DATA.as_usize(),
+        ))?;
     // SAFETY: the checked runtime allocation includes this disjoint,
     // page-aligned final arena with enough space for the complete lock and
     // state. No CPU or VMCS references it yet. The object never moves; all
     // post-entry terminal paths retain its pages and private HOST_CR3 map.
     unsafe {
-        msr_state.as_ptr().write(SpinLock::new(CpuRuntimeState::new(
+        monitor.as_ptr().write(CpuMonitor::new(CpuRuntimeState::new(
             ram,
             basic,
             [(block, block_end), (image_base, image_end)],
@@ -1616,8 +1657,12 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
             Some(maps.window),
             Some(handoff.bootstrap),
         )));
-        host_environment.bind_monitor_data(msr_state.cast());
+        host_environment.bind_monitor_data(monitor.cast());
     }
+    // SAFETY: the complete CpuMonitor was initialized in its final allocation
+    // above. Only a shared reference to its short diagnostic lock is borrowed;
+    // it cannot move or outlive the reserved block on this preparation path.
+    publish_diagnostics(unsafe { monitor.as_ref() }, block, block_end, serial)?;
     for address in host_environment.required_image_addresses() {
         if address < image_base || address >= image_end {
             return Err(Error::OutsideIdentityMap(address));
@@ -1653,8 +1698,6 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
     if host_cr4 & cr4_fixed0 != cr4_fixed0 || host_cr4 & !cr4_fixed1 != 0 {
         return Err(Error::Capability("private host CR4", host_cr4));
     }
-    ORIGINAL_CR0.store(original_cr0, Ordering::Relaxed);
-    ORIGINAL_CR4.store(original_cr4, Ordering::Relaxed);
     if feature_control & 1 == 0 {
         // SAFETY: this BSP read unlocked FEATURE_CONTROL at CPL0. All
         // platform-map/allocation/host-state validation has now succeeded;
@@ -1670,14 +1713,19 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
     }
     // SAFETY: CPUID advertised XSAVE and host CR4.OSXSAVE is now set. XCR0 is
     // restored before the original CR4 is restored.
-    ORIGINAL_XCR0.store(unsafe { cpu::xgetbv(0) }, Ordering::Relaxed);
+    let original_xcr0 = unsafe { cpu::xgetbv(0) };
+    let original = FirmwareControls {
+        cr0: original_cr0,
+        cr4: original_cr4,
+        xcr0: original_xcr0,
+    };
 
     // SAFETY: the checked, aligned runtime VMXON page contains this CPU's
     // revision ID. FEATURE_CONTROL permits VMX outside SMX and CR0/CR4 have
     // been normalized; failure restores the saved controls before cleanup.
     let vmxon_status = unsafe { vmx::vmxon(vmxon) };
     if vmxon_status != VmxStatus::Success {
-        restore_control_registers();
+        original.restore();
         return Err(Error::Instruction("VMXON", vmxon_status, u64::MAX));
     }
     #[cfg(feature = "host-xstate-test")]
@@ -1700,12 +1748,12 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
     );
 
     // This is reached only when VM entry failed.
-    leave_failed_launch(serial);
+    leave_failed_launch(&original, serial);
     result
 }
 
 /// A failed VMXOFF cannot authorize freeing a live VMXON/VMCS allocation.
-fn leave_failed_launch(serial: &mut SerialPort) {
+fn leave_failed_launch(original: &FirmwareControls, serial: &mut SerialPort) {
     let status = leave_vmx();
     if status != VmxStatus::Success {
         let _ = writeln!(
@@ -1716,7 +1764,7 @@ fn leave_failed_launch(serial: &mut SerialPort) {
             core::hint::spin_loop();
         }
     }
-    restore_control_registers();
+    original.restore();
 }
 
 /// Loads the staged test/Linux image, or Windows from another filesystem.
@@ -2277,8 +2325,13 @@ fn configure_and_launch(
     guest_rsp: u64,
     true_controls: bool,
 ) -> Result<(), Error> {
-    require("VMCLEAR", unsafe { vmx::vmclear(vmcs_page) })?;
-    require("VMPTRLD", unsafe { vmcs_load(vmcs_page) })?;
+    // SAFETY: this CPU owns the checked WB carrier region and is in VMX root.
+    // Firmware GS is still active: preparation uses raw HAL operations, never
+    // the post-exit CPU-local diagnostic wrappers.
+    unsafe {
+        require("VMCLEAR", vmx::vmclear(vmcs_page))?;
+        require("VMPTRLD", vmx::vmptrld(vmcs_page))?;
+    }
 
     let pin_msr = if true_controls {
         vmx::IA32_VMX_TRUE_PINBASED_CTLS
@@ -2401,16 +2454,15 @@ fn configure_and_launch(
     write_host_state(host_cr0, host_cr3, host_cr4, host_pat, host_environment)?;
     log_guest_state();
 
-    *L1_VCPU_STATE.lock() = VcpuState::new();
-    *CARRIER_PATCH_VALUES.lock() = None;
-    *DIRECT_PATCH_VALUES.lock() = None;
-    *DIRECT_ENTRY_POLICY.lock() = None;
-    *NESTED_RUN.lock() = None;
+    // CpuMonitor::new already initialized this CPU's nested state before its
+    // private GS pointer was bound. Do not access that pointer before VM exit.
+    // SAFETY: all carrier fields and backing were prepared on this CPU in VMX
+    // root. On immediate VMfail no host state was loaded; return for cleanup.
     let launch = unsafe { vmx::vmlaunch() };
     Err(Error::Instruction(
         "VMLAUNCH",
         launch,
-        vm_instruction_error(),
+        initial_vm_instruction_error(),
     ))
 }
 
@@ -2587,11 +2639,17 @@ fn guest_system_segment(
 }
 
 fn write_vmcs(field: u32, value: u64) -> Result<(), Error> {
-    let status = unsafe { vmcs_write(field, value) };
+    // SAFETY: only initial carrier preparation calls this helper. This CPU
+    // owns the current VMCS in VMX root, but firmware GS is still installed.
+    let status = unsafe { vmx::vmwrite(field, value) };
     if status == VmxStatus::Success {
         Ok(())
     } else {
-        Err(Error::Vmwrite(field, status, vm_instruction_error()))
+        Err(Error::Vmwrite(
+            field,
+            status,
+            initial_vm_instruction_error(),
+        ))
     }
 }
 
@@ -2602,7 +2660,7 @@ fn require(instruction: &'static str, status: VmxStatus) -> Result<(), Error> {
         Err(Error::Instruction(
             instruction,
             status,
-            vm_instruction_error(),
+            initial_vm_instruction_error(),
         ))
     }
 }
@@ -2611,8 +2669,17 @@ fn vm_instruction_error() -> u64 {
     unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) }.unwrap_or(u64::MAX)
 }
 
+/// Initial entry failure may have no current VMCS and has no private GS yet.
+fn initial_vm_instruction_error() -> u64 {
+    // SAFETY: preparation still runs in VMX root on the owning CPU; an absent
+    // current VMCS returns VMfailInvalid instead of causing a host exception.
+    unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.unwrap_or(u64::MAX)
+}
+
 fn log_guest_state() {
-    let read = |field| unsafe { vmcs_read(field) }.unwrap_or(u64::MAX);
+    // SAFETY: initial preparation owns the current carrier, before any guest
+    // entry. Use the raw HAL because private GS is not installed until exit.
+    let read = |field| unsafe { vmx::vmread(field) }.unwrap_or(u64::MAX);
     let mut serial = SerialPort;
     serial.init();
     let _ = writeln!(
@@ -2638,15 +2705,6 @@ fn log_guest_state() {
         read(vmcs::GUEST_LDTR_SELECTOR),
         read(vmcs::GUEST_LDTR_AR_BYTES),
     );
-}
-
-fn restore_control_registers() {
-    // SAFETY: these are the exact values captured before enabling VMX.
-    unsafe {
-        cpu::xsetbv(0, ORIGINAL_XCR0.load(Ordering::Relaxed));
-        cpu::write_cr4(ORIGINAL_CR4.load(Ordering::Relaxed));
-        cpu::write_cr0(ORIGINAL_CR0.load(Ordering::Relaxed));
-    }
 }
 
 /// First non-root instruction stream.
@@ -2843,7 +2901,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     clobber_host_xmm();
     // SAFETY: `vmexit_entry` passes its live, uniquely owned stack frame.
     let registers = unsafe { &mut *registers };
-    let nested_run = NESTED_RUN.lock().take();
+    let nested_run = current_cpu().nested_run.lock().take();
     if let Some(run) = nested_run {
         // SAFETY: a hardware exit entered L0 with the direct VMCS current; this
         // read-only telemetry access neither changes fields nor emulation policy.
@@ -3327,7 +3385,7 @@ fn handle_l1_vmxon(
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     if state.in_vmx_operation() {
         complete_vmx_instruction(
             l1_vmx_failure(&state, VMXERR_VMXON_IN_ROOT),
@@ -3376,7 +3434,7 @@ fn handle_l1_vmxon(
                     registers,
                 );
             }
-            L1_VCPU_STATE.lock().record_vmxon_success(region);
+            current_cpu().vcpu.lock().record_vmxon_success(region);
             VmInstructionResult::Vmsucceed
         },
     );
@@ -3398,7 +3456,7 @@ fn handle_l1_vmxoff(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -3434,7 +3492,7 @@ fn handle_l1_vmxoff(
             registers,
         );
     }
-    L1_VCPU_STATE.lock().record_vmxoff_success();
+    current_cpu().vcpu.lock().record_vmxoff_success();
     complete_vmx_instruction(
         VmInstructionResult::Vmsucceed,
         reason,
@@ -3453,7 +3511,7 @@ fn handle_l1_vmclear(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -3534,7 +3592,7 @@ fn handle_l1_vmclear(
         );
     };
     if result == VmInstructionResult::Vmsucceed {
-        L1_VCPU_STATE.lock().record_vmclear_success(region);
+        current_cpu().vcpu.lock().record_vmclear_success(region);
     }
     complete_vmx_instruction(
         result,
@@ -3576,7 +3634,7 @@ fn handle_l1_vmptrld(
         );
     };
 
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -3701,7 +3759,7 @@ fn handle_l1_vmptrld(
         );
     };
     if result == VmInstructionResult::Vmsucceed {
-        L1_VCPU_STATE.lock().record_vmptrld_success(region);
+        current_cpu().vcpu.lock().record_vmptrld_success(region);
     }
     complete_vmx_instruction(
         result,
@@ -3721,7 +3779,7 @@ fn handle_l1_vmptrst(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -3768,7 +3826,7 @@ fn handle_l1_vmentry(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) -> u64 {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -3832,7 +3890,7 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let cached_direct = match *DIRECT_PATCH_VALUES.lock() {
+    let cached_direct = match *current_cpu().direct_patch.lock() {
         Some((address, values)) if address == current.address() => Some(values),
         Some(_) => stop_unexpected_exit(
             b"cached direct VMCS does not match current pointer",
@@ -3847,7 +3905,7 @@ fn handle_l1_vmentry(
     let carrier_values = if cached_direct.is_some() {
         None
     } else {
-        let mut cached = CARRIER_PATCH_VALUES.lock();
+        let mut cached = current_cpu().carrier_patch.lock();
         let values = if let Some(values) = *cached {
             values
         } else {
@@ -3950,7 +4008,7 @@ fn handle_l1_vmentry(
             registers,
         );
     };
-    let cache_entry_policy = match *DIRECT_ENTRY_POLICY.lock() {
+    let cache_entry_policy = match *current_cpu().entry_policy.lock() {
         Some((address, controls)) if address == current.address() && controls == exit_controls => {
             false
         }
@@ -4000,8 +4058,8 @@ fn handle_l1_vmentry(
                     registers,
                 );
             }
-            *DIRECT_PATCH_VALUES.lock() = None;
-            *DIRECT_ENTRY_POLICY.lock() = None;
+            *current_cpu().direct_patch.lock() = None;
+            *current_cpu().entry_policy.lock() = None;
             let mut accesses = vmx::VmcsAccessCounts::default();
             // SAFETY: the BSP owns this current direct VMCS, outside SMM; all
             // original fields are materialized. A proven-invalid control or
@@ -4085,7 +4143,7 @@ fn handle_l1_vmentry(
                 registers,
             );
         }
-        *DIRECT_PATCH_VALUES.lock() = Some((current.address(), saved_direct));
+        *current_cpu().direct_patch.lock() = Some((current.address(), saved_direct));
     }
     if prepare_direct_msr_fields(&saved_direct).is_none() {
         stop_unexpected_exit(
@@ -4098,10 +4156,10 @@ fn handle_l1_vmentry(
         );
     }
     if cache_entry_policy {
-        *DIRECT_ENTRY_POLICY.lock() = Some((current.address(), exit_controls));
+        *current_cpu().entry_policy.lock() = Some((current.address(), exit_controls));
     }
 
-    let mut active = NESTED_RUN.lock();
+    let mut active = current_cpu().nested_run.lock();
     if active.is_some() {
         stop_unexpected_exit(
             b"nested VMLAUNCH already active",
@@ -4246,7 +4304,7 @@ fn l1_host_validation_limits() -> Option<host_validation::Limits> {
             cr0_fixed1: cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1),
             cr4_fixed0: cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0),
             cr4_fixed1: cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1),
-            physical_bits: max_physical_address_bits()?,
+            physical_bits: current_cpu().physical_bits,
             linear_bits,
             lam: features.eax >= 1 && cpu::cpuid(7, 1).eax & (1 << 26) != 0,
             efer_allowed: 0x501
@@ -4472,7 +4530,7 @@ fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
                 efer: vmcs_read(vmcs::GUEST_IA32_EFER).ok()?,
             }
         };
-        let mut cache = DIRECT_PATCH_VALUES.lock();
+        let mut cache = current_cpu().direct_patch.lock();
         let (address, values) = cache.as_mut()?;
         if *address != run.direct {
             return None;
@@ -4500,7 +4558,7 @@ fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
 
 /// Materializes one retained direct VMCS while VMCS01 is current.
 fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
-    let mut cached = DIRECT_PATCH_VALUES.lock();
+    let mut cached = current_cpu().direct_patch.lock();
     let Some((direct, values)) = *cached else {
         return true;
     };
@@ -4523,7 +4581,7 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
         return false;
     }
     *cached = None;
-    *DIRECT_ENTRY_POLICY.lock() = None;
+    *current_cpu().entry_policy.lock() = None;
     true
 }
 
@@ -4811,7 +4869,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
     clobber_host_xmm();
     // SAFETY: `vmexit_entry` passes its live, uniquely owned saved-GPR frame.
     let registers = unsafe { &*registers };
-    let Some(run) = NESTED_RUN.lock().take() else {
+    let Some(run) = current_cpu().nested_run.lock().take() else {
         stop_unexpected_exit(b"missing failed VMLAUNCH state", 20, 0, 0, 0, registers);
     };
     record_diagnostic(DiagnosticEvent::EntryFailure(run.outer_reason));
@@ -4871,7 +4929,7 @@ fn handle_l1_vmcs_access(
     instruction_len: u64,
     registers: &mut GuestRegisters,
 ) {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -5025,7 +5083,7 @@ fn handle_l1_vmcs_access(
     let shadowed = if let Some(value) = exit_value {
         Some(Some(value))
     } else {
-        let mut cached = DIRECT_PATCH_VALUES.lock();
+        let mut cached = current_cpu().direct_patch.lock();
         match cached.as_mut() {
             Some((address, _)) if *address != current.address() => stop_unexpected_exit(
                 b"cached direct VMCS does not match VMCS access",
@@ -5121,7 +5179,7 @@ fn handle_l1_vmcs_access(
                 | vmcs::SECONDARY_VM_EXEC_CONTROL
         )
     {
-        *DIRECT_ENTRY_POLICY.lock() = None;
+        *current_cpu().entry_policy.lock() = None;
     }
 
     let result = match status {
@@ -5186,7 +5244,7 @@ fn handle_l1_invept(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -5287,7 +5345,7 @@ fn handle_l1_invvpid(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    let state = *L1_VCPU_STATE.lock();
+    let state = *current_cpu().vcpu.lock();
     let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
@@ -5462,7 +5520,7 @@ fn execute_l1_vmx_instruction(
 
 /// Commits a synthetic error to the opaque hardware VMCS, on the cold fail path.
 fn publish_l1_instruction_error(error: u32) -> Option<()> {
-    let current = L1_VCPU_STATE.lock().current_vmcs()?.address();
+    let current = current_cpu().vcpu.lock().current_vmcs()?.address();
     let mut carrier_address = u64::MAX;
     // SAFETY: completion runs in the BSP's root-mode carrier exit handler, with
     // an exclusive writable local destination for its current VMCS pointer.
@@ -5657,7 +5715,7 @@ fn l1_data_access() -> Option<DataAccess> {
             efer: vmcs_read(vmcs::GUEST_IA32_EFER).ok()?,
             rflags: vmcs_read(vmcs::GUEST_RFLAGS).ok()?,
             cpl: (vmcs_read(vmcs::GUEST_CS_SELECTOR).ok()? & 3) as u8,
-            physical_bits: max_physical_address_bits()?,
+            physical_bits: current_cpu().physical_bits,
             page_1g: cpu::cpuid(0x8000_0001, 0).edx & (1 << 26) != 0,
             pkru,
             pkrs: if cr4 & (1 << 24) != 0 {
@@ -5794,13 +5852,9 @@ fn inject_l1_operand_fault(
     }
 }
 
-/// Returns the physical-address width exposed unchanged to L1 by CPUID.
+/// Firmware-side discovery on the calling CPU. Runtime reads the checked width
+/// from its own CpuMonitor, not a mutable cross-CPU CPUID cache.
 fn max_physical_address_bits() -> Option<u8> {
-    let cached = MAX_PHYSICAL_ADDRESS_BITS.load(Ordering::Relaxed);
-    if cached != 0 {
-        return Some(cached);
-    }
-
     let bits = if cpu::cpuid(0x8000_0000, 0).eax < 0x8000_0008 {
         36
     } else {
@@ -5809,7 +5863,6 @@ fn max_physical_address_bits() -> Option<u8> {
     if !(12..=52).contains(&bits) {
         return None;
     }
-    MAX_PHYSICAL_ADDRESS_BITS.store(bits, Ordering::Relaxed);
     Some(bits)
 }
 
@@ -6485,7 +6538,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_msr_state_is_bounded_disjoint_and_initially_empty() {
+    fn cpu_monitor_state_is_bounded_disjoint_and_initially_empty() {
         let make = || {
             let ram = super::FirmwareMap::new(
                 &[super::FirmwareDescriptor {
@@ -6545,9 +6598,52 @@ mod tests {
             None
         );
         assert_ne!(first.entry.as_ptr(), second.entry.as_ptr());
-        assert!(
-            core::mem::size_of::<mutex::SpinLock<super::CpuRuntimeState>>()
-                <= super::CPU_STATE_PAGES * 4096
+        assert!(core::mem::size_of::<super::CpuMonitor>() <= super::CPU_STATE_PAGES * 4096);
+        let first = super::CpuMonitor::new(first);
+        let second = super::CpuMonitor::new(second);
+        let vmxon = super::VmxonPhys::new(0x1000).unwrap();
+        let direct = super::VmcsPhys::new(0x2000).unwrap();
+        first.vcpu.lock().record_vmxon_success(vmxon);
+        first.vcpu.lock().record_vmptrld_success(direct);
+        let saved = [0; super::DIRECT_VMCS_PATCH_MANIFEST.len()];
+        *first.carrier_patch.lock() = Some(saved);
+        *first.direct_patch.lock() = Some((direct, saved));
+        *first.entry_policy.lock() = Some((direct, 0));
+        *first.nested_run.lock() = Some(super::NestedRun {
+            carrier: super::VmcsPhys::new(0x3000).unwrap(),
+            direct,
+            saved_direct: saved,
+            l1_interruptibility: 0,
+            outer_reason: 20,
+            outer_qualification: 0,
+            outer_rip: 0,
+            outer_instruction_len: 3,
+        });
+        // VMCS telemetry must not recursively acquire MSR/runtime metadata.
+        let first_runtime = first.runtime.lock();
+        first
+            .diagnostics
+            .lock()
+            .record(super::DiagnosticEvent::L1Exit(10));
+        assert_eq!(
+            first.physical_bits,
+            first_runtime.ram.physical_width().bits()
+        );
+        assert_eq!(first.diagnostics.lock().values.cpuid_exits, 1);
+        assert_eq!(second.diagnostics.lock().values.cpuid_exits, 0);
+        assert!(first.vcpu.lock().current_vmcs().is_some());
+        assert!(second.vcpu.lock().current_vmcs().is_none());
+        assert!(second.carrier_patch.lock().is_none());
+        assert!(second.direct_patch.lock().is_none());
+        assert!(second.entry_policy.lock().is_none());
+        assert!(second.nested_run.lock().is_none());
+        assert_ne!(
+            first_runtime.entry.as_ptr(),
+            second.runtime.lock().entry.as_ptr()
+        );
+        assert_ne!(
+            core::ptr::from_ref(&*first.diagnostics.lock()),
+            core::ptr::from_ref(&*second.diagnostics.lock())
         );
     }
 
@@ -6607,7 +6703,6 @@ mod tests {
     use super::ExitCounterValues;
     use super::ExitDiagnostics;
     use super::INJECT_EXTERNAL_INTERRUPT;
-    use super::MAX_PHYSICAL_ADDRESS_BITS;
     use super::VmcsField;
     use super::acknowledged_external_interrupt;
     use super::max_physical_address_bits;
@@ -6878,10 +6973,9 @@ mod tests {
     }
 
     #[test]
-    fn physical_address_width_is_retained_after_discovery() {
+    fn physical_address_width_discovery_matches_cpuid() {
         let bits = max_physical_address_bits().expect("x86-64 physical-address width");
-
-        assert_eq!(MAX_PHYSICAL_ADDRESS_BITS.load(Ordering::Relaxed), bits);
+        assert!((12..=52).contains(&bits));
         assert_eq!(max_physical_address_bits(), Some(bits));
     }
 

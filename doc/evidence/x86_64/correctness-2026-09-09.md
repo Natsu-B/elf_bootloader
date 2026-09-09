@@ -2038,3 +2038,81 @@ timing-sensitive Direct failures remain open. Multicore physical boot remains
 deliberately gated; do not try the original OEM Windows installation yet.
 Outer-KVM evidence is reference-only. No AArch64 implementation or pre-existing
 user `AGENTS.md` changes are part of this step.
+
+## Step 12a — CPU-local runtime state, not AP enablement
+
+Confirmed at `ef01276`: MSR mirrors/VPID/physical-access state were already
+GS-bound, but `L1_VCPU_STATE`, `CARRIER_PATCH_VALUES`, `DIRECT_PATCH_VALUES`,
+`DIRECT_ENTRY_POLICY`, `NESTED_RUN`, `EXIT_DIAGNOSTICS`, original control-register
+values and the physical-width cache were still BSP globals.
+
+`x86_uefi_loader/src/vmx_smoke.rs` now initializes a bounded `CpuMonitor` in the
+existing CPU-owned reserved block. `current_cpu` obtains that exact object via
+the existing `HostEnvironment::bind_monitor_data`/private GS mechanism; all
+nested instruction handlers, reflection, immediate nested-entry failure and
+diagnostics use its fields. The allocation owns the VMXON/carrier/error VMCS,
+host stack, GDT/IDT/TSS/IST, XSTATE scratch, MSR bitmap and private HOST_CR3 arena
+as before. No new global lock or shared singleton replaces the deleted globals.
+
+Separate existing SpinLocks protect short metadata borrows. In particular,
+diagnostics do not acquire the MSR/runtime lock: list processing can count VMCS
+accesses while holding that lock. No guard crosses VM entry. The expanded host
+test constructs two independent objects, mutates VMX/current-VMCS/patch/policy/
+nested-run/diagnostic state on only one and verifies the other remains empty.
+It also checks bounded storage, list alignment and disjoint diagnostic/MSR slots.
+This is a host ownership test, **not a two-pCPU hardware launch test**.
+
+Initial preparation has no private GS installed yet. `FirmwareControls` keeps
+the original CR0/CR4/XCR0 on that CPU's live preparation stack; VMXON/initial
+entry failure restores them only after VMX is inactive. Initial VMCS setup,
+logging and `initial_vm_instruction_error` use raw HAL access, not post-exit
+diagnostic wrappers. The counters now count runtime accesses from the first VM
+exit, excluding one-time boot setup. Normal L2 reflection still does **not**
+restore an obsolete L1 extended-state/control snapshot. The immutable checked
+physical width resides in each `CpuMonitor`; firmware discovery has no cache.
+
+Only the four intentional **L1 bootstrap** atomics remain in this module
+(`GUEST_IMAGE`, `SYSTEM_TABLE`, `GUEST_RAN`, `GUEST_STATUS`). Runtime VMX state is
+no longer in those image globals. The separately gated research variable
+overlay is unchanged; production-selection builds still omit it.
+
+`scripts/x86_64/decode-vmx-diagnostics.py` recognizes the explicit
+`storage=cpu-runtime` publication and checks its reserved allocation bounds,
+alignment, ordering, duplication and image disjointness before reading the same
+176-byte ABI. Legacy image-scoped records remain explicitly supported for old
+A/B captures. Host regressions cover wrong-owner records and allocations above
+8 GiB up to the current private host-map ceiling, without reading any guest or
+firmware payload.
+
+Completed validation, all Cargo through the repository Nix environment:
+
+* `cargo xtest -p x86_uefi_loader` and `cargo xtest -p xtask`: **183 + 33 PASS,
+  0 FAIL**, including the decoder's pure self-tests.
+* `cargo xtest -p nested_vmx`, `-p x86_64_hal`, `-p x86_guest_uefi_test`:
+  **29 + 59 + 10 PASS, 0 FAIL**. Combined requested packages: **314 PASS**.
+* `cargo xbuild x86 --release`, `cargo xbuild x86`: **PASS**.
+* `cargo xrun x86 --nested --release`: **15 PASS, 5 FAIL / 20**, exit **1**;
+  all **14 Direct cases PASS**, including the negative SMP gate. The five
+  reference discrepancies are unchanged. `/tmp/x86-cpu-local-first.log`.
+* `cargo xrun x86 --release`: **9 PASS, 0 FAIL** (7 KVM/2 TCG, with the explicit
+  expected root-fault case). `/tmp/x86-cpu-local-core.log`.
+* Existing Linux runner with `LINUX_KVM_BACKEND=direct-vmx`,
+  `LINUX_KVM_DIRECT_MODE=physical-uefi`, `LINUX_KVM_CYCLES=4096`,
+  `LINUX_KVM_MEMORY=12G`, `LINUX_KVM_TIMEOUT_SECONDS=600`,
+  `X86_UEFI_PCI_PROFILE=firmware-default`, `X86_UEFI_REQUIRE_HIGH_PCI=1`:
+  **PASS**, all 4096 cycles and S5 poweroff, runner exit **0**.
+  `/tmp/x86-cpu-local-4096.log`. A read-only HMP sidecar captured only the
+  published 176-byte CPU-owned record at `0x7e6f3010`: valid even sequence,
+  257445 observed L2 entries/reflections and zero nested-entry failures at that
+  sample. `/tmp/x86-cpu-local-capture-retry.log`, sidecar exit **0**. The first
+  sidecar attempt used a wrong start-marker anchor; its recorded terminal result
+  was a shell parse error, exit **2**, before pausing/capturing. Restarting the
+  corrected diagnostic script captured and resumed the same workload. The
+  original combined wrapper reports exit **1** (`runner=0 probe=2`) for that
+  first sidecar failure, not a Linux failure. The
+  paused run is lifetime/state evidence, not a performance benchmark.
+
+AP initialization, INIT/SIPI delivery and cross-pCPU lifecycle qualification are
+still pending. The physical multi-CPU rejection gate stays enabled. This step
+does not claim SMP, S3, Direct Hyper-V/WSL2 or physical readiness. No physical
+machine or Windows installation was tested. Outer KVM remains reference-only.
