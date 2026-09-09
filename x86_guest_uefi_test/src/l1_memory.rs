@@ -194,6 +194,35 @@ pub(super) fn before_vmxon(base: u64) -> Result<()> {
     })
 }
 
+/// Repeats a stopped Direct guest-field write via memory. A cached field must
+/// not suppress #PF/#GP source faults. The caller owns PAGES scratch pages and
+/// a valid current VMCS whose field already contains the supplied value.
+pub(super) fn repeat_vmwrite(base: u64, field: u32, value: u64) -> Result<()> {
+    with_pages(base, |linear, _, data, noncanonical| {
+        let absent = linear + (2 * PAGE) as u64;
+        fault(
+            Instruction::Vmwrite,
+            absent,
+            u64::from(field),
+            14,
+            0,
+            absent,
+        )?;
+        fault(
+            Instruction::Vmwrite,
+            noncanonical,
+            u64::from(field),
+            13,
+            0,
+            0,
+        )?;
+        // SAFETY: prepare_pages returned this exclusive aligned WB payload,
+        // mapped at linear. Its eight-byte operand is live through the probe.
+        unsafe { ptr::write_volatile(data as *mut u64, value) };
+        succeeds(Instruction::Vmwrite, linear, u64::from(field))
+    })
+}
+
 /// VMCS validity is checked before VMREAD/VMWRITE access their memory operand;
 /// an unsupported invalidation type also fails without reading its descriptor.
 pub(super) fn without_current(base: u64) -> Result<()> {

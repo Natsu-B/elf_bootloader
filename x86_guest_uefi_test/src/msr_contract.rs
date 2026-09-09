@@ -32,7 +32,9 @@ const EPT_PAGE: usize = VPID_PAGE + super::l1_memory::PAGES;
 const DATA_PAGE: usize = EPT_PAGE + 5;
 // Two aligned 2 MiB payloads, plus at most one 2 MiB alignment gap.
 const SNAPSHOT_VMCS_PAGE: usize = DATA_PAGE + 3 * 512;
-const PAGES: usize = SNAPSHOT_VMCS_PAGE + 1;
+// Do not overwrite the stopped L2's CR3 tables with L1 operand-fault scratch.
+const REPEAT_PAGE: usize = SNAPSHOT_VMCS_PAGE + 1;
+const PAGES: usize = REPEAT_PAGE + super::l1_memory::PAGES;
 const PAT: u32 = 0x277;
 const EFER: u32 = 0xc000_0080;
 
@@ -1439,6 +1441,27 @@ unsafe fn ept_large_pages(
                 read_field("snapshot-guest", *field)?,
                 changed,
             )?;
+            // A successful same-value write must leave the previous VMfail
+            // error intact. Exercise both register and faulting/mapped memory
+            // sources while L0's stopped-VMCS snapshot is populated.
+            let repeated = changed | if narrow { 0x5a5a_a5a5 << 32 } else { 0 };
+            write(*field, repeated)?;
+            equal(
+                "snapshot-repeat-error",
+                read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                12,
+            )?;
+            super::l1_memory::repeat_vmwrite(base + (REPEAT_PAGE * PAGE) as u64, *field, repeated)?;
+            equal(
+                "snapshot-repeat-memory-error",
+                read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                12,
+            )?;
+            equal(
+                "snapshot-repeat-value",
+                read_field("snapshot-guest", *field)?,
+                changed,
+            )?;
             write(*field, *original)?;
             equal(
                 "snapshot-guest-restored",
@@ -1583,7 +1606,7 @@ unsafe fn ept_large_pages(
         )?;
         let _ = writeln!(
             serial,
-            "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject={} switches=4 clear=1 guest_fields=4 guest_writes=9 guest_reject=4 guest_resume=1",
+            "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject={} switches=4 clear=1 guest_fields=4 guest_writes=17 guest_reject=4 guest_resume=1 guest_repeat=8 guest_operand_faults=8",
             u8::from(readonly_reject)
         );
         Ok(())

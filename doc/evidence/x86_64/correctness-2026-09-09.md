@@ -2523,7 +2523,7 @@ Frozen `4b79eed`, `/tmp/x86-windows-physical-validation`, completed the
 no-overlay matrix `/tmp/x86-windows-physical.Orhw0p`: **1 PASS, 1 FAIL**.
 Both cases used `WINDOWS_DIRECT_MODE=physical-uefi WINDOWS_MEMORY=4G
 WINDOWS_PCI_PROFILE=firmware-default`, fresh disposable image/vars/TPM state,
-and the unchanged 600-second marker bound.
+and the unchanged marker bounds (900 seconds normal, 600 seconds Hyper-V).
 
 - `windows-test.sh monitor`: **PASS**, desktop keyboard/COM2 marker
   `thinhvwindowsdesktop`, mode/map gates and final poweroff. Automatic screen
@@ -2682,3 +2682,130 @@ release nested **15 PASS, 5 FAIL / 20**, all **14 Direct PASS**. The new snapsho
 contract itself also passes on the reference before its unchanged later MSR
 failure. `/tmp/x86-idle-guest-snapshot-regression.log`. Timed A/B, the original
 timing-sensitive tests and post-optimization Hyper-V remain to be run.
+
+### Timed Direct A/B of the two measured optimizations
+
+Frozen baseline `c44f6c1` and optimized `d031d65` (CPU-limit retention plus
+write-through guest-field snapshot) used the same three existing immutable
+`linux-kunit-ab-*.efi` guests. `run-uefi-smoke.sh` plus the existing strict
+`run-linux-kunit-test.sh --check-log` validator ran each baseline/optimized
+pair alternately three times, with unchanged q35-smoke-1g benchmark settings,
+CPU arguments, guest workload and time limits. **18 PASS, 0 FAIL**; all EFI,
+UKI and driver hashes remained unchanged. `/tmp/x86-idle-guest-ab-batch.log`,
+individual logs `/tmp/x86-idle-guest-ab.l9bvXi`.
+
+| Case | Baseline ticks/iteration (3 runs) | Optimized ticks/iteration (3 runs) | Median reduction |
+| --- | --- | --- | ---: |
+| CPUID | 344990, 341911, 345125 | 290541, 290869, 289582 | 15.78% |
+| VMCALL | 1105674, 1098774, 1108646 | 906879, 917283, 923532 | 17.04% |
+| PM timer IN | 413903, 412687, 416556 | 346647, 346723, 349701 | 16.23% |
+
+These are upstream guest TSC ticks per iteration under QEMU/KVM, not a
+physical-L0 cycle cost or an isolated CPU/frequency-controlled measurement.
+Windows and other project QEMU tests had finished before this A/B. The
+high-PCI default-layout regressions remain separate mandatory tests; this
+historical benchmark profile does not replace them. The table measures both
+optimizations together, not their individual contributions. No timeout increase
+is an optimization result.
+
+### Post-optimization complete finite matrix (`d031d65`)
+
+The existing twelve-case VM-exit manifest passed on both backends: **24 PASS,
+0 FAIL**. Commands: `LINUX_KUNIT_BACKEND={outer-kvm,direct-vmx}` and each
+`LINUX_KUNIT_CASE=vmexit_*` through `run-linux-kunit-test.sh`, using the same
+pinned upstream test binaries and L2 QEMU. The subsequent Direct 4,096-cycle
+lifecycle run, `LINUX_KVM_MEMORY=12G LINUX_KVM_HOST_XSTATE_TEST=1`, still
+**FAILs at the unchanged default 300-second bound**: 3,931 fully checked cycles
+at guest time 299.313484, versus the earlier 3,487. No individual state check
+failed, but the required final 4,096-cycle completion marker is absent.
+Combined matrix: **24 PASS, 1 FAIL / 25**.
+`/tmp/x86-idle-full-vmexit-batch.log`, `/tmp/x86-idle-full-vmexit.N40qKb`.
+
+Original Linux selftests plus S3: **5 PASS, 3 FAIL / 8**. PASS:
+`xcr0_cpuid_test`, `dirty_log_page_splitting_test`, `nx_huge_pages_test`,
+`memslot_modification_stress_test`, `kvm_page_table_test`. FAIL:
+`memslot_perf_test` exits 142 on its original alarm;
+`vmx_exception_with_invalid_guest_state` exits 137 at its original 600-second
+bound; S3 resumes but fresh KVM creation hits an invalid-opcode Oops in
+`alloc_loaded_vmcs`, following a `kvm_resume` warning. No S3 lifecycle fix or
+weakened capability check is present. No debugger pause was used on the
+timing-sensitive selftests. `/tmp/x86-idle-guest-linux-batch.log`, individual
+logs `/tmp/x86-idle-guest-linux.g5q759`.
+
+No-overlay Windows, default high-PCI layout, 4 GiB and one CPU: **1 PASS,
+1 FAIL / 2**. Normal Windows boots to the required COM2 desktop marker and
+powers off (900-second bound). Hyper-V still misses its 600-second marker;
+the live screen shows **Please wait**, not a captured bugcheck. The final
+validated v4 record has 4,052,723 L2 entries/reflections, zero entry failures,
+27,686,534 VMPTRLDs, 699,222,778 VMREADs and 161,456,441 VMWRITEs. This is
+6.83 VMPTRLDs per L2 entry versus 13.52 for the prior `c44f6c1` run, but it is
+not a Hyper-V/WSL2 PASS. Guest RIP/RFLAGS/CS-attribute/interruptibility hardware
+misses drop to 1,245 / 37,885 / 0 / 29,778. A brief diagnostic pause makes this
+Windows run unsuitable as an isolated timing benchmark. Image checks,
+artifact hashes and original seed comparisons pass.
+`/tmp/x86-idle-guest-windows-batch.log`, matrix
+`/tmp/x86-idle-guest-windows.vzVZBZ`, Hyper-V final counters under
+`direct-hyperv/monitor-hyperv-failure-diagnostics.w30K4B`.
+
+All of these are **QEMU/KVM** results (outer-KVM is reference evidence only),
+not physical-machine qualification. The 300-second lifecycle FAIL and the
+original timing failures remain recorded even when a longer historical
+comparison bound is used separately to complete state-lifetime coverage.
+
+Frozen `d031d65` also completed a separate 4,096-cycle state-lifetime test:
+**PASS** at guest time 315.761469 with `LINUX_KVM_TIMEOUT_SECONDS=600`, the
+existing historical comparison bound. `/tmp/x86-idle-guest-4096-historical-bound.log`.
+This run overlapped host compilation and is not a controlled timing comparison.
+The unchanged default 300-second test above remains **FAIL**.
+
+## Idempotent stopped guest-field VMWRITE
+
+`ExitSnapshot::write_is_redundant` recognizes only the same owner's four
+retained, mandatory writable guest fields and their exact width-truncated
+hardware values. `handle_l1_vmcs_access` performs its existing VMX/CPL/current
+pointer and full memory-source checks before this decision. A same-value write
+needs no hardware mutation or VMCS switch; changed writes still reach hardware
+immediately, and successful completion still updates flags without clearing
+VM_INSTRUCTION_ERROR. Reserved/high aliases and read-only fields never use the
+shortcut. The Intel SDM VMWRITE operation checks encoding/access, not entry
+validity of a field's value. No new VMCS composition, capability or deferred
+state is introduced. The existing measured fields and invalidation lifetimes
+are unchanged.
+
+Native `msr_contract`/`l1_memory::repeat_vmwrite` now check four register and
+four memory same-value writes, 32-bit truncation, retained error 12, four #PF
+and four #GP source faults followed by continued execution, and the unchanged
+owner/failed-entry/VMRESUME tests. Seven disposable fixture pages keep fault
+scratch disjoint from the stopped L2's CR3. Runner/xtask gates require the new
+exact coverage counts; reduced or missing evidence cannot pass.
+
+The first test run caught the shared `l1_fault::with_handler` assuming
+IDTR.limit <= 4095. VM exit architecturally loads 0xffff. The helper now copies
+at most the 256 addressable IDT gates, uses that bounded temporary limit, and
+restores the exact original limit on every ordinary return. It never reads an
+extra 60 KiB merely because hardware loaded 0xffff. Initial regression log:
+`/tmp/x86-repeat-vmwrite-regression.log`; the corrected native test passes on
+both Direct and reference (the reference's later existing MSR failure remains).
+
+Corrected validation: `cargo xtest -p nested_vmx`, `-p x86_uefi_loader`,
+`-p x86_guest_uefi_test`, `-p x86_64_hal`, `-p xtask`: **344 PASS, 0 FAIL**
+(31 + 208 + 10 + 59 + 36). `cargo xbuild x86` PASS; standard release QEMU
+**9 PASS, 0 FAIL** (7 KVM, 2 TCG). Release nested suite **15 PASS, 5 FAIL / 20**,
+all **14 Direct PASS**, including all six Linux modes/layouts and the separate
+physical-SMP rejection fixture (not SMP support). The five reference failures
+are unchanged. `/tmp/x86-repeat-vmwrite-regression-fixed.log`.
+`cargo fmt --check`, shell syntax and `git diff --check` PASS in
+`/tmp/x86-repeat-vmwrite-format.log`. No AArch64 implementation file changed.
+
+The same immutable-UKI, alternating three-pair A/B against `d031d65` passed
+**18/18** with unchanged artifact hashes and no other project QEMU running.
+Baseline/optimized ticks per iteration:
+
+* CPUID: 290702/292468, 289640/291818, 289269/289412.
+* VMCALL: 911318/906674, 914843/929045, 918537/907123.
+* PM timer IN: 340981/342192, 354459/342171, 342269/349495.
+
+Median changes are +0.75%, -0.84%, -0.02% respectively: **no demonstrated
+Linux benchmark speedup** from this additional optimization. Windows's actual
+VMCS-operation counts still need remeasurement before claiming usefulness for
+Hyper-V. `/tmp/x86-repeat-vmwrite-ab-batch.log`, `/tmp/x86-idle-guest-ab.1SxLMq`.

@@ -5152,19 +5152,31 @@ fn handle_l1_vmcs_access(
         );
         return;
     }
-    let exit_value = if write {
-        None
-    } else {
-        with_cpu_runtime(|state| {
+    // The full source access and architectural privilege/pointer checks above
+    // must precede this shortcut. The snapshot proves an exact mandatory guest
+    // field already contains this width-truncated value in hardware; VMWRITE
+    // has no additional value-validation side effect (SDM Vol. 3C, VMWRITE).
+    // Never skip a changed write or synthesize unknown/read-only encodings.
+    let retained_access = with_cpu_runtime(|state| {
+        if let Some(value) = write_value {
+            state
+                .exit_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.write_is_redundant(current.address(), field, value)
+                })
+                .then_some(None)
+        } else {
             state
                 .exit_snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.read(current.address(), field))
-        })
-        .flatten()
-    };
-    let shadowed = if let Some(value) = exit_value {
-        Some(Some(value))
+                .map(Some)
+        }
+    })
+    .flatten();
+    let shadowed = if retained_access.is_some() {
+        retained_access
     } else {
         let mut cached = current_cpu().direct_patch.lock();
         match cached.as_mut() {
@@ -5254,9 +5266,9 @@ fn handle_l1_vmcs_access(
         (status, read_value, hardware_error)
     };
     if let Some(value) = write_value {
-        // Hardware executed/validated the write before updating any retained
-        // guest value. A failed write must leave that value untouched. L1's
-        // CPU is stopped, and the helper accepts only the exact snapshot owner.
+        // Changed guest values reached hardware first; an idempotent write
+        // leaves both copies unchanged. Failure never updates the snapshot.
+        // L1 is stopped and the helper accepts only the exact VMCS owner.
         if with_cpu_runtime(|state| {
             if let Some(snapshot) = state.exit_snapshot.as_mut() {
                 snapshot.written(

@@ -96,18 +96,22 @@ pub(super) fn with_handler<T>(operation: impl FnOnce() -> Result<T>) -> Result<T
     let original_idt = cpu::sidt();
     equal(
         "l1-fault-idt-range",
-        u64::from((239..=4095).contains(&original_idt.limit)),
+        u64::from(original_idt.limit >= 239),
         1,
     )?;
     equal("l1-fault-idt-base", u64::from(original_idt.base != 0), 1)?;
     let mut idt = [0_u128; 256];
-    // SAFETY: firmware's live IDTR range fits this local copy. It remains live
-    // until the original IDTR is restored below on every ordinary return path.
+    // VM exit sets IDTR.limit to 0xffff even for a 4 KiB IDT. Only vectors
+    // 0..255 are addressable: preserve all possible gates without reading the
+    // unrelated 60 KiB beyond them. Restore the exact original limit below.
+    let copied_limit = original_idt.limit.min(4095);
+    // SAFETY: the live IDT covers these at most 256 gates; the bounded copy
+    // fits idt and stays live until IDTR is restored on every ordinary return.
     unsafe {
         ptr::copy_nonoverlapping(
             original_idt.base as *const u8,
             idt.as_mut_ptr().cast(),
-            usize::from(original_idt.limit) + 1,
+            usize::from(copied_limit) + 1,
         )
     };
     for (vector, entry) in [
@@ -119,7 +123,7 @@ pub(super) fn with_handler<T>(operation: impl FnOnce() -> Result<T>) -> Result<T
         idt[vector] = gate(entry as u64, cpu::read_cs());
     }
     let replacement = Idtr {
-        limit: original_idt.limit,
+        limit: copied_limit,
         base: idt.as_ptr() as u64,
     };
     let original = Idtr {

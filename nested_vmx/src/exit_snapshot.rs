@@ -4,8 +4,9 @@
 //! L1 must not be allowed to write exit information (VMX_MISC[29] is hidden).
 //! Drop the snapshot before any VM entry, VMCLEAR, VMCS switch or VMX lifetime
 //! transition. Never cache VM_INSTRUCTION_ERROR: later VMfail changes it.
-//! Guest fields are write-through: update only after hardware VMWRITE succeeds.
-//! This never defers a hardware write or constructs a software entry VMCS.
+//! Changed guest fields are write-through, after hardware VMWRITE succeeds.
+//! Exact idempotent guest writes need no hardware change. This never defers a
+//! changed hardware write or constructs a software entry VMCS.
 
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::vmcs;
@@ -38,6 +39,17 @@ pub struct ExitSnapshot {
 }
 
 impl ExitSnapshot {
+    /// Width of the four mandatory writable fields retained from hardware.
+    fn guest_value(field: u32, value: u64) -> Option<u64> {
+        match field {
+            vmcs::GUEST_RIP | vmcs::GUEST_RFLAGS => Some(value),
+            vmcs::GUEST_CS_AR_BYTES | vmcs::GUEST_INTERRUPTIBILITY_INFO => {
+                Some(u64::from(value as u32))
+            }
+            _ => None,
+        }
+    }
+
     /// Capture while `owner` is current and stopped after a real VM exit.
     /// A failed read never publishes a partial snapshot. Undefined exit-field
     /// contents are retained verbatim, not synthesized as meaningful values.
@@ -67,7 +79,17 @@ impl ExitSnapshot {
             .map(|index| self.values[index] >> shift)
     }
 
-    /// Update a retained guest field only after its hardware VMWRITE succeeded.
+    /// Whether an exact mandatory writable field already has the requested
+    /// value in the stopped hardware VMCS. The caller must first validate VMX
+    /// operation, CPL, the current pointer and the complete memory operand.
+    /// VMWRITE checks field existence/access, not VM-entry validity of its value;
+    /// VMsucceed must still update flags without clearing VM_INSTRUCTION_ERROR.
+    #[must_use]
+    pub fn write_is_redundant(&self, owner: VmcsPhys, field: u32, value: u64) -> bool {
+        Self::guest_value(field, value).is_some_and(|value| self.read(owner, field) == Some(value))
+    }
+
+    /// Update a retained guest field only after a successful VMWRITE.
     /// Failure, a foreign VMCS, read-only information, and unsupported aliases
     /// must not modify the snapshot. Width truncation matches x86-64 VMWRITE;
     /// entry validity checks still belong to the actual hardware VMCS.
@@ -75,10 +97,8 @@ impl ExitSnapshot {
         if !succeeded || owner != self.owner {
             return;
         }
-        let value = match field {
-            vmcs::GUEST_RIP | vmcs::GUEST_RFLAGS => value,
-            vmcs::GUEST_CS_AR_BYTES | vmcs::GUEST_INTERRUPTIBILITY_INFO => u64::from(value as u32),
-            _ => return,
+        let Some(value) = Self::guest_value(field, value) else {
+            return;
         };
         if let Some(index) = FIELDS.iter().position(|&candidate| candidate == field) {
             self.values[index] = value;
@@ -156,6 +176,42 @@ mod tests {
         // A new hardware exit changes guest state independently of L1 writes.
         let snapshot = ExitSnapshot::capture(owner, |_| Some(19)).unwrap();
         assert_eq!(snapshot.read(owner, vmcs::GUEST_RIP), Some(19));
+    }
+
+    #[test]
+    fn only_exact_idle_guest_values_can_elide_a_write() {
+        let owner = VmcsPhys::new(0x1000).unwrap();
+        let foreign = VmcsPhys::new(0x2000).unwrap();
+        let mut snapshot = ExitSnapshot::capture(owner, |_| Some(7)).unwrap();
+        for field in FIELDS {
+            let writable = matches!(
+                field,
+                vmcs::GUEST_RIP
+                    | vmcs::GUEST_RFLAGS
+                    | vmcs::GUEST_CS_AR_BYTES
+                    | vmcs::GUEST_INTERRUPTIBILITY_INFO
+            );
+            assert_eq!(snapshot.write_is_redundant(owner, field, 7), writable);
+            assert!(!snapshot.write_is_redundant(foreign, field, 7));
+            assert!(!snapshot.write_is_redundant(owner, field + 1, 7));
+            assert!(!snapshot.write_is_redundant(owner, field, 8));
+            let narrow = matches!(
+                field,
+                vmcs::GUEST_CS_AR_BYTES | vmcs::GUEST_INTERRUPTIBILITY_INFO
+            );
+            assert_eq!(
+                snapshot.write_is_redundant(owner, field, 0xffff_ffff_0000_0007),
+                narrow
+            );
+            snapshot.written(owner, field, 8, false);
+            assert_eq!(snapshot.write_is_redundant(owner, field, 7), writable);
+            snapshot.written(owner, field, 8, true);
+            assert_eq!(snapshot.write_is_redundant(owner, field, 8), writable);
+            assert!(!snapshot.write_is_redundant(owner, field, 7));
+        }
+        for field in [vmcs::HOST_RIP, vmcs::VM_INSTRUCTION_ERROR, 0x8000, u32::MAX] {
+            assert!(!snapshot.write_is_redundant(owner, field, 7));
+        }
     }
 
     #[test]
