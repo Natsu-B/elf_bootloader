@@ -1063,3 +1063,92 @@ Final serialized release result:
 * `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**. Only x86
   runtime/HAL, nested policy, x86 test/runner, xtask and this evidence changed.
   The user's unrelated `AGENTS.md` edit remains unstaged.
+
+## Proven 2 MiB nested EPT capability
+
+Confirmed: `TRUSTED_EPT_VPID_CAPABILITIES` hid both large-page sizes. Pinned
+Linux 7.1.5 `arch/x86/kvm/vmx/capabilities.h::ept_caps_to_lpage_level` therefore
+selected 4 KiB. Earlier Direct logs had zero 2 MiB pages where the unmodified
+huge-page tests required them. This was a capability/coverage limitation, not
+evidence that KVM ignored the advertised mask.
+
+Before changing that mask, `msr_contract::ept_large_pages` was added and executed
+through project Direct VMCS. Its marker explicitly recorded **advertised=0**:
+
+* a hardware 2 MiB leaf backed by owned, aligned WB pages;
+* write permission removal, EPT violation, and recovery at the same guest RIP;
+* 2 MiB -> 512 x 4 KiB splitting, permission changes and recovery;
+* replacement with a second owned 2 MiB backing region;
+* a reserved address bit producing a reflected EPT misconfiguration;
+* an absent leaf producing the correct EPT violation/GPA/GLA/qualification;
+* single-context and all-context INVEPT, ten successful invalidations in total.
+
+The controlled probe uses the existing q35-only 1 GiB identity helper for its
+code/stack and a separate 4 GiB guest-physical alias for the payload. It is **not
+the production platform map**. Physical 2 MiB support was already mandatory for
+Direct's smoke carrier. Ordinary guest software must obey advertised capabilities;
+the initial hidden-bit experiment was explicitly a native test proof. The test
+reuses `l1_memory::prepare_pages`, retains all allocation/descriptor lifetimes,
+and powers off the disposable VM. `enter` resume mode 2 restores the test's live
+RAX/RDX operands after wrapper MSR writes without changing the faulting RIP;
+`ept_store_guest` then proves the denied store actually completes after repair.
+
+Only after that proof passed was the existing HAL `EPT_CAP_PDE_2MB` added to the
+allowed capability set. `restrict_ept_vpid_capability` still intersects hardware
+support; missing hardware support never invents the bit. **1 GiB remains hidden**.
+The new unit test checks both boundaries. No Direct VMCS software EPT composition,
+new control bit, dependency, or fixed production map was added. Native runner/
+xtask gates now require advertised=1 and every proof count, rejecting missing,
+duplicated, hidden-bit or incomplete evidence.
+
+Validation (existing Nix/cargo/xtask runners, all disposable QEMU/KVM):
+
+* Before advertisement, the correctly built native Direct proof and complete
+  MSR fixture **PASS**; `/tmp/x86-ept2m-proof-direct-2.log`, build
+  `/tmp/x86-ept2m-proof-build-3.log`. Two earlier compile iterations failed on
+  the descriptor field name and an inferred integer type, then were corrected.
+  `/tmp/x86-ept2m-proof-direct.log` ran an older artifact after the first build
+  failure and has no EPT proof marker; it is **excluded** as proof evidence.
+* Five required host packages: **170 PASS, 0 FAIL** (nested 27, HAL 53, loader
+  47, guest 10, xtask 33); `/tmp/x86-ept2m-policy-unit.log`,
+  `/tmp/x86-ept2m-host-rest.log`. The guest-only iteration also passed 10 tests.
+* `LINUX_KVM_CYCLES=64 nix develop --accept-flake-config --command cargo xrun
+  x86 --nested --release`: **9 PASS, 5 FAIL**, exit 1;
+  `/tmp/x86-ept2m-nested-64.log`. All Direct native and Linux profiles PASS;
+  the same five reference-only failures remain. Both native backends emit the
+  new advertised=1 EPT proof marker. The latest 4096-cycle run is the preceding
+  VPID increment; no new 4096-cycle EPT measurement is claimed here.
+* Unmodified pinned `dirty_log_page_splitting_test` and `nx_huge_pages_test`:
+  **Direct PASS, exit 0**, fixing both previously recorded failures.
+* Unmodified `memslot_modification_stress_test` and `kvm_page_table_test`:
+  **Direct PASS, exit 0**.
+* Unmodified `memslot_perf_test`: **Direct FAIL, guest exit 142**. Five subtests
+  complete; the RW subtest's own `host_perform_sync::alarm(10)` expires. This is
+  not the outer runner or guest BusyBox timeout. The same unchanged `-s 4096`
+  test **also FAILS with 2 MiB advertisement temporarily removed**. That
+  temporary change was restored; reference **PASS, exit 0**. The 2026-09-08
+  Direct run also failed in RW, but used different slot defaults and is not
+  substituted for the new controlled comparison. No timeout, iteration count,
+  guest timer or assertion was weakened. This remains a Direct performance/
+  event-correctness failure for the next instrumentation increment.
+
+The five Direct selftests used `LINUX_SELFTEST_BACKEND=direct-vmx`,
+`LINUX_SELFTEST_NAME=<name>`, and `LINUX_SELFTEST_ELF=` the corresponding
+unmodified ELF under `/tmp/thin-hv-kvm-selftests-7.1.5.MUloxc/out/` (`x86/` for
+the two huge-page tests), then `nix develop --accept-flake-config --command
+./scripts/x86_64/run-linux-selftest.sh`. Logs are
+`/tmp/x86-ept2m-direct-<name>.log`; the additional control logs are
+`/tmp/x86-ept2m-direct-memslot_perf_test-capoff-control.log` and
+`/tmp/x86-ept2m-reference-memslot_perf_test.log`.
+
+No Windows/Hyper-V, S3 or physical machine was tested for this increment. The
+fixed active platform map, AP ownership, root NMI and S3 gaps remain; this is not
+physical readiness. Outer-KVM evidence remains reference only.
+
+Final checks after restoring the intended mask: `cargo xtest -p nested_vmx`
+**27 PASS**, `/tmp/x86-ept2m-restored-policy-unit.log`; `cargo xbuild x86`
+**PASS**, `/tmp/x86-ept2m-build-debug.log`; `cargo xrun x86 --release`
+**9 PASS, 0 FAIL** (seven QEMU/KVM, two QEMU/TCG),
+`/tmp/x86-ept2m-smoke.log`. The unmodified Direct `xcr0_cpuid_test` also
+**PASS**, `/tmp/x86-ept2m-direct-xcr0_cpuid_test.log`. Formatting and diff checks
+PASS; no AArch64 production code or user `AGENTS.md` change was included.

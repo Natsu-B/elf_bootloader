@@ -3617,8 +3617,9 @@ mod tests {
                     )
                 })
                 .collect::<String>();
+            let ept = "thin-hv: MSR EPT2M proof PASS advertised=1 large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10\n";
             let msr = format!(
-                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\nthin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\nthin-hv: MSR VPID lease cycles=64 fresh=64\n{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1\n"
+                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\nthin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\nthin-hv: MSR VPID lease cycles=64 fresh=64\n{ept}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1\n"
             );
             assert!(check_profile(backend, "msr", &msr));
             for fresh in [0, 1, 63] {
@@ -3632,6 +3633,13 @@ mod tests {
                 );
             }
             for broken in [
+                msr.replace(ept, ""),
+                msr.replace(ept, &format!("{ept}{ept}")),
+                msr.replace("advertised=1", "advertised=0"),
+                msr.replace("split=1", "split=0"),
+                msr.replace("misconfig=1", "misconfig=0"),
+                msr.replace("recovery=3", "recovery=2"),
+                msr.replace("invept=10", "invept=9"),
                 msr.replace(
                     "thin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\n",
                     "",

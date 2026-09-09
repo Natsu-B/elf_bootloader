@@ -12,9 +12,11 @@ use super::success;
 use core::arch::asm;
 use core::fmt::Write;
 use r_efi::efi;
+use x86_64_hal::addr::EptPhys;
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
 use x86_64_hal::cpu;
+use x86_64_hal::ept;
 use x86_64_hal::host_state::HOST_ENVIRONMENT_PAGES;
 use x86_64_hal::host_state::HostEnvironment;
 use x86_64_hal::host_state::HostStack;
@@ -26,7 +28,10 @@ const ENV_PAGE: usize = 4;
 const STACK_PAGE: usize = ENV_PAGE + HOST_ENVIRONMENT_PAGES;
 const LIST_PAGE: usize = STACK_PAGE + 2;
 const VPID_PAGE: usize = LIST_PAGE + 6;
-const PAGES: usize = VPID_PAGE + super::l1_memory::PAGES;
+const EPT_PAGE: usize = VPID_PAGE + super::l1_memory::PAGES;
+const DATA_PAGE: usize = EPT_PAGE + 5;
+// Two aligned 2 MiB payloads, plus at most one 2 MiB alignment gap.
+const PAGES: usize = DATA_PAGE + 3 * 512;
 const PAT: u32 = 0x277;
 const EFER: u32 = 0xc000_0080;
 
@@ -1127,6 +1132,257 @@ unsafe fn vpid_lifetime(
     }
 }
 
+/// Controlled q35 hardware proof before exposing 2 MiB EPT to ordinary L1s.
+/// Direct already requires physical 2 MiB support for its smoke carrier. This
+/// fixture intentionally exercises it even while L1's capability bit is hidden;
+/// that is a test-only probe, never a guest software capability-selection rule.
+unsafe fn ept_large_pages(
+    base: u64,
+    region: VmcsPhys,
+    env: &HostEnvironment<'_>,
+    serial: &mut Serial,
+) -> Result<()> {
+    const HUGE: u64 = 2 * 1024 * 1024;
+    const GPA: u64 = 1 << 32;
+    const WB: u64 = 6 << 3;
+    const LARGE: u64 = 1 << 7;
+    // SAFETY: the q35-only fixture retains its checked contiguous low WB
+    // allocation. The five EPT tables and two aligned 2 MiB payloads are
+    // disjoint from paging, VMX, descriptors and stacks. Only this CPU uses
+    // them, with IF=0; every mutation occurs with L2 stopped and is followed
+    // by INVEPT before re-entry. No physical device or firmware table is touched.
+    unsafe {
+        equal(
+            "ept-low-fixture",
+            u64::from(base + (PAGES * PAGE) as u64 <= 1 << 30),
+            1,
+        )?;
+        let capability = cpu::rdmsr(vmx::IA32_VMX_EPT_VPID_CAP);
+        equal("ept-invept-types", capability & (3 << 25), 3 << 25)?;
+        success("ept-clear", vmx::vmclear(region))?;
+        success("ept-current", vmx::vmptrld(region))?;
+        let original_pat = cpu::rdmsr(PAT);
+        let original_efer = cpu::rdmsr(EFER);
+        let cr3 = cpu::read_cr3();
+        let root = base + (VPID_PAGE * PAGE) as u64;
+        let (linear, pte, _) =
+            super::l1_memory::prepare_pages(root, cr3, cpu::read_cr4() & (1 << 12) != 0)?;
+        pte.write_volatile(GPA | 3);
+        let tables = base + (EPT_PAGE * PAGE) as u64;
+        let physical = |offset| EptPhys::new(tables + offset).ok_or(failure("ept-table-address"));
+        let eptp = ept::build_identity_1g(
+            &mut *(tables as *mut ept::EptPage),
+            physical(0)?,
+            &mut *((tables + PAGE as u64) as *mut ept::EptPage),
+            physical(PAGE as u64)?,
+            &mut *((tables + 2 * PAGE as u64) as *mut ept::EptPage),
+            physical(2 * PAGE as u64)?,
+        );
+        let pd = (tables + 3 * PAGE as u64) as *mut u64;
+        let pt = (tables + 4 * PAGE as u64) as *mut u64;
+        ((tables + PAGE as u64) as *mut u64)
+            .add(4)
+            .write_volatile(pd as u64 | 7);
+        let a = (base + (DATA_PAGE * PAGE) as u64 + HUGE - 1) & !(HUGE - 1);
+        let b = a + HUGE;
+        equal(
+            "ept-payload-bounds",
+            u64::from(b + HUGE <= base + (PAGES * PAGE) as u64),
+            1,
+        )?;
+        (a as *mut u64).write_volatile(0x1122_3344);
+        (b as *mut u64).write_volatile(0x5566_7788);
+        pd.write_volatile(a | WB | LARGE | 3);
+        let mut frame = Frame {
+            fx: [0; 512],
+            original_pat,
+            original_efer,
+            inherited_pat: original_pat,
+            inherited_efer: original_efer,
+            l2_pat: 0xaabb_ccdd,
+            l2_efer: original_efer,
+            entry_pat: 0,
+            entry_efer: 0,
+            exit_pat: 0,
+            exit_efer: 0,
+            l2_debugctl: linear,
+        };
+        let entry = controls(
+            vmx::IA32_VMX_ENTRY_CTLS,
+            vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+            vmcs::VM_ENTRY_IA32E_MODE
+                | vmcs::VM_ENTRY_LOAD_IA32_PAT
+                | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+        )?;
+        let exit = controls(
+            vmx::IA32_VMX_EXIT_CTLS,
+            vmx::IA32_VMX_TRUE_EXIT_CTLS,
+            vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                | vmcs::VM_EXIT_LOAD_IA32_PAT
+                | vmcs::VM_EXIT_LOAD_IA32_EFER,
+        )?;
+        configure(base, env, entry, exit)?;
+        let secondary = controls(
+            vmx::IA32_VMX_PROCBASED_CTLS2,
+            vmx::IA32_VMX_PROCBASED_CTLS2,
+            1 << 1,
+        )?;
+        write(
+            vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            read_field("ept-primary", vmcs::CPU_BASED_VM_EXEC_CONTROL)? | (1 << 31),
+        )?;
+        for (field, value) in [
+            (vmcs::SECONDARY_VM_EXEC_CONTROL, u64::from(secondary)),
+            (vmcs::EPT_POINTER, eptp),
+            (vmcs::GUEST_CR3, root | (cr3 & (0xfff | (3 << 61)))),
+            (vmcs::GUEST_IA32_PAT, original_pat),
+            (vmcs::HOST_IA32_PAT, original_pat),
+            (vmcs::GUEST_IA32_EFER, original_efer),
+            (vmcs::HOST_IA32_EFER, original_efer),
+        ] {
+            write(field, value)?;
+        }
+        let invalidate = |kind| {
+            success(
+                "ept-invept",
+                vmx::invept(
+                    kind,
+                    &vmx::InveptDescriptor {
+                        ept_pointer: eptp,
+                        reserved: 0,
+                    },
+                ),
+            )
+        };
+        let run = |frame: &mut Frame, resume, store, expected| -> Result<()> {
+            write(
+                vmcs::GUEST_RIP,
+                if store {
+                    ept_store_guest as *const ()
+                } else {
+                    vpid_guest as *const ()
+                } as usize as u64,
+            )?;
+            equal("ept-entry", enter(frame, resume), 0)?;
+            equal(
+                "ept-exit",
+                read_field("ept-reason", vmcs::VM_EXIT_REASON)?,
+                expected,
+            )
+        };
+        let fault = |access: u64, permissions: u64| -> Result<()> {
+            equal(
+                "ept-fault-address",
+                read_field("ept-gpa", vmcs::GUEST_PHYSICAL_ADDRESS)?,
+                GPA,
+            )?;
+            let qualification = read_field("ept-qualification", vmcs::EXIT_QUALIFICATION)?;
+            equal(
+                "ept-fault-access",
+                qualification & 0x3f,
+                access | (permissions << 3),
+            )?;
+            equal("ept-fault-linear-valid", qualification & (3 << 7), 3 << 7)?;
+            equal(
+                "ept-fault-linear",
+                read_field("ept-gla", vmcs::GUEST_LINEAR_ADDRESS)?,
+                linear,
+            )
+        };
+        invalidate(2)?;
+        run(&mut frame, 0, false, 18)?;
+        equal("ept-large-load", frame.entry_pat, 0x1122_3344)?;
+        pd.write_volatile(a | WB | LARGE | 1);
+        invalidate(1)?;
+        run(&mut frame, 1, true, 48)?;
+        fault(2, 1)?;
+        equal(
+            "ept-large-no-store",
+            (a as *const u64).read_volatile(),
+            0x1122_3344,
+        )?;
+        pd.write_volatile(a | WB | LARGE | 3);
+        invalidate(1)?;
+        // Resume the exact faulting store without rewriting GUEST_RIP. L1's
+        // handler explicitly restores its two live guest operands (mode 2).
+        equal("ept-large-recover-entry", enter(&mut frame, 2), 0)?;
+        equal(
+            "ept-large-recover-exit",
+            read_field("ept-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        equal(
+            "ept-large-store",
+            (a as *const u64).read_volatile(),
+            frame.l2_pat,
+        )?;
+        for index in 0..512 {
+            pt.add(index)
+                .write_volatile(a + (index * PAGE) as u64 | WB | 3);
+        }
+        pd.write_volatile(pt as u64 | 7);
+        invalidate(1)?;
+        run(&mut frame, 1, false, 18)?;
+        equal("ept-split-load", frame.entry_pat, frame.l2_pat)?;
+        pt.write_volatile(a | WB | 1);
+        invalidate(1)?;
+        frame.l2_pat ^= u64::MAX;
+        run(&mut frame, 1, true, 48)?;
+        fault(2, 1)?;
+        equal(
+            "ept-split-no-store",
+            (a as *const u64).read_volatile(),
+            frame.l2_pat ^ u64::MAX,
+        )?;
+        pt.write_volatile(a | WB | 3);
+        invalidate(1)?;
+        equal("ept-split-recover-entry", enter(&mut frame, 2), 0)?;
+        equal(
+            "ept-split-recover-exit",
+            read_field("ept-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        equal(
+            "ept-split-store",
+            (a as *const u64).read_volatile(),
+            frame.l2_pat,
+        )?;
+        pd.write_volatile(b | WB | LARGE | 3);
+        invalidate(2)?;
+        run(&mut frame, 1, false, 18)?;
+        equal("ept-replacement-load", frame.entry_pat, 0x5566_7788)?;
+        // Bits 20:12 are reserved in a present 2 MiB leaf: a nested EPT
+        // misconfiguration must return to L1, not stop the project monitor.
+        pd.write_volatile(b | PAGE as u64 | WB | LARGE | 3);
+        invalidate(2)?;
+        run(&mut frame, 1, false, 49)?;
+        equal(
+            "ept-misconfig-address",
+            read_field("ept-gpa", vmcs::GUEST_PHYSICAL_ADDRESS)?,
+            GPA,
+        )?;
+        pd.write_volatile(0);
+        invalidate(2)?;
+        run(&mut frame, 1, false, 48)?;
+        fault(1, 0)?;
+        pd.write_volatile(b | WB | LARGE | 3);
+        invalidate(2)?;
+        equal("ept-absent-recover-entry", enter(&mut frame, 2), 0)?;
+        equal(
+            "ept-absent-recover-exit",
+            read_field("ept-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        equal("ept-recovered-load", frame.entry_pat, 0x5566_7788)?;
+        let _ = writeln!(
+            serial,
+            "thin-hv: MSR EPT2M proof PASS advertised={} large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10",
+            (capability >> 16) & 1
+        );
+        Ok(())
+    }
+}
+
 /// A malformed exit item must abort this virtual CPU, after earlier stores.
 /// The runner reads only the abort indicator and one PAT value through QEMU's
 /// physical-memory monitor; any return to this fixture is an explicit failure.
@@ -1294,6 +1550,7 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
                     .and_then(|()| exit_lists(base, region, &env, serial))
                     .and_then(|()| control_cache(base, region, &env, serial))
                     .and_then(|()| vpid_lifetime(base, region, &env, serial, &mut vmx_active))
+                    .and_then(|()| ept_large_pages(base, region, &env, serial))
                     .and_then(|()| entry_lists(base, region, &env, serial))
             }
         };
@@ -1338,6 +1595,8 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
 // CR0.EM/TS=0 and OSFXSR=1. Only guest below runs, preserving RDI. The saved
 // SysV callee registers and FP image are restored on every immediate failure
 // or nested exit; no Rust executes before restoring original PAT/EFER.
+// Resume mode 2 restores the controlled EPT guest's RAX/RDX operands from its
+// live Frame after the entry wrapper's MSR writes, preserving the faulting RIP.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn enter(_frame: *mut Frame, _resume: u64) -> u64 {
     core::arch::naked_asm!(
@@ -1373,6 +1632,11 @@ unsafe extern "sysv64" fn enter(_frame: *mut Frame, _resume: u64) -> u64 {
         "vmlaunch",
         "jmp 7f",
         "6:",
+        "cmp rsi, 2",
+        "jne 5f",
+        "mov rax, [rdi + 592]",
+        "mov rdx, [rdi + 544]",
+        "5:",
         "vmresume",
         "7:",
         "pushfq",
@@ -1466,6 +1730,21 @@ unsafe extern "sysv64" fn vpid_guest() -> ! {
         "mov rax, [rdi + 592]",
         "mov rax, [rax]",
         "mov [rdi + 560], rax",
+        "vmcall",
+        "ud2",
+    );
+}
+
+// SAFETY: ept_large_pages supplies a retained Frame at RDI, CPL0 and IF=0.
+// Slot 592 names its controlled L2 leaf; the value at 544 is test data, not
+// an MSR value here. A denied write exits before changing memory; recovery
+// resumes that exact instruction. VMCALL is the only successful continuation.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn ept_store_guest() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, [rdi + 592]",
+        "mov rdx, [rdi + 544]",
+        "mov [rax], rdx",
         "vmcall",
         "ud2",
     );

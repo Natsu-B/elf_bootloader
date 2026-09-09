@@ -13,6 +13,7 @@ pub mod vpid;
 
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
+use x86_64_hal::ept::EPT_CAP_PDE_2MB;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::restrict_controls;
 
@@ -402,6 +403,9 @@ pub const HYPERV_REQUIRED_VPID_CAPABILITIES: u64 = VPID_INVVPID
 pub const TRUSTED_EPT_VPID_CAPABILITIES: u64 = KVM_REQUIRED_EPT_CAPABILITIES
     | HYPERV_REQUIRED_EPT_CAPABILITIES
     | EPT_INVEPT_SINGLE_CONTEXT
+    // Direct hardware tests cover 2 MiB leaves, permission faults, splitting,
+    // backing replacement and INVEPT. 1 GiB leaves remain unadvertised.
+    | EPT_CAP_PDE_2MB
     | HYPERV_REQUIRED_VPID_CAPABILITIES;
 /// VMFUNC functions exposed to trusted L1; VMFUNC is deliberately hidden.
 pub const TRUSTED_VMFUNC_CAPABILITIES: u64 = 0;
@@ -1162,6 +1166,19 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn ept_large_pages_require_hardware_support_and_keep_1g_hidden() {
+        let base = TRUSTED_EPT_VPID_CAPABILITIES & !EPT_CAP_PDE_2MB;
+        assert_eq!(restrict_ept_vpid_capability(base), Some(base));
+        assert_eq!(restrict_ept_vpid_capability(base | (1 << 17)), Some(base));
+        assert_eq!(
+            restrict_ept_vpid_capability(base | EPT_CAP_PDE_2MB | (1 << 17)),
+            Some(base | EPT_CAP_PDE_2MB),
+        );
+        assert_ne!(TRUSTED_EPT_VPID_CAPABILITIES & EPT_CAP_PDE_2MB, 0);
+        assert_eq!(TRUSTED_EPT_VPID_CAPABILITIES & (1 << 17), 0);
     }
 
     #[test]
