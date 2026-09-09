@@ -6,6 +6,10 @@
 compile_error!("Direct L0 requires a baseline, non-AVX compilation target");
 
 use crate::SerialPort;
+use crate::chainload;
+use crate::platform_acpi;
+use crate::platform_resources;
+use crate::platform_snapshot;
 use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
@@ -64,7 +68,10 @@ use x86_64_hal::paging::DataFault;
 use x86_64_hal::platform_memory;
 use x86_64_hal::platform_memory::FirmwareDescriptor;
 use x86_64_hal::platform_memory::FirmwareMap;
+use x86_64_hal::platform_memory::PageCapabilities;
+use x86_64_hal::platform_memory::PhysicalRange;
 use x86_64_hal::platform_memory::PhysicalWidth;
+use x86_64_hal::platform_memory::PlatformMap;
 use x86_64_hal::vmcs;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
@@ -72,25 +79,26 @@ use x86_64_hal::xstate;
 use x86_64_hal::xstate::XsetbvFault;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES + CPU_STATE_PAGES;
-/// First of eight page directories mapping the low eight gibibytes.
-const EPT_PD_FIRST_PAGE: u64 = 4;
+const MONITOR_PAGES: usize = CPU_STATE_FIRST_PAGE as usize + CPU_STATE_PAGES;
+/// Exclusive, bounded platform EPT arena; no incomplete EPTP is published.
+const EPT_FIRST_PAGE: u64 = 2;
+const EPT_PAGES: usize = 256;
 /// L1 MSR bitmap, including conservative VMX capability interception.
-const MSR_BITMAP_PAGE: u64 = 12;
+const MSR_BITMAP_PAGE: u64 = EPT_FIRST_PAGE + EPT_PAGES as u64;
 /// First page used as the host stack.
-const HOST_STACK_PAGE: u64 = 13;
+const HOST_STACK_PAGE: u64 = MSR_BITMAP_PAGE + 1;
 /// First page used as the guest stack.
-const GUEST_STACK_PAGE: u64 = 17;
+const GUEST_STACK_PAGE: u64 = HOST_STACK_PAGE + 4;
 /// Linux's EFI path uses more than the 128 KiB stack needed by small payloads.
 const GUEST_STACK_PAGES: u64 = 64;
 /// PML4 page for the L0-owned eight-gibibyte identity map.
-const HOST_PML4_PAGE: u64 = 81;
+const HOST_PML4_PAGE: u64 = GUEST_STACK_PAGE + GUEST_STACK_PAGES;
 /// PDPT page for the L0-owned eight-gibibyte identity map.
-const HOST_PDPT_PAGE: u64 = 82;
+const HOST_PDPT_PAGE: u64 = HOST_PML4_PAGE + 1;
 /// First of eight L0-owned page directories.
-const HOST_PD_FIRST_PAGE: u64 = 83;
+const HOST_PD_FIRST_PAGE: u64 = HOST_PDPT_PAGE + 1;
 /// Private GDT/TSS, IDT and four independent IST stacks, after the host tables.
-const HOST_ENVIRONMENT_FIRST_PAGE: u64 = 91;
+const HOST_ENVIRONMENT_FIRST_PAGE: u64 = HOST_PD_FIRST_PAGE + 8;
 /// Inactive, deliberately invalid-revision page used only to record VMX error 11.
 const ERROR_REVISION_PAGE: u64 =
     HOST_ENVIRONMENT_FIRST_PAGE + host_state::HOST_ENVIRONMENT_PAGES as u64;
@@ -881,6 +889,8 @@ pub(crate) enum Error {
     Firmware(&'static str, usize),
     /// A private descriptor, exception stack, or host ABI invariant was rejected.
     HostState(host_state::Error),
+    /// The platform inventory or complete EPT construction was rejected.
+    Platform(chainload::Error),
 }
 
 impl Error {
@@ -895,6 +905,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            Self::Platform(error) => write!(formatter, "platform map: {error}"),
             Self::Capability(name, value) => write!(formatter, "capability {name}={value:#x}"),
             Self::Allocate(status) => write!(formatter, "AllocatePages status={status:#x}"),
             Self::Instruction(name, status, vm_error) => write!(
@@ -1119,30 +1130,7 @@ fn run_direct_monitor(
             initialize_l1_msr_bitmap(block + MSR_BITMAP_PAGE * PAGE_SIZE);
         }
 
-        let ept_address = |address| {
-            EptPhys::new(address).ok_or(Error::Firmware(
-                "EPT page address",
-                efi::Status::COMPROMISED_DATA.as_usize(),
-            ))
-        };
-        let pml4_phys = ept_address(block + 2 * PAGE_SIZE)?;
-        let pdpt_phys = ept_address(block + 3 * PAGE_SIZE)?;
-        let mut pd_phys = [pml4_phys; 8];
-        for (index, physical) in pd_phys.iter_mut().enumerate() {
-            *physical = ept_address(block + (EPT_PD_FIRST_PAGE + index as u64) * PAGE_SIZE)?;
-        }
-        // SAFETY: these ten exclusive pages are aligned and zeroed, and the final
-        // eight are one contiguous `[EptPage; 8]` allocation.
-        let ept_pointer = unsafe {
-            ept::build_identity_8g(
-                &mut *((block + 2 * PAGE_SIZE) as *mut ept::EptPage),
-                pml4_phys,
-                &mut *((block + 3 * PAGE_SIZE) as *mut ept::EptPage),
-                pdpt_phys,
-                &mut *((block + EPT_PD_FIRST_PAGE * PAGE_SIZE) as *mut [ept::EptPage; 8]),
-                pd_phys,
-            )
-        };
+        let ept_pointer = build_carrier_ept(system_table, block, &ram, serial)?;
         // SAFETY: the ten host paging-structure pages are exclusive, aligned and zeroed.
         let host_cr3 = unsafe { build_host_identity_8g(block) };
 
@@ -1650,6 +1638,62 @@ fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
 }
 
 /// Checks the live runtime allocation against a bounded firmware memory map.
+/// No VMX instruction executes until this complete platform EPT is returned.
+fn build_carrier_ept(
+    system_table: *mut efi::SystemTable,
+    block: u64,
+    ram: &FirmwareMap<205>,
+    serial: &mut SerialPort,
+) -> Result<u64, Error> {
+    platform_snapshot::with_snapshot(system_table, serial, |cpu, map, serial| {
+        let reject = |stage: &'static str| chainload::Error::Firmware(stage, efi::Status::UNSUPPORTED.as_usize());
+        let width = ram.physical_width();
+        if cpu.physical_bits() != width.bits() {
+            return Err(reject("carrier CPU/map physical width changed"));
+        }
+        let tables = platform_acpi::Tables::from_system_table(system_table, map)?;
+        let mmio = platform_resources::platform_mmio(system_table, map, width, tables.as_ref(), serial)?;
+        let mtrrs = cpu.mtrrs().map_err(|_| reject("carrier MTRR state"))?
+            .ok_or_else(|| reject("carrier MTRRs unavailable"))?;
+        // Every VMX/host/EPT page must really be WB, not merely advertise the
+        // firmware WB cache capability or fall inside a q35 address bucket.
+        for page in 0..MONITOR_PAGES {
+            if mtrrs.memory_type(block + page as u64 * PAGE_SIZE)
+                .map_err(|_| reject("carrier monitor MTRR conflict"))?
+                != platform_memory::MemoryType::WriteBack {
+                return Err(reject("carrier monitor memory is not WB"));
+            }
+        }
+        let capabilities = PageCapabilities::from_vmx_capability(cpu.ept_caps()
+            .ok_or_else(|| reject("carrier EPT unavailable"))?)
+            .map_err(|_| reject("carrier EPT page capabilities"))?;
+        let base = block + EPT_FIRST_PAGE * PAGE_SIZE;
+        let end = base + EPT_PAGES as u64 * PAGE_SIZE;
+        let private = [PhysicalRange::new(base, end, width)
+            .map_err(|_| reject("carrier EPT private range"))?];
+        // This post-AllocatePages map includes the complete retained monitor.
+        // Intervening discovery calls allocate/free temporary RAM pools only;
+        // they do not change physical RAM extents or cache attributes.
+        let plan = PlatformMap::new(ram.descriptors(), &private, mmio.ranges(), mtrrs, capabilities)
+            .map_err(|_| reject("carrier platform map"))?;
+        let physical = EptPhys::new(base).ok_or_else(|| reject("carrier EPT address"))?;
+        // SAFETY: the checked exclusive, zero-initialized monitor block contains
+        // these EPT_PAGES contiguous aligned pages, disjoint from VMXON/VMCS,
+        // stacks and Rust state. No VMCS is live yet; the hardware retains this
+        // backing until terminal VMX teardown, never a returning firmware path.
+        let pages = unsafe { core::slice::from_raw_parts_mut(base as *mut ept::EptPage, EPT_PAGES) };
+        let built = ept::build_platform_identity(&plan, pages, physical).map_err(|error| {
+            let _ = writeln!(serial, "thin-hv: direct platform EPT FAIL error={error:?}");
+            reject("carrier platform EPT construction")
+        })?;
+        let _ = writeln!(serial,
+            "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables={} leaves={} private_pages={} host_map=fixed-8g bootstrap=shared-runtime physical_ready=0",
+            built.table_pages(), built.leaf_count(), EPT_PAGES);
+        Ok(built.eptp())
+    }).map_err(Error::Platform)
+}
+
+/// Checks the live runtime allocation against a bounded firmware memory map.
 fn validate_monitor_allocation(
     system_table: *mut efi::SystemTable,
     base: u64,
@@ -1708,17 +1752,14 @@ fn validate_monitor_allocation(
     })
 }
 
-/// Requires unique runtime RAM coverage inside the QEMU backend's WB buckets.
-///
-/// This is deliberately a smoke-backend check, not a physical MTRR/EPT policy.
+/// Requires unique writable runtime RAM with WB capability; the carrier builder
+/// separately checks effective MTRRs before publishing the EPTP. The temporary
+/// HOST_CR3 limit remains explicit until its platform-derived replacement.
 fn monitor_allocation_is_wb(regions: &[FirmwareDescriptor], base: u64) -> bool {
     let Some(end) = base.checked_add(MONITOR_PAGES as u64 * PAGE_SIZE) else {
         return false;
     };
-    if base == 0
-        || !base.is_multiple_of(PAGE_SIZE)
-        || !((base < 1 << 31 && end <= 1 << 31) || (base >= 1 << 32 && end <= 6 << 30))
-    {
+    if base == 0 || !base.is_multiple_of(PAGE_SIZE) || end > IDENTITY_MAP_LIMIT {
         return false;
     }
     let mut covered = [0_u8; MONITOR_PAGES];
@@ -5761,12 +5802,16 @@ mod tests {
         region.memory_type = efi::BOOT_SERVICES_DATA;
         assert!(!super::monitor_allocation_is_wb(&[region], base));
         region.memory_type = efi::RUNTIME_SERVICES_DATA;
-        for base in [0, 1, 1 << 31, 6 << 30, u64::MAX - 4095] {
+        for base in [0, 1, super::IDENTITY_MAP_LIMIT, u64::MAX - 4095] {
             region.physical_start = base;
             assert!(!super::monitor_allocation_is_wb(&[region], base));
         }
         region.physical_start = 1 << 32;
         assert!(super::monitor_allocation_is_wb(&[region], 1 << 32));
+        for base in [1 << 31, 6 << 30] {
+            region.physical_start = base;
+            assert!(super::monitor_allocation_is_wb(&[region], base));
+        }
         assert!(super::ERROR_REVISION_PAGE > 1);
         assert_eq!(super::ERROR_REVISION_PAGE + 1, super::CPU_STATE_FIRST_PAGE);
         assert_eq!(

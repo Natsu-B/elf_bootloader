@@ -427,6 +427,7 @@ pub(crate) fn collect(
         Ok(())
     })?;
     let mut bars = 0usize;
+    let mut highest_bar_end = 0u64;
     let devices = interfaces(services, map, pci_io::PROTOCOL_GUID, |interface| {
         let bytes = interface_bytes(map, interface, mem::size_of::<pci_io::Protocol>())?;
         let location = function(map, bytes, mem::offset_of!(pci_io::Protocol, get_location))?;
@@ -516,6 +517,9 @@ pub(crate) fn collect(
             let result = firmware_resources(map, resources, true, width, |item| {
                 check_bar_config(&header, bar, item, previous)?;
                 roots.check_bar(owner, item)?;
+                if item.kind == 0 {
+                    highest_bar_end = highest_bar_end.max(item.end);
+                }
                 previous = Some(item);
                 Ok(())
             });
@@ -534,7 +538,7 @@ pub(crate) fn collect(
     }
     let _ = writeln!(
         serial,
-        "thin-hv: preflight PCI MMIO roots={} devices={devices} windows={} bars={bars} ranges={} mmio_complete=0 direct_vmx_ready=0",
+        "thin-hv: preflight PCI MMIO roots={} devices={devices} windows={} bars={bars} ranges={} highest_bar_end={highest_bar_end:#018x} mmio_complete=0 direct_vmx_ready=0",
         roots.count,
         roots.window_count,
         output.ranges().len()

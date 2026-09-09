@@ -37,25 +37,20 @@ compile_error!("x86 UEFI backends are mutually exclusive");
 )))]
 compile_error!("select one x86 UEFI backend");
 
-#[cfg(any(
-    feature = "trusted-outer-kvm",
-    feature = "physical-chainload",
-    feature = "physical-preflight"
-))]
 mod chainload;
 #[cfg(feature = "physical-chainload")]
 mod physical_chainload;
 #[cfg(feature = "physical-preflight")]
 mod physical_preflight;
-#[cfg(feature = "physical-preflight")]
+#[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
 mod platform_acpi;
 #[cfg(feature = "physical-preflight")]
 mod platform_ept_audit;
-#[cfg(feature = "physical-preflight")]
+#[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
 mod platform_pci;
-#[cfg(feature = "physical-preflight")]
+#[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
 mod platform_resources;
-#[cfg(feature = "physical-preflight")]
+#[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
 mod platform_snapshot;
 
 #[cfg(feature = "direct-vmx")]

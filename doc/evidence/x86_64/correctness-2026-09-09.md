@@ -1592,3 +1592,78 @@ still pending; `mmio_complete=0 direct_vmx_ready=0` is intentional. These
 non-VMX QEMU preflight results do not resolve the Direct high-PCI Linux failure.
 Outer-KVM successes remain reference evidence only. The pre-existing user edit
 to `AGENTS.md` remains unstaged.
+
+## Active Direct carrier platform EPT (stage 10, HOST_CR3 still pending)
+
+`vmx_smoke::run_direct_monitor` now calls `build_carrier_ept`, not
+`ept::build_identity_8g`. The complete checked UEFI RAM map, CPU physical width,
+effective MTRRs and shared GCD/ACPI/PCI resource inventory feed the existing HAL
+platform planner/materializer. `platform_acpi::Tables::from_system_table` and
+`platform_resources::platform_mmio` keep the preflight and carrier selection
+logic identical. The retained monitor block has a bounded 256-page EPT arena;
+all page offsets derive from that size. The arena is excluded from ordinary L1
+EPT mappings and all of its pages must be runtime-owned, writable and genuinely
+WB under the captured MTRRs. Old q35 WB address buckets no longer decide cache
+validity. No EPTP is returned before complete construction and snapshot cleanup;
+allocation/capacity/attribute failures have no fixed-map or outer-KVM fallback.
+The HAL fixed smoke builders remain available for explicit test consumers.
+
+This is an incremental carrier-EPT change, not completed physical support.
+`HOST_CR3` and operand-access bounds still use the explicit 8 GiB host limit.
+Guest bootstrap and variable overlay still share the retained runtime image;
+other monitor pages are not yet excluded from the normal L1 EPT. The marker
+states `host_map=fixed-8g bootstrap=shared-runtime physical_ready=0`. Production
+host mapping, bootstrap/private-page separation, overlay removal, pCPU/AP/NMI/S3
+and Windows qualification remain pending. No new nested EPT capability is
+advertised: outer EPT leaf sizes use hardware capabilities independently of the
+already restricted L1-visible capability mask.
+
+The runner now requires an active Direct platform-EPT construction marker even
+for the expected terminal exception/abort fixtures. A preflight-only or
+outer-KVM success cannot satisfy that gate. PCI inventory records the highest
+actual BAR end; `X86_UEFI_REQUIRE_HIGH_PCI=1` rejects a run without a BAR above
+8 GiB or with the reduced q35 smoke aperture. `LINUX_KVM_MEMORY=2G|4G` selects a
+bounded Linux regression size. `cargo xrun x86 --nested --release` now includes a
+mandatory 4G, firmware-default, high-BAR Direct Linux lifecycle case with separate
+evidence `bin/x86_64/nested-linux-direct-vmx-high-pci-4g.log`.
+
+Validation, all through `nix develop --accept-flake-config --command`:
+
+* `cargo fmt && cargo xtest -p x86_uefi_loader && cargo xbuild x86 --release`:
+  **120 host PASS, 0 FAIL**, release build/ISA checks **PASS**;
+  `/tmp/x86-platform-carrier-first-build.log`. Shared inventory tests now also
+  execute under both Direct feature entries; counts include those variants.
+* Minimal Direct UEFI smoke: **PASS**, `/tmp/x86-platform-carrier-uefi-first.log`.
+* `cargo fmt && cargo xtest -p xtask`, followed by
+  `LINUX_KVM_BACKEND=direct-vmx LINUX_KVM_MEMORY=4G LINUX_KVM_CYCLES=64
+  X86_UEFI_PCI_PROFILE=firmware-default X86_UEFI_REQUIRE_HIGH_PCI=1
+  scripts/x86_64/run-linux-kvm-test.sh`: **33 host PASS, 0 FAIL; Direct Linux
+  64 cycles PASS**, `/tmp/x86-platform-carrier-linux-high-first.log`.
+  Actual highest BAR end is **0x380000004000**, in the 56 TiB aperture. Linux
+  boots, performs the deterministic KVM_RUN I/O/state/remap checks and powers off
+  without the previous high-PCI-placement EPT violation.
+* All five required `cargo xtest -p` packages: **246 PASS, 0 FAIL** (nested 29,
+  HAL 54, loader 120, guest 10, xtask 33). `cargo xbuild x86`, `cargo fmt --check`
+  and `cargo xrun x86 --release`: **PASS**; standard suite **9 PASS, 0 FAIL**
+  (seven KVM including expected host exception, two TCG).
+  `/tmp/x86-platform-carrier-final-checks.log`.
+* Exact release nested command: **10 PASS, 5 FAIL** across 15 cases; all nine
+  Direct cases pass (six native/MSR contracts and three Linux lifecycle modes).
+  Reference Linux passes; the same five previously documented outer-KVM
+  partial-operand/PAT-shadow/abort-indicator comparisons fail. Overall command
+  exit is **1**, not a clean-suite PASS. `/tmp/x86-platform-carrier-nested-64.log`.
+* High-BAR plus live-XSTATE clobber lifecycle, unchanged existing bounded 600s
+  long-run limit: **4096 cycles PASS**, poweroff at guest time 322.657906s;
+  `/tmp/x86-platform-carrier-high-clobber-4096.log`:
+
+  ```sh
+  nix develop --accept-flake-config --command env \
+      LINUX_KVM_BACKEND=direct-vmx LINUX_KVM_MEMORY=4G LINUX_KVM_CYCLES=4096 \
+      LINUX_KVM_TIMEOUT_SECONDS=600 LINUX_KVM_HOST_XSTATE_TEST=1 \
+      X86_UEFI_PCI_PROFILE=firmware-default X86_UEFI_REQUIRE_HIGH_PCI=1 \
+      scripts/x86_64/run-linux-kvm-test.sh
+  ```
+
+The old unmodified timing-sensitive KVM failures still require replay against
+this increment; no claim that platform EPT fixes them is made. No Direct Windows
+Hyper-V or physical machine was tested. Outer-KVM results are reference-only.

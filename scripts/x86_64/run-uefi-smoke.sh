@@ -343,7 +343,7 @@ check_preflight_ept_log() {
     local acpi=0 acpi_ranges=0 pci=0 pci_ranges=0 gcd=0 ranges=0 previous_end=0 start end
     local pass_pattern='^thin-hv: preflight EPT audit PASS scope=uefi-memory-map\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=288 mmio_complete=0 direct_vmx_ready=0$'
     local acpi_pattern='^thin-hv: preflight ACPI MMIO mcfg=1 madt=1 ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
-    local pci_pattern='^thin-hv: preflight PCI MMIO roots=([1-9][0-9]?) devices=([1-9][0-9]{0,3}) windows=([1-9][0-9]{0,2}) bars=([1-9][0-9]{0,4}) ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
+    local pci_pattern='^thin-hv: preflight PCI MMIO roots=([1-9][0-9]?) devices=([1-9][0-9]{0,3}) windows=([1-9][0-9]{0,2}) bars=([1-9][0-9]{0,4}) ranges=([1-9][0-9]{0,2}) highest_bar_end=0x([0-9a-f]{16}) mmio_complete=0 direct_vmx_ready=0$'
     local gcd_pattern='^thin-hv: preflight MMIO PASS source=gcd\+acpi\+pci descriptors=([1-9][0-9]{0,3}) mmio_ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
     local range_pattern='^thin-hv: preflight platform MMIO index=(0|[1-9][0-9]{0,2}) start=0x([0-9a-f]{16}) end=0x([0-9a-f]{16}) ept_type=UC$'
     [[ "$accel" == kvm || "$accel" == tcg ]] || return 1
@@ -366,6 +366,7 @@ check_preflight_ept_log() {
         if [[ "$line" =~ $pci_pattern ]]; then
             ((acpi == 1 && pci == 0 && ranges == 0 && gcd == 0 && passes == 0 && skips == 0)) || return 1
             ((BASH_REMATCH[1] <= 32 && BASH_REMATCH[2] <= 4096 && BASH_REMATCH[3] <= 128 && BASH_REMATCH[4] <= 6 * BASH_REMATCH[2] && BASH_REMATCH[5] <= BASH_REMATCH[3])) || return 1
+            [[ ${BASH_REMATCH[6]} > 0000000000000000 && ${BASH_REMATCH[6]} < 0010000000000001 ]] || return 1
             pci=1
             pci_ranges=${BASH_REMATCH[5]}
             continue
@@ -425,6 +426,34 @@ check_preflight_ept_log() {
     else
         ((passes == 0 && skips == 1 && vmx_markers == 1))
     fi
+}
+
+# Independent of terminal exception/abort verdicts: those fixtures must still
+# prove that the real Direct carrier consumed a complete platform EPT.
+check_direct_platform_log() {
+    local log=$1 high=$2 line count=0 high_bar=0 bytes transcript
+    local pattern='^thin-hv: direct platform EPT PASS source=uefi\+mtrr\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 host_map=fixed-8g bootstrap=shared-runtime physical_ready=0$'
+    [[ "$high" == 0 || "$high" == 1 ]] || return 1
+    [[ -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 2097152)) || return 1
+    if IFS= read -r -d '' -n 2097153 transcript <"$log"; then return 1; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" =~ $pattern ]]; then
+            ((BASH_REMATCH[1] <= 256)) || return 1
+            if ((${#BASH_REMATCH[2]} == 20)) && [[ ${BASH_REMATCH[2]} > 18446744073709551615 ]]; then return 1; fi
+            ((count += 1))
+            ((count <= 64)) || return 1 # bounded reset/reboot transcripts
+        elif [[ "$line" == 'thin-hv: direct platform EPT '* ]]; then
+            return 1
+        elif [[ "$line" == 'thin-hv: preflight PCI MMIO '* ]]; then
+            [[ "$line" =~ ' highest_bar_end=0x'([0-9a-f]{16})' mmio_complete=0 direct_vmx_ready=0'$ ]] || return 1
+            [[ ${BASH_REMATCH[1]} > 0000000000000000 && ${BASH_REMATCH[1]} < 0010000000000001 ]] || return 1
+            if [[ ${BASH_REMATCH[1]} > 0000000200000000 ]]; then high_bar=1; fi
+        fi
+    done <<<"$transcript"
+    ((count > 0 && (high == 0 || high_bar == 1)))
 }
 
 # Validate the complete ordered transcript, not just the final fixture marker.
@@ -537,12 +566,22 @@ if [[ ${1:-} == --check-preflight-ept-log ]]; then
     check_preflight_ept_log "$2" "$3" || die 'preflight EPT construction transcript check failed'
     exit 0
 fi
+if [[ ${1:-} == --check-direct-platform-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-direct-platform-log HIGH_PCI LOG'
+    check_direct_platform_log "$3" "$2" || die 'Direct platform EPT evidence rejected'
+    exit 0
+fi
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
 pci_profile=${X86_UEFI_PCI_PROFILE:-firmware-default}
+require_high_pci=${X86_UEFI_REQUIRE_HIGH_PCI:-0}
+[[ "$require_high_pci" =~ ^[01]$ ]] || die 'X86_UEFI_REQUIRE_HIGH_PCI must be 0 or 1'
+if ((require_high_pci)); then
+    [[ "$backend" == direct-vmx && "$pci_profile" == firmware-default ]] || die 'high PCI regression requires Direct and firmware-default layout'
+fi
 pci_args=()
 case "$pci_profile" in
     firmware-default) ;;
@@ -939,6 +978,9 @@ set -e
 qemu_pid=
 
 cat -- "$serial_log"
+if [[ "$backend" == direct-vmx ]]; then
+    check_direct_platform_log "$serial_log" "$require_high_pci" || die 'Direct platform EPT evidence missing or malformed'
+fi
 if ((qemu_status != 0)); then
     cat -- "$qemu_log" >&2
 fi

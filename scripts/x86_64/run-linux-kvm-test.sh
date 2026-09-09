@@ -63,6 +63,8 @@ fi
 backend=${LINUX_KVM_BACKEND:-direct-vmx}
 cycles=${LINUX_KVM_CYCLES:-64}
 timeout_seconds=${LINUX_KVM_TIMEOUT_SECONDS:-300}
+memory=${LINUX_KVM_MEMORY:-2G}
+case "$memory" in 2G|4G) ;; *) die 'LINUX_KVM_MEMORY must be 2G or 4G' ;; esac
 host_xstate_test=${LINUX_KVM_HOST_XSTATE_TEST:-0}
 [[ "$host_xstate_test" =~ ^[01]$ ]] || die 'LINUX_KVM_HOST_XSTATE_TEST must be 0 or 1'
 [[ "$host_xstate_test" == 0 || "$backend" == direct-vmx ]] || die 'host XSTATE fixture requires project Direct L0'
@@ -103,7 +105,7 @@ env \
     X86_UEFI_ACCEL=kvm \
     X86_MONITOR_IMAGE="$monitor" \
     X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
-    X86_UEFI_MEMORY=2G \
+    X86_UEFI_MEMORY="$memory" \
     X86_UEFI_SMP=1 \
     X86_UEFI_GUEST_LOCATION=guest \
     X86_UEFI_ALLOW_REBOOT=0 \

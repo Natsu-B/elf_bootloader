@@ -965,7 +965,12 @@ fn run_x86_nested() -> Result<(), String> {
             }
         }
     }
-    for (backend, host_xstate) in [("outer-kvm", "0"), ("direct-vmx", "0"), ("direct-vmx", "1")] {
+    for (backend, host_xstate, memory) in [
+        ("outer-kvm", "0", "2G"),
+        ("direct-vmx", "0", "2G"),
+        ("direct-vmx", "1", "2G"),
+        ("direct-vmx", "0", "4G"),
+    ] {
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -975,11 +980,17 @@ fn run_x86_nested() -> Result<(), String> {
             }
         }
         eprintln!(
-            "\n--- Nested Linux state/lifetime backend={backend} host_xstate={host_xstate} environment=QEMU/kvm ---"
+            "\n--- Nested Linux state/lifetime backend={backend} host_xstate={host_xstate} memory={memory} environment=QEMU/kvm ---"
         );
         let result = Command::new("./scripts/x86_64/run-linux-kvm-test.sh")
             .env("LINUX_KVM_BACKEND", backend)
             .env("LINUX_KVM_HOST_XSTATE_TEST", host_xstate)
+            .env("LINUX_KVM_MEMORY", memory)
+            .env("X86_UEFI_PCI_PROFILE", "firmware-default")
+            .env(
+                "X86_UEFI_REQUIRE_HIGH_PCI",
+                if memory == "4G" { "1" } else { "0" },
+            )
             .env("X86_UEFI_MSR_ABORT_TEST", "0")
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
             .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
@@ -989,13 +1000,15 @@ fn run_x86_nested() -> Result<(), String> {
             .status();
         match result {
             Ok(status) if status.success() => {
-                eprintln!("nested Linux: PASS backend={backend} host_xstate={host_xstate}")
+                eprintln!("nested Linux: PASS backend={backend} host_xstate={host_xstate} memory={memory}")
             }
             other => failures.push(format!(
-                "nested Linux backend={backend} host_xstate={host_xstate}: {other:?}"
+                "nested Linux backend={backend} host_xstate={host_xstate} memory={memory}: {other:?}"
             )),
         }
-        let suffix = if host_xstate == "1" {
+        let suffix = if memory == "4G" {
+            "-high-pci-4g"
+        } else if host_xstate == "1" {
             "-host-xstate"
         } else {
             ""
@@ -3261,7 +3274,7 @@ mod tests {
             "thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0\n";
         let gcd = concat!(
             "thin-hv: preflight ACPI MMIO mcfg=1 madt=1 ranges=3 mmio_complete=0 direct_vmx_ready=0\n",
-            "thin-hv: preflight PCI MMIO roots=1 devices=6 windows=2 bars=3 ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
+            "thin-hv: preflight PCI MMIO roots=1 devices=6 windows=2 bars=3 ranges=2 highest_bar_end=0x0000380000001000 mmio_complete=0 direct_vmx_ready=0\n",
             "thin-hv: preflight platform MMIO index=0 start=0x00000000fec00000 end=0x00000000fec01000 ept_type=UC\n",
             "thin-hv: preflight platform MMIO index=1 start=0x0000008000000000 end=0x0000008000001000 ept_type=UC\n",
             "thin-hv: preflight MMIO PASS source=gcd+acpi+pci descriptors=3 mmio_ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
@@ -3376,6 +3389,59 @@ mod tests {
             }
             assert!(!check(accel, &valid.replace(gcd, "")));
             assert!(!check(accel, &format!("{valid}{gcd}")));
+        }
+        let check_direct = |high: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-direct-platform-log", high])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let direct = "thin-hv: direct platform EPT PASS source=uefi+mtrr+gcd+acpi+pci tables=38 leaves=17240 private_pages=256 host_map=fixed-8g bootstrap=shared-runtime physical_ready=0\n";
+        assert!(check_direct("0", direct));
+        assert!(!check_direct("1", direct));
+        assert!(check_direct("1", &format!("{gcd}{direct}")));
+        assert!(check_direct(
+            "1",
+            &format!("{gcd}{direct}").replace('\n', "\r\n")
+        ));
+        assert!(!check_direct("2", &format!("{gcd}{direct}")));
+        assert!(!check_direct("0", &kvm)); // non-VMX audit is not an active carrier
+        assert!(!check_direct(
+            "0",
+            "thin-hv: trusted outer KVM guest PASS\n"
+        ));
+        assert!(check_direct("0", &direct.repeat(64)));
+        assert!(!check_direct("0", &direct.repeat(65)));
+        for (from, to) in [
+            ("tables=38", "tables=0"),
+            ("tables=38", "tables=257"),
+            ("leaves=17240", "leaves=18446744073709551616"),
+            ("private_pages=256", "private_pages=0"),
+            ("source=uefi+mtrr+gcd+acpi+pci", "source=q35-smoke"),
+            ("physical_ready=0", "physical_ready=1"),
+            ("EPT PASS", "EPT FAIL"),
+            ("EPT PASS", "EPT\0 PASS"),
+        ] {
+            assert!(
+                !check_direct("0", &direct.replace(from, to)),
+                "{from} -> {to}"
+            );
+        }
+        for end in [
+            "0x0000000200000000",
+            "0x0000000080000000",
+            "0x0010000000000001",
+        ] {
+            assert!(!check_direct(
+                "1",
+                &format!("{gcd}{direct}").replace("0x0000380000001000", end)
+            ));
         }
     }
 

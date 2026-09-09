@@ -4,7 +4,6 @@ use crate::SerialPort;
 use crate::chainload::Error;
 use crate::platform_acpi;
 use crate::platform_ept_audit;
-use crate::platform_pci;
 use crate::platform_resources;
 use crate::platform_snapshot;
 use crate::platform_snapshot::MemoryMap;
@@ -65,23 +64,13 @@ fn inventory(system_table: *mut efi::SystemTable, serial: &mut SerialPort) -> Re
             let tables = inventory_tables(system_table, map, serial)?;
             let width = PhysicalWidth::new(cpu.physical_bits())
                 .map_err(|_| malformed("GCD physical-address width"))?;
-            let mut acpi = match &tables {
-                Some(tables) => tables.mmio(map, width)?,
-                None => platform_resources::MmioMap::empty(width)?,
-            };
-            let _ = writeln!(
+            let mmio = platform_resources::platform_mmio(
+                system_table,
+                map,
+                width,
+                tables.as_ref(),
                 serial,
-                "thin-hv: preflight ACPI MMIO mcfg={} madt={} ranges={} mmio_complete=0 direct_vmx_ready=0",
-                u8::from(tables.as_ref().is_some_and(|tables| tables.mcfg.is_some())),
-                u8::from(tables.as_ref().is_some_and(|tables| tables.madt.is_some())),
-                acpi.ranges().len()
-            );
-            let pci = platform_pci::collect(system_table, map, width, serial)?;
-            for range in pci.ranges() {
-                acpi.insert(*range, width)?;
-            }
-            let mmio =
-                platform_resources::collect(system_table, map, width, acpi.ranges(), serial)?;
+            )?;
             storage.inspect(cpu, map, mmio.ranges(), serial)
         })
     })
@@ -133,8 +122,8 @@ fn inventory_tables(
             address.unwrap_or(0)
         );
     }
-    let tables = if let Some(rsdp) = acpi2.or(acpi1) {
-        let tables = platform_acpi::discover(rsdp, map)?;
+    let tables = if let Some(tables) = platform_acpi::Tables::from_system_table(system_table, map)?
+    {
         let _ = writeln!(
             serial,
             "thin-hv: preflight MSDM={} payload=not-read",

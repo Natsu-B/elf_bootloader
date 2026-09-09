@@ -6,6 +6,8 @@
 use crate::SerialPort;
 use crate::chainload;
 use crate::chainload::Error;
+use crate::platform_acpi;
+use crate::platform_pci;
 use crate::platform_snapshot::MemoryMap;
 use crate::platform_snapshot::malformed;
 use crate::platform_snapshot::read_u32;
@@ -219,7 +221,7 @@ fn collect_with_resources(
 
 /// The only DXE operation is GetMemorySpaceMap, whose temporary pool allocation
 /// is released on every inspection result. No firmware table or device is changed.
-pub(crate) fn collect(
+fn collect(
     system_table: *mut efi::SystemTable,
     map: &MemoryMap<'_>,
     width: PhysicalWidth,
@@ -305,6 +307,33 @@ pub(crate) fn collect(
         result.count
     );
     Ok(result)
+}
+
+/// Shared physical inventory for the disposable preflight and the active
+/// Direct carrier. Neither caller may substitute a q35 range on failure.
+pub(crate) fn platform_mmio(
+    system_table: *mut efi::SystemTable,
+    map: &MemoryMap<'_>,
+    width: PhysicalWidth,
+    tables: Option<&platform_acpi::Tables>,
+    serial: &mut SerialPort,
+) -> Result<MmioMap, Error> {
+    let mut resources = match tables {
+        Some(tables) => tables.mmio(map, width)?,
+        None => MmioMap::empty(width)?,
+    };
+    let _ = writeln!(
+        serial,
+        "thin-hv: preflight ACPI MMIO mcfg={} madt={} ranges={} mmio_complete=0 direct_vmx_ready=0",
+        u8::from(tables.is_some_and(|tables| tables.mcfg.is_some())),
+        u8::from(tables.is_some_and(|tables| tables.madt.is_some())),
+        resources.ranges().len()
+    );
+    let pci = platform_pci::collect(system_table, map, width, serial)?;
+    for range in pci.ranges() {
+        resources.insert(*range, width)?;
+    }
+    collect(system_table, map, width, resources.ranges(), serial)
 }
 
 #[cfg(test)]

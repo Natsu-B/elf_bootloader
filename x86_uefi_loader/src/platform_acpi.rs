@@ -7,6 +7,7 @@ use crate::platform_snapshot::MemoryMap;
 use crate::platform_snapshot::malformed;
 use crate::platform_snapshot::read_u32;
 use crate::platform_snapshot::read_u64;
+use r_efi::efi;
 use x86_64_hal::platform_memory::PhysicalRange;
 use x86_64_hal::platform_memory::PhysicalWidth;
 
@@ -24,6 +25,32 @@ pub(crate) struct Tables {
 }
 
 impl Tables {
+    /// Uses the firmware's preferred ACPI revision, rejecting ambiguous pointers.
+    pub(crate) fn from_system_table(
+        system_table: *mut efi::SystemTable,
+        map: &MemoryMap<'_>,
+    ) -> Result<Option<Self>, Error> {
+        let (mut acpi1, mut acpi2) = (None, None);
+        for entry in map.configuration_tables(system_table)? {
+            let slot = if entry.vendor_guid == efi::ACPI_20_TABLE_GUID {
+                &mut acpi2
+            } else if entry.vendor_guid == efi::ACPI_10_TABLE_GUID {
+                &mut acpi1
+            } else {
+                continue;
+            };
+            let address = entry.vendor_table as usize as u64;
+            if address == 0 || slot.is_some_and(|previous| previous != address) {
+                return Err(malformed("null/duplicate firmware ACPI table"));
+            }
+            *slot = Some(address);
+        }
+        acpi2
+            .or(acpi1)
+            .map(|address| discover(address, map))
+            .transpose()
+    }
+
     /// Reads only the two allowlisted resource payloads and publishes no partial
     /// MMIO list on malformed tables. This never changes either firmware table.
     pub(crate) fn mmio(&self, map: &MemoryMap<'_>, width: PhysicalWidth) -> Result<MmioMap, Error> {
