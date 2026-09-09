@@ -2604,3 +2604,42 @@ reference failures. Python decoder: **12 PASS, 0 FAIL**; fmt/fmt-check,
 bash syntax and diff checks PASS. Logs `/tmp/x86-vmread-fields-host.log` and
 `/tmp/x86-vmread-fields-regression.log`. No architectural VMX operation,
 capability, timeout or guest-state policy was changed by this profiling step.
+
+`f97d3b9` completed **FAIL** at the unchanged 600-second Hyper-V marker bound.
+The final serial transcript contains a second complete L0 boot/publication,
+so an unexpected reboot occurred; its cause was not captured. The final
+screen shows TianoCore and the Windows spinner, not a visible BSOD. The
+decoder correctly rejected the ambiguous multi-boot publication instead of
+reading an old monitor address. Only the earlier validated sample is evidence
+for counters. Image integrity/artifact/seed checks passed. Final screenshot:
+`/tmp/x86-exit-reasons-windows.F6kFDb/direct-hyperv/monitor-hyperv-failure-diagnostics.JEqQZ6/screen.ppm`.
+
+The early `c44f6c1` sample has 636,510 L2 entries and zero entry failures.
+Hardware-backed L1 VMREADs: RIP 597,844; RFLAGS 205,315; CS attributes 597,847;
+interruptibility 669,161; other selected/overflow bins total 86,559. Thus
+those four stopped-guest fields account for about 96% of actual read misses.
+L2 RDMSR exits are 506,054; L1 VMREAD exits 3,437,637; VMPTRLDs 8,556,554.
+The bounded pause/copy resumed successfully. Saved publication and 1,344-byte
+record: `/tmp/x86-vmread-hyperv-early-serial.log` and
+`/tmp/x86-vmread-hyperv-early.bin`. Full run is not yet a PASS.
+
+## CPU-local immutable nested host-validation limits
+
+`CpuMonitor` now owns the fixed host-validation CPUID/MSR limits captured by
+`capture_host_validation_limits` on its physical CPU before the first entry.
+Only static width, NX, LAM, SHSTK/IBT and VMX CR fixed-bit capabilities are
+retained; no dynamic OSXSAVE/OSPKE/XCR0/XSS state is cached. Physical reset,
+resume or CPU ownership transition requires rebuilding this monitor object.
+`host_limits_for_efer` combines those limits with the same current-carrier
+EFER value already read by `handle_l1_vmentry` for PAT/EFER inheritance.
+This removes repeated static CPUID/four RDMSR operations and one duplicate
+EFER VMREAD per nested entry without removing original-host validation,
+changing exception priority or caching L1's LMA across entries.
+
+The existing CPU-ownership host test now checks two distinct CPU capabilities
+and repeated LME/LMA/NX mode transitions, proving that the immutable owner
+values remain unchanged. All five package checks: **342 PASS, 0 FAIL**;
+debug build PASS; standard QEMU **9 PASS, 0 FAIL**; release nested **15 PASS,
+5 FAIL / 20**, all **14 Direct PASS** and the same five reference differences.
+`/tmp/x86-host-limits-cache-regression.log`. Timed A/B and the original
+timing-sensitive regressions are still required before quantifying speedup.

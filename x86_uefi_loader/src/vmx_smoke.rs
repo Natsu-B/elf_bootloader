@@ -745,6 +745,9 @@ struct NestedRun {
 #[repr(C, align(16))]
 struct CpuMonitor {
     physical_bits: u8,
+    /// Captured on this physical CPU before entry, immutable for its VMX
+    /// lifetime. l1_ia32e is deliberately false here, never cached guest mode.
+    host_limits: host_validation::Limits,
     diagnostics: SpinLock<ExitDiagnostics>,
     vcpu: SpinLock<VcpuState>,
     carrier_patch: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]>>,
@@ -755,9 +758,10 @@ struct CpuMonitor {
 }
 
 impl CpuMonitor {
-    fn new(runtime: CpuRuntimeState) -> Self {
+    fn new(runtime: CpuRuntimeState, host_limits: host_validation::Limits) -> Self {
         Self {
             physical_bits: runtime.ram.physical_width().bits(),
+            host_limits,
             diagnostics: SpinLock::new(ExitDiagnostics::new()),
             vcpu: SpinLock::new(VcpuState::new()),
             carrier_patch: SpinLock::new(None),
@@ -765,6 +769,16 @@ impl CpuMonitor {
             entry_policy: SpinLock::new(None),
             nested_run: SpinLock::new(None),
             runtime: SpinLock::new(runtime),
+        }
+    }
+
+    /// Combine immutable CPU limits with this entry's actual stopped L1 mode.
+    /// VMXOFF/VMXON in L1 does not change physical CPU capabilities. A physical
+    /// CPU reset/migration/resume must rebuild the owning monitor, not copy it.
+    fn host_limits_for_efer(&self, efer: u64) -> host_validation::Limits {
+        host_validation::Limits {
+            l1_ia32e: efer & (1 << 10) != 0,
+            ..self.host_limits
         }
     }
 }
@@ -1696,19 +1710,27 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
             "CPU runtime state address",
             efi::Status::COMPROMISED_DATA.as_usize(),
         ))?;
+    // SAFETY: the same physical CPU remains at CPL0 in firmware preparation.
+    // CPUID.VMX and VMX capability MSRs were checked before reaching this path.
+    // The validated firmware map supplies its physical width. No guest has run;
+    // this immutable snapshot belongs only to this CPU's newly allocated state.
+    let host_limits = unsafe { capture_host_validation_limits(ram.physical_width().bits()) };
     // SAFETY: the checked runtime allocation includes this disjoint,
     // page-aligned final arena with enough space for the complete lock and
     // state. No CPU or VMCS references it yet. The object never moves; all
     // post-entry terminal paths retain its pages and private HOST_CR3 map.
     unsafe {
-        monitor.as_ptr().write(CpuMonitor::new(CpuRuntimeState::new(
-            ram,
-            basic,
-            [(block, block_end), (image_base, image_end)],
-            maps.mmio,
-            Some(maps.window),
-            Some(handoff.bootstrap),
-        )));
+        monitor.as_ptr().write(CpuMonitor::new(
+            CpuRuntimeState::new(
+                ram,
+                basic,
+                [(block, block_end), (image_base, image_end)],
+                maps.mmio,
+                Some(maps.window),
+                Some(handoff.bootstrap),
+            ),
+            host_limits,
+        ));
         host_environment.bind_monitor_data(monitor.cast());
     }
     // SAFETY: the complete CpuMonitor was initialized in its final allocation
@@ -3985,16 +4007,6 @@ fn handle_l1_vmentry(
     };
     let l1_interruptibility =
         unsafe { vmcs_read(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
-    let Some(host_limits) = l1_host_validation_limits() else {
-        stop_unexpected_exit(
-            b"reading L1 host validation context failed",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
-    };
     // SAFETY: the owning CPU's carrier is still current. These are the stopped
     // L1's saved MSRs, not the private host values installed for Rust execution.
     let inherited = unsafe {
@@ -4002,14 +4014,20 @@ fn handle_l1_vmentry(
             .ok()
             .zip(vmcs_read(vmcs::GUEST_IA32_EFER).ok())
     };
-    if inherited
-        .and_then(|(pat, efer)| {
-            with_cpu_runtime(|state| {
-                state.inherited = PatEfer { pat, efer };
-            })
-        })
-        .is_none()
-    {
+    let Some((pat, efer)) = inherited else {
+        stop_unexpected_exit(
+            b"reading inherited L1 MSRs failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    // Reuse this exact stopped-carrier EFER read for the mode check. There is
+    // no intervening guest execution or write to EFER; never cache L1's LMA.
+    let host_limits = current_cpu().host_limits_for_efer(efer);
+    if with_cpu_runtime(|state| state.inherited = PatEfer { pat, efer }).is_none() {
         stop_unexpected_exit(
             b"capturing inherited L1 MSRs failed",
             reason,
@@ -4338,9 +4356,15 @@ fn l1_direct_controls_supported(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()])
     Some(true)
 }
 
-/// Captures CPU limits and the stopped L1's mode while its carrier is current.
-/// No extra VMX capability is exposed by these host checks.
-fn l1_host_validation_limits() -> Option<host_validation::Limits> {
+/// Capture static host-validation capabilities once on the owning CPU.
+/// Leaf 7 SHSTK/IBT/LAM, NX and address widths are feature availability, not
+/// CR4-dependent OSXSAVE/OSPKE or XCR0/XSS-dependent CPUID. No live guest mode
+/// is read here. Rebuild after any physical CPU reset or ownership transition.
+///
+/// # Safety
+/// Caller is pinned at CPL0 on a CPUID.VMX-capable CPU, before its first L0
+/// entry, with validated physical-address width and readable VMX fixed MSRs.
+unsafe fn capture_host_validation_limits(physical_bits: u8) -> host_validation::Limits {
     let features = cpu::cpuid(7, 0);
     let extended = cpu::cpuid(0x8000_0001, 0);
     let linear_bits = if cpu::cpuid(0x8000_0000, 0).eax >= 0x8000_0008 {
@@ -4354,16 +4378,16 @@ fn l1_host_validation_limits() -> Option<host_validation::Limits> {
         } else {
             0
         });
-    // SAFETY: this is the VMX-enabled BSP's root-mode L1-exit path with carrier
-    // current. The four fixed-bit MSRs exist and are read-only; GUEST_EFER holds
-    // L1's captured architectural mode, not L0's private long-mode EFER.
+    // SAFETY: CPL0 and CPUID.VMX establish all four read-only fixed-bit MSRs.
+    // Only this pinned physical CPU's static capabilities are sampled; there
+    // is no current-VMCS, guest-state or firmware-lifetime dependency.
     unsafe {
-        Some(host_validation::Limits {
+        host_validation::Limits {
             cr0_fixed0: cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED0),
             cr0_fixed1: cpu::rdmsr(vmx::IA32_VMX_CR0_FIXED1),
             cr4_fixed0: cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0),
             cr4_fixed1: cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1),
-            physical_bits: current_cpu().physical_bits,
+            physical_bits,
             linear_bits,
             lam: features.eax >= 1 && cpu::cpuid(7, 1).eax & (1 << 26) != 0,
             efer_allowed: 0x501
@@ -4373,8 +4397,8 @@ fn l1_host_validation_limits() -> Option<host_validation::Limits> {
                     0
                 },
             cet_allowed,
-            l1_ia32e: vmcs_read(vmcs::GUEST_IA32_EFER).ok()? & (1 << 10) != 0,
-        })
+            l1_ia32e: false,
+        }
     }
 }
 
@@ -6661,8 +6685,45 @@ mod tests {
         );
         assert_ne!(first.entry.as_ptr(), second.entry.as_ptr());
         assert!(core::mem::size_of::<super::CpuMonitor>() <= super::CPU_STATE_PAGES * 4096);
-        let first = super::CpuMonitor::new(first);
-        let second = super::CpuMonitor::new(second);
+        let limits = super::host_validation::Limits {
+            cr0_fixed0: 0x80000021,
+            cr0_fixed1: u32::MAX.into(),
+            cr4_fixed0: 1 << 13,
+            cr4_fixed1: 0x3f_ffff,
+            physical_bits: first.ram.physical_width().bits(),
+            linear_bits: 48,
+            lam: false,
+            efer_allowed: 0xd01,
+            cet_allowed: 0,
+            l1_ia32e: false,
+        };
+        let second_limits = super::host_validation::Limits {
+            physical_bits: second.ram.physical_width().bits(),
+            linear_bits: 57,
+            lam: true,
+            cet_allowed: 3,
+            ..limits
+        };
+        let first = super::CpuMonitor::new(first, limits);
+        let second = super::CpuMonitor::new(second, second_limits);
+        for efer in [0, 0x100, 0x500, 0xd01, 0x800, 0x400, 0] {
+            for owner in [&first, &second] {
+                let entry = owner.host_limits_for_efer(efer);
+                assert_eq!(entry.l1_ia32e, efer & 0x400 != 0);
+                assert!(!owner.host_limits.l1_ia32e);
+                assert_eq!(entry.physical_bits, owner.physical_bits);
+                assert_eq!(entry.cr0_fixed0, limits.cr0_fixed0);
+                assert_eq!(entry.cr0_fixed1, limits.cr0_fixed1);
+                assert_eq!(entry.cr4_fixed0, limits.cr4_fixed0);
+                assert_eq!(entry.cr4_fixed1, limits.cr4_fixed1);
+                assert_eq!(entry.efer_allowed, limits.efer_allowed);
+                assert_eq!(entry.linear_bits, owner.host_limits.linear_bits);
+                assert_eq!(entry.lam, owner.host_limits.lam);
+                assert_eq!(entry.cet_allowed, owner.host_limits.cet_allowed);
+            }
+        }
+        assert_eq!(first.host_limits.linear_bits, 48);
+        assert_eq!(second.host_limits.linear_bits, 57);
         let vmxon = super::VmxonPhys::new(0x1000).unwrap();
         let direct = super::VmcsPhys::new(0x2000).unwrap();
         first.vcpu.lock().record_vmxon_success(vmxon);
