@@ -340,10 +340,11 @@ check_host_exception_log() {
 # The application may legitimately skip elsewhere; that is not this KVM test's PASS.
 check_preflight_ept_log() {
     local accel=$1 log=$2 line transcript bytes passes=0 skips=0 vmx_markers=0 tables leaves
-    local acpi=0 acpi_ranges=0 gcd=0 ranges=0 previous_end=0 start end
-    local pass_pattern='^thin-hv: preflight EPT audit PASS scope=uefi-memory-map\+gcd\+acpi tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=288 mmio_complete=0 direct_vmx_ready=0$'
+    local acpi=0 acpi_ranges=0 pci=0 pci_ranges=0 gcd=0 ranges=0 previous_end=0 start end
+    local pass_pattern='^thin-hv: preflight EPT audit PASS scope=uefi-memory-map\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=288 mmio_complete=0 direct_vmx_ready=0$'
     local acpi_pattern='^thin-hv: preflight ACPI MMIO mcfg=1 madt=1 ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
-    local gcd_pattern='^thin-hv: preflight MMIO PASS source=gcd\+acpi descriptors=([1-9][0-9]{0,3}) mmio_ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
+    local pci_pattern='^thin-hv: preflight PCI MMIO roots=([1-9][0-9]?) devices=([1-9][0-9]{0,3}) windows=([1-9][0-9]{0,2}) bars=([1-9][0-9]{0,4}) ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
+    local gcd_pattern='^thin-hv: preflight MMIO PASS source=gcd\+acpi\+pci descriptors=([1-9][0-9]{0,3}) mmio_ranges=([1-9][0-9]{0,2}) mmio_complete=0 direct_vmx_ready=0$'
     local range_pattern='^thin-hv: preflight platform MMIO index=(0|[1-9][0-9]{0,2}) start=0x([0-9a-f]{16}) end=0x([0-9a-f]{16}) ept_type=UC$'
     [[ "$accel" == kvm || "$accel" == tcg ]] || return 1
     [[ -f "$log" ]] || return 1
@@ -362,8 +363,15 @@ check_preflight_ept_log() {
             acpi_ranges=${BASH_REMATCH[1]}
             continue
         fi
+        if [[ "$line" =~ $pci_pattern ]]; then
+            ((acpi == 1 && pci == 0 && ranges == 0 && gcd == 0 && passes == 0 && skips == 0)) || return 1
+            ((BASH_REMATCH[1] <= 32 && BASH_REMATCH[2] <= 4096 && BASH_REMATCH[3] <= 128 && BASH_REMATCH[4] <= 6 * BASH_REMATCH[2] && BASH_REMATCH[5] <= BASH_REMATCH[3])) || return 1
+            pci=1
+            pci_ranges=${BASH_REMATCH[5]}
+            continue
+        fi
         if [[ "$line" =~ $range_pattern ]]; then
-            ((acpi == 1 && gcd == 0 && passes == 0 && skips == 0 && ranges < 128)) || return 1
+            ((acpi == 1 && pci == 1 && gcd == 0 && passes == 0 && skips == 0 && ranges < 128)) || return 1
             ((BASH_REMATCH[1] == ranges)) || return 1
             # CPUID MAXPHYADDR never exceeds 52: reject before signed arithmetic.
             [[ ${BASH_REMATCH[2]} < 0010000000000000 && ${BASH_REMATCH[3]} < 0010000000000001 ]] || return 1
@@ -374,7 +382,7 @@ check_preflight_ept_log() {
             continue
         fi
         if [[ "$line" =~ $gcd_pattern ]]; then
-            ((gcd == 0 && passes == 0 && skips == 0 && BASH_REMATCH[1] <= 4096 && BASH_REMATCH[1] + acpi_ranges >= ranges && BASH_REMATCH[2] == ranges && ranges > 0)) || return 1
+            ((gcd == 0 && passes == 0 && skips == 0 && BASH_REMATCH[1] <= 4096 && BASH_REMATCH[1] + acpi_ranges + pci_ranges >= ranges && BASH_REMATCH[2] == ranges && ranges > 0)) || return 1
             gcd=1
             continue
         fi
@@ -408,7 +416,7 @@ check_preflight_ept_log() {
                 vmx_markers=1
                 ;;
             *'FAIL'* | *'panic'* | 'thin-hv: preflight EPT audit'* | 'thin-hv: preflight GCD '* | \
-            'thin-hv: preflight ACPI MMIO'* | 'thin-hv: preflight platform MMIO'* | 'thin-hv: preflight MMIO '* | \
+            'thin-hv: preflight ACPI MMIO'* | 'thin-hv: preflight PCI MMIO'* | 'thin-hv: preflight platform MMIO'* | 'thin-hv: preflight MMIO '* | \
             'thin-hv: preflight VMX='*) return 1 ;;
         esac
     done <<<"$transcript"

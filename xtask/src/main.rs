@@ -3261,13 +3261,14 @@ mod tests {
             "thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0\n";
         let gcd = concat!(
             "thin-hv: preflight ACPI MMIO mcfg=1 madt=1 ranges=3 mmio_complete=0 direct_vmx_ready=0\n",
+            "thin-hv: preflight PCI MMIO roots=1 devices=6 windows=2 bars=3 ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
             "thin-hv: preflight platform MMIO index=0 start=0x00000000fec00000 end=0x00000000fec01000 ept_type=UC\n",
             "thin-hv: preflight platform MMIO index=1 start=0x0000008000000000 end=0x0000008000001000 ept_type=UC\n",
-            "thin-hv: preflight MMIO PASS source=gcd+acpi descriptors=3 mmio_ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
+            "thin-hv: preflight MMIO PASS source=gcd+acpi+pci descriptors=3 mmio_ranges=2 mmio_complete=0 direct_vmx_ready=0\n",
         );
         let pass = |tables: &str, leaves: &str| {
             format!(
-                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
+                "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi+pci tables={tables} leaves={leaves} private_pages=288 mmio_complete=0 direct_vmx_ready=0\n"
             )
         };
         let kvm = format!("{vmx_present}{gcd}{}", pass("12", "3456"));
@@ -3349,6 +3350,15 @@ mod tests {
                 ("madt=1", "madt=0"),
                 ("ranges=3", "ranges=0"),
                 ("ranges=3", "ranges=129"),
+                ("roots=1", "roots=0"),
+                ("roots=1", "roots=33"),
+                ("devices=6", "devices=0"),
+                ("devices=6", "devices=4097"),
+                ("windows=2", "windows=129"),
+                ("windows=2", "windows=1"),
+                ("bars=3", "bars=0"),
+                ("bars=3", "bars=37"),
+                ("PCI MMIO", "PCI MMIO\0"),
                 ("source=gcd+acpi", "source=gcd"),
                 ("mmio_ranges=2", "mmio_ranges=1"),
                 ("index=1", "index=0"),

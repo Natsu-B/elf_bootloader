@@ -1531,3 +1531,64 @@ architectural milestones remain pending. Markers still state
 `mmio_complete=0 direct_vmx_ready=0`; these non-VMX preflight results are not
 Direct high-BAR Linux boot or physical-readiness evidence. Outer KVM is reference
 evidence only.
+
+## PCI firmware aperture/BAR cross-checks (stage 10 increment)
+
+Added `platform_pci::{collect, parse_resources, Roots}` to the non-VMX preflight.
+Read-only RootBridgeIo `Configuration()` supplies root memory and bus windows;
+PCI I/O `GetLocation()`, configuration-header reads and `GetBarAttributes()`
+cross-check assigned BARs against their owning segment/bus/root window. No
+driver connection, BAR sizing writes, command-bit writes or attribute changes
+occur. Root buffers remain firmware-owned; temporary handle/BAR pools are freed
+on success and validation errors. Existing `MmioMap` and GCD-versus-RAM checks
+are reused for the final ACPI/PCI/GCD union.
+
+The bounded parser accepts UEFI QWORD descriptors plus a checked End Tag;
+rejects missing/truncated terminators, malformed types/flags/lengths, checksum
+errors, arithmetic/physical-width overflow, overlapping root windows/bus
+ownership, BAR/root/config mismatches and capacity exhaustion. Host minima stay
+host addresses; signed host-to-PCI translation offsets are used only for the
+configuration-register comparison, with interval-wrap checks. EDK2's precise
+power-of-two BAR alignment-mask form is accepted alongside the specification's
+ending-address form, not as an unchecked arbitrary maximum. Multi-descriptor
+BARs must be contiguous and consistent; duplicates/gaps are rejected. Limits
+are 32 roots, 4096 handles, 128 descriptors/windows; unsupported CardBus header
+layouts or unavailable root resources fail explicitly instead of falling back.
+
+Primary references inspected: [UEFI 2.11 PCI protocols](https://uefi.org/specs/UEFI/2.11/14_Protocols_PCI_Bus_Support.html),
+[EDK2 RootBridgeIo ABI](https://github.com/tianocore/edk2/blob/master/MdePkg/Include/Protocol/PciRootBridgeIo.h),
+and [EDK2 PciIoGetBarAttributes](https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Bus/Pci/PciBusDxe/PciIo.c).
+
+Validation (all commands use `nix develop --accept-flake-config --command`):
+
+* Initial `cargo fmt && cargo xtest -p x86_uefi_loader`: **66 PASS, 0 FAIL**,
+  including six new PCI tests; `/tmp/x86-pci-mmio-host-first.log`.
+* `cargo fmt && cargo xtest -p xtask && cargo xbuild x86 --release`, followed by
+  the explicit 4G/default-q35 preflight command below: **33 host PASS, 0 FAIL**,
+  build and QEMU preflight **PASS**; `/tmp/x86-pci-mmio-high-first.log`.
+* After multi-descriptor BAR validation, all five `cargo xtest -p` packages:
+  **192 PASS, 0 FAIL** (nested 29, HAL 54, loader 66, guest 10, xtask 33).
+  `cargo xbuild x86`, `cargo fmt --check`, `cargo xrun x86 --release` also pass.
+  Standard suite: **9 PASS, 0 FAIL**, seven KVM (including the expected-stop
+  private-host exception fixture), two TCG; `/tmp/x86-pci-mmio-final-checks.log`.
+* Final built artifact replay: **PASS**, `/tmp/x86-pci-mmio-high-final.log`:
+
+  ```sh
+  nix develop --accept-flake-config --command env \
+      X86_UEFI_BACKEND=physical-preflight X86_UEFI_ACCEL=kvm \
+      X86_UEFI_CPU=host,+vmx,-hypervisor X86_UEFI_MEMORY=4G \
+      X86_UEFI_PCI_PROFILE=firmware-default X86_UEFI_TIMEOUT_SECONDS=30 \
+      scripts/x86_64/run-uefi-smoke.sh bin/x86_64/x86-uefi-preflight.efi
+  ```
+
+  OVMF reports one root, five devices, two memory windows and three memory BARs.
+  Combined MMIO remains eight intervals, including `[56 TiB,64 TiB)` and ECAM;
+  EPT construction uses 38 tables / 17,240 leaves. Runner gates require the PCI
+  summary before combined MMIO/EPT PASS and reject missing/malformed provenance.
+
+No Direct runtime, AArch64 production path, Windows or physical machine changed
+or was tested by this increment. The active Direct EPT/HOST_CR3 integration is
+still pending; `mmio_complete=0 direct_vmx_ready=0` is intentional. These
+non-VMX QEMU preflight results do not resolve the Direct high-PCI Linux failure.
+Outer-KVM successes remain reference evidence only. The pre-existing user edit
+to `AGENTS.md` remains unstaged.

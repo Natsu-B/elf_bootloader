@@ -4,6 +4,7 @@ use crate::SerialPort;
 use crate::chainload::Error;
 use crate::platform_acpi;
 use crate::platform_ept_audit;
+use crate::platform_pci;
 use crate::platform_resources;
 use crate::platform_snapshot;
 use crate::platform_snapshot::MemoryMap;
@@ -64,7 +65,7 @@ fn inventory(system_table: *mut efi::SystemTable, serial: &mut SerialPort) -> Re
             let tables = inventory_tables(system_table, map, serial)?;
             let width = PhysicalWidth::new(cpu.physical_bits())
                 .map_err(|_| malformed("GCD physical-address width"))?;
-            let acpi = match &tables {
+            let mut acpi = match &tables {
                 Some(tables) => tables.mmio(map, width)?,
                 None => platform_resources::MmioMap::empty(width)?,
             };
@@ -75,6 +76,10 @@ fn inventory(system_table: *mut efi::SystemTable, serial: &mut SerialPort) -> Re
                 u8::from(tables.as_ref().is_some_and(|tables| tables.madt.is_some())),
                 acpi.ranges().len()
             );
+            let pci = platform_pci::collect(system_table, map, width, serial)?;
+            for range in pci.ranges() {
+                acpi.insert(*range, width)?;
+            }
             let mmio =
                 platform_resources::collect(system_table, map, width, acpi.ranges(), serial)?;
             storage.inspect(cpu, map, mmio.ranges(), serial)

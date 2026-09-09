@@ -143,7 +143,7 @@ impl AuditStorage {
             .map_err(|error| report(serial, "EPT construction", error))?;
         let _ = writeln!(
             serial,
-            "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",
+            "thin-hv: preflight EPT audit PASS scope=uefi-memory-map+gcd+acpi+pci tables={} leaves={} private_pages={} mmio_complete=0 direct_vmx_ready=0",
             tables.table_pages(),
             tables.leaf_count(),
             TOTAL_PAGES

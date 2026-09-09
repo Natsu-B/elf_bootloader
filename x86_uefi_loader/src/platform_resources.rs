@@ -1,4 +1,4 @@
-//! Read-only PI GCD MMIO discovery and checked union with ACPI resources.
+//! Read-only PI GCD MMIO discovery and checked union with ACPI/PCI resources.
 //!
 //! PI 1.9 sections 4.1 and 7.2.4.8 define the DXE table and descriptor ABI.
 //! A GCD inventory is not yet proof of complete PCI/APIC/ACPI aperture coverage.
@@ -191,24 +191,24 @@ fn collect_mmio(descriptors: &[GcdDescriptor], width: PhysicalWidth) -> Result<M
     Ok(result)
 }
 
-/// Checks additional ACPI resources while the complete GCD map is still live;
+/// Checks additional ACPI/PCI resources while the complete GCD map is still live;
 /// a reserved/absent GCD entry is not fabricated into RAM or a fixed PCI bucket.
-fn collect_with_acpi(
+fn collect_with_resources(
     descriptors: &[GcdDescriptor],
     width: PhysicalWidth,
-    acpi: &[PhysicalRange],
+    resources: &[PhysicalRange],
 ) -> Result<MmioMap, Error> {
-    if acpi.len() > MAX_MMIO_RANGES {
-        return Err(malformed("ACPI MMIO range capacity"));
+    if resources.len() > MAX_MMIO_RANGES {
+        return Err(malformed("firmware MMIO range capacity"));
     }
     let mut result = collect_mmio(descriptors, width)?;
-    for range in acpi {
+    for range in resources {
         for region in descriptors {
             if !matches!(region.kind, 0 | 1 | 3)
                 && range.start() < descriptor_end(region, width)?
                 && region.base < range.end()
             {
-                return Err(malformed("ACPI MMIO conflicts with GCD system memory"));
+                return Err(malformed("firmware MMIO conflicts with GCD system memory"));
             }
         }
         result.insert(*range, width)?;
@@ -223,7 +223,7 @@ pub(crate) fn collect(
     system_table: *mut efi::SystemTable,
     map: &MemoryMap<'_>,
     width: PhysicalWidth,
-    acpi: &[PhysicalRange],
+    resources: &[PhysicalRange],
     serial: &mut SerialPort,
 ) -> Result<MmioMap, Error> {
     let mut address = None;
@@ -285,7 +285,7 @@ pub(crate) fn collect(
         // identity-readable RAM were checked. Padding and owner pointers are
         // not inspected; no descriptor reference survives FreePool below.
         let descriptors = unsafe { slice::from_raw_parts(pointer, count) };
-        collect_with_acpi(descriptors, width, acpi)
+        collect_with_resources(descriptors, width, resources)
     })();
     // The allocation originates in the successful DXE service, including when
     // metadata/content validation fails. Cleanup errors take precedence.
@@ -301,7 +301,7 @@ pub(crate) fn collect(
     }
     let _ = writeln!(
         serial,
-        "thin-hv: preflight MMIO PASS source=gcd+acpi descriptors={count} mmio_ranges={} mmio_complete=0 direct_vmx_ready=0",
+        "thin-hv: preflight MMIO PASS source=gcd+acpi+pci descriptors={count} mmio_ranges={} mmio_complete=0 direct_vmx_ready=0",
         result.count
     );
     Ok(result)
@@ -428,7 +428,7 @@ mod tests {
     fn acpi_mmio_union_checks_gcd_ram_and_the_current_physical_width() {
         let ecam = PhysicalRange::new(0xe000_0000, 0xf000_0000, width()).unwrap();
         for kind in [0, 1, 3] {
-            let map = collect_with_acpi(
+            let map = collect_with_resources(
                 &[region(ecam.start(), ecam.bytes(), kind)],
                 width(),
                 &[ecam],
@@ -438,7 +438,7 @@ mod tests {
         }
         for kind in [2, 4, 5, 6] {
             assert!(
-                collect_with_acpi(
+                collect_with_resources(
                     &[region(ecam.start(), ecam.bytes(), kind)],
                     width(),
                     &[ecam]
@@ -448,7 +448,7 @@ mod tests {
         }
         let high = PhysicalRange::new(1 << 39, (1 << 39) + PAGE, width()).unwrap();
         assert!(
-            collect_with_acpi(
+            collect_with_resources(
                 &[region(0, PAGE, 2)],
                 PhysicalWidth::new(32).unwrap(),
                 &[high]
@@ -456,12 +456,12 @@ mod tests {
             .is_err()
         );
         assert!(
-            collect_with_acpi(&[region(0, PAGE, 2)], width(), &[ecam; MAX_MMIO_RANGES + 1])
+            collect_with_resources(&[region(0, PAGE, 2)], width(), &[ecam; MAX_MMIO_RANGES + 1])
                 .is_err()
         );
         let low = region(0x8000_0000, 0x6000_0000, 3);
         let reserved = region(ecam.start(), ecam.bytes(), 1);
-        let joined = collect_with_acpi(&[reserved, low], width(), &[ecam]).unwrap();
+        let joined = collect_with_resources(&[reserved, low], width(), &[ecam]).unwrap();
         assert_eq!(
             joined.ranges(),
             &[PhysicalRange::new(0x8000_0000, 0xf000_0000, width()).unwrap()]

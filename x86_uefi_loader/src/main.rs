@@ -52,6 +52,8 @@ mod platform_acpi;
 #[cfg(feature = "physical-preflight")]
 mod platform_ept_audit;
 #[cfg(feature = "physical-preflight")]
+mod platform_pci;
+#[cfg(feature = "physical-preflight")]
 mod platform_resources;
 #[cfg(feature = "physical-preflight")]
 mod platform_snapshot;
