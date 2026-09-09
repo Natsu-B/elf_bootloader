@@ -2825,23 +2825,18 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
 
 /// Existing L1 emulation, separated only to count successfully handled exits.
 fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
-    // These instructions may change exit information or its VMCS/lifetime
-    // ownership. Invalidate even on a subsequently faulting/failed instruction;
-    // a miss falls through to hardware, never to an older saved generation.
+    // Retire queued guest writes before L1 changes VMCS/lifetime ownership,
+    // even on a subsequently faulting instruction. Entry uses the already
+    // necessary Direct selection to flush instead of adding another round trip.
     if reason & (1 << 31) == 0
         && matches!(
             reason & 0xffff,
-            EXIT_REASON_VMLAUNCH
-                | EXIT_REASON_VMRESUME
-                | EXIT_REASON_VMCLEAR
-                | EXIT_REASON_VMPTRLD
-                | EXIT_REASON_VMXON
-                | EXIT_REASON_VMXOFF
+            EXIT_REASON_VMCLEAR | EXIT_REASON_VMPTRLD | EXIT_REASON_VMXON | EXIT_REASON_VMXOFF
         )
-        && with_cpu_runtime(|state| state.exit_snapshot = None).is_none()
+        && !retire_idle_guest_snapshot()
     {
         stop_unexpected_exit(
-            b"invalidating direct exit snapshot failed",
+            b"retiring direct guest snapshot failed",
             reason,
             0,
             0,
@@ -3869,6 +3864,19 @@ fn handle_l1_vmentry(
     if unsafe { vmcs_load(current.address()) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"selecting L1 VMCS for VMLAUNCH failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    // Complete prior successful L1 VMWRITEs before any physical entry attempt,
+    // including one that will fail controls/host/guest validation. No stale
+    // exit snapshot survives immediate VMfail or a subsequent hardware exit.
+    if !flush_current_idle_guest_snapshot(current.address()) {
+        stop_unexpected_exit(
+            b"flushing direct guest writes before entry failed",
             reason,
             qualification,
             guest_rip,
@@ -4988,19 +4996,17 @@ fn handle_l1_vmcs_access(
         );
         return;
     }
-    // The full source access and architectural privilege/pointer checks above
-    // must precede this shortcut. The snapshot proves an exact mandatory guest
-    // field already contains this width-truncated value in hardware; VMWRITE
-    // has no additional value-validation side effect (SDM Vol. 3C, VMWRITE).
-    // Never skip a changed write or synthesize unknown/read-only encodings.
+    // Full source access and privilege/pointer checks precede this shortcut.
+    // Hardware capture proved these four exact mandatory guest fields exist;
+    // VMWRITE does not validate their entry values. Retain width-truncated L1
+    // writes until entry or an L1 ownership boundary selects the SAME VMCS.
+    // Unknown/read-only encodings still follow their hardware/error paths.
     let retained_access = with_cpu_runtime(|state| {
         if let Some(value) = write_value {
             state
                 .exit_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    snapshot.write_is_redundant(current.address(), field, value)
-                })
+                .as_mut()
+                .is_some_and(|snapshot| snapshot.queue_write(current.address(), field, value))
                 .then_some(None)
         } else {
             state
@@ -5101,32 +5107,8 @@ fn handle_l1_vmcs_access(
         }
         (status, read_value, hardware_error)
     };
-    if let Some(value) = write_value {
-        // Changed guest values reached hardware first; an idempotent write
-        // leaves both copies unchanged. Failure never updates the snapshot.
-        // L1 is stopped and the helper accepts only the exact VMCS owner.
-        if with_cpu_runtime(|state| {
-            if let Some(snapshot) = state.exit_snapshot.as_mut() {
-                snapshot.written(
-                    current.address(),
-                    field,
-                    value,
-                    status == VmxStatus::Success,
-                );
-            }
-        })
-        .is_none()
-        {
-            stop_unexpected_exit(
-                b"updating idle direct guest snapshot failed",
-                reason,
-                qualification,
-                guest_rip,
-                instruction_len,
-                registers,
-            );
-        }
-    }
+    // Every retained writable field was queued above, before any hardware
+    // fallback. Other encodings cannot mutate the snapshot's four guest values.
     if status == VmxStatus::Success
         && write_value.is_some()
         && matches!(
@@ -5422,6 +5404,56 @@ fn owns_l1_vpid_namespace(state: &VcpuState) -> bool {
     state
         .vmxon_region()
         .is_some_and(|owner| with_cpu_runtime(|runtime| runtime.vpids.owns(owner)) == Some(true))
+}
+
+/// Commit bounded idle guest writes while their exact Direct VMCS is current.
+/// Failure retains the snapshot/remaining dirty bits and cannot authorize entry.
+fn flush_current_idle_guest_snapshot(current: VmcsPhys) -> bool {
+    with_cpu_runtime(|state| {
+        if let Some(snapshot) = state.exit_snapshot.as_mut() {
+            if !snapshot.flush(current, |field, value| {
+                // SAFETY: the caller selected this CPU's stopped Direct VMCS;
+                // flush checks its exact owner. Successful hardware capture
+                // established each mandatory field. VMWRITE validates no guest
+                // value here; no guest or other CPU can mutate this VMCS.
+                unsafe { vmcs_write(field, value) == VmxStatus::Success }
+            }) {
+                return false;
+            }
+        }
+        state.exit_snapshot = None;
+        true
+    }) == Some(true)
+}
+
+/// Flush before an L1 VMCS selection/clear/VMX lifetime instruction. Temporary
+/// L0 selections for unrelated field/error/invalidation accesses need not flush:
+/// those operations neither consume nor expose these four shadowed guest fields.
+fn retire_idle_guest_snapshot() -> bool {
+    let Some(owner) = with_cpu_runtime(|state| {
+        if let Some(snapshot) = state.exit_snapshot.as_ref() {
+            if snapshot.has_pending_writes() {
+                return Some(snapshot.owner());
+            }
+        }
+        state.exit_snapshot = None;
+        None
+    }) else {
+        return false;
+    };
+    let Some(owner) = owner else {
+        return true;
+    };
+    if current_cpu()
+        .vcpu
+        .lock()
+        .current_vmcs()
+        .map(|current| current.address())
+        != Some(owner)
+    {
+        return false;
+    }
+    with_l1_current_vmcs(Some(owner), || flush_current_idle_guest_snapshot(owner)) == Some(true)
 }
 
 /// Runs an operation with L1's current VMCS selected and restores the carrier.

@@ -3187,5 +3187,119 @@ also running. `/tmp/x86-rflags-ab.log`, `/tmp/x86-idle-guest-ab.JK0hIU`;
 `BASELINE_IMAGES=/tmp/x86-rflags-baseline-images`
 `OPTIMIZED_IMAGES=/tmp/x86-rflags-optimized-images`
 `nix develop --accept-flake-config --command bash /tmp/x86-idle-guest-ab.sh`.
-The original Linux timing/S3 and Windows Direct runs after this change remain
-pending; the earlier frozen runs are not silently attributed to this code.
+The follow-up runs below use this exact committed code, not earlier images.
+
+### RFLAGS-elision Linux and Windows follow-up (`4607886`)
+
+The frozen `/tmp/x86-rflags-linux-validation` runs the original seven Linux
+selftests and S3: **5 PASS, 3 FAIL**. xcr0/CPUID, dirty-log splitting, NX huge
+pages, memslot modification and guest page-table tests pass. `memslot_perf_test`
+still exits 142; `vmx_exception_with_invalid_guest_state` exits 137 at its
+unchanged 600-second guest limit. S3 still ends in the post-resume KVM invalid
+opcode Oops. `/tmp/x86-rflags-linux-batch.log`,
+`/tmp/x86-idle-guest-linux.BMj9Ju`.
+
+All **24 VM-exit benchmark cases PASS** (12 Direct and 12 reference).
+The subsequent Direct **4096-cycle/default-300-second test FAILS**: cycles
+1 through 3729 finish with explicit teardown and process exit 0, but the
+required final 4096-cycle marker is absent at QEMU exit 124. This is not a
+4096-cycle PASS, and no timeout was changed.
+`/tmp/x86-idle-full-vmexit.UXoFWi`; existing orchestration:
+`VALIDATION_REPO=/tmp/x86-rflags-linux-validation`
+`nix develop --accept-flake-config --command bash /tmp/x86-idle-guest-linux-regressions.sh`,
+then the same environment with `/tmp/x86-idle-full-vmexit.sh`.
+
+Windows was actually retested from `/tmp/x86-rflags-windows-validation`, with
+fresh disposable overlays, the physical-UEFI/no-variable-overlay Direct mode,
+default q35 PCI layout, one L1 CPU and 4 GiB. **Normal boot PASS; Direct Hyper-V
+FAIL** at the existing 600-second limit. The live screenshot shows a spinner;
+the final screenshot shows `Please wait`, not a visible bugcheck. This run has
+one firmware/monitor lifetime, so its bounded diagnostic record is accepted.
+It reports 4,084,458 direct entry attempts, zero nested entry failures,
+20,588,642 VMPTRLDs, 704,636,083 VMREADs and 150,815,771 VMWRITEs. The stopped
+record is between nested-exit dispatch and reflection completion (4,084,457
+reflections), not evidence of a lost exit. RDMSR dominates the L2 exit counts.
+These counters identify costs; they do not establish the cause of the boot
+failure or prove correctness merely because entry failures are zero.
+
+`/tmp/x86-rflags-windows-batch.log`,
+`/tmp/x86-idle-guest-windows.Za0O3f`; invocation:
+`VALIDATION_REPO=/tmp/x86-rflags-windows-validation WINDOWS_MATRIX_SERIAL=1`
+`nix develop --accept-flake-config --command bash /tmp/x86-idle-guest-windows.sh`.
+All four runner/EFI hashes, both qcow checks and seed comparisons pass.
+Functional runs overlap the independent full KVM unit matrix and are not
+isolated performance measurements. No physical machine was tested. Neither
+the successful reference Hyper-V runs nor these Direct attempts establish
+Direct Hyper-V/WSL2 readiness.
+
+### Retire bounded Direct guest writes at hardware-consumption boundaries
+
+The existing `ExitSnapshot` already retains four measured, mandatory guest
+fields: RIP, RFLAGS, CS access rights and interruptibility. After complete
+VMX privilege/pointer/memory-operand checks, `queue_write` now accumulates
+changes to those exact encodings in the owning pCPU's existing snapshot.
+VMREAD sees the latest width-truncated value. VMWRITE validates field access,
+not entry validity; real entry validation still consumes L1's hardware VMCS.
+No new VMCS, capability, allocator or guest/host composition model is added.
+
+`flush_current_idle_guest_snapshot` writes only dirty fields after the entry
+path has selected the exact Direct VMCS, before host/control/guest checks and
+before any physical entry attempt. `retire_idle_guest_snapshot` reuses
+`with_l1_current_vmcs` for cold VMPTRLD/VMCLEAR/VMXON/VMXOFF boundaries. Clean
+snapshots need no extra selection. Temporary L0 selections for unrelated
+fields and VM_INSTRUCTION_ERROR neither consume nor expose these four fields.
+A failed flush preserves failed/unattempted dirty bits and cannot authorize
+entry, clearing or ownership release. The four fields are disjoint from the
+existing Direct host/control patch manifest.
+
+The host tests check exact owner/encoding/width, read-only rejection, repeated
+writes, changes back to original values, clean retirement and failure at each
+flush position. Native tests execute all four changed values through same-VMCS
+VMPTRLD retirement, all four through rejected HOST_CS=0 entry, and RIP through
+VMCLEAR/reload. Existing successful entries, rejected aliases, memory faults,
+idempotent writes, VMCS switches and flag/error behavior remain checked.
+The strict existing MSR contract gate requires the new ordered retirement
+marker; xtask rejects missing, duplicate, malformed and misplaced markers.
+
+Validation, through `nix develop --accept-flake-config --command`:
+
+```sh
+cargo xtest -p nested_vmx
+cargo xtest -p x86_64_hal
+cargo xtest -p x86_uefi_loader
+cargo xtest -p x86_guest_uefi_test
+cargo xtest -p xtask
+cargo xbuild x86
+cargo xbuild x86 --release
+cargo xrun x86 --release
+cargo xrun x86 --nested --release
+cargo fmt --check
+```
+
+**350 host PASS, 0 FAIL** (32 nested, 59 HAL, 211 loader, 10 guest, 38 xtask),
+debug/release builds PASS, standard QEMU **11 PASS, 0 FAIL** (9 KVM, 2 TCG).
+Release nested **15 PASS, 5 FAIL / 20**, all **14 Direct PASS**, including the
+new native retirement probes and default high-PCI platform-map Linux cases.
+The same five reference-only operand/PAT/abort differences remain failures;
+they are not skipped or attributed to the deferred-write change.
+`/tmp/x86-deferred-guest-boundaries.log`, `/tmp/x86-deferred-guest-regression.log`,
+`/tmp/x86-deferred-guest-release.log`, `/tmp/x86-deferred-guest-format.log`.
+
+The fixed-image alternating three-pair comparison gives **18 PASS, 0 FAIL**,
+with all nine input artifact/runner/UKI hashes unchanged. Median ticks:
+
+| Existing benchmark | `4607886` | Deferred guest writes | Reduction |
+| --- | ---: | ---: | ---: |
+| CPUID | 296,501 | 277,027 | 6.57% |
+| VMCALL | 947,692 | 912,632 | 3.70% |
+| PM timer INL | 366,325 | 350,824 | 4.23% |
+
+`BASELINE_IMAGES=/tmp/x86-rflags-optimized-images`
+`OPTIMIZED_IMAGES=/tmp/x86-deferred-guest-optimized-images`
+`nix develop --accept-flake-config --command bash /tmp/x86-idle-guest-ab.sh`;
+`/tmp/x86-deferred-guest-ab.log`, `/tmp/x86-idle-guest-ab.MG2kqo`.
+The independent full KVM unit matrix also ran; the paired QEMU measurements
+support this bounded optimization, not physical-machine or Windows speed
+claims. No test timeout, original upstream test or capability was changed.
+Full timing-sensitive Linux, S3 and Windows follow-up remains separate from
+these completed checks. AP/root-NMI/S3 lifecycle gaps are not fixed here.

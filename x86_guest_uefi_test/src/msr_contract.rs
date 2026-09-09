@@ -1405,7 +1405,7 @@ unsafe fn ept_large_pages(
             )?;
         }
         // L2 is stopped at VMCALL. These temporary values are never entered;
-        // verify exact hardware write-through (including 32-bit truncation),
+        // verify exact L1-visible writes (including 32-bit truncation),
         // rejected aliases, and restoration before any later entry attempt.
         let mut guest_fields = [
             (vmcs::GUEST_RIP, 0),
@@ -1516,6 +1516,41 @@ unsafe fn ept_large_pages(
             read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
             18,
         )?;
+        // Re-enter at the same VMCALL to obtain a fresh stopped-VMCS snapshot
+        // for each field. After VMPTRLD the monitor must have retired it, so
+        // the read checks hardware visibility, not merely the idle software view.
+        for (field, original) in guest_fields {
+            equal("retire-switch-warm", enter(&mut frame, 1), 0)?;
+            equal(
+                "retire-switch-exit",
+                read_field("retire-reason", vmcs::VM_EXIT_REASON)?,
+                18,
+            )?;
+            write(field, original ^ 1)?;
+            equal(
+                "retire-switch-visible",
+                read_field("retire-guest", field)?,
+                original ^ 1,
+            )?;
+            success("retire-same-current", vmx::vmptrld(region))?;
+            equal(
+                "retire-switch-hardware",
+                read_field("retire-guest", field)?,
+                original ^ 1,
+            )?;
+            write(field, original)?;
+        }
+        equal("retire-failed-entry-warm", enter(&mut frame, 1), 0)?;
+        equal(
+            "retire-failed-entry-exit",
+            read_field("retire-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        // All four writes must become hardware-visible even when HOST_CS=0
+        // makes the next VMRESUME fail before any guest instruction can run.
+        for (field, original) in guest_fields {
+            write(field, original ^ 1)?;
+        }
         let cs = read_field("snapshot-host-cs", vmcs::HOST_CS_SELECTOR)?;
         write(vmcs::HOST_CS_SELECTOR, 0)?;
         equal("snapshot-failed-entry", enter(&mut frame, 1), 0x40)?;
@@ -1533,8 +1568,9 @@ unsafe fn ept_large_pages(
             equal(
                 "snapshot-guest-failed-entry",
                 read_field("snapshot-guest", field)?,
-                original,
+                original ^ 1,
             )?;
+            write(field, original)?;
         }
         write(vmcs::HOST_CS_SELECTOR, cs)?;
 
@@ -1597,6 +1633,17 @@ unsafe fn ept_large_pages(
             read_field("snapshot-rip", vmcs::GUEST_RIP)?,
             other_rip + 3,
         )?;
+        // VMCLEAR must write queued guest state back to the same opaque region;
+        // reloading it must not resurrect the earlier captured RIP. This value
+        // is never entered, and both VMCS regions remain exclusively test-owned.
+        write(vmcs::GUEST_RIP, other_rip + 4)?;
+        success("retire-dirty-clear", vmx::vmclear(other))?;
+        success("retire-cleared-reload", vmx::vmptrld(other))?;
+        equal(
+            "retire-clear-hardware",
+            read_field("retire-rip", vmcs::GUEST_RIP)?,
+            other_rip + 4,
+        )?;
         success("snapshot-other-final-clear", vmx::vmclear(other))?;
         success("snapshot-final-current", vmx::vmptrld(region))?;
         equal(
@@ -1604,6 +1651,10 @@ unsafe fn ept_large_pages(
             read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
             18,
         )?;
+        let _ = writeln!(
+            serial,
+            "thin-hv: MSR guest retirement PASS fields=4 switch=4 failed_entry=4 clear=1 reload=1"
+        );
         let _ = writeln!(
             serial,
             "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject={} switches=4 clear=1 guest_fields=4 guest_writes=17 guest_reject=4 guest_resume=1 guest_repeat=8 guest_operand_faults=8",

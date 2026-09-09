@@ -4022,8 +4022,9 @@ mod tests {
                 .collect::<String>();
             let ept = "thin-hv: MSR EPT2M proof PASS advertised=1 large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10\n";
             let snapshot = "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=1 switches=4 clear=1 guest_fields=4 guest_writes=17 guest_reject=4 guest_resume=1 guest_repeat=8 guest_operand_faults=8\n";
+            let retirement = "thin-hv: MSR guest retirement PASS fields=4 switch=4 failed_entry=4 clear=1 reload=1\n";
             let msr = format!(
-                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\nthin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\nthin-hv: MSR VPID lease cycles=64 fresh=64\n{ept}{snapshot}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1\n"
+                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\nthin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\nthin-hv: MSR VPID lease cycles=64 fresh=64\n{ept}{retirement}{snapshot}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1\n"
             );
             assert!(check_profile(backend, "msr", &msr));
             assert_eq!(
@@ -4045,6 +4046,16 @@ mod tests {
                 );
             }
             for broken in [
+                msr.replace(retirement, ""),
+                msr.replace(retirement, &retirement.repeat(2)),
+                msr.replace("retirement PASS fields=4", "retirement PASS fields=3"),
+                msr.replace("switch=4 failed_entry=4", "switch=3 failed_entry=4"),
+                msr.replace("failed_entry=4", "failed_entry=3"),
+                msr.replace("clear=1 reload=1", "clear=0 reload=1"),
+                msr.replace("reload=1", "reload=0"),
+                msr.replace(retirement, &retirement.replace('\n', "\r\r\n")),
+                format!("{retirement}{msr}"),
+                format!("{}{retirement}", msr.replace(retirement, "")),
                 msr.replace(snapshot, ""),
                 msr.replace(snapshot, &format!("{snapshot}{snapshot}")),
                 msr.replace("gpa_high=24", "gpa_high=23"),

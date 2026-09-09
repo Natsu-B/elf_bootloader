@@ -261,7 +261,7 @@ check_nested_contract_log() {
 # Real L2 entries with every PAT/EFER control combination. This image deliberately
 # powers off instead of returning into disposable firmware descriptor state.
 check_msr_contract_log() {
-    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 exits=0 debug=0 cache=0 vpid=0 lease=0 ept=0 snapshot=0 entries=0 checked=0 backends=0 private=0 expected_backends
+    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 exits=0 debug=0 cache=0 vpid=0 lease=0 ept=0 snapshot=0 retirement=0 entries=0 checked=0 backends=0 private=0 expected_backends
     local vpid_lease='^thin-hv: MSR VPID lease cycles=64 fresh=(0|[1-9][0-9]?)$'
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -311,9 +311,12 @@ check_msr_contract_log() {
             'thin-hv: MSR EPT2M proof PASS advertised=1 large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10')
                 ((phase == 1 && lease == 1 && ept == 0 && entries == 0)) || return 1
                 ept=1 ;;
+            'thin-hv: MSR guest retirement PASS fields=4 switch=4 failed_entry=4 clear=1 reload=1')
+                ((phase == 1 && ept == 1 && retirement == 0 && snapshot == 0 && entries == 0)) || return 1
+                retirement=1 ;;
             'thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=1 switches=4 clear=1 guest_fields=4 guest_writes=17 guest_reject=4 guest_resume=1 guest_repeat=8 guest_operand_faults=8' | \
             'thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=0 switches=4 clear=1 guest_fields=4 guest_writes=17 guest_reject=4 guest_resume=1 guest_repeat=8 guest_operand_faults=8')
-                ((phase == 1 && ept == 1 && snapshot == 0 && entries == 0)) || return 1
+                ((phase == 1 && ept == 1 && retirement == 1 && snapshot == 0 && entries == 0)) || return 1
                 [[ "$backend" != direct-vmx || "$line" == *'readonly_reject=1 '* ]] || return 1
                 snapshot=1 ;;
             'thin-hv: MSR late-failure guest-field changes=0')
