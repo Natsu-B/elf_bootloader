@@ -37,6 +37,7 @@ use nested_vmx::VcpuState;
 use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
+use nested_vmx::exit_snapshot::ExitSnapshot;
 use nested_vmx::host_validation;
 use nested_vmx::msr_list::Entry as MsrEntry;
 use nested_vmx::msr_list::ExitStoreSource;
@@ -529,9 +530,20 @@ unsafe fn vmcs_load(region: VmcsPhys) -> VmxStatus {
     unsafe { vmx::vmptrld(region) }
 }
 
-/// Counts one reflected L1 state write in both the total and subset, atomically
-/// with respect to telemetry readers. Only the owned carrier may be current.
+/// Writes only a dirty reflected field, comparing the live carrier value.
+/// No prior L1 snapshot is trusted: L1 may change selectors, CRs, MSRs or tables
+/// without exiting. The current VM-exit state is the sole equality witness.
+/// Only the owned carrier may be current; fields/values are validated by the
+/// reflection manifest, and a read failure is returned without hiding it.
 unsafe fn vmcs_write_reflected(field: u32, value: u64) -> VmxStatus {
+    // SAFETY: this CPU owns the stopped carrier; each field is readable as well
+    // as writable. No guest execution or VMCS switch occurs between comparison
+    // and write, so equality cannot race an architectural update.
+    match unsafe { vmcs_read(field) } {
+        Ok(current) if current == value => return VmxStatus::Success,
+        Ok(_) => {}
+        Err(status) => return status,
+    }
     record_diagnostic(DiagnosticEvent::ReflectedStateWrite);
     // SAFETY: reflection selected this CPU's resident carrier in VMX root;
     // field/value are the validated L1 host state or architectural exit resets.
@@ -663,6 +675,7 @@ struct NestedRun {
 #[repr(C, align(16))]
 struct CpuRuntimeState {
     vpids: VpidNamespace,
+    exit_snapshot: Option<ExitSnapshot>,
     ram: FirmwareMap<205>,
     private: [(u64, u64); 2],
     entry: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
@@ -682,6 +695,7 @@ impl CpuRuntimeState {
     fn new(ram: FirmwareMap<205>, private: [(u64, u64); 2]) -> Self {
         Self {
             vpids: VpidNamespace::new(),
+            exit_snapshot: None,
             ram,
             private,
             entry: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
@@ -2379,6 +2393,30 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
 
 /// Existing L1 emulation, separated only to count successfully handled exits.
 fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
+    // These instructions may change exit information or its VMCS/lifetime
+    // ownership. Invalidate even on a subsequently faulting/failed instruction;
+    // a miss falls through to hardware, never to an older saved generation.
+    if reason & (1 << 31) == 0
+        && matches!(
+            reason & 0xffff,
+            EXIT_REASON_VMLAUNCH
+                | EXIT_REASON_VMRESUME
+                | EXIT_REASON_VMCLEAR
+                | EXIT_REASON_VMPTRLD
+                | EXIT_REASON_VMXON
+                | EXIT_REASON_VMXOFF
+        )
+        && with_cpu_runtime(|state| state.exit_snapshot = None).is_none()
+    {
+        stop_unexpected_exit(
+            b"invalidating direct exit snapshot failed",
+            reason,
+            0,
+            0,
+            0,
+            registers,
+        );
+    }
     let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
     let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
     let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
@@ -4008,6 +4046,30 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
     if unsafe { vmx::vmptrst(&mut current) } != VmxStatus::Success || current != run.direct.get() {
         stop_nested_exit(b"unexpected direct VMCS on L2 exit", run.direct, registers);
     }
+    let snapshot = ExitSnapshot::capture(run.direct, |field| {
+        if field == vmcs::VM_EXIT_REASON {
+            Some(reason)
+        } else {
+            // SAFETY: this CPU owns the current stopped direct VMCS. These are
+            // mandatory exit fields (EPT capability is a launch prerequisite),
+            // not opaque VMCS memory. Capture does not alter guest-visible data.
+            unsafe { vmcs_read(field) }.ok()
+        }
+    });
+    let Some(snapshot) = snapshot else {
+        stop_nested_exit(
+            b"capturing direct exit information failed",
+            run.direct,
+            registers,
+        );
+    };
+    if with_cpu_runtime(|state| state.exit_snapshot = Some(snapshot)).is_none() {
+        stop_nested_exit(
+            b"publishing direct exit snapshot failed",
+            run.direct,
+            registers,
+        );
+    }
     let Some(l1_msrs) = reflected_direct_msrs(run, reason) else {
         stop_nested_exit(
             b"reflecting original MSR controls failed",
@@ -4462,7 +4524,20 @@ fn handle_l1_vmcs_access(
         );
         return;
     }
-    let shadowed = {
+    let exit_value = if write {
+        None
+    } else {
+        with_cpu_runtime(|state| {
+            state
+                .exit_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.read(current.address(), field))
+        })
+        .flatten()
+    };
+    let shadowed = if let Some(value) = exit_value {
+        Some(Some(value))
+    } else {
         let mut cached = DIRECT_PATCH_VALUES.lock();
         match cached.as_mut() {
             Some((address, _)) if *address != current.address() => stop_unexpected_exit(

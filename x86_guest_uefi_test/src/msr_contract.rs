@@ -31,7 +31,8 @@ const VPID_PAGE: usize = LIST_PAGE + 6;
 const EPT_PAGE: usize = VPID_PAGE + super::l1_memory::PAGES;
 const DATA_PAGE: usize = EPT_PAGE + 5;
 // Two aligned 2 MiB payloads, plus at most one 2 MiB alignment gap.
-const PAGES: usize = DATA_PAGE + 3 * 512;
+const SNAPSHOT_VMCS_PAGE: usize = DATA_PAGE + 3 * 512;
+const PAGES: usize = SNAPSHOT_VMCS_PAGE + 1;
 const PAT: u32 = 0x277;
 const EFER: u32 = 0xc000_0080;
 
@@ -1187,7 +1188,7 @@ unsafe fn ept_large_pages(
         let b = a + HUGE;
         equal(
             "ept-payload-bounds",
-            u64::from(b + HUGE <= base + (PAGES * PAGE) as u64),
+            u64::from(b + HUGE <= base + (SNAPSHOT_VMCS_PAGE * PAGE) as u64),
             1,
         )?;
         (a as *mut u64).write_volatile(0x1122_3344);
@@ -1271,6 +1272,21 @@ unsafe fn ept_large_pages(
             )
         };
         let fault = |access: u64, permissions: u64| -> Result<()> {
+            // Repeated L1 VMREADs hit the project's retained exit snapshot.
+            // This field is defined for these EPT violations; its high alias
+            // must not be confused with an unsupported natural-width alias.
+            for _ in 0..8 {
+                equal(
+                    "ept-gpa-high",
+                    read_field("ept-high", vmcs::GUEST_PHYSICAL_ADDRESS + 1)?,
+                    GPA >> 32,
+                )?;
+                equal(
+                    "ept-gpa-repeat",
+                    read_field("ept-full", vmcs::GUEST_PHYSICAL_ADDRESS)?,
+                    GPA,
+                )?;
+            }
             equal(
                 "ept-fault-address",
                 read_field("ept-gpa", vmcs::GUEST_PHYSICAL_ADDRESS)?,
@@ -1378,6 +1394,123 @@ unsafe fn ept_large_pages(
             serial,
             "thin-hv: MSR EPT2M proof PASS advertised={} large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10",
             (capability >> 16) & 1
+        );
+        for _ in 0..8 {
+            equal(
+                "snapshot-warm",
+                read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+                18,
+            )?;
+        }
+        equal(
+            "snapshot-reserved-field",
+            u64::from(matches!(
+                vmx::vmread(0x8000),
+                Err(vmx::VmxStatus::FailValid)
+            )),
+            1,
+        )?;
+        equal(
+            "snapshot-error-12",
+            read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+            12,
+        )?;
+        let readonly_reject = cpu::rdmsr(vmx::IA32_VMX_MISC) & (1 << 29) == 0;
+        let written = vmx::vmwrite(vmcs::VM_EXIT_REASON, 10);
+        if readonly_reject {
+            equal(
+                "snapshot-readonly",
+                u64::from(written == vmx::VmxStatus::FailValid),
+                1,
+            )?;
+            equal(
+                "snapshot-error-13",
+                read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                13,
+            )?;
+        } else {
+            // Reference hardware may advertise writable exit fields. Direct
+            // must not: its transcript gate requires the rejected-write branch.
+            success("snapshot-writable", written)?;
+            equal(
+                "snapshot-write-visible",
+                read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+                10,
+            )?;
+            equal(
+                "snapshot-error-retained",
+                read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                12,
+            )?;
+            write(vmcs::VM_EXIT_REASON, 18)?;
+        }
+        equal(
+            "snapshot-readonly-unchanged",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        let cs = read_field("snapshot-host-cs", vmcs::HOST_CS_SELECTOR)?;
+        write(vmcs::HOST_CS_SELECTOR, 0)?;
+        equal("snapshot-failed-entry", enter(&mut frame, 1), 0x40)?;
+        equal(
+            "snapshot-error-8",
+            read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+            8,
+        )?;
+        equal(
+            "snapshot-failed-entry-reason",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        write(vmcs::HOST_CS_SELECTOR, cs)?;
+
+        // A second owned page proves the snapshot cannot follow another VMCS.
+        // It is disjoint from all live EPT, payload, stack and descriptor pages.
+        let other_address = base + (SNAPSHOT_VMCS_PAGE * PAGE) as u64;
+        let other = VmcsPhys::new(other_address).ok_or(failure("snapshot-vmcs-address"))?;
+        (other_address as *mut u32)
+            .write_volatile(cpu::rdmsr(vmx::IA32_VMX_BASIC) as u32 & 0x7fff_ffff);
+        success("snapshot-other-clear", vmx::vmclear(other))?;
+        success("snapshot-other-current", vmx::vmptrld(other))?;
+        configure(base, env, entry, exit)?;
+        for (field, value) in [
+            (vmcs::GUEST_IA32_PAT, original_pat),
+            (vmcs::HOST_IA32_PAT, original_pat),
+            (vmcs::GUEST_IA32_EFER, original_efer),
+            (vmcs::HOST_IA32_EFER, original_efer),
+            (vmcs::GUEST_RIP, snapshot_guest as *const () as usize as u64),
+        ] {
+            write(field, value)?;
+        }
+        equal("snapshot-other-entry", enter(&mut frame, 0), 0)?;
+        equal(
+            "snapshot-other-exit",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            10,
+        )?;
+        success("snapshot-original-current", vmx::vmptrld(region))?;
+        equal(
+            "snapshot-original-exit",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        success("snapshot-other-reload", vmx::vmptrld(other))?;
+        equal(
+            "snapshot-other-retained",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            10,
+        )?;
+        success("snapshot-other-final-clear", vmx::vmclear(other))?;
+        success("snapshot-final-current", vmx::vmptrld(region))?;
+        equal(
+            "snapshot-after-clear",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        let _ = writeln!(
+            serial,
+            "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject={} switches=4 clear=1",
+            u8::from(readonly_reject)
         );
         Ok(())
     }
@@ -1589,6 +1722,14 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
         // SAFETY: a failed shutdown cannot return to disposable firmware state.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
+}
+
+// SAFETY: the retained fixture owns this mapped executable L2 entry. Its
+// current VMCS has valid long-mode state and CPUID exits unconditionally.
+// No stack/memory operand or ABI call executes; RDI (the Frame) stays intact.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn snapshot_guest() -> ! {
+    core::arch::naked_asm!("cpuid", "vmcall", "ud2");
 }
 
 // SAFETY: matrix owns the clear current VMCS and aligned Frame, with CPL0,

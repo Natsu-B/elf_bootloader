@@ -1210,3 +1210,140 @@ Nix `cargo fmt --check` and `git diff --check` **PASS**. An accidental non-Nix
 installing rust-src due to an existing file conflict; that is a local toolchain
 failure, not formatting evidence. No toolchain repair was attempted; validation
 continues with the repository's Nix-pinned environment.
+
+## Exit snapshots and live reflection dirtiness
+
+After the telemetry baseline, `nested_vmx::exit_snapshot::ExitSnapshot` retains
+ten hardware read-only exit-information fields in `CpuRuntimeState`, selected
+through the owning CPU's private GS. It snapshots the actual direct VMCS after
+an exit; it does not compose a VMCS12/VMCS02, guest state or L1 host state.
+VMREAD hits avoid switching to the direct VMCS and back. Exact encodings and
+the GPA high-half alias are handled; unsupported encodings still use hardware.
+`VM_INSTRUCTION_ERROR` is deliberately excluded because later VMfail changes it.
+Snapshot validity requires the existing hidden VMX_MISC[29] policy, checked by
+a unit assertion. Entry attempts, VMCLEAR, VMPTRLD and VMXON/OFF invalidate the
+CPU's snapshot conservatively before emulation, including failed operations.
+No incomplete capture is published and no lock/borrow spans guest execution.
+
+`vmcs_write_reflected` additionally compares each target with the **current
+carrier VMCS field**, writing only differences. It never trusts a stale copy
+across L1 execution: L1 can change CRs, MSRs, descriptors and selectors without
+exiting. All original 54 reflection targets and read/write error paths remain.
+This trades 54 VMREADs for fewer VMWRITEs, not an assumption that host fields
+never change. Raw operation telemetry measures both sides of that trade.
+
+Native `msr_contract::ept_large_pages` now also proves 24 repeated GPA high-half
+reads, eight warm reason reads, unsupported-field and bad-host-entry VMfail with
+fresh instruction-error values, read-only write rejection, and switching between
+two actual VMCSes with different CPUID/VMCALL exits. The second VMCS page is
+separate from EPT tables/payloads and is cleared before fixture completion.
+The strict shell/xtask gate requires complete, ordered snapshot evidence.
+Reference CPUs advertising writable exit fields take an explicitly tested
+success/write/restore branch; **Direct must take readonly_reject=1**. An initial
+fixture mistakenly demanded rejection from the writable reference CPU; that
+test assumption was corrected without relaxing Direct's requirement. Reference
+then reaches its already-recorded late-entry PAT-save failure again.
+
+Validation so far (QEMU/KVM, never physical hardware):
+
+* Snapshot-only host iteration: nested **29 PASS**, loader **49 PASS**;
+  `/tmp/x86-exit-snapshot-unit.log`. Full host checks after live comparison:
+  **175 PASS, 0 FAIL** (nested 29, HAL 54, loader 49, guest 10, xtask 33), using
+  `cargo xtest -p nested_vmx -p x86_64_hal -p x86_uefi_loader
+  -p x86_guest_uefi_test -p xtask` through Nix;
+  `/tmp/x86-reflection-dirty-host.log`.
+* Snapshot-only release build **PASS**, `/tmp/x86-exit-snapshot-build.log`.
+  Its first nested-64 run has all Direct cases **PASS**, but the initial
+  reference fixture assumption above fails before the prior reference failure.
+  `/tmp/x86-exit-snapshot-nested-64.log` is intermediate evidence only.
+* With corrected fixture and live reflection comparison:
+  `LINUX_KVM_CYCLES=64 nix develop --accept-flake-config --command cargo xrun
+  x86 --nested --release`: **9 PASS, 5 FAIL**; all Direct native/Linux and
+  reference Linux cases pass, with the same five reference-only failures.
+  `/tmp/x86-reflection-dirty-nested-64.log`.
+* Unpaused, unmodified Direct `memslot_perf_test`: **FAIL, guest exit 142** for
+  both snapshot-only and live-comparison variants. Map averages in these single
+  runs are 1.7594 and 1.6680 seconds (telemetry baseline 1.9288); these are not
+  controlled production-speed claims. RW still expires its own alarm. Logs:
+  `/tmp/x86-exit-snapshot-memslot-unpaused.log` and
+  `/tmp/x86-reflection-dirty-memslot-unpaused.log`.
+* Separate paused diagnostic repetitions each yield five valid 176-byte records.
+  Snapshot-only: 12,409 reflected-exit delta, 5.425 VMPTRLD, 135.264 VMREAD,
+  110.181 VMWRITE, 53.996 reflected writes per reflected exit. With live comparison:
+  16,837 reflected-exit delta, 4.632 VMPTRLD, 168.480 VMREAD, 50.124 VMWRITE,
+  **2.447 reflected writes** per reflected exit. Logs:
+  `/tmp/x86-exit-snapshot-counter-samples.log` and
+  `/tmp/x86-reflection-dirty-counter-samples.log`.
+  Workload phases/intervening L1 exits differ; these ratios confirm reduced
+  switching/writes, not latency or throughput equivalence. Both diagnostic
+  repetitions still reach the RW alarm and are excluded from timing qualification.
+
+The original timing-sensitive regressions are not waived, and no timeouts or
+capabilities were weakened. Windows Hyper-V, S3 and physical hardware remain
+unverified for this increment; outer-KVM results remain reference evidence only.
+
+### VM-exit benchmarks and controlled Direct A/B
+
+All twelve existing `vmexit_*` manifest cases pass on both backends:
+**24 PASS, 0 FAIL**, through `run-linux-kunit-test.sh`, with
+`LINUX_KUNIT_BACKEND=<backend>`, `LINUX_KUNIT_CASE=<case>`,
+`LINUX_L2_KUNIT_DIR=/tmp/thin-hv-kvm-unit-tests-20260908/x86`, and the same pinned
+L2 test QEMU used by the previous evidence:
+`LINUX_L2_QEMU=/nix/store/dz3ivvcn2916ac16l95vzgshikxrbicr-qemu-host-cpu-only-for-vm-tests-10.1.5/bin/qemu-system-x86_64`.
+Each invokes `nix develop --accept-flake-config --command bash
+scripts/x86_64/run-linux-kunit-test.sh`. No manifest case, guest argument, CPU
+setting, adaptive benchmark loop or time limit was changed. Logs:
+`/tmp/x86-reflection-vmexit-final-<backend>-<case>.log`; batch result:
+`/tmp/x86-reflection-vmexit-final-batch.log`.
+
+| Benchmark | Reference ticks/iteration | Direct ticks/iteration |
+| --- | ---: | ---: |
+| CPUID | 12,949 | 361,080 |
+| VMCALL | 39,062 | 1,125,321 |
+| CR8 read | 8 | 9 |
+| CR8 write | 17 | 12 |
+| PM timer IN | 19,271 | 417,728 |
+| IPI | 63,160 | 2,775,465 |
+| IPI + halt | 62,358 | 2,819,064 |
+| PLE round robin | 5,462,094 | 5,465,527 |
+| TSC deadline | 12,970 | 850,246 |
+| Immediate TSC deadline | 25,925 | 1,207,403 |
+| CR0.WP toggle | 54,332 | 2,299,058 |
+| CR4.PGE toggle | 1,534 | 2,203 |
+
+These are QEMU/KVM observations, not physical-L0 measurements or CPU-isolated
+results. Multi-vCPU L2 cases still share one L1 CPU and do not prove physical SMP.
+An initial launch omitted the recorded L2 QEMU override: four reference cases
+failed before their guests ran with `Failed loading SDL3 library`, exit 134.
+That batch was stopped (exit 143; the fifth case did not finish setup). Its
+non-`final` logs remain infrastructure failures, not architectural benchmark
+results. Explicitly restoring the previously recorded QEMU path fixed setup;
+no desktop dependency or test bypass was added to the repository.
+
+To measure the optimization itself, the immediately preceding telemetry commit
+`c5d8ece` was built in the separate **detached** worktree
+`/tmp/x86-telemetry-baseline.YhT7nE`. The main branch never changed. Baseline
+release build/ISA checks pass (`/tmp/x86-reflection-ab-baseline-build.log`).
+For CPUID, VMCALL and PM timer IN, one immutable UKI per case was used by the
+existing `run-uefi-smoke.sh` and strict `run-linux-kunit-test.sh --check-log`
+gate, alternating baseline/current loader+monitor pairs three times. All
+QEMU settings match the corresponding manifest runner. **18 PASS, 0 FAIL**;
+artifact hashes and statuses are in `/tmp/x86-reflection-ab.log`, individual
+logs `/tmp/x86-reflection-ab-<case>-<baseline|optimized>-<1|2|3>.log`.
+
+| Case | Baseline ticks (three runs) | Optimized ticks (three runs) | Median reduction |
+| --- | --- | --- | ---: |
+| CPUID | 378611, 378131, 381084 | 345276, 344174, 343867 | 9.10% |
+| VMCALL | 1186845, 1180898, 1188367 | 1095071, 1092606, 1098096 | 7.73% |
+| PM timer IN | 458047, 449060, 463299 | 421242, 412741, 413742 | 9.67% |
+
+The controlled comparison supports retaining these two bounded optimizations,
+but does not resolve RW's alarm or establish physical/Windows performance.
+
+Final pre-commit checks: Nix `cargo xbuild x86` **PASS**
+(`/tmp/x86-reflection-dirty-build-debug.log`), `cargo xrun x86 --release`
+**9 PASS, 0 FAIL** (seven KVM/two TCG;
+`/tmp/x86-reflection-dirty-smoke.log`), `cargo fmt --check` and
+`git diff --check` **PASS**. The latest full 4096-cycle and isolated invalid-
+guest-state results still precede this performance increment; they remain to
+be rerun and are not claimed as current qualification here.

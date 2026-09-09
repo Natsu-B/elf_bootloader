@@ -7,6 +7,7 @@
 //! architectural state and the deliberately small feature policy exposed to a
 //! trusted L1 hypervisor.
 
+pub mod exit_snapshot;
 pub mod host_validation;
 pub mod msr_list;
 pub mod vpid;
