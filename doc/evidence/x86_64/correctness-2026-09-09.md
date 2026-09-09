@@ -1152,3 +1152,61 @@ Final checks after restoring the intended mask: `cargo xtest -p nested_vmx`
 `/tmp/x86-ept2m-smoke.log`. The unmodified Direct `xcr0_cpuid_test` also
 **PASS**, `/tmp/x86-ept2m-direct-xcr0_cpuid_test.log`. Formatting and diff checks
 PASS; no AArch64 production code or user `AGENTS.md` change was included.
+
+## VMCS operation telemetry before performance changes
+
+`vmx_smoke::{vmcs_read,vmcs_write,vmcs_load,vmcs_write_reflected}` now count
+actual hardware attempts, including failures. `vmx::VmcsAccessCounts` retains
+the completed operation prefix inside guarded entry/error helpers, including
+their raw VMPTRLD assembly. Software mirror hits do not count as VMREADs.
+Counters saturate, never print from the hot path, and do not overwrite the
+last exit phase/reason. Reflection writes are a subset of total VMWRITEs.
+No required VMCS operation has been removed in this instrumentation increment.
+
+The existing bounded diagnostic record is version 2, 176 bytes. The Python
+decoder and Windows HMP capture agree on this exact length; old versions,
+misaligned/out-of-image addresses and torn/exhausted records remain rejected.
+Storage is still explicitly BSP-only, not physical SMP support. The Windows
+reader change is host-tested only, not a Windows boot/Hyper-V result.
+
+Validation:
+
+* `cargo xtest -p x86_64_hal -p x86_uefi_loader -p xtask` and
+  `cargo xtest -p nested_vmx -p x86_guest_uefi_test`, through the Nix environment:
+  **173 PASS, 0 FAIL** (HAL 54, loader 49, xtask 33, nested 27, guest 10).
+  Logs: `/tmp/x86-vmcs-telemetry-host-complete.log` and
+  `/tmp/x86-vmcs-telemetry-host-rest.log`.
+* `cargo xbuild x86 --release`: **PASS**;
+  `/tmp/x86-vmcs-telemetry-build-release.log`.
+* `LINUX_KVM_CYCLES=64 nix develop --accept-flake-config --command cargo xrun
+  x86 --nested --release`: **9 PASS, 5 FAIL**; every Direct native/Linux profile
+  passes, with the same five previously explained reference failures.
+  `/tmp/x86-vmcs-telemetry-nested-64.log`.
+* Unmodified Direct `memslot_perf_test`, same pinned ELF and runner parameters
+  as the preceding increment: **FAIL, guest exit 142**, RW alarm after five
+  completed subtests; `/tmp/x86-vmcs-telemetry-memslot-baseline.log`.
+* Separate diagnostic-only repetition: five paused snapshots of **only the
+  published 176-byte counter record**, using the existing HMP FIFO and decoder.
+  `/tmp/x86-vmcs-counter-samples.log` and
+  `/tmp/x86-vmcs-telemetry-memslot-sampled.log`. All five records validate.
+  Across the sampling interval, 44,348 reflected exits correspond to about
+  11.00 VMPTRLD, 83.57 VMREAD, 91.08 VMWRITE attempts per reflected exit;
+  54.00 are reflected-state writes. These include intervening L1 exits and
+  partial boundary exits, not an isolated per-exit instruction benchmark.
+  Pauses make this run **ineligible for timing qualification**; its eventual
+  RW alarm is not substituted for the unpaused failure above. No timeout or
+  upstream test was changed, and no guest/firmware data was dumped.
+
+This identifies VMCS switching and the 54 unconditional reflection writes as
+measurable optimization candidates, not a demonstrated watchdog root cause.
+No Windows, S3 or physical hardware test is claimed; outer KVM remains reference
+evidence only. The active 8 GiB platform-map and physical ownership gaps remain.
+
+Final instrumentation checks: Nix `cargo xbuild x86` **PASS**
+(`/tmp/x86-vmcs-telemetry-build-debug.log`), `cargo xrun x86 --release`
+**9 PASS, 0 FAIL**, seven KVM/two TCG (`/tmp/x86-vmcs-telemetry-smoke.log`).
+Nix `cargo fmt --check` and `git diff --check` **PASS**. An accidental non-Nix
+`cargo fmt --check` first tried updating the floating rustup nightly and failed
+installing rust-src due to an existing file conflict; that is a local toolchain
+failure, not formatting evidence. No toolchain repair was attempted; validation
+continues with the repository's Nix-pinned environment.

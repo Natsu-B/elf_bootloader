@@ -2,7 +2,7 @@
 """Validate and decode only the BSP QEMU prototype's fixed VM-exit counters.
 
 The address command accepts one publication inside one resident monitor image,
-never a free-form physical address. The decode command reads exactly 144 bytes;
+never a free-form physical address. The decode command reads exactly 176 bytes;
 it does not inspect guest, firmware, crash, or licensing data.
 """
 
@@ -15,7 +15,7 @@ import sys
 import unittest
 
 
-SIZE = 144
+SIZE = 176
 U64_MAX = (1 << 64) - 1
 PROTOTYPE_LIMIT = 8 << 30
 MAX_LOG_BYTES = 64 << 20
@@ -24,13 +24,15 @@ BACKEND = "thin-hv: backend=direct-vmx role=project-l0"
 IMAGE = re.compile(r"thin-hv: runtime image base=0x([0-9a-f]{16}) end=0x([0-9a-f]{16})")
 PUBLICATION = re.compile(
     r"thin-hv: vmx diagnostics address=0x([0-9a-f]{16}) "
-    r"size=144 version=1 scope=bsp-only environment=qemu-prototype"
+    r"size=176 version=2 scope=bsp-only environment=qemu-prototype"
 )
 COUNTERS = (
     "l1_exits", "direct_entry_attempts", "observed_l2_entries",
     "reflected_l2_exits", "l0_only_handled_exits", "external_interrupt_exits",
     "interrupt_window_exits", "invept", "invvpid", "nested_entry_failures",
     "cpuid_exits",
+    "vmread_attempts", "vmwrite_attempts", "vmptrld_attempts",
+    "reflected_state_writes",
 )
 PHASES = (
     "initial", "l1-exit", "l0-handled-resume", "direct-entry-prepared",
@@ -112,15 +114,15 @@ def decode_record(data, address):
     """Decode the immutable snapshot; never accept a torn or exhausted sequence."""
     if len(data) != SIZE or data[:8] != b"THVSTAT1":
         raise InvalidRecord("incorrect diagnostics size or magic")
-    words = struct.unpack("<18Q", data)
-    if words[1] != 1 or words[2] != SIZE or words[4] != 1:
+    words = struct.unpack("<22Q", data)
+    if words[1] != 2 or words[2] != SIZE or words[4] != 1:
         raise InvalidRecord("unsupported diagnostics version, size, or scope")
     if words[3] & 1 or words[3] == U64_MAX:
         raise InvalidRecord("torn or exhausted diagnostics sequence")
-    if words[16] >= len(PHASES) or (words[17] > 0xFFFFFFFF and words[17] != U64_MAX):
+    if words[20] >= len(PHASES) or (words[21] > 0xFFFFFFFF and words[21] != U64_MAX):
         raise InvalidRecord("invalid diagnostics phase or VM-exit reason")
     return {
-        "schema": "thin-hv.vmx-diagnostics.v1",
+        "schema": "thin-hv.vmx-diagnostics.v2",
         "backend": "direct-vmx",
         "role": "project-l0",
         "environment": "QEMU/KVM",
@@ -128,9 +130,9 @@ def decode_record(data, address):
         "address": f"0x{address:016x}",
         "size": SIZE,
         "sequence": words[3],
-        "counters": dict(zip(COUNTERS, words[5:16])),
-        "last_phase": {"value": words[16], "name": PHASES[words[16]]},
-        "last_reason": None if words[17] == U64_MAX else words[17],
+        "counters": dict(zip(COUNTERS, words[5:20])),
+        "last_phase": {"value": words[20], "name": PHASES[words[20]]},
+        "last_reason": None if words[21] == U64_MAX else words[21],
     }
 
 
@@ -143,13 +145,13 @@ class DecoderTests(unittest.TestCase):
             BACKEND,
             "thin-hv: runtime image base=0x0000000000100000 end=0x0000000000101000",
             "thin-hv: vmx diagnostics address=0x0000000000100040 "
-            "size=144 version=1 scope=bsp-only environment=qemu-prototype",
+            "size=176 version=2 scope=bsp-only environment=qemu-prototype",
         ]
-        self.words = [int.from_bytes(b"THVSTAT1", "little"), 1, SIZE, 2, 1]
-        self.words += list(range(11)) + [4, 48]
+        self.words = [int.from_bytes(b"THVSTAT1", "little"), 2, SIZE, 2, 1]
+        self.words += list(range(15)) + [4, 48]
 
     def record(self, words=None):
-        return struct.pack("<18Q", *(self.words if words is None else words))
+        return struct.pack("<22Q", *(self.words if words is None else words))
 
     def test_valid_publication_and_crlf(self):
         expected = (0x100040, (0x100000, 0x101000))
@@ -173,12 +175,12 @@ class DecoderTests(unittest.TestCase):
             publication(self.lines + ["thin-hv: trusted outer KVM guest PASS"])
 
     def test_address_alignment_and_image_boundaries(self):
-        for address in (0, 0xFFFF8, 0x100041, 0x100F78, U64_MAX):
+        for address in (0, 0xFFFF8, 0x100041, 0x100F58, U64_MAX):
             invalid = self.lines[:3] + [self.lines[3].replace("0000000000100040", f"{address:016x}")]
             with self.assertRaises(InvalidRecord):
                 publication(invalid)
-        valid = self.lines[:3] + [self.lines[3].replace("0000000000100040", "0000000000100f70")]
-        self.assertEqual(publication(valid)[0], 0x100F70)
+        valid = self.lines[:3] + [self.lines[3].replace("0000000000100040", "0000000000100f50")]
+        self.assertEqual(publication(valid)[0], 0x100F50)
 
     def test_prototype_bounds_and_publication_metadata(self):
         for line in (
@@ -187,7 +189,7 @@ class DecoderTests(unittest.TestCase):
         ):
             with self.assertRaises(InvalidRecord):
                 publication(self.lines[:2] + [line, self.lines[3]])
-        for field, replacement in (("size=144", "size=145"), ("version=1", "version=2"),
+        for field, replacement in (("size=176", "size=144"), ("version=2", "version=1"),
                                    ("scope=bsp-only", "scope=smp")):
             with self.assertRaises(InvalidRecord):
                 publication(self.lines[:3] + [self.lines[3].replace(field, replacement)])
@@ -196,14 +198,14 @@ class DecoderTests(unittest.TestCase):
         for data in (self.record()[:-1], self.record() + b"\0", b"NOTSTAT1" + self.record()[8:]):
             with self.assertRaises(InvalidRecord):
                 decode_record(data, 0x100040)
-        for index, value in ((1, 2), (2, 145), (4, 2)):
+        for index, value in ((1, 1), (2, 144), (4, 2)):
             words = self.words.copy()
             words[index] = value
             with self.assertRaises(InvalidRecord):
                 decode_record(self.record(words), 0x100040)
 
     def test_odd_exhausted_sequence_phase_and_reason(self):
-        for index, value in ((3, 1), (3, U64_MAX), (16, 8), (17, 1 << 32)):
+        for index, value in ((3, 1), (3, U64_MAX), (20, 8), (21, 1 << 32)):
             words = self.words.copy()
             words[index] = value
             with self.assertRaises(InvalidRecord):
@@ -211,10 +213,14 @@ class DecoderTests(unittest.TestCase):
 
     def test_bounded_json_counter_mapping_and_saturation(self):
         self.words[5] = U64_MAX
-        self.words[17] = U64_MAX
+        self.words[21] = U64_MAX
         result = decode_record(self.record(), 0x100040)
         self.assertEqual(result["counters"]["l1_exits"], U64_MAX)
         self.assertEqual(result["counters"]["cpuid_exits"], 10)
+        self.assertEqual(result["counters"]["vmread_attempts"], 11)
+        self.assertEqual(result["counters"]["vmwrite_attempts"], 12)
+        self.assertEqual(result["counters"]["vmptrld_attempts"], 13)
+        self.assertEqual(result["counters"]["reflected_state_writes"], 14)
         self.assertEqual(result["last_phase"]["name"], "nested-exit")
         self.assertIsNone(result["last_reason"])
         self.assertLess(len(json.dumps(result)), 2048)

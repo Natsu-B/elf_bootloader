@@ -347,6 +347,33 @@ impl RecordedFailure {
     }
 }
 
+/// Exact VMCS operation attempts made inside a compound guarded VMX helper.
+/// Caller-owned storage retains the completed prefix even when a helper fails;
+/// no callback, global telemetry, allocation or additional VMX operation is used.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VmcsAccessCounts {
+    /// Hardware VMREAD attempts, including failures.
+    pub reads: u64,
+    /// Hardware VMWRITE attempts, including restoration and failures.
+    pub writes: u64,
+    /// Hardware VMPTRLD attempts, including deliberate VMfail generation.
+    pub loads: u64,
+}
+
+impl VmcsAccessCounts {
+    fn read(&mut self) {
+        self.reads = self.reads.saturating_add(1);
+    }
+
+    fn write(&mut self) {
+        self.writes = self.writes.saturating_add(1);
+    }
+
+    fn load(&mut self) {
+        self.loads = self.loads.saturating_add(1);
+    }
+}
+
 /// Records one error in the current VMCS using a guaranteed-failing instruction.
 ///
 /// Intel SDM Vol. 3C sections 31.2–31.4 define these failure conditions and the
@@ -368,8 +395,10 @@ pub unsafe fn record_failure(
     failure: RecordedFailure,
     vmxon_region: VmxonPhys,
     invalid_revision_region: VmcsPhys,
+    accesses: &mut VmcsAccessCounts,
 ) -> VmxStatus {
     if failure == RecordedFailure::UnsupportedComponent {
+        accesses.read();
         // SAFETY: the caller supplies a valid current VMCS. Bit 15 is reserved
         // in VMCS field encodings, so this register-form access must fail.
         return match unsafe { vmread(1 << 15) } {
@@ -378,6 +407,7 @@ pub unsafe fn record_failure(
         };
     }
     if failure == RecordedFailure::ReadOnlyComponent {
+        accesses.write();
         // SAFETY: physical IA32_VMX_MISC[29] is clear by the caller's contract;
         // VMWRITE cannot write this read-only field and instead records error 13.
         return unsafe { vmwrite(crate::vmcs::VM_INSTRUCTION_ERROR, 0) };
@@ -420,6 +450,7 @@ pub unsafe fn record_failure(
                 options(nostack)
             );
         } else {
+            accesses.load();
             asm!(
                 "vmptrld [{physical}]",
                 "setc {carry}",
@@ -606,11 +637,14 @@ pub unsafe fn vmwrite(field: u32, value: u64) -> VmxStatus {
 /// keeps all its fields and backing live. Use this only after finding invalid
 /// original host state: it intentionally cannot validate an otherwise good host.
 /// L1 fields hidden by Direct patching must already have been materialized.
-pub unsafe fn reject_host_entry(resume: bool) -> Option<VmxStatus> {
+pub unsafe fn reject_host_entry(
+    resume: bool,
+    accesses: &mut VmcsAccessCounts,
+) -> Option<VmxStatus> {
     // SAFETY: current VMCS ownership is the caller's invariant. HOST_CS is a
     // writable 16-bit field; a null selector is unconditionally invalid for
     // host state on VM entry outside SMM, even with invalid controls/guest state.
-    unsafe { reject_entry_field(resume, crate::vmcs::HOST_CS_SELECTOR, 0) }
+    unsafe { reject_entry_field(resume, crate::vmcs::HOST_CS_SELECTOR, 0, accesses) }
 }
 
 /// Records invalid original controls before Direct patching can hide them.
@@ -622,7 +656,10 @@ pub unsafe fn reject_host_entry(resume: bool) -> Option<VmxStatus> {
 /// The caller is outside SMM at CPL0 in VMX root and owns a valid current VMCS
 /// with all L1-visible fields materialized. Use only for invalid original
 /// controls. The mandatory VMX capability MSRs must be readable on this CPU.
-pub unsafe fn reject_control_entry(resume: bool) -> Option<VmxStatus> {
+pub unsafe fn reject_control_entry(
+    resume: bool,
+    accesses: &mut VmcsAccessCounts,
+) -> Option<VmxStatus> {
     // SAFETY: the caller establishes VMX and exclusive current-VMCS ownership.
     // BASIC selects an available control MSR. Verify bit0 cannot be one before
     // forcing it; this guarantees early rejection even on a future processor.
@@ -636,22 +673,36 @@ pub unsafe fn reject_control_entry(resume: bool) -> Option<VmxStatus> {
         if caps & (1 << 32) != 0 {
             return None;
         }
+        accesses.read();
         let original = vmread(crate::vmcs::CPU_BASED_VM_EXEC_CONTROL).ok()?;
-        reject_entry_field(resume, crate::vmcs::CPU_BASED_VM_EXEC_CONTROL, original | 1)
+        reject_entry_field(
+            resume,
+            crate::vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            original | 1,
+            accesses,
+        )
     }
 }
 
 /// Executes only with a field/value pair proven to force an early rejection.
-unsafe fn reject_entry_field(resume: bool, field: u32, value: u64) -> Option<VmxStatus> {
+unsafe fn reject_entry_field(
+    resume: bool,
+    field: u32,
+    value: u64,
+    accesses: &mut VmcsAccessCounts,
+) -> Option<VmxStatus> {
     // SAFETY: the two callers prove that this writable field/value pair must
     // fail before guest loading, and establish exclusive current VMCS ownership.
     // Successful restoration leaves the hardware instruction-error field intact.
     unsafe {
+        accesses.read();
         let original = vmread(field).ok()?;
+        accesses.write();
         if vmwrite(field, value) != VmxStatus::Success {
             return None;
         }
         let status = vm_entry_instruction(resume);
+        accesses.write();
         if vmwrite(field, original) != VmxStatus::Success {
             return None;
         }
@@ -727,6 +778,42 @@ unsafe fn vm_entry_instruction(resume: bool) -> VmxStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compound_vmcs_access_counts_keep_partial_prefixes_and_saturate() {
+        let mut counts = super::VmcsAccessCounts::default();
+        counts.read();
+        assert_eq!(
+            counts,
+            super::VmcsAccessCounts {
+                reads: 1,
+                writes: 0,
+                loads: 0
+            }
+        );
+        counts.write();
+        counts.write();
+        counts.load();
+        assert_eq!(
+            counts,
+            super::VmcsAccessCounts {
+                reads: 1,
+                writes: 2,
+                loads: 1
+            }
+        );
+        counts = super::VmcsAccessCounts {
+            reads: u64::MAX,
+            writes: u64::MAX,
+            loads: u64::MAX,
+        };
+        counts.read();
+        counts.write();
+        counts.load();
+        assert_eq!(counts.reads, u64::MAX);
+        assert_eq!(counts.writes, u64::MAX);
+        assert_eq!(counts.loads, u64::MAX);
+    }
+
     use super::InvvpidDescriptor;
     use super::RecordedFailure;
     use super::VmxBasic;

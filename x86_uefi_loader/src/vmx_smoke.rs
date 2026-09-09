@@ -258,17 +258,17 @@ static CARRIER_PATCH_VALUES: SpinLock<Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.le
 // per-VMCS storage only when the trusted single-vCPU path needs concurrency.
 static DIRECT_PATCH_VALUES: SpinLock<Option<(VmcsPhys, [u64; DIRECT_VMCS_PATCH_MANIFEST.len()])>> =
     SpinLock::new(None);
-/// Validated direct-VMCS entry policy, invalidated by its three writable fields.
+/// Validated direct-VMCS entry policy, invalidated by entry-affecting writes.
 static DIRECT_ENTRY_POLICY: SpinLock<Option<(VmcsPhys, u64)>> = SpinLock::new(None);
 /// State abandoned on the L0 stack while a direct L2 is running.
 // ponytail: one global direct run is sufficient for the current one-pCPU
 // probe; move this into per-pCPU storage before enabling SMP.
 static NESTED_RUN: SpinLock<Option<NestedRun>> = SpinLock::new(None);
 
-/// Little-endian snapshot signature; only this 144-byte record may be captured.
+/// Little-endian snapshot signature; only this 176-byte record may be captured.
 const DIAGNOSTIC_MAGIC: u64 = u64::from_le_bytes(*b"THVSTAT1");
 /// Fixed snapshot ABI, independent of the Rust lock's private layout.
-const DIAGNOSTIC_VERSION: u64 = 1;
+const DIAGNOSTIC_VERSION: u64 = 2;
 /// Scope value 1 means the current BSP-only QEMU Direct-VMX prototype.
 const DIAGNOSTIC_BSP_SCOPE: u64 = 1;
 
@@ -281,6 +281,11 @@ enum DiagnosticEvent {
     Reflected(u64),
     EntryFailure(u64),
     GuestReturned,
+    VmcsRead,
+    VmcsWrite,
+    VmcsLoad,
+    ReflectedStateWrite,
+    VmcsAccessBatch(vmx::VmcsAccessCounts),
 }
 
 /// Movable value state for eventual per-pCPU ownership; all counters saturate.
@@ -298,6 +303,12 @@ struct ExitCounterValues {
     invvpid: u64,
     nested_entry_failures: u64,
     cpuid_exits: u64,
+    /// Raw hardware attempts, including failures; no software-cache hit counts.
+    vmread_attempts: u64,
+    vmwrite_attempts: u64,
+    vmptrld_attempts: u64,
+    /// Subset of vmwrite_attempts reconstructing L1 state for reflection.
+    reflected_state_writes: u64,
     /// 0 initial, 1 L1 exit, 2 L0 handled, 3 direct entry, 4 L2 exit,
     /// 5 reflection complete, 6 immediate entry failure, 7 bounded guest return.
     last_phase: u64,
@@ -319,6 +330,10 @@ impl ExitCounterValues {
             invvpid: 0,
             nested_entry_failures: 0,
             cpuid_exits: 0,
+            vmread_attempts: 0,
+            vmwrite_attempts: 0,
+            vmptrld_attempts: 0,
+            reflected_state_writes: 0,
             last_phase: 0,
             last_reason: u64::MAX,
         }
@@ -341,7 +356,8 @@ impl ExitCounterValues {
         }
     }
 
-    /// Updates scalar cells only, avoiding a bulk copy in the unsaved-XSAVE path.
+    /// Updates scalar cells only. VMCS operations do not change the last exit
+    /// phase/reason; operation telemetry must not obscure progress diagnostics.
     fn record(&mut self, event: DiagnosticEvent) {
         let (phase, reason) = match event {
             DiagnosticEvent::L1Exit(reason) => {
@@ -380,6 +396,29 @@ impl ExitCounterValues {
                 (6, reason)
             }
             DiagnosticEvent::GuestReturned => (7, EXIT_REASON_VMCALL),
+            DiagnosticEvent::VmcsRead => {
+                diagnostic_increment(&mut self.vmread_attempts);
+                return;
+            }
+            DiagnosticEvent::VmcsWrite => {
+                diagnostic_increment(&mut self.vmwrite_attempts);
+                return;
+            }
+            DiagnosticEvent::VmcsLoad => {
+                diagnostic_increment(&mut self.vmptrld_attempts);
+                return;
+            }
+            DiagnosticEvent::ReflectedStateWrite => {
+                diagnostic_increment(&mut self.vmwrite_attempts);
+                diagnostic_increment(&mut self.reflected_state_writes);
+                return;
+            }
+            DiagnosticEvent::VmcsAccessBatch(accesses) => {
+                diagnostic_add(&mut self.vmread_attempts, accesses.reads);
+                diagnostic_add(&mut self.vmwrite_attempts, accesses.writes);
+                diagnostic_add(&mut self.vmptrld_attempts, accesses.loads);
+                return;
+            }
         };
         diagnostic_store(&mut self.last_phase, phase);
         diagnostic_store(&mut self.last_reason, reason);
@@ -395,7 +434,11 @@ fn diagnostic_store(destination: &mut u64, value: u64) {
 }
 
 fn diagnostic_increment(destination: &mut u64) {
-    let next = destination.saturating_add(1);
+    diagnostic_add(destination, 1);
+}
+
+fn diagnostic_add(destination: &mut u64, amount: u64) {
+    let next = destination.saturating_add(amount);
     diagnostic_store(destination, next);
 }
 
@@ -407,7 +450,7 @@ fn diagnostic_next_sequence(previous: u64) -> Option<(u64, u64)> {
     Some((previous.checked_add(1)?, previous.checked_add(2)?))
 }
 
-/// Exactly 18 little-endian u64 words; sequence is word 3, counters start at 5.
+/// Exactly 22 little-endian u64 words; sequence is word 3, counters start at 5.
 /// Readers require magic/version/size/scope and a stable even sequence. Stop all
 /// QEMU vCPUs before copying this record; an odd/exhausted snapshot is not valid.
 #[repr(C)]
@@ -447,11 +490,52 @@ impl ExitDiagnostics {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 144);
+const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 176);
 
 /// No serial or allocation is permitted here: this is the bounded hot-path hook.
 fn record_diagnostic(event: DiagnosticEvent) {
     EXIT_DIAGNOSTICS.lock().record(event);
+}
+
+/// Counts a real VMREAD, never a read from a software mirror.
+///
+/// # Safety
+/// Caller remains at CPL0 in VMX root operation on the owning CPU. The current
+/// VMCS and its backing remain live. Unsupported encodings return VMfail through
+/// the unchanged HAL result; counting neither loads nor changes a VMCS.
+unsafe fn vmcs_read(field: u32) -> Result<u64, VmxStatus> {
+    record_diagnostic(DiagnosticEvent::VmcsRead);
+    // SAFETY: the caller supplies the HAL's CPU-mode/current-VMCS invariants;
+    // the short telemetry lock is released before executing the instruction.
+    unsafe { vmx::vmread(field) }
+}
+
+/// Counts a real VMWRITE. The caller owns the current resident VMCS at CPL0
+/// in VMX root operation; values retain the HAL's exact hardware failure path.
+unsafe fn vmcs_write(field: u32, value: u64) -> VmxStatus {
+    record_diagnostic(DiagnosticEvent::VmcsWrite);
+    // SAFETY: current-VMCS ownership/mode/backing are caller invariants; the
+    // telemetry update has completed without changing any hardware VMCS state.
+    unsafe { vmx::vmwrite(field, value) }
+}
+
+/// Counts a VMPTRLD attempt without modifying VMCS ownership or failure flags.
+/// Caller is pinned at CPL0 in VMX root operation and supplies a checked aligned
+/// physical VMCS region, distinct from VMXON and owned by this CPU alone.
+unsafe fn vmcs_load(region: VmcsPhys) -> VmxStatus {
+    record_diagnostic(DiagnosticEvent::VmcsLoad);
+    // SAFETY: the caller validated region alignment, residency and CPU ownership
+    // according to the HAL contract; hardware still validates its VMCS header.
+    unsafe { vmx::vmptrld(region) }
+}
+
+/// Counts one reflected L1 state write in both the total and subset, atomically
+/// with respect to telemetry readers. Only the owned carrier may be current.
+unsafe fn vmcs_write_reflected(field: u32, value: u64) -> VmxStatus {
+    record_diagnostic(DiagnosticEvent::ReflectedStateWrite);
+    // SAFETY: reflection selected this CPU's resident carrier in VMX root;
+    // field/value are the validated L1 host state or architectural exit resets.
+    unsafe { vmx::vmwrite(field, value) }
 }
 
 /// Preserves existing cold diagnostic fields with a saturating counter.
@@ -478,7 +562,7 @@ fn publish_diagnostics(
     drop(diagnostics);
     let _ = writeln!(
         serial,
-        "thin-hv: vmx diagnostics address={address:#018x} size={size} version=1 scope=bsp-only environment=qemu-prototype"
+        "thin-hv: vmx diagnostics address={address:#018x} size={size} version=2 scope=bsp-only environment=qemu-prototype"
     );
     Ok(())
 }
@@ -509,6 +593,13 @@ fn log_diagnostic_summary(serial: &mut SerialPort) {
         (&b"invvpid"[..], values.invvpid),
         (&b"nested_entry_failures"[..], values.nested_entry_failures),
         (&b"cpuid_exits"[..], values.cpuid_exits),
+        (&b"vmread_attempts"[..], values.vmread_attempts),
+        (&b"vmwrite_attempts"[..], values.vmwrite_attempts),
+        (&b"vmptrld_attempts"[..], values.vmptrld_attempts),
+        (
+            &b"reflected_state_writes"[..],
+            values.reflected_state_writes,
+        ),
         (&b"last_phase"[..], values.last_phase),
         (&b"last_reason"[..], values.last_reason),
     ] {
@@ -720,7 +811,7 @@ impl CpuRuntimeState {
             let value = match exit_store_source(item.index) {
                 // SAFETY: the stopped L2's Direct VMCS is current on its owning
                 // CPU. These mandatory fields hold hardware-saved guest values.
-                ExitStoreSource::GuestField(field) => Some(unsafe { vmx::vmread(field) }.ok()?),
+                ExitStoreSource::GuestField(field) => Some(unsafe { vmcs_read(field) }.ok()?),
                 ExitStoreSource::PrivateDebugCapture => {
                     (self.capture_count >= 1).then_some(self.exit_capture[0].value)
                 }
@@ -1700,7 +1791,7 @@ fn configure_and_launch(
     true_controls: bool,
 ) -> Result<(), Error> {
     require("VMCLEAR", unsafe { vmx::vmclear(vmcs_page) })?;
-    require("VMPTRLD", unsafe { vmx::vmptrld(vmcs_page) })?;
+    require("VMPTRLD", unsafe { vmcs_load(vmcs_page) })?;
 
     let pin_msr = if true_controls {
         vmx::IA32_VMX_TRUE_PINBASED_CTLS
@@ -2010,7 +2101,7 @@ fn guest_system_segment(
 }
 
 fn write_vmcs(field: u32, value: u64) -> Result<(), Error> {
-    let status = unsafe { vmx::vmwrite(field, value) };
+    let status = unsafe { vmcs_write(field, value) };
     if status == VmxStatus::Success {
         Ok(())
     } else {
@@ -2031,11 +2122,11 @@ fn require(instruction: &'static str, status: VmxStatus) -> Result<(), Error> {
 }
 
 fn vm_instruction_error() -> u64 {
-    unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.unwrap_or(u64::MAX)
+    unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) }.unwrap_or(u64::MAX)
 }
 
 fn log_guest_state() {
-    let read = |field| unsafe { vmx::vmread(field) }.unwrap_or(u64::MAX);
+    let read = |field| unsafe { vmcs_read(field) }.unwrap_or(u64::MAX);
     let mut serial = SerialPort;
     serial.init();
     let _ = writeln!(
@@ -2270,7 +2361,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     if let Some(run) = nested_run {
         // SAFETY: a hardware exit entered L0 with the direct VMCS current; this
         // read-only telemetry access neither changes fields nor emulation policy.
-        let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+        let reason = unsafe { vmcs_read(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
         record_diagnostic(DiagnosticEvent::NestedExit(reason));
         reflect_l2_vmexit(&run, reason, registers);
         record_diagnostic(DiagnosticEvent::Reflected(reason));
@@ -2278,7 +2369,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
     }
 
     // SAFETY: the hardware exit selected the live carrier VMCS for this BSP.
-    let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    let reason = unsafe { vmcs_read(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
     complete_reflected_msr_load(reason, registers);
     record_diagnostic(DiagnosticEvent::L1Exit(reason));
     let action = dispatch_l1_exit(registers, reason);
@@ -2288,12 +2379,12 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
 
 /// Existing L1 emulation, separated only to count successfully handled exits.
 fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
-    let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
-    let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
-    let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+    let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
 
     // VM-entry event fields persist in the VMCS after delivery.
-    let clear_event = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
+    let clear_event = unsafe { vmcs_write(vmcs::VM_ENTRY_INTR_INFO_FIELD, 0) };
     if clear_event != VmxStatus::Success {
         stop_unexpected_exit(
             b"clearing VM-entry event failed",
@@ -2306,7 +2397,7 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_EXTERNAL_INTERRUPT {
-        let interruption = unsafe { vmx::vmread(vmcs::VM_EXIT_INTR_INFO) }.unwrap_or(0);
+        let interruption = unsafe { vmcs_read(vmcs::VM_EXIT_INTR_INFO) }.unwrap_or(0);
         let Ok(acknowledged) = acknowledged_external_interrupt(interruption) else {
             stop_unexpected_exit(
                 b"invalid acknowledged external interrupt",
@@ -2320,7 +2411,7 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
         let prepared = if let Some(interruption) = acknowledged {
             guest_accepts_external_interrupt() == Some(true)
                 && set_carrier_interrupt_controls(true, false, false)
-                && (unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, interruption) })
+                && (unsafe { vmcs_write(vmcs::VM_ENTRY_INTR_INFO_FIELD, interruption) })
                     == VmxStatus::Success
         } else {
             match guest_accepts_external_interrupt() {
@@ -2418,8 +2509,8 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
         // SAFETY: the current carrier VMCS belongs to this BSP and contains
         // the exiting L1 state. VM86 always has CPL3 regardless of CS bits.
         let privilege = unsafe {
-            vmx::vmread(vmcs::GUEST_RFLAGS).and_then(|flags| {
-                vmx::vmread(vmcs::GUEST_CS_SELECTOR).map(|cs| {
+            vmcs_read(vmcs::GUEST_RFLAGS).and_then(|flags| {
+                vmcs_read(vmcs::GUEST_CS_SELECTOR).map(|cs| {
                     if flags & (1 << 17) != 0 {
                         3
                     } else {
@@ -2509,7 +2600,7 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
         let fixed = (value | CR4_VMX_ENABLE | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
             & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
         for (field, field_value) in [(vmcs::GUEST_CR4, fixed), (vmcs::CR4_READ_SHADOW, value)] {
-            let status = unsafe { vmx::vmwrite(field, field_value) };
+            let status = unsafe { vmcs_write(field, field_value) };
             if status != VmxStatus::Success {
                 stop_unexpected_exit(
                     b"virtualizing CR4 write failed",
@@ -2624,9 +2715,9 @@ fn acknowledged_external_interrupt(interruption: u64) -> Result<Option<u64>, ()>
 
 /// Reports whether L1 can accept an external interrupt on the next VM entry.
 fn guest_accepts_external_interrupt() -> Option<bool> {
-    let rflags = unsafe { vmx::vmread(vmcs::GUEST_RFLAGS) }.ok()?;
-    let interruptibility = unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.ok()?;
-    let activity = unsafe { vmx::vmread(vmcs::GUEST_ACTIVITY_STATE) }.ok()?;
+    let rflags = unsafe { vmcs_read(vmcs::GUEST_RFLAGS) }.ok()?;
+    let interruptibility = unsafe { vmcs_read(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.ok()?;
+    let activity = unsafe { vmcs_read(vmcs::GUEST_ACTIVITY_STATE) }.ok()?;
     if activity > 1 {
         return None;
     }
@@ -2652,11 +2743,11 @@ fn set_carrier_interrupt_controls(external: bool, acknowledge: bool, window: boo
             external,
         ),
     ] {
-        let Ok(value) = (unsafe { vmx::vmread(field) }) else {
+        let Ok(value) = (unsafe { vmcs_read(field) }) else {
             return false;
         };
         let value = if enabled { value | mask } else { value & !mask };
-        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+        if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
             return false;
         }
     }
@@ -2705,12 +2796,12 @@ fn handle_l1_vmxon(
     instruction_len: u64,
     registers: &GuestRegisters,
 ) {
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -2727,7 +2818,7 @@ fn handle_l1_vmxon(
         );
         return;
     }
-    let cr0 = unsafe { vmx::vmread(vmcs::GUEST_CR0) }.unwrap_or(0);
+    let cr0 = unsafe { vmcs_read(vmcs::GUEST_CR0) }.unwrap_or(0);
     if !vmx_control_registers_valid(cr0, cr4_shadow) {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -2787,12 +2878,12 @@ fn handle_l1_vmxoff(
     registers: &GuestRegisters,
 ) {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -2842,12 +2933,12 @@ fn handle_l1_vmclear(
     registers: &GuestRegisters,
 ) {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -2965,12 +3056,12 @@ fn handle_l1_vmptrld(
     };
 
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -3073,7 +3164,7 @@ fn handle_l1_vmptrld(
         // SAFETY: the operand is an aligned, in-range trusted L1 allocation,
         // distinct from the carrier and VMXON pages. Hardware validates its
         // revision before making it current, retaining the old VMCS on failure.
-        unsafe { vmx::vmptrld(region) }
+        unsafe { vmcs_load(region) }
     }) else {
         stop_unexpected_exit(
             b"executing VMPTRLD with L1 VMCS failed",
@@ -3106,12 +3197,12 @@ fn handle_l1_vmptrst(
     registers: &GuestRegisters,
 ) {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -3153,12 +3244,12 @@ fn handle_l1_vmentry(
     registers: &GuestRegisters,
 ) -> u64 {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return VMEXIT_ACTION_RESUME;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return VMEXIT_ACTION_RESUME;
@@ -3251,7 +3342,7 @@ fn handle_l1_vmentry(
         Some(values)
     };
     let l1_interruptibility =
-        unsafe { vmx::vmread(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
+        unsafe { vmcs_read(vmcs::GUEST_INTERRUPTIBILITY_INFO) }.unwrap_or(u64::MAX) & 8;
     let Some(host_limits) = l1_host_validation_limits() else {
         stop_unexpected_exit(
             b"reading L1 host validation context failed",
@@ -3265,9 +3356,9 @@ fn handle_l1_vmentry(
     // SAFETY: the owning CPU's carrier is still current. These are the stopped
     // L1's saved MSRs, not the private host values installed for Rust execution.
     let inherited = unsafe {
-        vmx::vmread(vmcs::GUEST_IA32_PAT)
+        vmcs_read(vmcs::GUEST_IA32_PAT)
             .ok()
-            .zip(vmx::vmread(vmcs::GUEST_IA32_EFER).ok())
+            .zip(vmcs_read(vmcs::GUEST_IA32_EFER).ok())
     };
     if inherited
         .and_then(|(pat, efer)| {
@@ -3287,7 +3378,7 @@ fn handle_l1_vmentry(
         );
     }
 
-    if unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success {
+    if unsafe { vmcs_load(current.address()) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"selecting L1 VMCS for VMLAUNCH failed",
             reason,
@@ -3386,6 +3477,7 @@ fn handle_l1_vmentry(
             }
             *DIRECT_PATCH_VALUES.lock() = None;
             *DIRECT_ENTRY_POLICY.lock() = None;
+            let mut accesses = vmx::VmcsAccessCounts::default();
             // SAFETY: the BSP owns this current direct VMCS, outside SMM; all
             // original fields are materialized. A proven-invalid control or
             // HOST_CS=0 guarantees early VMfail without guest/MSR loading.
@@ -3393,13 +3485,20 @@ fn handle_l1_vmentry(
             // helper restores its guard field before carrier selection.
             let result = unsafe {
                 let status = if invalid_controls {
-                    vmx::reject_control_entry(instruction == VmEntryInstruction::Vmresume)
+                    vmx::reject_control_entry(
+                        instruction == VmEntryInstruction::Vmresume,
+                        &mut accesses,
+                    )
                 } else {
-                    vmx::reject_host_entry(instruction == VmEntryInstruction::Vmresume)
+                    vmx::reject_host_entry(
+                        instruction == VmEntryInstruction::Vmresume,
+                        &mut accesses,
+                    )
                 };
+                record_diagnostic(DiagnosticEvent::VmcsAccessBatch(accesses));
                 match status {
                     Some(VmxStatus::FailInvalid) => Some(VmInstructionResult::VmfailInvalid),
-                    Some(VmxStatus::FailValid) => vmx::vmread(vmcs::VM_INSTRUCTION_ERROR)
+                    Some(VmxStatus::FailValid) => vmcs_read(vmcs::VM_INSTRUCTION_ERROR)
                         .ok()
                         .and_then(|error| u32::try_from(error).ok())
                         .map(VmInstructionResult::VmfailValid),
@@ -3419,7 +3518,7 @@ fn handle_l1_vmentry(
             // SAFETY: the reserved carrier remains owned/live and the guarded
             // failure did not clear or launch either VMCS. Restore its selection
             // before changing L1 flags/RIP; completion reads the preserved error.
-            if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+            if unsafe { vmcs_load(carrier) } != VmxStatus::Success {
                 stop_unexpected_exit(
                     b"restoring carrier after entry rejection failed",
                     reason,
@@ -3544,7 +3643,7 @@ fn l1_direct_controls_supported(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()])
     // SAFETY: this CPU owns the current stopped Direct VMCS. Its execution
     // controls are never patched by L0; hardware returns the original L1 word.
     let primary =
-        u32::try_from(unsafe { vmx::vmread(vmcs::CPU_BASED_VM_EXEC_CONTROL) }.ok()?).ok()?;
+        u32::try_from(unsafe { vmcs_read(vmcs::CPU_BASED_VM_EXEC_CONTROL) }.ok()?).ok()?;
     for (field, legacy, true_msr) in [
         (
             vmcs::PIN_BASED_VM_EXEC_CONTROL,
@@ -3583,7 +3682,7 @@ fn l1_direct_controls_supported(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()])
             vmcs::CPU_BASED_VM_EXEC_CONTROL => u64::from(primary),
             // SAFETY: the owned/current Direct VMCS retains these unpatched
             // mandatory execution fields; no guest runs during the check.
-            _ => unsafe { vmx::vmread(field) }.ok()?,
+            _ => unsafe { vmcs_read(field) }.ok()?,
         };
         let word = ControlProvenance::new(u32::try_from(original).ok()?, 0);
         if !word.requested_supported(l1_vmx_capability(if true_controls {
@@ -3632,7 +3731,7 @@ fn l1_host_validation_limits() -> Option<host_validation::Limits> {
                     0
                 },
             cet_allowed,
-            l1_ia32e: vmx::vmread(vmcs::GUEST_IA32_EFER).ok()? & (1 << 10) != 0,
+            l1_ia32e: vmcs_read(vmcs::GUEST_IA32_EFER).ok()? & (1 << 10) != 0,
         })
     }
 }
@@ -3641,7 +3740,7 @@ fn l1_host_validation_limits() -> Option<host_validation::Limits> {
 fn read_direct_patch_fields() -> Option<[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]> {
     let mut values = [0; DIRECT_VMCS_PATCH_MANIFEST.len()];
     for (value, patch) in values.iter_mut().zip(DIRECT_VMCS_PATCH_MANIFEST) {
-        *value = unsafe { vmx::vmread(patch.field as u32) }.ok()?;
+        *value = unsafe { vmcs_read(patch.field as u32) }.ok()?;
     }
     Some(values)
 }
@@ -3724,7 +3823,7 @@ fn patch_direct_vmcs(
         if saved_direct[index] == value {
             continue;
         }
-        if unsafe { vmx::vmwrite(patch.field as u32, value) } != VmxStatus::Success {
+        if unsafe { vmcs_write(patch.field as u32, value) } != VmxStatus::Success {
             return false;
         }
     }
@@ -3734,7 +3833,7 @@ fn patch_direct_vmcs(
 /// Restores every L1-visible field before exposing a retained direct VMCS.
 fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool {
     for (value, patch) in values.iter().zip(DIRECT_VMCS_PATCH_MANIFEST) {
-        if unsafe { vmx::vmwrite(patch.field as u32, *value) } != VmxStatus::Success {
+        if unsafe { vmcs_write(patch.field as u32, *value) } != VmxStatus::Success {
             return false;
         }
     }
@@ -3763,7 +3862,7 @@ fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) ->
         efer: direct_patch_value(saved, VmcsField::GuestIa32Efer)?,
     };
     // SAFETY: this CPU owns the current Direct VMCS; guest CR0 is not patched.
-    let cr0 = unsafe { vmx::vmread(vmcs::GUEST_CR0) }.ok()?;
+    let cr0 = unsafe { vmcs_read(vmcs::GUEST_CR0) }.ok()?;
     let entry_address = direct_patch_value(saved, VmcsField::VmEntryMsrLoadAddress)?;
     let entry_count =
         u32::try_from(direct_patch_value(saved, VmcsField::VmEntryMsrLoadCount)?).ok()?;
@@ -3803,7 +3902,7 @@ fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) ->
     ] {
         // SAFETY: only the owned Direct VMCS changes. Original fields remain in
         // the patch manifest; no hardware entry occurs until all writes succeed.
-        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+        if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
             return None;
         }
     }
@@ -3830,7 +3929,7 @@ fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
             34 => {
                 // SAFETY: this CPU owns the failed-entry Direct VMCS; hardware
                 // supplies the one-based index of the first failing list item.
-                let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.ok()?;
+                let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.ok()?;
                 with_cpu_runtime(|state| {
                     state
                         .entry_loaded
@@ -3844,8 +3943,8 @@ fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
         // this CPU-owned VMCS before hardware loaded L0's private host values.
         let captured = unsafe {
             PatEfer {
-                pat: vmx::vmread(vmcs::GUEST_IA32_PAT).ok()?,
-                efer: vmx::vmread(vmcs::GUEST_IA32_EFER).ok()?,
+                pat: vmcs_read(vmcs::GUEST_IA32_PAT).ok()?,
+                efer: vmcs_read(vmcs::GUEST_IA32_EFER).ok()?,
             }
         };
         let mut cache = DIRECT_PATCH_VALUES.lock();
@@ -3892,9 +3991,9 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
         return false;
     };
     if carrier == direct
-        || unsafe { vmx::vmptrld(direct) } != VmxStatus::Success
+        || unsafe { vmcs_load(direct) } != VmxStatus::Success
         || !restore_direct_vmcs(&values)
-        || unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success
+        || unsafe { vmcs_load(carrier) } != VmxStatus::Success
     {
         return false;
     }
@@ -3946,7 +4045,7 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
         Some(Err(())) => nested_vmx_abort(run.direct, 1, registers),
         None => stop_nested_exit(b"unsupported exit MSR-list backing", run.direct, registers),
     };
-    if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
+    if unsafe { vmcs_load(run.carrier) } != VmxStatus::Success {
         stop_nested_exit(
             b"restoring carrier after L2 exit failed",
             run.direct,
@@ -3963,7 +4062,7 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
     ] {
         // SAFETY: the owned carrier is current. The stable per-CPU mirror is
         // published only after its complete copy; no lock spans hardware entry.
-        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+        if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
             stop_nested_exit(
                 b"publishing reflected host MSR list failed",
                 run.direct,
@@ -4003,7 +4102,7 @@ fn complete_reflected_msr_load(reason: u64, registers: &GuestRegisters) {
     for field in [vmcs::VM_ENTRY_MSR_LOAD_COUNT, vmcs::VM_ENTRY_MSR_LOAD_ADDR] {
         // SAFETY: this is the first exit of the owned carrier after the list was
         // consumed. No guest executes while its next entry is being prepared.
-        if unsafe { vmx::vmwrite(field, 0) } != VmxStatus::Success {
+        if unsafe { vmcs_write(field, 0) } != VmxStatus::Success {
             stop_nested_exit(b"clearing reflected MSR list failed", owner, registers);
         }
     }
@@ -4051,13 +4150,13 @@ fn nested_vmx_abort(direct: VmcsPhys, code: u32, registers: &GuestRegisters) -> 
 
 /// Stops after recovering L2's exit diagnostics only on an error path.
 fn stop_nested_exit(message: &'static [u8], direct: VmcsPhys, registers: &GuestRegisters) -> ! {
-    if unsafe { vmx::vmptrld(direct) } != VmxStatus::Success {
+    if unsafe { vmcs_load(direct) } != VmxStatus::Success {
         stop_unexpected_exit(message, u64::MAX, u64::MAX, u64::MAX, u64::MAX, registers);
     }
-    let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
-    let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
-    let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
-    let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+    let reason = unsafe { vmcs_read(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
     stop_unexpected_exit(
         message,
         reason,
@@ -4148,7 +4247,9 @@ fn write_reflected_l1_state(run: &NestedRun, l1_pat: u64, l1_efer: u64) -> Optio
         ),
         (vmcs::VM_ENTRY_INTR_INFO_FIELD, 0),
     ] {
-        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+        // SAFETY: the owned carrier is current; all reflected fields above
+        // come from validated original L1 host state or specified VM-exit resets.
+        if unsafe { vmcs_write_reflected(field, value) } != VmxStatus::Success {
             return None;
         }
     }
@@ -4168,7 +4269,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
     let result = if rflags & 1 != 0 {
         VmInstructionResult::VmfailInvalid
     } else if rflags & (1 << 6) != 0 {
-        let Some(error) = (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+        let Some(error) = (unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) })
             .ok()
             .and_then(|value| u32::try_from(value).ok())
         else {
@@ -4192,7 +4293,7 @@ unsafe extern "sysv64" fn nested_vmentry_failed(registers: *const GuestRegisters
             registers,
         );
     };
-    if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
+    if unsafe { vmcs_load(run.carrier) } != VmxStatus::Success {
         stop_unexpected_exit(
             b"restoring carrier after VMLAUNCH failure failed",
             run.outer_reason,
@@ -4222,12 +4323,12 @@ fn handle_l1_vmcs_access(
     registers: &mut GuestRegisters,
 ) {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -4244,7 +4345,7 @@ fn handle_l1_vmcs_access(
         return;
     };
 
-    let Some(instruction_info) = (unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) })
+    let Some(instruction_info) = (unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) })
         .ok()
         .and_then(|value| u32::try_from(value).ok())
     else {
@@ -4333,7 +4434,7 @@ fn handle_l1_vmcs_access(
         let Some(result) = execute_l1_vmx_instruction(&state, || {
             // SAFETY: the helper selects L1's valid VMCS; register-form VMREAD
             // validates this encoding without changing the addressed field.
-            match unsafe { vmx::vmread(field) } {
+            match unsafe { vmcs_read(field) } {
                 Ok(_) => VmxStatus::Success,
                 Err(status) => status,
             }
@@ -4407,7 +4508,7 @@ fn handle_l1_vmcs_access(
             );
         };
         if carrier == current.address()
-            || unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success
+            || unsafe { vmcs_load(current.address()) } != VmxStatus::Success
         {
             stop_unexpected_exit(
                 b"selecting L1 VMCS for access failed",
@@ -4420,21 +4521,21 @@ fn handle_l1_vmcs_access(
         }
 
         let (status, read_value) = if let Some(value) = write_value {
-            (unsafe { vmx::vmwrite(field, value) }, None)
+            (unsafe { vmcs_write(field, value) }, None)
         } else {
-            match unsafe { vmx::vmread(field) } {
+            match unsafe { vmcs_read(field) } {
                 Ok(value) => (VmxStatus::Success, Some(value)),
                 Err(status) => (status, None),
             }
         };
         let hardware_error = if status == VmxStatus::FailValid {
-            (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) })
+            (unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) })
                 .ok()
                 .and_then(|value| u32::try_from(value).ok())
         } else {
             None
         };
-        if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+        if unsafe { vmcs_load(carrier) } != VmxStatus::Success {
             stop_unexpected_exit(
                 b"restoring VMCS-access carrier failed",
                 reason,
@@ -4524,22 +4625,22 @@ fn handle_l1_invept(
     registers: &GuestRegisters,
 ) {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
 
-    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+    let instruction_info = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) }
         .ok()
         .and_then(|value| u32::try_from(value).ok());
-    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
-    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+    let fs_base = unsafe { vmcs_read(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    let gs_base = unsafe { vmcs_read(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
     let operands = instruction_info.and_then(|information| {
         let kind = guest_gpr(registers, ((information >> 28) & 0xf) as u8)?;
         let linear = vmx::memory_operand_address_64(
@@ -4625,22 +4726,22 @@ fn handle_l1_invvpid(
     registers: &GuestRegisters,
 ) {
     let state = *L1_VCPU_STATE.lock();
-    let cr4_shadow = unsafe { vmx::vmread(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
+    let cr4_shadow = unsafe { vmcs_read(vmcs::CR4_READ_SHADOW) }.unwrap_or(0);
     if cr4_shadow & CR4_VMX_ENABLE == 0 || !state.in_vmx_operation() {
         inject_invalid_opcode(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
-    let cs = unsafe { vmx::vmread(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
+    let cs = unsafe { vmcs_read(vmcs::GUEST_CS_SELECTOR) }.unwrap_or(u64::MAX);
     if cs & 3 != 0 {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
     }
 
-    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }
+    let instruction_info = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) }
         .ok()
         .and_then(|value| u32::try_from(value).ok());
-    let fs_base = unsafe { vmx::vmread(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
-    let gs_base = unsafe { vmx::vmread(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
+    let fs_base = unsafe { vmcs_read(vmcs::GUEST_FS_BASE) }.unwrap_or(u64::MAX);
+    let gs_base = unsafe { vmcs_read(vmcs::GUEST_GS_BASE) }.unwrap_or(u64::MAX);
     let operands = instruction_info.and_then(|information| {
         let kind = guest_gpr(registers, ((information >> 28) & 0xf) as u8)?;
         let linear = vmx::memory_operand_address_64(
@@ -4762,14 +4863,14 @@ fn with_l1_current_vmcs<T>(current: Option<VmcsPhys>, operation: impl FnOnce() -
         }
         // SAFETY: VcpuState records only a VMCS successfully loaded by this BSP,
         // and that L1-owned allocation remains live while it is current in L1.
-        if unsafe { vmx::vmptrld(current) } != VmxStatus::Success {
+        if unsafe { vmcs_load(current) } != VmxStatus::Success {
             return None;
         }
     }
     let result = operation();
     // SAFETY: this is the reserved carrier captured above; no operation passed
     // here clears/frees it. Restore even if the operation returned an error.
-    if unsafe { vmx::vmptrld(carrier) } != VmxStatus::Success {
+    if unsafe { vmcs_load(carrier) } != VmxStatus::Success {
         return None;
     }
     Some(result)
@@ -4789,7 +4890,7 @@ fn execute_l1_vmx_instruction(
                 VmxStatus::FailValid => {
                     // SAFETY: VMfailValid guarantees a valid hardware current VMCS;
                     // no intervening failing instruction has overwritten its error.
-                    let error = unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.ok()?;
+                    let error = unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) }.ok()?;
                     Some(l1_vmx_failure(state, u32::try_from(error).ok()?))
                 }
             }
@@ -4819,7 +4920,7 @@ fn publish_l1_instruction_error(error: u32) -> Option<()> {
     with_l1_current_vmcs(Some(current), || {
         // SAFETY: the helper selected L1's valid hardware VMCS; VMREAD does not
         // modify the opaque error field on success.
-        if unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.ok() == Some(u64::from(error)) {
+        if unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) }.ok() == Some(u64::from(error)) {
             return Some(());
         }
         // SAFETY: IA32_VMX_MISC exists on this VMX-enabled CPU and this read
@@ -4828,10 +4929,11 @@ fn publish_l1_instruction_error(error: u32) -> Option<()> {
         let recorded = if writable_exit_fields {
             // SAFETY: physical IA32_VMX_MISC[29] explicitly permits VMWRITE to
             // VM-exit information, including the current VMCS's error field.
-            (unsafe { vmx::vmwrite(vmcs::VM_INSTRUCTION_ERROR, u64::from(error)) })
+            (unsafe { vmcs_write(vmcs::VM_INSTRUCTION_ERROR, u64::from(error)) })
                 == VmxStatus::Success
         } else {
             let failure = vmx::RecordedFailure::from_error(error)?;
+            let mut accesses = vmx::VmcsAccessCounts::default();
             // SAFETY: this BSP is in root mode with L1's valid current VMCS;
             // vmxon is its active page by the allocation invariant above.
             // INVVPID support is required by Direct-VMX capabilities; physical
@@ -4840,15 +4942,17 @@ fn publish_l1_instruction_error(error: u32) -> Option<()> {
             // with BASIC.revision_id XOR 1 before VMXON and is never activated,
             // rewritten, or freed while the monitor runs. Its complete address
             // range and the required WB memory type were checked at allocation.
-            (unsafe { vmx::record_failure(failure, vmxon, invalid_revision) })
-                == VmxStatus::FailValid
+            let status =
+                unsafe { vmx::record_failure(failure, vmxon, invalid_revision, &mut accesses) };
+            record_diagnostic(DiagnosticEvent::VmcsAccessBatch(accesses));
+            status == VmxStatus::FailValid
         };
         if !recorded {
             return None;
         }
         // SAFETY: the checked instruction retained the selected VMCS; verify
         // its error before making the result observable to L1.
-        (unsafe { vmx::vmread(vmcs::VM_INSTRUCTION_ERROR) }.ok() == Some(u64::from(error)))
+        (unsafe { vmcs_read(vmcs::VM_INSTRUCTION_ERROR) }.ok() == Some(u64::from(error)))
             .then_some(())
     })?
 }
@@ -4898,9 +5002,9 @@ fn l1_memory_operand(qualification: u64, registers: &GuestRegisters) -> Result<u
     // SAFETY: the BSP's carrier is current throughout L1 instruction emulation.
     let (information, fs_base, gs_base) = unsafe {
         (
-            vmx::vmread(vmcs::VMX_INSTRUCTION_INFO),
-            vmx::vmread(vmcs::GUEST_FS_BASE),
-            vmx::vmread(vmcs::GUEST_GS_BASE),
+            vmcs_read(vmcs::VMX_INSTRUCTION_INFO),
+            vmcs_read(vmcs::GUEST_FS_BASE),
+            vmcs_read(vmcs::GUEST_GS_BASE),
         )
     };
     vmx::memory_operand_address_64(
@@ -4978,15 +5082,15 @@ fn l1_data_access() -> Option<DataAccess> {
     unsafe {
         Some(DataAccess {
             cr0: xstate::visible_cr(
-                vmx::vmread(vmcs::GUEST_CR0).ok()?,
-                vmx::vmread(vmcs::CR0_GUEST_HOST_MASK).ok()?,
-                vmx::vmread(vmcs::CR0_READ_SHADOW).ok()?,
+                vmcs_read(vmcs::GUEST_CR0).ok()?,
+                vmcs_read(vmcs::CR0_GUEST_HOST_MASK).ok()?,
+                vmcs_read(vmcs::CR0_READ_SHADOW).ok()?,
             ),
-            cr3: vmx::vmread(vmcs::GUEST_CR3).ok()?,
+            cr3: vmcs_read(vmcs::GUEST_CR3).ok()?,
             cr4,
-            efer: vmx::vmread(vmcs::GUEST_IA32_EFER).ok()?,
-            rflags: vmx::vmread(vmcs::GUEST_RFLAGS).ok()?,
-            cpl: (vmx::vmread(vmcs::GUEST_CS_SELECTOR).ok()? & 3) as u8,
+            efer: vmcs_read(vmcs::GUEST_IA32_EFER).ok()?,
+            rflags: vmcs_read(vmcs::GUEST_RFLAGS).ok()?,
+            cpl: (vmcs_read(vmcs::GUEST_CS_SELECTOR).ok()? & 3) as u8,
             physical_bits: max_physical_address_bits()?,
             page_1g: cpu::cpuid(0x8000_0001, 0).edx & (1 << 26) != 0,
             pkru,
@@ -5069,7 +5173,7 @@ fn inject_l1_operand_fault(
             // SAFETY: carrier exit information identifies the faulting L1
             // instruction. Long mode ignores segment limits, but SS retains
             // its distinct noncanonical-address #SS(0) exception.
-            let information = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) };
+            let information = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) };
             let Ok(information) = information else {
                 stop_unexpected_exit(
                     b"operand segment unavailable",
@@ -5108,8 +5212,8 @@ fn inject_l1_operand_fault(
     // SAFETY: this BSP owns the current carrier; the hardware-exception event
     // has an error code and preserves the faulting RIP and guest VMX flags.
     let injected = unsafe {
-        vmx::vmwrite(vmcs::VM_ENTRY_EXCEPTION_ERROR_CODE, error) == VmxStatus::Success
-            && vmx::vmwrite(
+        vmcs_write(vmcs::VM_ENTRY_EXCEPTION_ERROR_CODE, error) == VmxStatus::Success
+            && vmcs_write(
                 vmcs::VM_ENTRY_INTR_INFO_FIELD,
                 (1 << 31) | (1 << 11) | (3 << 8) | vector,
             ) == VmxStatus::Success
@@ -5183,7 +5287,7 @@ fn complete_vmx_instruction(
             );
         }
     }
-    let Some(rflags) = (unsafe { vmx::vmread(vmcs::GUEST_RFLAGS) }).ok() else {
+    let Some(rflags) = (unsafe { vmcs_read(vmcs::GUEST_RFLAGS) }).ok() else {
         stop_unexpected_exit(
             b"VMREAD(GUEST_RFLAGS) failed",
             reason,
@@ -5193,7 +5297,7 @@ fn complete_vmx_instruction(
             registers,
         );
     };
-    if unsafe { vmx::vmwrite(vmcs::GUEST_RFLAGS, result.apply_to_rflags(rflags)) }
+    if unsafe { vmcs_write(vmcs::GUEST_RFLAGS, result.apply_to_rflags(rflags)) }
         != VmxStatus::Success
     {
         stop_unexpected_exit(
@@ -5215,7 +5319,7 @@ fn guest_gpr(registers: &GuestRegisters, index: u8) -> Option<u64> {
         1 => registers.rcx,
         2 => registers.rdx,
         3 => registers.rbx,
-        4 => unsafe { vmx::vmread(vmcs::GUEST_RSP) }.ok()?,
+        4 => unsafe { vmcs_read(vmcs::GUEST_RSP) }.ok()?,
         5 => registers.rbp,
         6 => registers.rsi,
         7 => registers.rdi,
@@ -5238,7 +5342,7 @@ fn set_guest_gpr(registers: &mut GuestRegisters, index: u8, value: u64) -> bool 
         1 => registers.rcx = value,
         2 => registers.rdx = value,
         3 => registers.rbx = value,
-        4 => return unsafe { vmx::vmwrite(vmcs::GUEST_RSP, value) } == VmxStatus::Success,
+        4 => return unsafe { vmcs_write(vmcs::GUEST_RSP, value) } == VmxStatus::Success,
         5 => registers.rbp = value,
         6 => registers.rsi = value,
         7 => registers.rdi = value,
@@ -5261,9 +5365,9 @@ fn l1_visible_cr4() -> Option<u64> {
     // VMCS current; these VMREADs cannot access another CPU's VMCS state.
     unsafe {
         Some(xstate::visible_cr(
-            vmx::vmread(vmcs::GUEST_CR4).ok()?,
-            vmx::vmread(vmcs::CR4_GUEST_HOST_MASK).ok()?,
-            vmx::vmread(vmcs::CR4_READ_SHADOW).ok()?,
+            vmcs_read(vmcs::GUEST_CR4).ok()?,
+            vmcs_read(vmcs::CR4_GUEST_HOST_MASK).ok()?,
+            vmcs_read(vmcs::CR4_READ_SHADOW).ok()?,
         ))
     }
 }
@@ -5282,7 +5386,7 @@ fn inject_general_protection(
     ] {
         // SAFETY: the BSP's carrier VMCS is current. The fields describe a
         // hardware #GP(0) on the unchanged L1 RIP, not an L0 exception.
-        let status = unsafe { vmx::vmwrite(field, value) };
+        let status = unsafe { vmcs_write(field, value) };
         if status != VmxStatus::Success {
             stop_unexpected_exit(
                 b"injecting guest #GP failed",
@@ -5306,7 +5410,7 @@ fn inject_invalid_opcode(
 ) {
     // SAFETY: the BSP's carrier VMCS is current; this is a hardware #UD event
     // with no error code and does not change the faulting L1 RIP.
-    let status = unsafe { vmx::vmwrite(vmcs::VM_ENTRY_INTR_INFO_FIELD, INJECT_INVALID_OPCODE) };
+    let status = unsafe { vmcs_write(vmcs::VM_ENTRY_INTR_INFO_FIELD, INJECT_INVALID_OPCODE) };
     if status != VmxStatus::Success {
         stop_unexpected_exit(
             b"injecting guest #UD failed",
@@ -5337,7 +5441,7 @@ fn advance_guest_rip(
             registers,
         );
     };
-    let status = unsafe { vmx::vmwrite(vmcs::GUEST_RIP, next_rip) };
+    let status = unsafe { vmcs_write(vmcs::GUEST_RIP, next_rip) };
     if status != VmxStatus::Success {
         stop_unexpected_exit(
             b"VMWRITE(GUEST_RIP) failed",
@@ -5418,7 +5522,7 @@ fn stop_unexpected_exit(
     registers: &GuestRegisters,
 ) -> ! {
     let vm_error = vm_instruction_error();
-    let instruction_info = unsafe { vmx::vmread(vmcs::VMX_INSTRUCTION_INFO) }.unwrap_or(u64::MAX);
+    let instruction_info = unsafe { vmcs_read(vmcs::VMX_INSTRUCTION_INFO) }.unwrap_or(u64::MAX);
     let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;
     serial.init();
@@ -5459,10 +5563,10 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
     } else {
         u64::MAX
     };
-    let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
-    let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
-    let guest_rip = unsafe { vmx::vmread(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
-    let instruction_len = unsafe { vmx::vmread(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
+    let reason = unsafe { vmcs_read(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    let qualification = unsafe { vmcs_read(vmcs::EXIT_QUALIFICATION) }.unwrap_or(u64::MAX);
+    let guest_rip = unsafe { vmcs_read(vmcs::GUEST_RIP) }.unwrap_or(u64::MAX);
+    let instruction_len = unsafe { vmcs_read(vmcs::VM_EXIT_INSTRUCTION_LEN) }.unwrap_or(u64::MAX);
     let cpuid_exits = cpuid_exit_count();
     let mut serial = SerialPort;
     serial.init();
@@ -5831,6 +5935,49 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_count_vmcs_attempts_without_changing_exit_context() {
+        let mut diagnostics = ExitDiagnostics::new();
+        diagnostics.record(DiagnosticEvent::NestedExit(48));
+        for event in [
+            DiagnosticEvent::VmcsRead,
+            DiagnosticEvent::VmcsWrite,
+            DiagnosticEvent::VmcsLoad,
+            DiagnosticEvent::ReflectedStateWrite,
+        ] {
+            diagnostics.record(event);
+        }
+        let values = diagnostics.values;
+        assert_eq!(values.vmread_attempts, 1);
+        assert_eq!(values.vmwrite_attempts, 2);
+        assert_eq!(values.vmptrld_attempts, 1);
+        assert_eq!(values.reflected_state_writes, 1);
+        assert_eq!((values.last_phase, values.last_reason), (4, 48));
+        assert_eq!(diagnostics.sequence.load(Ordering::Relaxed), 10);
+        diagnostics.record(DiagnosticEvent::VmcsAccessBatch(
+            super::vmx::VmcsAccessCounts {
+                reads: 2,
+                writes: 3,
+                loads: 4,
+            },
+        ));
+        assert_eq!(diagnostics.values.vmread_attempts, 3);
+        assert_eq!(diagnostics.values.vmwrite_attempts, 5);
+        assert_eq!(diagnostics.values.vmptrld_attempts, 5);
+        assert_eq!(diagnostics.values.reflected_state_writes, 1);
+        assert_eq!(diagnostics.values.last_reason, 48);
+        diagnostics.record(DiagnosticEvent::VmcsAccessBatch(
+            super::vmx::VmcsAccessCounts {
+                reads: u64::MAX,
+                writes: u64::MAX,
+                loads: u64::MAX,
+            },
+        ));
+        assert_eq!(diagnostics.values.vmread_attempts, u64::MAX);
+        assert_eq!(diagnostics.values.vmwrite_attempts, u64::MAX);
+        assert_eq!(diagnostics.values.vmptrld_attempts, u64::MAX);
+    }
+
+    #[test]
     fn diagnostics_all_counters_saturate_without_wrapping() {
         let almost = u64::MAX - 1;
         let mut values = ExitCounterValues {
@@ -5845,6 +5992,10 @@ mod tests {
             invvpid: almost,
             nested_entry_failures: almost,
             cpuid_exits: almost,
+            vmread_attempts: almost,
+            vmwrite_attempts: almost,
+            vmptrld_attempts: almost,
+            reflected_state_writes: almost,
             last_phase: 0,
             last_reason: u64::MAX,
         };
@@ -5865,6 +6016,14 @@ mod tests {
             values.record(DiagnosticEvent::NestedExit(super::EXIT_REASON_CPUID));
             values.record(DiagnosticEvent::Reflected(super::EXIT_REASON_CPUID));
             values.record(DiagnosticEvent::EntryFailure(super::EXIT_REASON_VMLAUNCH));
+            for event in [
+                DiagnosticEvent::VmcsRead,
+                DiagnosticEvent::VmcsWrite,
+                DiagnosticEvent::VmcsLoad,
+                DiagnosticEvent::ReflectedStateWrite,
+            ] {
+                values.record(event);
+            }
         }
         for counter in [
             values.l1_exits,
@@ -5878,6 +6037,10 @@ mod tests {
             values.invvpid,
             values.nested_entry_failures,
             values.cpuid_exits,
+            values.vmread_attempts,
+            values.vmwrite_attempts,
+            values.vmptrld_attempts,
+            values.reflected_state_writes,
         ] {
             assert_eq!(counter, u64::MAX);
         }
@@ -5885,9 +6048,14 @@ mod tests {
 
     #[test]
     fn diagnostics_snapshot_layout_and_sequence_exhaustion_are_fail_closed() {
-        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 144);
+        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 176);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, sequence), 24);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, values), 40);
+        assert_eq!(
+            core::mem::offset_of!(ExitCounterValues, vmread_attempts),
+            88
+        );
+        assert_eq!(core::mem::offset_of!(ExitCounterValues, last_phase), 120);
         assert_eq!(super::DIAGNOSTIC_MAGIC.to_le_bytes(), *b"THVSTAT1");
         assert_eq!(super::diagnostic_next_sequence(0), Some((1, 2)));
         assert_eq!(super::diagnostic_next_sequence(1), None);

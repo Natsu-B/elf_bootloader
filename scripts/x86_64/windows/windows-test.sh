@@ -718,7 +718,7 @@ run_windows() {
                 quoted_record=${quoted_record//\"/\\\"}
                 # The decoder validated this unique monitor-owned publication.
                 # The VM is stopped, and the fixed byte count is never log input.
-                if printf 'pmemsave %s 144 "%s"\n' "$address" "$quoted_record" >&9 && \
+                if printf 'pmemsave %s 176 "%s"\n' "$address" "$quoted_record" >&9 && \
                     [[ $(direct_monitor_state) == paused ]] && \
                     python3 "$decoder" decode "$serial_log" "$record" >"$json_file"; then
                     printf 'Windows x86 test: direct diagnostics counters=%s reason=%s\n' "$json_file" "$reason"
