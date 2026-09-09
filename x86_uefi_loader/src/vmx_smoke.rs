@@ -4679,8 +4679,8 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
             Some(reason)
         } else {
             // SAFETY: this CPU owns the current stopped direct VMCS. These are
-            // mandatory exit fields (EPT capability is a launch prerequisite),
-            // not opaque VMCS memory. Capture does not alter guest-visible data.
+            // mandatory exit/guest fields (EPT is a launch prerequisite), not
+            // opaque VMCS memory. Capturing the idle state changes no fields.
             unsafe { vmcs_read(field) }.ok()
         }
     });
@@ -5253,6 +5253,32 @@ fn handle_l1_vmcs_access(
         }
         (status, read_value, hardware_error)
     };
+    if let Some(value) = write_value {
+        // Hardware executed/validated the write before updating any retained
+        // guest value. A failed write must leave that value untouched. L1's
+        // CPU is stopped, and the helper accepts only the exact snapshot owner.
+        if with_cpu_runtime(|state| {
+            if let Some(snapshot) = state.exit_snapshot.as_mut() {
+                snapshot.written(
+                    current.address(),
+                    field,
+                    value,
+                    status == VmxStatus::Success,
+                );
+            }
+        })
+        .is_none()
+        {
+            stop_unexpected_exit(
+                b"updating idle direct guest snapshot failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    }
     if status == VmxStatus::Success
         && write_value.is_some()
         && matches!(

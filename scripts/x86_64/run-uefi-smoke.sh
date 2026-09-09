@@ -258,8 +258,8 @@ check_msr_contract_log() {
             'thin-hv: MSR EPT2M proof PASS advertised=1 large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10')
                 ((phase == 1 && lease == 1 && ept == 0 && entries == 0)) || return 1
                 ept=1 ;;
-            'thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=1 switches=4 clear=1' | \
-            'thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=0 switches=4 clear=1')
+            'thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=1 switches=4 clear=1 guest_fields=4 guest_writes=9 guest_reject=4 guest_resume=1' | \
+            'thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=0 switches=4 clear=1 guest_fields=4 guest_writes=9 guest_reject=4 guest_resume=1')
                 ((phase == 1 && ept == 1 && snapshot == 0 && entries == 0)) || return 1
                 [[ "$backend" != direct-vmx || "$line" == *'readonly_reject=1 '* ]] || return 1
                 snapshot=1 ;;

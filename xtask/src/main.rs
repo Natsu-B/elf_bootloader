@@ -3903,7 +3903,7 @@ mod tests {
                 })
                 .collect::<String>();
             let ept = "thin-hv: MSR EPT2M proof PASS advertised=1 large=1 split=1 replacement=1 violations=3 misconfig=1 recovery=3 invept=10\n";
-            let snapshot = "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=1 switches=4 clear=1\n";
+            let snapshot = "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject=1 switches=4 clear=1 guest_fields=4 guest_writes=9 guest_reject=4 guest_resume=1\n";
             let msr = format!(
                 "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\nthin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\nthin-hv: MSR VPID lease cycles=64 fresh=64\n{ept}{snapshot}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1\n"
             );
@@ -3933,6 +3933,14 @@ mod tests {
                 msr.replace("access_errors=2", "access_errors=1"),
                 msr.replace("readonly_reject=1", "readonly_reject=2"),
                 msr.replace("switches=4", "switches=3"),
+                msr.replace(
+                    " guest_fields=4 guest_writes=9 guest_reject=4 guest_resume=1",
+                    "",
+                ),
+                msr.replace("guest_fields=4", "guest_fields=3"),
+                msr.replace("guest_writes=9", "guest_writes=8"),
+                msr.replace("guest_reject=4", "guest_reject=3"),
+                msr.replace("guest_resume=1", "guest_resume=0"),
                 msr.replace(ept, ""),
                 msr.replace(ept, &format!("{ept}{ept}")),
                 msr.replace("advertised=1", "advertised=0"),

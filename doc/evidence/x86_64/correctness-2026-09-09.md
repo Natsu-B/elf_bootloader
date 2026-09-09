@@ -2643,3 +2643,42 @@ debug build PASS; standard QEMU **9 PASS, 0 FAIL**; release nested **15 PASS,
 5 FAIL / 20**, all **14 Direct PASS** and the same five reference differences.
 `/tmp/x86-host-limits-cache-regression.log`. Timed A/B and the original
 timing-sensitive regressions are still required before quantifying speedup.
+
+## Write-through stopped Direct guest-field snapshot
+
+`c44f6c1` Hyper-V profiling completed **FAIL**, unchanged 600-second marker
+timeout, no second L0 publication and no terminal monitor fault. Final screen
+shows the Windows spinner on black. The verified ABI v4 final record contains
+3,605,523 L2 entries/reflections, zero failed entries, 2,713,092 L2 RDMSR exits,
+489,558 L2 WRMSR exits, 19,395,011 L1 VMREADs and 48,758,970 VMPTRLDs.
+Actual L1 VMREAD misses for RIP/RFLAGS/CS attributes/interruptibility are
+3,293,556 / 1,443,510 / 3,294,655 / 3,797,430 respectively. This confirms the
+early sample's hotspot throughout the run. Snapshot directory:
+`/tmp/x86-vmread-fields-windows.FpTEJP/direct-hyperv/monitor-hyperv-failure-diagnostics.mekD5l`;
+batch `/tmp/x86-vmread-fields-windows-batch.log`. Image/artifact/seed checks
+pass. This is still not a Hyper-V/WSL2 PASS.
+
+`nested_vmx::exit_snapshot::ExitSnapshot` now captures those four measured
+guest fields alongside the existing exit fields while the stopped hardware
+Direct VMCS is already current. Hardware remains authoritative: every guest
+VMWRITE still executes before `written` updates the exact-owner saved value.
+Failed writes do not update it; 32-bit writes truncate exactly; reserved
+aliases, other VMCS owners and VM_INSTRUCTION_ERROR are never synthesized.
+The existing invalidation before entry, clear, switch and VMX lifetime
+transitions also covers these fields, including immediate entry failures.
+No write is deferred and no VMCS12/VMCS02 or guest-context switching is added.
+
+The native MSR contract now proves all four fields' changed/restored values,
+four rejected aliases, guest values retained after a failed host-state entry,
+and a second VMCS resuming through NOP to VMCALL with a newly advanced RIP.
+The existing runner and xtask transcript test require the added exact counters;
+an older or incomplete PASS line cannot satisfy the new gate. The snapshot
+unit tests cover complete capture failure, owner separation, high aliases,
+successful/failed write-through, widths and new-exit replacement.
+
+All five host package checks: **343 PASS, 0 FAIL** (nested 30, loader 208,
+guest 10, HAL 59, xtask 36). Debug build PASS; standard QEMU **9 PASS, 0 FAIL**;
+release nested **15 PASS, 5 FAIL / 20**, all **14 Direct PASS**. The new snapshot
+contract itself also passes on the reference before its unchanged later MSR
+failure. `/tmp/x86-idle-guest-snapshot-regression.log`. Timed A/B, the original
+timing-sensitive tests and post-optimization Hyper-V remain to be run.

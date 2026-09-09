@@ -1402,6 +1402,50 @@ unsafe fn ept_large_pages(
                 18,
             )?;
         }
+        // L2 is stopped at VMCALL. These temporary values are never entered;
+        // verify exact hardware write-through (including 32-bit truncation),
+        // rejected aliases, and restoration before any later entry attempt.
+        let mut guest_fields = [
+            (vmcs::GUEST_RIP, 0),
+            (vmcs::GUEST_RFLAGS, 0),
+            (vmcs::GUEST_CS_AR_BYTES, 0),
+            (vmcs::GUEST_INTERRUPTIBILITY_INFO, 0),
+        ];
+        for (field, original) in &mut guest_fields {
+            *original = read_field("snapshot-guest-original", *field)?;
+            let changed = *original ^ 1;
+            let narrow = matches!(
+                *field,
+                vmcs::GUEST_CS_AR_BYTES | vmcs::GUEST_INTERRUPTIBILITY_INFO
+            );
+            write(*field, changed | if narrow { 0xa5a5_5a5a << 32 } else { 0 })?;
+            equal(
+                "snapshot-guest-written",
+                read_field("snapshot-guest", *field)?,
+                changed,
+            )?;
+            equal(
+                "snapshot-guest-alias-rejected",
+                u64::from(vmx::vmwrite(*field + 1, 0) == vmx::VmxStatus::FailValid),
+                1,
+            )?;
+            equal(
+                "snapshot-guest-alias-error",
+                read_field("snapshot-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                12,
+            )?;
+            equal(
+                "snapshot-guest-failure-unchanged",
+                read_field("snapshot-guest", *field)?,
+                changed,
+            )?;
+            write(*field, *original)?;
+            equal(
+                "snapshot-guest-restored",
+                read_field("snapshot-guest", *field)?,
+                *original,
+            )?;
+        }
         equal(
             "snapshot-reserved-field",
             u64::from(matches!(
@@ -1462,6 +1506,13 @@ unsafe fn ept_large_pages(
             read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
             18,
         )?;
+        for (field, original) in guest_fields {
+            equal(
+                "snapshot-guest-failed-entry",
+                read_field("snapshot-guest", field)?,
+                original,
+            )?;
+        }
         write(vmcs::HOST_CS_SELECTOR, cs)?;
 
         // A second owned page proves the snapshot cannot follow another VMCS.
@@ -1500,6 +1551,29 @@ unsafe fn ept_large_pages(
             read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
             10,
         )?;
+        let other_rip = snapshot_guest as *const () as usize as u64;
+        equal(
+            "snapshot-other-rip",
+            read_field("snapshot-rip", vmcs::GUEST_RIP)?,
+            other_rip,
+        )?;
+        write(vmcs::GUEST_RIP, other_rip + 2)?; // Skip CPUID; execute NOP then VMCALL.
+        equal(
+            "snapshot-other-write",
+            read_field("snapshot-rip", vmcs::GUEST_RIP)?,
+            other_rip + 2,
+        )?;
+        equal("snapshot-other-resume", enter(&mut frame, 1), 0)?;
+        equal(
+            "snapshot-other-new-exit",
+            read_field("snapshot-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        equal(
+            "snapshot-other-new-rip",
+            read_field("snapshot-rip", vmcs::GUEST_RIP)?,
+            other_rip + 3,
+        )?;
         success("snapshot-other-final-clear", vmx::vmclear(other))?;
         success("snapshot-final-current", vmx::vmptrld(region))?;
         equal(
@@ -1509,7 +1583,7 @@ unsafe fn ept_large_pages(
         )?;
         let _ = writeln!(
             serial,
-            "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject={} switches=4 clear=1",
+            "thin-hv: MSR exit snapshot PASS warm=8 gpa_high=24 access_errors=2 readonly_reject={} switches=4 clear=1 guest_fields=4 guest_writes=9 guest_reject=4 guest_resume=1",
             u8::from(readonly_reject)
         );
         Ok(())
@@ -1729,7 +1803,7 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
 // No stack/memory operand or ABI call executes; RDI (the Frame) stays intact.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn snapshot_guest() -> ! {
-    core::arch::naked_asm!("cpuid", "vmcall", "ud2");
+    core::arch::naked_asm!("cpuid", "nop", "vmcall", "ud2");
 }
 
 // SAFETY: matrix owns the clear current VMCS and aligned Frame, with CPL0,

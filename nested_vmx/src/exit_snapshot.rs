@@ -1,15 +1,20 @@
-//! Read-only exit information retained while the hardware direct VMCS is idle.
+//! Hardware exit and selected guest fields retained while a direct VMCS is idle.
 //!
 //! This is not guest/host VMCS composition: hardware remains authoritative.
 //! L1 must not be allowed to write exit information (VMX_MISC[29] is hidden).
 //! Drop the snapshot before any VM entry, VMCLEAR, VMCS switch or VMX lifetime
 //! transition. Never cache VM_INSTRUCTION_ERROR: later VMfail changes it.
+//! Guest fields are write-through: update only after hardware VMWRITE succeeds.
+//! This never defers a hardware write or constructs a software entry VMCS.
 
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::vmcs;
 
-/// Mandatory VMX exit information plus the GPA field of the required EPT CPU.
-const FIELDS: [u32; 10] = [
+/// Mandatory exit information and the four guest fields dominating measured
+/// Hyper-V VMREAD misses. Capturing them while the direct VMCS is current avoids
+/// switching it back in for each L1 read. No field changes while L2 is stopped
+/// except through explicit, hardware-validated VMWRITE.
+const FIELDS: [u32; 14] = [
     vmcs::VM_EXIT_REASON,
     vmcs::VM_EXIT_INTR_INFO,
     vmcs::VM_EXIT_INTR_ERROR_CODE,
@@ -20,6 +25,10 @@ const FIELDS: [u32; 10] = [
     vmcs::EXIT_QUALIFICATION,
     vmcs::GUEST_LINEAR_ADDRESS,
     vmcs::GUEST_PHYSICAL_ADDRESS,
+    vmcs::GUEST_RIP,
+    vmcs::GUEST_RFLAGS,
+    vmcs::GUEST_CS_AR_BYTES,
+    vmcs::GUEST_INTERRUPTIBILITY_INFO,
 ];
 
 /// One completed hardware snapshot belonging to one CPU-owned direct VMCS.
@@ -57,6 +66,24 @@ impl ExitSnapshot {
             .position(|&candidate| candidate == field)
             .map(|index| self.values[index] >> shift)
     }
+
+    /// Update a retained guest field only after its hardware VMWRITE succeeded.
+    /// Failure, a foreign VMCS, read-only information, and unsupported aliases
+    /// must not modify the snapshot. Width truncation matches x86-64 VMWRITE;
+    /// entry validity checks still belong to the actual hardware VMCS.
+    pub fn written(&mut self, owner: VmcsPhys, field: u32, value: u64, succeeded: bool) {
+        if !succeeded || owner != self.owner {
+            return;
+        }
+        let value = match field {
+            vmcs::GUEST_RIP | vmcs::GUEST_RFLAGS => value,
+            vmcs::GUEST_CS_AR_BYTES | vmcs::GUEST_INTERRUPTIBILITY_INFO => u64::from(value as u32),
+            _ => return,
+        };
+        if let Some(index) = FIELDS.iter().position(|&candidate| candidate == field) {
+            self.values[index] = value;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -64,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_immutable_exit_fields_and_exact_width_aliases_are_retained() {
+    fn only_selected_hardware_fields_and_exact_width_aliases_are_retained() {
         assert_eq!(
             crate::restrict_vmx_capability(x86_64_hal::vmx::IA32_VMX_MISC, u64::MAX).unwrap()
                 & (1 << 29),
@@ -75,7 +102,12 @@ mod tests {
         let snapshot =
             ExitSnapshot::capture(owner, |field| Some(u64::from(field) << 32 | 7)).unwrap();
         for field in FIELDS {
-            assert_eq!((field >> 10) & 3, 1);
+            assert!(matches!((field >> 10) & 3, 1 | 2));
+            assert!(
+                !crate::DIRECT_VMCS_PATCH_MANIFEST
+                    .iter()
+                    .any(|patch| patch.field as u32 == field)
+            );
             assert_eq!(
                 snapshot.read(owner, field),
                 Some(u64::from(field) << 32 | 7)
@@ -90,7 +122,7 @@ mod tests {
         );
         for field in [
             vmcs::VM_INSTRUCTION_ERROR,
-            vmcs::GUEST_RIP,
+            vmcs::GUEST_RSP,
             vmcs::HOST_RIP,
             0x8000,
             u32::MAX,
@@ -101,6 +133,29 @@ mod tests {
             snapshot.read(VmcsPhys::new(0x2000).unwrap(), vmcs::VM_EXIT_REASON),
             None
         );
+    }
+
+    #[test]
+    fn guest_writes_require_hardware_success_owner_and_exact_width() {
+        let owner = VmcsPhys::new(0x1000).unwrap();
+        let foreign = VmcsPhys::new(0x2000).unwrap();
+        let mut snapshot = ExitSnapshot::capture(owner, |_| Some(7)).unwrap();
+        for field in FIELDS {
+            let expected = match field {
+                vmcs::GUEST_RIP | vmcs::GUEST_RFLAGS => u64::MAX,
+                vmcs::GUEST_CS_AR_BYTES | vmcs::GUEST_INTERRUPTIBILITY_INFO => u32::MAX.into(),
+                _ => 7,
+            };
+            snapshot.written(owner, field, u64::MAX, false);
+            snapshot.written(foreign, field, u64::MAX, true);
+            snapshot.written(owner, field + 1, u64::MAX, true);
+            assert_eq!(snapshot.read(owner, field), Some(7));
+            snapshot.written(owner, field, u64::MAX, true);
+            assert_eq!(snapshot.read(owner, field), Some(expected));
+        }
+        // A new hardware exit changes guest state independently of L1 writes.
+        let snapshot = ExitSnapshot::capture(owner, |_| Some(19)).unwrap();
+        assert_eq!(snapshot.read(owner, vmcs::GUEST_RIP), Some(19));
     }
 
     #[test]
