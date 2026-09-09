@@ -597,8 +597,15 @@ Validation through the existing Nix/cargo framework:
   pass, including the deliberately faulting root-MSR/XSTATE fixture. The only
   failures remain both reference native partial-store assertions.
 * `cargo xbuild x86`: **PASS**; `/tmp/x86-correctness-step5-list-xbuild.log`.
-* The same release suite with `LINUX_KVM_CYCLES=4096` was started for the next
-  verification record: `/tmp/x86-correctness-step5-list-nested-final.log`.
-  Its completion is not claimed by this intermediate record.
+* The same release suite with `LINUX_KVM_CYCLES=4096`: **6 PASS, 2 FAIL**,
+  process exit 1; `/tmp/x86-correctness-step5-list-nested-final.log`.
+  All three Linux runs completed 4096 cycles with explicit teardown and clean
+  poweroff; all Direct native cases pass. Both reference failures are the same
+  partial-store assertions, not a Direct regression. Guest lifecycle elapsed
+  times: reference 38.341233s, Direct 314.687588s, Direct FP-clobber/root-MSR-fault
+  fixture 313.779621s. These are instrumented QEMU lifecycle timings, not
+  physical-machine or daily-use performance claims.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**;
+  `/tmp/x86-correctness-step5-list-fmt.log`. No AArch64 production changes.
 
 No Windows/Hyper-V, S3 or physical-hardware qualification was performed here.
