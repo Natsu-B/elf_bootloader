@@ -676,3 +676,30 @@ Validation through `nix develop --accept-flake-config --command`:
 Nonempty MSR lists remain unsupported at this checkpoint. Original timing-
 sensitive KVM failure, physical platform mapping, pCPU/AP, root NMI and S3 work
 remain open. Windows/Hyper-V and physical hardware have not been retested here.
+
+### Comparable 4096-cycle PAT/EFER follow-up
+
+The `c044844` runtime and fixtures completed:
+
+```sh
+LINUX_KVM_CYCLES=4096 LINUX_KVM_TIMEOUT_SECONDS=600 \
+  nix develop --accept-flake-config --command cargo xrun x86 --nested --release
+```
+
+**8 PASS, 2 FAIL**, process exit 1, in
+`/tmp/x86-msr-matrix-nested-4096-comparable.log`. All Direct native profiles,
+both real-entry MSR matrices and all three Linux lifecycle runs passed. The
+only failures are the two previously recorded outer-KVM native partial-store
+assertions. The runner did not stop testing after those failures.
+
+All Linux runs completed 4096 cycles and powered off. Guest lifecycle times:
+reference **38.203544s**, Direct **321.315544s**, Direct FP-clobber/root-MSR-fault
+fixture **321.066644s**. Direct is approximately 2% slower than the prior
+314.687588s / 313.779621s measurements; that cost is retained for subsequent
+correctness-instrumented optimization, not hidden by changing a timeout. The
+600-second setting is the same established extended-lifecycle bound used before
+this patch. The mistaken default-300-second run remains a recorded FAIL.
+
+These are QEMU/KVM results only. No Windows, S3 or physical hardware run is
+implied by this follow-up. Nonempty-list implementation work is subsequent to
+the tested `c044844` snapshot.
