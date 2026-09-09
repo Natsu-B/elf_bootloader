@@ -3,7 +3,8 @@
 
 The address command accepts one publication inside reserved CPU-owned storage
 (or the resident image for explicitly legacy publications),
-never a free-form physical address. The decode command reads exactly 176 bytes;
+never a free-form physical address. Only ABI v2 (176 bytes) and v3 (1216 bytes)
+records are accepted, with matching publication/header versions and sizes;
 it does not inspect guest, firmware, crash, or licensing data.
 """
 
@@ -17,6 +18,7 @@ import unittest
 
 
 SIZE = 176
+SIZES = {2: SIZE, 3: 1216}
 U64_MAX = (1 << 64) - 1
 PROTOTYPE_LIMIT = 1 << 47  # current private HOST_CR3 low-canonical address ceiling
 MAX_LOG_BYTES = 64 << 20
@@ -26,7 +28,7 @@ IMAGE = re.compile(r"thin-hv: runtime image base=0x([0-9a-f]{16}) end=0x([0-9a-f
 BLOCK = re.compile(r"thin-hv: monitor block=0x([0-9a-f]{16}) end=0x([0-9a-f]{16})")
 PUBLICATION = re.compile(
     r"thin-hv: vmx diagnostics address=0x([0-9a-f]{16}) "
-    r"size=176 version=2 scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
+    r"size=(176|1216) version=([23]) scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
 )
 COUNTERS = (
     "l1_exits", "direct_entry_attempts", "observed_l2_entries",
@@ -47,13 +49,14 @@ class InvalidRecord(ValueError):
     """A bounded validation failure whose text contains no log contents."""
 
 
-def publication(lines):
+def publication(lines, with_extent=False):
     """Return the one validated record address and its owning allocation bounds."""
     backend_count = 0
     image = None
     block = None
     owner = None
     address = None
+    record_size = record_version = None
     for raw in lines:
         line = raw.rstrip("\r\n")
         if line.startswith("thin-hv: backend="):
@@ -83,14 +86,17 @@ def publication(lines):
             if match is None or backend_count != 2 or image is None or address is not None:
                 raise InvalidRecord("invalid, unordered, or repeated diagnostics publication")
             address = int(match[1], 16)
-            owner = block if match[2] is not None else image
-            if owner is None or address % 8 or not (owner[0] <= address and address + SIZE <= owner[1]):
+            record_size, record_version = int(match[2]), int(match[3])
+            if SIZES[record_version] != record_size:
+                raise InvalidRecord("publication version/size mismatch")
+            owner = block if match[4] is not None else image
+            if owner is None or address % 8 or not (owner[0] <= address and address + record_size <= owner[1]):
                 raise InvalidRecord("diagnostics record is not wholly inside its declared owner")
         elif "thin-hv: trusted outer KVM" in line:
             raise InvalidRecord("reference backend cannot publish Direct-VMX diagnostics")
     if backend_count != 2 or image is None or address is None:
         raise InvalidRecord("incomplete Direct-VMX diagnostics publication")
-    return address, owner
+    return (address, owner, record_size, record_version) if with_extent else (address, owner)
 
 
 def regular_file(path):
@@ -105,7 +111,7 @@ def regular_file(path):
         raise
 
 
-def published_address(path):
+def published_address(path, with_extent=False):
     """Scan a bounded serial log without retaining or printing its contents."""
     with regular_file(path) as source:
         if os.fstat(source.fileno()).st_size > MAX_LOG_BYTES:
@@ -122,33 +128,40 @@ def published_address(path):
                     raise InvalidRecord("serial log exceeds diagnostic scan bound")
                 yield line.decode("utf-8", errors="replace")
 
-        return publication(lines())
+        return publication(lines(), with_extent)
 
 
 def decode_record(data, address):
     """Decode the immutable snapshot; never accept a torn or exhausted sequence."""
-    if len(data) != SIZE or data[:8] != b"THVSTAT1":
+    if len(data) not in SIZES.values() or data[:8] != b"THVSTAT1":
         raise InvalidRecord("incorrect diagnostics size or magic")
-    words = struct.unpack("<22Q", data)
-    if words[1] != 2 or words[2] != SIZE or words[4] != 1:
+    words = struct.unpack(f"<{len(data) // 8}Q", data)
+    if SIZES.get(words[1]) != len(data) or words[2] != len(data) or words[4] != 1:
         raise InvalidRecord("unsupported diagnostics version, size, or scope")
     if words[3] & 1 or words[3] == U64_MAX:
         raise InvalidRecord("torn or exhausted diagnostics sequence")
     if words[20] >= len(PHASES) or (words[21] > 0xFFFFFFFF and words[21] != U64_MAX):
         raise InvalidRecord("invalid diagnostics phase or VM-exit reason")
-    return {
-        "schema": "thin-hv.vmx-diagnostics.v2",
+    result = {
+        "schema": f"thin-hv.vmx-diagnostics.v{words[1]}",
         "backend": "direct-vmx",
         "role": "project-l0",
         "environment": "QEMU/KVM",
         "scope": "bsp-only-qemu-prototype",
         "address": f"0x{address:016x}",
-        "size": SIZE,
+        "size": len(data),
         "sequence": words[3],
         "counters": dict(zip(COUNTERS, words[5:20])),
         "last_phase": {"value": words[20], "name": PHASES[words[20]]},
         "last_reason": None if words[21] == U64_MAX else words[21],
     }
+    if words[1] == 3:
+        result["exit_reasons"] = {
+            layer: {str(index) if index < 64 else "64-plus": count
+                    for index, count in enumerate(bins) if count}
+            for layer, bins in (("l1", words[22:87]), ("l2", words[87:152]))
+        }
+    return result
 
 
 class DecoderTests(unittest.TestCase):
@@ -259,23 +272,52 @@ class DecoderTests(unittest.TestCase):
         self.assertIsNone(result["last_reason"])
         self.assertLess(len(json.dumps(result)), 2048)
 
+    def test_v3_histograms_extend_the_original_prefix_without_payload(self):
+        words = self.words + [0] * 130
+        words[1:3] = [3, SIZES[3]]
+        words[22 + 25] = 19
+        words[87 + 31] = 7
+        words[87 + 64] = U64_MAX
+        data = struct.pack("<152Q", *words)
+        result = decode_record(data, 0x100040)
+        self.assertEqual(result["schema"], "thin-hv.vmx-diagnostics.v3")
+        self.assertEqual(result["counters"]["vmread_attempts"], 11)
+        self.assertEqual(result["exit_reasons"], {"l1": {"25": 19}, "l2": {"31": 7, "64-plus": U64_MAX}})
+        self.assertLess(len(json.dumps(result)), 4096)
+        for invalid in (data[:-1], data + b"\0", self.record() + data[176:]):
+            with self.assertRaises(InvalidRecord):
+                decode_record(invalid, 0x100040)
+
+    def test_v3_publication_requires_the_complete_owned_extent(self):
+        line = self.lines[3].replace("size=176 version=2", "size=1216 version=3")
+        self.assertEqual(publication(self.lines[:3] + [line], True), (0x100040, (0x100000, 0x101000), 1216, 3))
+        for invalid in (line.replace("size=1216", "size=176"), line.replace("version=3", "version=2"),
+                        line.replace("0000000000100040", "0000000000100f50")):
+            with self.assertRaises(InvalidRecord):
+                publication(self.lines[:3] + [invalid], True)
+
 
 def main(arguments):
     """Expose only provenance-derived addressing and fixed-record decoding."""
     if arguments == ["--self-test"]:
         unittest.main(argv=[sys.argv[0]])
         return 0
-    if len(arguments) not in (2, 3) or arguments[0] not in ("address", "decode"):
-        raise InvalidRecord("usage: address LOG | decode LOG RECORD | --self-test")
-    if (arguments[0] == "address") != (len(arguments) == 2):
+    if len(arguments) not in (2, 3) or arguments[0] not in ("address", "extent", "decode"):
+        raise InvalidRecord("usage: address LOG | extent LOG | decode LOG RECORD | --self-test")
+    if (arguments[0] in ("address", "extent")) != (len(arguments) == 2):
         raise InvalidRecord("incorrect diagnostics command arguments")
-    address, _ = published_address(arguments[1])
+    address, _, size, version = published_address(arguments[1], True)
     if arguments[0] == "address":
         print(f"0x{address:016x}")
+    elif arguments[0] == "extent":
+        print(f"0x{address:016x} {size}")
     else:
         with regular_file(arguments[2]) as source:
-            data = source.read(SIZE + 1)
-        print(json.dumps(decode_record(data, address), sort_keys=True, separators=(",", ":")))
+            data = source.read(size + 1)
+        decoded = decode_record(data, address)
+        if decoded["size"] != size or decoded["schema"] != f"thin-hv.vmx-diagnostics.v{version}":
+            raise InvalidRecord("publication/header ABI mismatch")
+        print(json.dumps(decoded, sort_keys=True, separators=(",", ":")))
     return 0
 
 

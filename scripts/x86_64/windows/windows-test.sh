@@ -768,7 +768,7 @@ run_windows() {
     capture_direct_diagnostics() {
         local reason=$1 resume=$2 directory screen record json_file quoted_record
         local decoder="$repo_root/scripts/x86_64/decode-vmx-diagnostics.py"
-        local initial_state='' stopped=0 must_resume=0 address='' result=1
+        local initial_state='' stopped=0 must_resume=0 address='' extent='' bytes='' result=1
 
         ((is_direct && monitor_fd_open)) && qemu_is_owned || return 1
         [[ "$reason" == failure || "$reason" == pre-success ]] || return 1
@@ -795,13 +795,15 @@ run_windows() {
             printf 'Windows x86 test: direct diagnostics screen=%s reason=%s\n' "$screen" "$reason"
         fi
         if ((stopped)) && command -v python3 >/dev/null && [[ -f "$decoder" ]]; then
-            address=$(python3 "$decoder" address "$serial_log") || address=
-            if [[ "$address" =~ ^0x[0-9a-f]{16}$ ]]; then
+            extent=$(python3 "$decoder" extent "$serial_log") || extent=
+            read -r address bytes <<<"$extent"
+            if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 ) ]]; then
                 quoted_record=${record//\\/\\\\}
                 quoted_record=${quoted_record//\"/\\\"}
                 # The decoder validated this unique monitor-owned publication.
-                # The VM is stopped, and the fixed byte count is never log input.
-                if printf 'pmemsave %s 176 "%s"\n' "$address" "$quoted_record" >&9 && \
+                # The VM is stopped; only the two compiled ABI extents above
+                # are accepted, never an arbitrary log-supplied memory length.
+                if printf 'pmemsave %s %s "%s"\n' "$address" "$bytes" "$quoted_record" >&9 && \
                     [[ $(direct_monitor_state) == paused ]] && \
                     python3 "$decoder" decode "$serial_log" "$record" >"$json_file"; then
                     printf 'Windows x86 test: direct diagnostics counters=%s reason=%s\n' "$json_file" "$reason"

@@ -278,10 +278,12 @@ impl FirmwareControls {
     }
 }
 
-/// Little-endian snapshot signature; only this 176-byte record may be captured.
+/// Little-endian snapshot signature; only the published owned record is captured.
 const DIAGNOSTIC_MAGIC: u64 = u64::from_le_bytes(*b"THVSTAT1");
 /// Fixed snapshot ABI, independent of the Rust lock's private layout.
-const DIAGNOSTIC_VERSION: u64 = 2;
+const DIAGNOSTIC_VERSION: u64 = 3;
+/// Reasons 0..63 have separate bins; newer/unknown basic reasons share bin 64.
+const DIAGNOSTIC_REASON_BINS: usize = 65;
 /// Scope value 1 means the current BSP-only QEMU Direct-VMX prototype.
 const DIAGNOSTIC_BSP_SCOPE: u64 = 1;
 
@@ -327,6 +329,9 @@ struct ExitCounterValues {
     last_phase: u64,
     /// Raw VM-exit reason, or u64::MAX when unavailable; never a guest payload.
     last_reason: u64,
+    /// Actual hardware exits only, not reflected copies or entry-failure exits.
+    l1_reasons: [u64; DIAGNOSTIC_REASON_BINS],
+    l2_reasons: [u64; DIAGNOSTIC_REASON_BINS],
 }
 
 impl ExitCounterValues {
@@ -349,6 +354,8 @@ impl ExitCounterValues {
             reflected_state_writes: 0,
             last_phase: 0,
             last_reason: u64::MAX,
+            l1_reasons: [0; DIAGNOSTIC_REASON_BINS],
+            l2_reasons: [0; DIAGNOSTIC_REASON_BINS],
         }
     }
 
@@ -357,6 +364,13 @@ impl ExitCounterValues {
         if reason == u64::MAX || reason & (1 << 31) != 0 {
             return;
         }
+        let bin = ((reason & 0xffff) as usize).min(DIAGNOSTIC_REASON_BINS - 1);
+        let reasons = if l1 {
+            &mut self.l1_reasons
+        } else {
+            &mut self.l2_reasons
+        };
+        diagnostic_increment(&mut reasons[bin]);
         match reason & 0xffff {
             EXIT_REASON_EXTERNAL_INTERRUPT => {
                 diagnostic_increment(&mut self.external_interrupt_exits)
@@ -463,7 +477,8 @@ fn diagnostic_next_sequence(previous: u64) -> Option<(u64, u64)> {
     Some((previous.checked_add(1)?, previous.checked_add(2)?))
 }
 
-/// Exactly 22 little-endian u64 words; sequence is word 3, counters start at 5.
+/// ABI v3: the original 22-word prefix followed by two 65-word histograms.
+/// Sequence is word 3, counters start at 5. No guest address/data is recorded.
 /// Readers require magic/version/size/scope and a stable even sequence. Stop all
 /// QEMU vCPUs before copying this record; an odd/exhausted snapshot is not valid.
 #[repr(C)]
@@ -503,7 +518,7 @@ impl ExitDiagnostics {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 176);
+const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 1216);
 
 /// No serial or allocation is permitted here: this is the bounded hot-path hook.
 fn record_diagnostic(event: DiagnosticEvent) {
@@ -588,7 +603,7 @@ fn publish_diagnostics(
     drop(diagnostics);
     let _ = writeln!(
         serial,
-        "thin-hv: vmx diagnostics address={address:#018x} size={size} version=2 scope=bsp-only environment=qemu-prototype storage=cpu-runtime"
+        "thin-hv: vmx diagnostics address={address:#018x} size={size} version={DIAGNOSTIC_VERSION} scope=bsp-only environment=qemu-prototype storage=cpu-runtime"
     );
     Ok(())
 }
@@ -6952,6 +6967,8 @@ mod tests {
             reflected_state_writes: almost,
             last_phase: 0,
             last_reason: u64::MAX,
+            l1_reasons: [almost; super::DIAGNOSTIC_REASON_BINS],
+            l2_reasons: [almost; super::DIAGNOSTIC_REASON_BINS],
         };
         for _ in 0..3 {
             for reason in [
@@ -6995,6 +7012,8 @@ mod tests {
             values.vmwrite_attempts,
             values.vmptrld_attempts,
             values.reflected_state_writes,
+            values.l1_reasons[super::EXIT_REASON_CPUID as usize],
+            values.l2_reasons[super::EXIT_REASON_CPUID as usize],
         ] {
             assert_eq!(counter, u64::MAX);
         }
@@ -7002,7 +7021,7 @@ mod tests {
 
     #[test]
     fn diagnostics_snapshot_layout_and_sequence_exhaustion_are_fail_closed() {
-        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 176);
+        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 1216);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, sequence), 24);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, values), 40);
         assert_eq!(
@@ -7010,6 +7029,8 @@ mod tests {
             88
         );
         assert_eq!(core::mem::offset_of!(ExitCounterValues, last_phase), 120);
+        assert_eq!(core::mem::offset_of!(ExitCounterValues, l1_reasons), 136);
+        assert_eq!(core::mem::offset_of!(ExitCounterValues, l2_reasons), 656);
         assert_eq!(super::DIAGNOSTIC_MAGIC.to_le_bytes(), *b"THVSTAT1");
         assert_eq!(super::diagnostic_next_sequence(0), Some((1, 2)));
         assert_eq!(super::diagnostic_next_sequence(1), None);
@@ -7023,6 +7044,29 @@ mod tests {
         diagnostics.record(DiagnosticEvent::L1Exit(super::EXIT_REASON_CPUID));
         assert_eq!(diagnostics.sequence.load(Ordering::Relaxed), u64::MAX);
         assert_eq!(diagnostics.values.l1_exits, 3);
+    }
+
+    #[test]
+    fn diagnostics_histograms_separate_layers_and_do_not_double_count_reflection() {
+        let mut values = ExitCounterValues::new();
+        for reason in [0, 1, 7, 25, 31, 55, 63, 64, 79, 0xffff] {
+            values.record(DiagnosticEvent::L1Exit(reason));
+            values.record(DiagnosticEvent::NestedExit(reason));
+            values.record(DiagnosticEvent::Reflected(reason));
+        }
+        for reason in [u64::MAX, (1 << 31) | 33] {
+            values.record(DiagnosticEvent::L1Exit(reason));
+            values.record(DiagnosticEvent::NestedExit(reason));
+        }
+        assert_eq!(values.l1_reasons.iter().sum::<u64>(), 10);
+        assert_eq!(values.l2_reasons.iter().sum::<u64>(), 10);
+        assert_eq!(values.l1_reasons[25], 1);
+        assert_eq!(values.l2_reasons[31], 1);
+        assert_eq!(values.l1_reasons[33], 0);
+        assert_eq!(values.l1_reasons[64], 3);
+        assert_eq!(values.l2_reasons[64], 3);
+        assert_eq!(values.observed_l2_entries, 10);
+        assert_eq!(values.reflected_l2_exits, 10);
     }
 
     #[test]

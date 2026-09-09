@@ -2517,4 +2517,63 @@ ESP helper's standard-library boundary tests. `cargo xtest -p xtask`:
 `cargo fmt --check`, `git diff --check`, `bash -n` and `cargo xbuild x86` pass.
 Read-only selection on the actual evaluation image returns byte offset
 1,048,576 from GPT metadata. `/tmp/x86-windows-physical-fixture-build.log`.
-No physical machine or OEM installation was touched. QEMU runs follow.
+No physical machine or OEM installation was touched.
+
+Frozen `4b79eed`, `/tmp/x86-windows-physical-validation`, completed the
+no-overlay matrix `/tmp/x86-windows-physical.Orhw0p`: **1 PASS, 1 FAIL**.
+Both cases used `WINDOWS_DIRECT_MODE=physical-uefi WINDOWS_MEMORY=4G
+WINDOWS_PCI_PROFILE=firmware-default`, fresh disposable image/vars/TPM state,
+and the unchanged 600-second marker bound.
+
+- `windows-test.sh monitor`: **PASS**, desktop keyboard/COM2 marker
+  `thinhvwindowsdesktop`, mode/map gates and final poweroff. Automatic screen
+  inspection confirms the desktop and shell. Pre-success counters: 456,927 L1
+  exits, 419,150 external-interrupt exits, 9,478 interrupt-window exits,
+  4,845,651 VMREADs, 1,975,946 VMWRITEs, no nested entries/failures.
+- `windows-test.sh monitor-hyperv`: **FAIL**, marker timeout, not a monitor
+  terminal fault. Final screen is black with the Windows progress spinner,
+  not a BSOD. Counters: 3,643,929 observed/reflected L2 entries, zero entry
+  failures, 32,361,269 L1 exits, 515,451 external-interrupt exits, 302,311
+  interrupt-window exits, 7,000 INVEPTs, 5,981 INVVPIDs, 49,146,628 VMPTRLDs,
+  635,034,860 VMREADs, 147,327,850 VMWRITEs and 7,660,268 reflected field
+  writes. Last sampled L1 exit is VMWRITE. Hyper-V/WSL2 remains unvalidated.
+
+Both qcow2 checks, artifact hashes, seed metadata and variable-store comparisons
+passed. `/tmp/x86-windows-physical-batch.log`; automatic snapshot directories
+`direct-normal/monitor-pre-success-diagnostics.dgjesG` and
+`direct-hyperv/monitor-hyperv-failure-diagnostics.cYX4iv`. This copied-ESP QEMU
+test does not qualify a motherboard ESP, physical SMP or Windows activation.
+
+## Bounded per-layer VM-exit reason profiling
+
+`ExitCounterValues::count_reason` now records actual L1 and L2 hardware exit
+reasons separately, once per exit, with saturating counters. Reasons 0..63
+have individual bins; newer reasons share a bounded overflow bin. VM-entry
+failures are excluded from these histograms and retain their separate counter.
+Reflection does not double-count a hardware exit. No guest RIP, register, MSR
+payload or firmware data is collected, and no formatted hot-path logging or
+new lock/allocation is added. This is instrumentation, not a performance fix.
+
+Diagnostics ABI v3 appends two 65-word arrays to the v2 prefix, for 1,216 bytes.
+The existing CPU-owned record/seqlock remains authoritative. The decoder and
+Windows capture accept only the exact v2/v3 version/size pairs (176/1,216
+bytes), wholly inside the published monitor-owned allocation; mismatched,
+truncated, torn and exhausted records fail closed. Existing saved v2 captures
+still decode. Both layer histograms are exposed in bounded JSON.
+
+Validation through `nix develop --accept-flake-config --command`:
+
+- `cargo xtest -p x86_uefi_loader` **205 PASS**, `-p xtask` **36 PASS**,
+  `-p x86_64_hal` **59 PASS**, `-p nested_vmx` **29 PASS**,
+  `-p x86_guest_uefi_test` **10 PASS**: **339 host PASS, 0 FAIL**.
+- `cargo xbuild x86`: PASS. `cargo xrun x86 --release`: **9 PASS, 0 FAIL**
+  (7 QEMU/KVM, 2 QEMU/TCG).
+- `cargo xrun x86 --nested --release`: **15 PASS, 5 FAIL / 20**; all
+  **14 Direct cases PASS**. The same five outer-KVM instruction-contract
+  differences documented above remain failures; overall command exits 1.
+- `python3 scripts/x86_64/decode-vmx-diagnostics.py --self-test`:
+  **11 PASS, 0 FAIL**, including legacy/new layout and ownership boundaries.
+  `bash -n scripts/x86_64/windows/windows-test.sh` and `git diff --check`: PASS.
+
+Logs: `/tmp/x86-exit-reasons-host.log`, `/tmp/x86-exit-reasons-regression.log`.
+No physical machine was tested; outer-KVM is reference evidence only.
