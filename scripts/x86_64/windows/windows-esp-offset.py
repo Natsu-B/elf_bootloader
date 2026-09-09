@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Select one ESP from read-only sfdisk JSON for a disposable QEMU fixture.
 
-Only the byte offset is emitted. No partition identifiers, files, BCD or
+Only byte sizes/offsets are emitted. No partition identifiers, files, BCD or
 activation data are changed. This is not physical-machine disk tooling.
 """
 
@@ -21,7 +21,7 @@ def integer(value, minimum=0):
     return value
 
 
-def select_offset(document, image_bytes):
+def select_extent(document, image_bytes):
     table = document["partitiontable"]
     sector = integer(table["sectorsize"], 1)
     image_bytes = integer(image_bytes, 1)
@@ -42,13 +42,24 @@ def select_offset(document, image_bytes):
         kind = str(uuid.UUID(partition["type"]))
         ranges.append((start, end))
         if kind == ESP:
-            candidates.append(start * sector)
+            candidates.append((start * sector, count * sector))
     ordered = sorted(ranges)
     if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
         raise ValueError("overlapping partitions")
     if len(candidates) != 1:
         raise ValueError("expected exactly one Windows test ESP")
     return candidates[0]
+
+
+def select_offset(document, image_bytes):
+    return select_extent(document, image_bytes)[0]
+
+
+def virtual_size(document):
+    size = integer(document["virtual-size"], 2 * 1048576)
+    if document["format"] != "qcow2" or size % 512:
+        raise ValueError("unsupported QEMU image geometry")
+    return size
 
 
 def unique_object(pairs):
@@ -73,6 +84,7 @@ class OffsetTests(unittest.TestCase):
                 doc["partitiontable"]["sectorsize"] = sector
                 doc["partitiontable"]["partitions"][0]["start"] = start
                 self.assertEqual(select_offset(doc, 4096 * sector), start * sector)
+                self.assertEqual(select_extent(doc, 4096 * sector), (start * sector, 1024 * sector))
         for key, bad in (("start", True), ("start", -1), ("start", LIMIT),
                          ("size", 0), ("size", LIMIT), ("type", "not-a-guid")):
             doc = self.fixture()
@@ -95,18 +107,37 @@ class OffsetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             json.loads('{"a":1,"a":2}', object_pairs_hook=unique_object)
 
+    def test_virtual_geometry_is_explicit_aligned_and_arithmetic_bounded(self):
+        for size in (2 * 1048576, 80 << 30, LIMIT & ~511):
+            self.assertEqual(virtual_size({"format": "qcow2", "virtual-size": size}), size)
+        for size in (True, -1, 0, 1048576, (80 << 30) + 1, LIMIT + 1):
+            with self.assertRaises(ValueError):
+                virtual_size({"format": "qcow2", "virtual-size": size})
+        with self.assertRaises(ValueError):
+            virtual_size({"format": "raw", "virtual-size": 80 << 30})
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         unittest.main(argv=[sys.argv[0]])
     else:
         try:
-            if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdecimal():
+            args = sys.argv[1:]
+            extent = len(args) == 2 and args[0] == "--extent"
+            geometry = args == ["--virtual-size"]
+            size = args[-1] if args else ""
+            if not geometry and not ((len(args) == 1 or extent) and size.isascii() and size.isdecimal()):
                 raise ValueError("expected image byte size")
             data = sys.stdin.buffer.read(1048577)
             if len(data) > 1048576:
                 raise ValueError("partition JSON too large")
-            print(select_offset(json.loads(data, object_pairs_hook=unique_object), int(sys.argv[1])))
+            document = json.loads(data, object_pairs_hook=unique_object)
+            if geometry:
+                print(virtual_size(document))
+            elif extent:
+                print(*select_extent(document, int(size)))
+            else:
+                print(select_offset(document, int(size)))
         except (ValueError, KeyError, TypeError, AttributeError, OSError, RecursionError):
             print("Windows QEMU ESP selection failed: malformed, unsupported or ambiguous layout", file=sys.stderr)
             sys.exit(1)

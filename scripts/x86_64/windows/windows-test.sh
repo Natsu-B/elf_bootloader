@@ -133,25 +133,51 @@ prepare_install_media() {
 }
 
 copy_windows_test_esp() (
-    local source=$1 format=$2 destination=$3 temporary='' image_bytes offset
+    local source=$1 format=$2 destination=$3 temporary='' image_bytes offset extent esp_bytes tail_sector
+    local selector="$repo_root/scripts/x86_64/windows/windows-esp-offset.py"
     need_command sfdisk
     need_command mcopy
     need_command python3
     [[ -f "$source" ]] || die 'same-ESP fixture requires a regular QEMU Windows image'
     if [[ "$format" == qcow2 ]]; then
         need_command qemu-img
-        temporary=$(mktemp "$work/monitor-esp-source.XXXXXX.raw")
-        # Only this freshly created, disposable conversion is removed; the
-        # evaluation source/overlay and its original ESP are always read-only.
-        trap 'rm -f -- "$temporary"' EXIT
-        qemu-img convert -f qcow2 -O raw "$source" "$temporary"
-        source=$temporary
-    elif [[ "$format" != raw ]]; then
+        need_command truncate
+        need_command dd
+        temporary=$(mktemp -d "$work/monitor-esp-source.XXXXXX")
+        # Only these freshly created disposable files are removed; the source
+        # and backing chain stay read-only. Never materialize the Windows volume
+        # merely to copy its ESP (an 80 GiB conversion can exhaust CI storage).
+        trap 'rm -f -- "$temporary/gpt.raw" "$temporary/tail.raw" "$temporary/esp.raw"; rmdir -- "$temporary"' EXIT
+        image_bytes=$(qemu-img info -f qcow2 --output=json -- "$source" | python3 "$selector" --virtual-size) \
+            || die 'unsupported Windows QEMU image geometry'
+        # Bounded primary/backup GPT windows. sfdisk still validates the tables;
+        # layouts whose arrays lie outside these windows fail, with no fallback.
+        # The sparse middle is never read as partition content or written back.
+        tail_sector=$((image_bytes / 512 - 2048))
+        qemu-img dd -f qcow2 -O raw bs=512 count=2048 "if=$source" "of=$temporary/gpt.raw"
+        qemu-img dd -f qcow2 -O raw bs=512 "skip=$tail_sector" "if=$source" "of=$temporary/tail.raw"
+        [[ $(stat -Lc %s -- "$temporary/gpt.raw") == 1048576 &&
+           $(stat -Lc %s -- "$temporary/tail.raw") == 1048576 ]] || die 'incomplete Windows test GPT read'
+        truncate -s "$image_bytes" "$temporary/gpt.raw"
+        dd "if=$temporary/tail.raw" "of=$temporary/gpt.raw" bs=512 "seek=$tail_sector" conv=notrunc status=none
+        extent=$(sfdisk --json "$temporary/gpt.raw" | python3 "$selector" --extent "$image_bytes") \
+            || die 'cannot identify one original Windows test ESP'
+        read -r offset esp_bytes <<< "$extent"
+        # QEMU 10.1 img_dd caps the input at count*bs BEFORE applying skip;
+        # unlike dd(1), count is the exclusive end here. The checked extent's
+        # sum is <= image_bytes <= INT64_MAX. Reject any short/changed semantics.
+        qemu-img dd -f qcow2 -O raw bs=512 "skip=$((offset / 512))" "count=$(((offset + esp_bytes) / 512))" \
+            "if=$source" "of=$temporary/esp.raw"
+        [[ $(stat -Lc %s -- "$temporary/esp.raw") == "$esp_bytes" ]] || die 'incomplete Windows test ESP read'
+        source="$temporary/esp.raw"
+        offset=0
+    elif [[ "$format" == raw ]]; then
+        image_bytes=$(stat -Lc %s -- "$source")
+        offset=$(sfdisk --json -- "$source" | python3 "$selector" "$image_bytes") \
+            || die 'cannot identify one original Windows test ESP'
+    else
         die 'unsupported Windows ESP source format'
     fi
-    image_bytes=$(stat -Lc %s -- "$source")
-    offset=$(sfdisk --json -- "$source" | python3 "$repo_root/scripts/x86_64/windows/windows-esp-offset.py" "$image_bytes") \
-        || die 'cannot identify one original Windows test ESP'
     mkdir -p -- "$destination/EFI"
     # Read the existing ESP with mtools; no mount, loop device, BCD edit or
     # source-disk write. This is disposable QEMU staging, never claimed as the

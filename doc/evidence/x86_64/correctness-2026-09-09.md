@@ -2809,3 +2809,70 @@ Median changes are +0.75%, -0.84%, -0.02% respectively: **no demonstrated
 Linux benchmark speedup** from this additional optimization. Windows's actual
 VMCS-operation counts still need remeasurement before claiming usefulness for
 Hyper-V. `/tmp/x86-repeat-vmwrite-ab-batch.log`, `/tmp/x86-idle-guest-ab.1SxLMq`.
+
+Post-commit `0505598` original Linux/S3 matrix remains **5 PASS, 3 FAIL / 8**,
+with the same five passing cases and the same memslot alarm, invalid-guest-state
+600-second bound, and post-S3 KVM failure. `/tmp/x86-repeat-vmwrite-linux-batch.log`,
+`/tmp/x86-idle-guest-linux.oecdZW`. No timing-sensitive selftest was paused.
+Frozen no-overlay Windows normal boot **PASS**; the paired Hyper-V run failed
+in **test setup**, before QEMU launch, because whole-disk qcow2-to-raw conversion
+exhausted the approximately 32 GiB free space. Its temporary conversion was
+removed by the existing trap. This is not a Direct runtime failure or Hyper-V
+result. Both seed and EFI comparisons pass.
+`/tmp/x86-repeat-vmwrite-windows-batch.log`, `/tmp/x86-idle-guest-windows.ijwHQq`.
+
+## Bounded Windows test ESP extraction
+
+`windows-test.sh::copy_windows_test_esp` no longer converts the entire 80 GiB
+evaluation disk to obtain one ESP. For qcow2 it reads only the first/last 1 MiB
+GPT windows into a disposable sparse metadata image, uses the existing sfdisk
+validation and unique-ESP parser, then reads the exact validated ESP extent.
+Both GPT windows and the ESP require exact output sizes. This retains the
+Hyper-V overlay's own original BCD and changes no source/backing image. Raw
+test-image reading is unchanged. Unsupported/ambiguous GPTs fail without a
+different disk/backend fallback; temporary files are individually cleaned up.
+The physical firmware chainloader itself is unaffected.
+
+`windows-esp-offset.py::select_extent` reuses the existing overlap, bounds and
+partition checks. `virtual_size` validates explicit qcow2 geometry, minimum
+metadata window size, 512-byte alignment and signed-64-bit arithmetic bounds;
+the original offset-only CLI remains compatible. Its existing xtask entry runs
+both Python tests. Host validation **2 Python PASS, 36 xtask PASS**, shell syntax
+PASS (`/tmp/x86-esp-bounded-host-fixed.log`).
+
+Native exploration first rejected a truncated GPT image as intended; preserving
+its virtual size in a sparse metadata file permits read-only GPT validation.
+The QEMU 10.1.5 [`img_dd` implementation](https://github.com/qemu/qemu/blob/v10.1.5/qemu-img.c)
+applies the count boundary before skip, unlike dd(1). The runner therefore uses
+the checked exclusive end for ESP count, omits count for the last GPT window,
+and rejects any short or differently sized output. The actual fixture needs
+2 MiB of metadata plus a 260 MiB ESP, not the complete Windows volume.
+No new tool dependency, mount, NBD attachment, sudo, activation operation or
+physical-disk access is introduced.
+
+The corrected existing runner reaches Direct Hyper-V using bounded extraction:
+ESP staging/cleanup **PASS**, runtime Hyper-V **FAIL** at its original
+600-second marker bound. Final screen again shows **Please wait**; no bugcheck
+was captured. EFI/script hashes, qcow2 checks and original seed comparisons
+pass. `/tmp/x86-esp-bounded-hyperv-batch.log`,
+`/tmp/x86-esp-bounded-hyperv.fc5R9c`. Native diagnostic snapshots are under
+`direct-hyperv/monitor-hyperv-failure-diagnostics.VFEhvl`.
+
+The validated `0505598` v4 record contains 4,244,881 L2 entries/reflections,
+zero entry failures, 21,288,148 VMPTRLDs, 731,376,560 VMREADs and 164,809,381
+VMWRITEs. VMPTRLDs per entry fall from 6.83 to **5.02** versus `d031d65`,
+supporting the idempotent-write optimization's relevance to Hyper-V. This
+does not demonstrate Windows readiness or a controlled wall-time speedup;
+the run overlapped the separate VM-exit regression matrix. No live debugger
+pause was used; final diagnostic capture occurs only after the deadline.
+
+That complete twelve-case matrix separately passed **24/24** on reference and
+Direct, `/tmp/x86-repeat-vmwrite-full-vmexit-batch.log`,
+`/tmp/x86-idle-full-vmexit.6fYf1T`. Outer-KVM remains reference-only evidence.
+
+The isolated `0505598` 4,096-cycle run still **FAILs** at the unchanged
+300-second default: 3,931 checked cycles at guest time 299.270456, QEMU status
+124 and no final completion marker. No other x86 QEMU was running at start,
+and no concurrent project benchmark/Windows test or debugger pause was used.
+`/tmp/x86-repeat-vmwrite-4096-default.log`. Do not substitute the separate
+historical 600-second state-lifetime run for this default-bound failure.
