@@ -4971,6 +4971,75 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn windows_physical_direct_fixture_never_falls_back_to_research_or_reference() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let runner = root.join("scripts/x86_64/windows/windows-test.sh");
+        let check = |selection: Option<&str>, mode: &str| {
+            let mut command = Command::new("bash");
+            command
+                .arg(&runner)
+                .arg(mode)
+                .env_remove("WINDOWS_DIRECT_MODE");
+            if let Some(value) = selection {
+                command.env("WINDOWS_DIRECT_MODE", value);
+            }
+            command.output().expect("read-only Direct image selector")
+        };
+        for mode in [None, Some(""), Some("qemu-research"), Some("physical-uefi")] {
+            let result = check(mode, "print-direct-images");
+            assert!(result.status.success());
+            let fields: Vec<_> = result.stdout.split(|byte| *byte == 0).collect();
+            assert_eq!(fields.len(), 3);
+            assert!(fields[2].is_empty());
+            let prefix = if mode == Some("physical-uefi") {
+                "x86-uefi-physical-direct"
+            } else {
+                "x86-uefi"
+            };
+            for (field, suffix) in fields[..2].iter().zip(["loader.efi", "monitor.efi"]) {
+                assert!(
+                    String::from_utf8_lossy(field)
+                        .ends_with(&format!("/bin/x86_64/{prefix}-{suffix}"))
+                );
+            }
+        }
+        for invalid in ["outer-kvm", "physical-uefi\n", "fallback"] {
+            for mode in [
+                "print-direct-images",
+                "monitor",
+                "monitor-hyperv",
+                "trusted-kvm-hyperv",
+            ] {
+                let result = check(Some(invalid), mode);
+                assert!(!result.status.success());
+                assert!(result.stdout.is_empty());
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains("WINDOWS_DIRECT_MODE must be")
+                );
+            }
+        }
+        for mode in ["boot", "hyperv", "trusted-kvm-hyperv"] {
+            let result = check(Some("physical-uefi"), mode);
+            assert!(!result.status.success());
+            assert!(result.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("requires a Direct monitor test")
+            );
+        }
+        let offset = Command::new("python3")
+            .arg(root.join("scripts/x86_64/windows/windows-esp-offset.py"))
+            .arg("--self-test")
+            .output()
+            .expect("read-only ESP parser tests");
+        assert!(
+            offset.status.success(),
+            "{}",
+            String::from_utf8_lossy(&offset.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn windows_pci_profile_defaults_to_firmware_layout_without_fallback() {
         let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/x86_64/windows/windows-test.sh");

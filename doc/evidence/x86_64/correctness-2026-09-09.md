@@ -2424,3 +2424,97 @@ Windows revalidation on this map follows separately; no physical machine
 or original OEM installation has been tested.
 Final `cargo fmt --check`, `git diff --check` and TPM-equipped preflight passed
 again on the final code, `/tmp/x86-aml-final-preflight.log`.
+
+## `79cac98` Windows and extended Linux revalidation
+
+Frozen Windows worktree `/tmp/x86-windows-aml-validation`, matrix
+`/tmp/x86-windows-aml.hpYBST`, `/tmp/x86-windows-aml-batch.log`:
+
+- `windows-test.sh monitor`: **PASS**, exit **0**, exact
+  `thinhvwindowsdesktop` marker from the keyboard/COM2 desktop probe. Default
+  q35 high PCI and TPM remain enabled; the PPI EPT violation did not recur.
+  Pre-success QEMU running/resume validation and the protected counter decode
+  passed. Automatic screenshot was inspected and shows the Windows desktop
+  with PowerShell. Counters: 468,919 L1 exits, 430,823 external-interrupt exits,
+  no L2 entries, no nested entry failures. This is a QEMU research-mode boot
+  with the variable overlay, **not physical Windows qualification**.
+- `windows-test.sh monitor-hyperv`: **FAIL**, exit **1**, unchanged 600-second
+  timeout, no success marker. Final screenshot shows TianoCore with Windows
+  spinning dots, not a bugcheck or desktop. Counters: 3,515,990 actual Direct
+  L2 entries/reflections, zero nested entry failures, 31,501,997 L1 exits,
+  506,989 external-interrupt exits, 330,493 interrupt-window exits, 576 INVEPT,
+  520 INVVPID, 47,787,866 VMPTRLD, 614,065,991 VMREAD, 140,605,917 VMWRITE and
+  7,408,217 reflected field writes. The final sampled L1 reason is VMWRITE.
+  PPI mapping is fixed, but Hyper-V/WSL2 is still not validated.
+
+Matrix **1 PASS, 1 FAIL**. Both image checks, artifact hashes and seed
+metadata/variable-store comparisons passed. Counter/screenshot directories:
+`direct-normal/monitor-pre-success-diagnostics.KRKHw1` and
+`direct-hyperv/monitor-hyperv-failure-diagnostics.ZJqf70`.
+A manual normal-VM capture raced its successful cleanup and obtained no data;
+only the valid automatic capture is used above. No outer-KVM run was included;
+previous reference success is reference evidence only.
+
+The 12 GiB, default-high-PCI Direct Linux live-XSTATE-clobber fixture was run
+with `LINUX_KVM_CYCLES=4096 LINUX_KVM_HOST_XSTATE_TEST=1`:
+
+- Default 300-second runner bound: **FAIL** (exit 1/QEMU 124), cycle 3,487
+  completed successfully before timeout. `/tmp/x86-aml-linux-4096.log`.
+- The historical 4,096-cycle comparison bound of 600 seconds used at
+  `8598e86`: **PASS**, exit 0, all 4,096 cycles and final poweroff. First/last
+  cycle guest timestamps are 1.002/352.820 seconds.
+  `/tmp/x86-aml-linux-4096-historical-bound.log`.
+
+Both commands use `nix develop --accept-flake-config --command env
+LINUX_KVM_BACKEND=direct-vmx LINUX_KVM_CYCLES=4096 LINUX_KVM_MEMORY=12G
+LINUX_KVM_HOST_XSTATE_TEST=1 bash scripts/x86_64/run-linux-kvm-test.sh`;
+only the comparison run adds `LINUX_KVM_TIMEOUT_SECONDS=600`. **The longer
+bound is not a production fix or a performance improvement.** Each successful
+cycle exercises two VM contexts, eight rounds, I/O/HLT, remapping, CR2, paging,
+XMM0–15/MXCSR, MSR/debug state, TSC and explicit teardown.
+
+Frozen Linux worktree `/tmp/x86-aml-linux-regressions` at `79cac98` used the
+unchanged pinned upstream ELFs and `run-linux-selftest.sh` with
+`LINUX_SELFTEST_BACKEND=direct-vmx`, `LINUX_SELFTEST_NAME`, `LINUX_SELFTEST_ELF`:
+**5 PASS, 3 FAIL / 8**, `/tmp/x86-aml-linux-batch.log`.
+PASS: `xcr0_cpuid_test`, `dirty_log_page_splitting_test`, `nx_huge_pages_test`,
+`memslot_modification_stress_test`, `kvm_page_table_test`.
+FAIL: `memslot_perf_test` (original alarm, process 142),
+`vmx_exception_with_invalid_guest_state` (original 600-second limit, process
+137), and `LINUX_SUSPEND_BACKEND=direct-vmx run-linux-suspend-test.sh`.
+S3 resumed cycle 1 but the fresh KVM probe hit an invalid-opcode Oops while
+creating its VMCS (`alloc_loaded_vmcs`); the runner failed immediately on the
+Oops. There is still no post-S3 L0 re-entry/lifecycle implementation, and
+no capability check was weakened. All these Direct failures remain open.
+
+## Windows no-overlay same-ESP QEMU fixture
+
+The existing `windows-test.sh monitor` / `monitor-hyperv` now accept
+`WINDOWS_DIRECT_MODE=physical-uefi`, selecting the already-built physical
+Direct loader/monitor pair. Default `qemu-research` stays separate. Invalid
+modes, or physical selection with reference/ordinary boot modes, fail before
+test-state writes. Success also requires the existing Direct mode/overlay and
+platform-map validators; default q35 requires an observed PCI BAR above 8 GiB.
+The previous normal-Windows PASS transcript satisfies these additional gates.
+
+The physical loader deliberately accepts only its actual current ESP. Rather
+than weakening that rule, `copy_windows_test_esp` / `prepare_monitor_media`
+create a fresh disposable QEMU staging ESP containing an unmodified copy of
+the evaluation installation's `EFI/Microsoft` boot files and the project EFI
+pair. `sfdisk --json` plus `windows-esp-offset.py::{select_offset,integer,
+unique_object}` reject unsupported GPT geometry, overflow, overlaps and absent
+or ambiguous ESPs. Installed mtools reads the source filesystem; no mount,
+sudo, partition write, BCD edit or new dependency is needed. For Hyper-V the
+boot files come from its own qcow2 overlay, using a temporary sparse raw
+conversion removed after the copy, not the different normal-boot BCD.
+This is explicitly **QEMU copied-ESP coverage**, never evidence that an actual
+motherboard ESP, original Windows identity or activation has been qualified.
+
+`configure_direct_mode` and read-only `print-direct-images` have an xtask host
+regression including exact image names, rejection before fallback, and the
+ESP helper's standard-library boundary tests. `cargo xtest -p xtask`:
+**36 PASS, 0 FAIL** in `/tmp/x86-windows-physical-fixture-final-host.log`;
+`cargo fmt --check`, `git diff --check`, `bash -n` and `cargo xbuild x86` pass.
+Read-only selection on the actual evaluation image returns byte offset
+1,048,576 from GPT metadata. `/tmp/x86-windows-physical-fixture-build.log`.
+No physical machine or OEM installation was touched. QEMU runs follow.

@@ -132,6 +132,37 @@ prepare_install_media() {
     install -m 0644 -- "$answer_source/first-logon.ps1" "$answer_dir/thin-hv-first-logon.ps1"
 }
 
+copy_windows_test_esp() (
+    local source=$1 format=$2 destination=$3 temporary='' image_bytes offset
+    need_command sfdisk
+    need_command mcopy
+    need_command python3
+    [[ -f "$source" ]] || die 'same-ESP fixture requires a regular QEMU Windows image'
+    if [[ "$format" == qcow2 ]]; then
+        need_command qemu-img
+        temporary=$(mktemp "$work/monitor-esp-source.XXXXXX.raw")
+        # Only this freshly created, disposable conversion is removed; the
+        # evaluation source/overlay and its original ESP are always read-only.
+        trap 'rm -f -- "$temporary"' EXIT
+        qemu-img convert -f qcow2 -O raw "$source" "$temporary"
+        source=$temporary
+    elif [[ "$format" != raw ]]; then
+        die 'unsupported Windows ESP source format'
+    fi
+    image_bytes=$(stat -Lc %s -- "$source")
+    offset=$(sfdisk --json -- "$source" | python3 "$repo_root/scripts/x86_64/windows/windows-esp-offset.py" "$image_bytes") \
+        || die 'cannot identify one original Windows test ESP'
+    mkdir -p -- "$destination/EFI"
+    # Read the existing ESP with mtools; no mount, loop device, BCD edit or
+    # source-disk write. This is disposable QEMU staging, never claimed as the
+    # physical motherboard's original ESP. Hyper-V copies its own overlay BCD,
+    # not the normal Windows base image's different boot configuration.
+    mcopy -s -i "$source@@$offset" ::/EFI/Microsoft "$destination/EFI/" \
+        || die 'cannot read Windows boot files for same-ESP QEMU fixture'
+    [[ -f "$destination/EFI/Microsoft/Boot/bootmgfw.efi" && -f "$destination/EFI/Microsoft/Boot/BCD" ]] \
+        || die 'incomplete original Windows boot files in QEMU fixture'
+)
+
 prepare_monitor_media() {
     local boot_loader=${1:-$loader}
     local monitor_image=${2-$runtime_monitor}
@@ -140,6 +171,16 @@ prepare_monitor_media() {
     if [[ -n "$monitor_image" ]]; then
         [[ -f "$monitor_image" ]] || \
             die "runtime monitor not found: $monitor_image; run 'cargo xbuild x86'"
+    fi
+
+    if [[ ${direct_mode:-qemu-research} == physical-uefi ]]; then
+        monitor_esp=$(mktemp -d "$work/monitor-physical-esp.XXXXXX")
+        if [[ "$mode" == monitor-hyperv ]]; then
+            copy_windows_test_esp "$hyperv_disk" qcow2 "$monitor_esp"
+        else
+            copy_windows_test_esp "$disk" raw "$monitor_esp"
+        fi
+        printf 'Windows x86 test: same-ESP fixture source=original-test-esp copy=read-only-source bcd_modified=0 physical_hardware=0\n'
     fi
 
     mkdir -p -- "$monitor_esp/EFI/BOOT"
@@ -354,6 +395,20 @@ configure_pci_profile() {
     esac
 }
 
+configure_direct_mode() {
+    direct_mode=${WINDOWS_DIRECT_MODE:-qemu-research}
+    case "$direct_mode" in
+        qemu-research) ;;
+        physical-uefi)
+            [[ "$1" == monitor || "$1" == monitor-hyperv || "$1" == print-direct-images ]] \
+                || die 'WINDOWS_DIRECT_MODE=physical-uefi requires a Direct monitor test'
+            loader="$repo_root/bin/x86_64/x86-uefi-physical-direct-loader.efi"
+            runtime_monitor="$repo_root/bin/x86_64/x86-uefi-physical-direct-monitor.efi"
+            ;;
+        *) die 'WINDOWS_DIRECT_MODE must be qemu-research or physical-uefi' ;;
+    esac
+}
+
 run_windows() {
     local mode=$1
     local s4_phase=${2:-}
@@ -377,9 +432,11 @@ run_windows() {
     local physical_desktop_probe_sent=0
     local is_direct=0 diagnostics_failure_captured=0
     local pci_profile
+    local direct_mode loader=$loader runtime_monitor=$runtime_monitor monitor_esp=$monitor_esp
     local -a pci_args media_args network_args=(-netdev user,id=net0)
 
     configure_pci_profile
+    configure_direct_mode "$mode"
     valid_poweroff_timeout "$poweroff_timeout_seconds" || die 'poweroff timeout must be 1..1800 seconds'
 
     [[ "$mode" == check-physical-status ]] && is_physical_test=1
@@ -440,6 +497,9 @@ run_windows() {
     printf 'Windows x86 test: backend=%s mode=%s environment=QEMU/KVM (not physical hardware)\n' \
         "$backend_label" "$mode"
     printf 'Windows x86 test: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
+    if ((is_direct)); then
+        printf 'Windows x86 test: Direct mode=%s environment=QEMU (not physical hardware)\n' "$direct_mode"
+    fi
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
     ovmf_vars=$(first_file "${OVMF_FULL_VARS:-}") || die 'OVMF_FULL_VARS not found; run through nix develop'
@@ -1046,6 +1106,12 @@ run_windows() {
     if [[ "$mode" == monitor || "$mode" == monitor-hyperv ]]; then
         bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
             --check-backend-log direct-vmx "$serial_log" || die 'Direct-VMX backend provenance failed'
+        bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
+            --check-direct-mode-log "$direct_mode" "$serial_log" || die 'Direct mode/overlay provenance failed'
+        local high_pci_required=0
+        [[ "$pci_profile" != firmware-default ]] || high_pci_required=1
+        bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
+            --check-direct-platform-log "$high_pci_required" "$serial_log" || die 'Direct platform/high-PCI map evidence failed'
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
         [[ $(direct_monitor_state) == running ]] || die 'QEMU is not running before direct success validation'
@@ -1218,6 +1284,7 @@ usage() {
     printf 'usage: %s download|verify|download-wsl|verify-wsl|check-wsl-soak|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-wsl-soak|trusted-kvm-s4\n' "$0"
     printf '       %s check-physical-status (disposable QEMU eval SelfTest only)\n' "$0"
     printf '       WINDOWS_PCI_PROFILE=firmware-default (default) or q35-smoke-1g (explicit QEMU A/B fixture)\n'
+    printf '       WINDOWS_DIRECT_MODE=qemu-research (default) or physical-uefi (no-overlay same-ESP QEMU fixture)\n'
 }
 
 case ${1:-} in
@@ -1237,6 +1304,11 @@ case ${1:-} in
         (($# == 1)) || die 'print-pci-args takes no arguments'
         configure_pci_profile
         if ((${#pci_args[@]})); then printf '%s\0' "${pci_args[@]}"; fi
+        ;;
+    print-direct-images)
+        (($# == 1)) || die 'print-direct-images takes no arguments'
+        configure_direct_mode "$1"
+        printf '%s\0%s\0' "$loader" "$runtime_monitor"
         ;;
     check-poweroff-timeout)
         (($# == 2)) || die 'check-poweroff-timeout requires SECONDS'
