@@ -7,6 +7,11 @@ compile_error!("Direct L0 requires a baseline, non-AVX compilation target");
 
 use crate::SerialPort;
 use crate::chainload;
+use crate::chainload::device_path_utilities_protocol;
+#[cfg(not(feature = "physical-direct-vmx"))]
+use crate::chainload::load_image_from_other_filesystem;
+use crate::chainload::load_image_on_device;
+use crate::chainload::loaded_image_protocol;
 use crate::platform_acpi;
 use crate::platform_resources;
 use crate::platform_resources::MmioMap;
@@ -1183,13 +1188,10 @@ pub(crate) enum Error {
     Resident(resident_image::Error),
 }
 
-impl Error {
-    #[cfg(not(feature = "physical-direct-vmx"))]
-    fn is_missing_image(self) -> bool {
-        matches!(
-            self,
-            Self::Firmware("LoadImage", value) if value == efi::Status::NOT_FOUND.as_usize()
-        )
+impl From<chainload::Error> for Error {
+    fn from(error: chainload::Error) -> Self {
+        let chainload::Error::Firmware(service, status) = error;
+        Self::Firmware(service, status)
     }
 }
 
@@ -1228,12 +1230,6 @@ pub(crate) fn run(
     #[cfg(feature = "physical-direct-vmx")]
     crate::physical_chainload::require_single_cpu(system_table, serial).map_err(Error::Platform)?;
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
-    if loaded_image.is_null() {
-        return Err(Error::Firmware(
-            "LoadedImage interface",
-            efi::Status::COMPROMISED_DATA.as_usize(),
-        ));
-    }
     // SAFETY: HandleProtocol returned the non-null, live protocol for this
     // executing image. Copy only metadata while Boot Services are still live.
     let (parent_device, code_type) = unsafe {
@@ -1854,11 +1850,11 @@ fn load_selected_guest(
         system_table,
         parent_device,
         utilities,
-        GUEST_IMAGE_PATH,
+        &GUEST_IMAGE_PATH,
     ) {
         Ok(image) => return Ok((image, LINUX_PROFILE)),
         Err(error) if error.is_missing_image() => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
 
     let windows = match load_image_on_device(
@@ -1866,7 +1862,7 @@ fn load_selected_guest(
         system_table,
         parent_device,
         utilities,
-        WINDOWS_BOOT_IMAGE_PATH,
+        &WINDOWS_BOOT_IMAGE_PATH,
     ) {
         Ok(image) => image,
         Err(error) if error.is_missing_image() => load_image_from_other_filesystem(
@@ -1874,9 +1870,9 @@ fn load_selected_guest(
             parent_device,
             system_table,
             utilities,
-            WINDOWS_BOOT_IMAGE_PATH,
+            &WINDOWS_BOOT_IMAGE_PATH,
         )?,
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
     Ok((windows, WINDOWS_PROFILE))
 }
@@ -1897,52 +1893,98 @@ fn start_runtime_monitor(
             .map_err(Error::Platform)?,
         ProfileId(0),
     );
-    let monitor = match load_image_on_device(
-        parent_image,
-        system_table,
-        parent_device,
-        utilities,
-        MONITOR_IMAGE_PATH,
-    ) {
-        Ok(image) => image,
-        Err(error) => {
-            let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
-            return Err(error);
+    let services = chainload::boot_services(system_table)?;
+    let mut monitor_retired = false;
+    let result = (|| {
+        let monitor = load_image_on_device(
+            parent_image,
+            system_table,
+            parent_device,
+            utilities,
+            &MONITOR_IMAGE_PATH,
+        )?;
+        let metadata = (|| {
+            let loaded = loaded_image_protocol(monitor, system_table)?;
+            // SAFETY: this non-null live LoadedImage protocol belongs to the
+            // unstarted monitor. Copy memory types before publishing any handoff.
+            let (code, data) = unsafe { ((*loaded).image_code_type, (*loaded).image_data_type) };
+            if !runtime_image_types(code, data) {
+                return Err(Error::Firmware(
+                    "runtime monitor image types",
+                    efi::Status::UNSUPPORTED.as_usize(),
+                ));
+            }
+            Ok(loaded)
+        })();
+        let monitor_loaded = match metadata {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                chainload::unload_image(services, monitor)?;
+                monitor_retired = true;
+                return Err(error);
+            }
+        };
+        let mut guest_handoff = RuntimeHandoff {
+            guest,
+            profile: profile.0,
+            mode: RUNTIME_MODE,
+        };
+        // SAFETY: this driver has not started. The caller owns its load-option
+        // metadata and keeps this aligned handoff alive throughout StartImage and
+        // post-return cleanup. Preserve firmware's previous borrowed options.
+        let original_options = unsafe {
+            let original = (
+                (*monitor_loaded).load_options_size,
+                (*monitor_loaded).load_options,
+            );
+            (*monitor_loaded).load_options_size = core::mem::size_of::<RuntimeHandoff>() as u32;
+            (*monitor_loaded).load_options = ptr::addr_of_mut!(guest_handoff).cast();
+            original
+        };
+        let started = chainload::start_image(monitor, system_table);
+        // A driver that returns an error is unloaded by Exit; a successful
+        // driver, or one rejected before entry, may still be registered. Never
+        // dereference the pre-StartImage protocol or blindly unload its handle.
+        match loaded_image_protocol(monitor, system_table) {
+            Ok(live) => {
+                // SAFETY: a new firmware query proved this protocol is live.
+                // The project driver cannot return after launching L1. Thus no
+                // guest owns it here, and the stack handoff is still in scope.
+                unsafe {
+                    (*live).load_options_size = original_options.0;
+                    (*live).load_options = original_options.1;
+                }
+                chainload::unload_image(services, monitor)?;
+            }
+            Err(chainload::Error::Firmware("HandleProtocol(LoadedImage)", status))
+                if status == efi::Status::INVALID_PARAMETER.as_usize()
+                    || status == efi::Status::UNSUPPORTED.as_usize() => {}
+            Err(error) => return Err(error.into()),
         }
-    };
-    let monitor_loaded = match loaded_image_protocol(monitor, system_table) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            let _ = unsafe { ((*(*system_table).boot_services).unload_image)(monitor) };
-            let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
-            return Err(error);
-        }
-    };
-    let mut guest_handoff = RuntimeHandoff {
-        guest,
-        profile: profile.0,
-        mode: RUNTIME_MODE,
-    };
-    unsafe {
-        (*monitor_loaded).load_options_size = core::mem::size_of::<RuntimeHandoff>() as u32;
-        (*monitor_loaded).load_options = ptr::addr_of_mut!(guest_handoff).cast();
-    }
-    let mut exit_data_size = 0;
-    let mut exit_data = ptr::null_mut();
-    let status = unsafe {
-        ((*(*system_table).boot_services).start_image)(monitor, &mut exit_data_size, &mut exit_data)
-    };
-    // The direct backend normally never returns; clean up if StartImage does.
-    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(monitor) };
-    let _ = unsafe { ((*(*system_table).boot_services).unload_image)(guest) };
-    if status.is_error() {
+        monitor_retired = true;
+        started?;
+        // A normal Direct launch never returns. Even a warning/success from an
+        // unexpected returning runtime driver is not proof of resident VMX.
         Err(Error::Firmware(
-            "StartImage(runtime monitor)",
-            status.as_usize(),
+            "runtime monitor unexpectedly returned",
+            efi::Status::ABORTED.as_usize(),
         ))
-    } else {
-        Ok(())
+    })();
+    // This code is reachable only before L1 entry. The guest's LoadImage handle
+    // has never been started; attempt its cleanup even if monitor cleanup failed.
+    chainload::unload_image(services, guest)?;
+    if monitor_retired {
+        SerialPort.write_bytes(
+            b"thin-hv: runtime handoff cleanup PASS guest=unstarted monitor=retired\n",
+        );
     }
+    result
+}
+
+/// Reject a boot application masquerading as the runtime driver before it can
+/// recursively load another monitor or publish disposable Boot Services state.
+fn runtime_image_types(code: u32, data: u32) -> bool {
+    code == efi::RUNTIME_SERVICES_CODE && data == efi::RUNTIME_SERVICES_DATA
 }
 
 /// Reads the target handle and profile supplied by the boot application copy.
@@ -1987,213 +2029,6 @@ fn valid_runtime_profile(profile: ProfileId) -> bool {
     {
         matches!(profile, WINDOWS_PROFILE | LINUX_PROFILE)
     }
-}
-
-/// Loads one image from a filesystem other than the monitor's own ESP.
-#[cfg(not(feature = "physical-direct-vmx"))]
-fn load_image_from_other_filesystem<const PATH_SIZE: usize>(
-    parent_image: efi::Handle,
-    parent_device: efi::Handle,
-    system_table: *mut efi::SystemTable,
-    utilities: *mut efi::protocols::device_path_utilities::Protocol,
-    image_path: [efi::Char16; PATH_SIZE],
-) -> Result<efi::Handle, Error> {
-    let boot_services = unsafe { (*system_table).boot_services };
-    let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
-    let mut handle_count = 0;
-    let mut handles = ptr::null_mut();
-    let status = unsafe {
-        ((*boot_services).locate_handle_buffer)(
-            efi::BY_PROTOCOL,
-            &mut filesystem_guid,
-            ptr::null_mut(),
-            &mut handle_count,
-            &mut handles,
-        )
-    };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "LocateHandleBuffer(SimpleFileSystem)",
-            status.as_usize(),
-        ));
-    }
-    if handles.is_null() {
-        return Err(Error::Firmware(
-            "LocateHandleBuffer(SimpleFileSystem)",
-            efi::Status::INVALID_PARAMETER.as_usize(),
-        ));
-    }
-
-    let mut result = Err(Error::Firmware(
-        "LoadImage(other filesystem)",
-        efi::Status::NOT_FOUND.as_usize(),
-    ));
-    // ponytail: firmware order selects the first non-parent Windows ESP;
-    // select by profile partition GUID when multiple Windows installs matter.
-    for index in 0..handle_count {
-        let device_handle = unsafe { *handles.add(index) };
-        if device_handle != parent_device {
-            match load_image_on_device(
-                parent_image,
-                system_table,
-                device_handle,
-                utilities,
-                image_path,
-            ) {
-                Ok(image) => {
-                    result = Ok(image);
-                    break;
-                }
-                Err(error) if error.is_missing_image() => {}
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
-    }
-    free_pool(boot_services, handles.cast());
-    result
-}
-
-/// Loads one image using a complete path rooted at `device_handle`.
-fn load_image_on_device<const PATH_SIZE: usize>(
-    parent_image: efi::Handle,
-    system_table: *mut efi::SystemTable,
-    device_handle: efi::Handle,
-    utilities: *mut efi::protocols::device_path_utilities::Protocol,
-    image_path: [efi::Char16; PATH_SIZE],
-) -> Result<efi::Handle, Error> {
-    let boot_services = unsafe { (*system_table).boot_services };
-
-    let mut device_path_guid = efi::protocols::device_path::PROTOCOL_GUID;
-    let mut parent_device_path = ptr::null_mut();
-    let status = unsafe {
-        ((*boot_services).handle_protocol)(
-            device_handle,
-            &mut device_path_guid,
-            &mut parent_device_path,
-        )
-    };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "HandleProtocol(DevicePath)",
-            status.as_usize(),
-        ));
-    }
-
-    let node_size = PATH_SIZE
-        .checked_mul(core::mem::size_of::<efi::Char16>())
-        .and_then(|path_size| {
-            core::mem::size_of::<efi::protocols::device_path::Protocol>().checked_add(path_size)
-        })
-        .and_then(|size| u16::try_from(size).ok())
-        .ok_or(Error::Firmware(
-            "CreateDeviceNode(FilePath)",
-            efi::Status::INVALID_PARAMETER.as_usize(),
-        ))?;
-    let file_path_node = unsafe {
-        ((*utilities).create_device_node)(
-            efi::protocols::device_path::TYPE_MEDIA,
-            efi::protocols::device_path::Media::SUBTYPE_FILE_PATH,
-            node_size,
-        )
-    };
-    if file_path_node.is_null() {
-        return Err(Error::Firmware(
-            "CreateDeviceNode(FilePath)",
-            efi::Status::OUT_OF_RESOURCES.as_usize(),
-        ));
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(
-            image_path.as_ptr(),
-            file_path_node
-                .cast::<u8>()
-                .add(core::mem::size_of::<efi::protocols::device_path::Protocol>())
-                .cast::<efi::Char16>(),
-            PATH_SIZE,
-        );
-    }
-
-    let complete_path = unsafe {
-        ((*utilities).append_device_node)(parent_device_path.cast(), file_path_node.cast())
-    };
-    free_pool(boot_services, file_path_node.cast());
-    if complete_path.is_null() {
-        return Err(Error::Firmware(
-            "AppendDeviceNode(FilePath)",
-            efi::Status::OUT_OF_RESOURCES.as_usize(),
-        ));
-    }
-
-    let mut guest_image = ptr::null_mut();
-    let status = unsafe {
-        ((*boot_services).load_image)(
-            efi::Boolean::FALSE,
-            parent_image,
-            complete_path,
-            ptr::null_mut(),
-            0,
-            &mut guest_image,
-        )
-    };
-    free_pool(boot_services, complete_path.cast());
-    if status.is_error() {
-        if status == efi::Status::SECURITY_VIOLATION && !guest_image.is_null() {
-            let _ = unsafe { ((*boot_services).unload_image)(guest_image) };
-        }
-        return Err(Error::Firmware("LoadImage", status.as_usize()));
-    }
-    Ok(guest_image)
-}
-
-/// Returns the firmware's shared device-path helper protocol.
-fn device_path_utilities_protocol(
-    system_table: *mut efi::SystemTable,
-) -> Result<*mut efi::protocols::device_path_utilities::Protocol, Error> {
-    let mut guid = efi::protocols::device_path_utilities::PROTOCOL_GUID;
-    let mut interface = ptr::null_mut();
-    let status = unsafe {
-        ((*(*system_table).boot_services).locate_protocol)(
-            &mut guid,
-            ptr::null_mut(),
-            &mut interface,
-        )
-    };
-    if status.is_error() {
-        Err(Error::Firmware(
-            "LocateProtocol(DevicePathUtilities)",
-            status.as_usize(),
-        ))
-    } else {
-        Ok(interface.cast())
-    }
-}
-
-/// Returns the firmware's metadata for one loaded image handle.
-fn loaded_image_protocol(
-    image: efi::Handle,
-    system_table: *mut efi::SystemTable,
-) -> Result<*mut efi::protocols::loaded_image::Protocol, Error> {
-    let mut guid = efi::protocols::loaded_image::PROTOCOL_GUID;
-    let mut interface = ptr::null_mut();
-    let status = unsafe {
-        ((*(*system_table).boot_services).handle_protocol)(image, &mut guid, &mut interface)
-    };
-    if status.is_error() {
-        Err(Error::Firmware(
-            "HandleProtocol(LoadedImage)",
-            status.as_usize(),
-        ))
-    } else {
-        Ok(interface.cast())
-    }
-}
-
-fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
-    // SAFETY: `buffer` was allocated by this firmware or one of its protocols.
-    let _ = unsafe { ((*boot_services).free_pool)(buffer) };
 }
 
 /// Fully validated roots and CPU-owned access metadata, without retained borrows
@@ -2786,17 +2621,10 @@ extern "C" fn guest_entry() -> ! {
     GUEST_RAN.store(GUEST_MARKER, Ordering::Release);
     let system_table = SYSTEM_TABLE.load(Ordering::Acquire);
     let guest_image = GUEST_IMAGE.load(Ordering::Acquire);
-    let mut exit_data_size = 0_usize;
-    let mut exit_data = ptr::null_mut();
-    // SAFETY: both pointers were captured in root mode before VMLAUNCH, and
-    // UEFI Boot Services are still active for this late-launch smoke test.
-    let status = unsafe {
-        ((*(*system_table).boot_services).start_image)(
-            guest_image,
-            &mut exit_data_size,
-            &mut exit_data,
-        )
-    };
+    // The shared helper releases ExitData on both successful and failed returns.
+    // The guest executes this bootstrap while Boot Services remain available.
+    let status =
+        chainload::start_image(guest_image, system_table).unwrap_or_else(chainload::Error::status);
     GUEST_STATUS.store(status.as_usize(), Ordering::Release);
     // SAFETY: this guest runs specifically under the VMCALL smoke handler.
     unsafe { vmx::vmcall() };
@@ -6483,6 +6311,33 @@ fn leave_vmx() -> VmxStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_driver_rejects_disposable_code_or_data_before_handoff() {
+        use r_efi::efi;
+        for code in [
+            efi::LOADER_CODE,
+            efi::LOADER_DATA,
+            efi::BOOT_SERVICES_CODE,
+            efi::BOOT_SERVICES_DATA,
+            efi::RUNTIME_SERVICES_CODE,
+            efi::RUNTIME_SERVICES_DATA,
+            u32::MAX,
+        ] {
+            for data in [
+                efi::LOADER_DATA,
+                efi::BOOT_SERVICES_DATA,
+                efi::RUNTIME_SERVICES_CODE,
+                efi::RUNTIME_SERVICES_DATA,
+                u32::MAX,
+            ] {
+                assert_eq!(
+                    super::runtime_image_types(code, data),
+                    code == efi::RUNTIME_SERVICES_CODE && data == efi::RUNTIME_SERVICES_DATA
+                );
+            }
+        }
+    }
+
     #[test]
     fn runtime_handoff_rejects_cross_backend_profiles_and_null_guest() {
         for mode in [0, 1, 2, u32::MAX] {

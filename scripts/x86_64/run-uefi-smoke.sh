@@ -113,6 +113,55 @@ check_cpu_ownership_reject_log() {
     ((phase == 0 && attempts > 0))
 }
 
+# Pre-entry ownership negatives are never alternative Direct boot successes.
+check_runtime_reject_log() {
+    local kind=$1 status=$2 log=$3 bytes transcript line index=0 attempts=0
+    [[ "$status" == 0 && -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 65536)) || return 1
+    if IFS= read -r -d '' -n 65537 transcript <"$log"; then return 1; fi
+    local -a expected=(
+        'thin-hv: uefi entry'
+        'thin-hv: backend=direct-vmx role=project-l0'
+        'thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0'
+        'thin-hv: CPUID VMX=1' feature-control vmx-basic
+        'thin-hv: loading runtime monitor'
+    )
+    case "$kind" in
+        image-type) ;;
+        cross-mode)
+            expected+=(
+                'thin-hv: uefi entry'
+                'thin-hv: backend=direct-vmx role=project-l0'
+                'thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0'
+                'thin-hv: CPUID VMX=1' feature-control vmx-basic
+                'thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0'
+                'thin-hv: runtime monitor active'
+                'thin-hv: vmx smoke FAIL: runtime guest-image handoff status=0x8000000000000002'
+            ) ;;
+        *) return 1 ;;
+    esac
+    expected+=('thin-hv: runtime handoff cleanup PASS guest=unstarted monitor=retired')
+    if [[ "$kind" == image-type ]]; then
+        expected+=('thin-hv: vmx smoke FAIL: runtime monitor image types status=0x8000000000000003')
+    else
+        expected+=('thin-hv: vmx smoke FAIL: StartImage status=0x8000000000000007')
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        [[ "$line" == *thin-hv:* ]] || continue
+        if [[ "$line" =~ ^thin-hv:\ IA32_FEATURE_CONTROL=0x[0-9a-f]{16}\ lock=1\ vmx_outside_smx=1$ ]]; then
+            line=feature-control
+        elif [[ "$line" =~ ^thin-hv:\ IA32_VMX_BASIC=0x[0-9a-f]{16}\ revision=0x[0-9a-f]{8}\ region_size=[1-9][0-9]*\ memory_type=6\ true_controls=[01]$ ]]; then
+            line=vmx-basic
+        fi
+        ((attempts < 64)) && [[ "$line" == "${expected[index]}" ]] || return 1
+        ((index+=1))
+        if ((index == ${#expected[@]})); then index=0; ((attempts+=1)); fi
+    done <<<"$transcript"
+    ((index == 0 && attempts > 0))
+}
+
 # Hardware-backed instruction assertions must precede a successful guest return.
 # Optional capability checks remain explicit in the evidence, never implied PASS.
 check_nested_contract_log() {
@@ -671,6 +720,12 @@ if [[ ${1:-} == --check-cpu-ownership-reject-log ]]; then
     exit 0
 fi
 
+if [[ ${1:-} == --check-runtime-reject-log ]]; then
+    [[ $# == 4 ]] || die 'usage: --check-runtime-reject-log KIND QEMU_STATUS LOG'
+    check_runtime_reject_log "$2" "$3" "$4" || die 'runtime rejection evidence rejected'
+    exit 0
+fi
+
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
@@ -698,6 +753,8 @@ printf 'x86 UEFI smoke: PCI profile=%s environment=QEMU (not physical hardware)\
 physical_policy=${X86_UEFI_PHYSICAL_POLICY:-0}
 host_exception_test=${X86_UEFI_HOST_EXCEPTION_TEST:-0}
 cpu_reject_test=${X86_UEFI_CPU_REJECT_TEST:-0}
+runtime_reject_test=${X86_UEFI_RUNTIME_REJECT_TEST:-0}
+case "$runtime_reject_test" in 0|image-type|cross-mode) ;; *) die 'invalid runtime rejection fixture' ;; esac
 [[ "$cpu_reject_test" =~ ^[01]$ ]] || die 'X86_UEFI_CPU_REJECT_TEST must be 0 or 1'
 msr_abort_test=${X86_UEFI_MSR_ABORT_TEST:-0}
 [[ "$msr_abort_test" =~ ^[014]$ ]] || die 'X86_UEFI_MSR_ABORT_TEST must be 0, 1 or 4'
@@ -863,6 +920,21 @@ elif [[ ${guest##*/} == x86-uefi-msr-abort-*.efi ]]; then
     die 'terminal MSR fixtures must not run as ordinary smoke tests'
 fi
 command -v timeout >/dev/null || die "GNU timeout is required"
+
+if [[ "$runtime_reject_test" != 0 ]]; then
+    [[ "$backend" == direct-vmx && "$direct_mode" == qemu-research && "$accel" == kvm &&
+        "$smp" == 1 && "$memory" == 256M && "$physical_policy" == 0 && "$cpu_reject_test" == 0 &&
+        "$host_exception_test" == 0 && "$msr_abort_test" == 0 && "$acpi_s3" == 0 &&
+        "$wake_cycles" == 0 && "$allow_reboot" == 0 && "$require_poweroff" == 0 &&
+        "$usernet" == 0 && -z "$data_disk" && -z "$failure_marker" && "$guest_location" == guest ]] ||
+        die 'runtime rejection requires an isolated one-CPU QEMU/KVM fixture'
+    [[ "$timeout_seconds" =~ ^([1-9]|[1-5][0-9]|60)$ ]] || die 'runtime rejection timeout must be bounded to 1..60 seconds'
+    [[ ${loader##*/} == x86-uefi-loader.efi && ${guest##*/} == x86_guest_uefi_test.efi ]] || die 'runtime rejection requires the project loader and native test guest'
+    case "$runtime_reject_test" in
+        image-type) [[ "$monitor" == "$loader" ]] || die 'image-type fixture must use the application as monitor' ;;
+        cross-mode) [[ ${monitor##*/} == x86-uefi-physical-direct-monitor.efi ]] || die 'cross-mode fixture requires the physical monitor' ;;
+    esac
+fi
 
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
 qemu=$(command -v -- "$qemu") || die "qemu-system-x86_64 not found"
@@ -1086,6 +1158,11 @@ set -e
 qemu_pid=
 
 cat -- "$serial_log"
+if [[ "$runtime_reject_test" != 0 ]]; then
+    check_runtime_reject_log "$runtime_reject_test" "$qemu_status" "$serial_log" || die 'runtime rejection fixture failed'
+    printf 'x86 UEFI runtime rejection fixture: PASS kind=%s project_vmx=0 environment=QEMU/kvm (not physical hardware)\n' "$runtime_reject_test"
+    exit 0
+fi
 if ((cpu_reject_test)); then
     check_cpu_ownership_reject_log "$qemu_status" "$serial_log" || die 'CPU ownership rejection fixture failed'
     printf 'x86 UEFI CPU ownership rejection fixture: PASS backend=direct-vmx cpus=2 project_vmx=0 physical_smp=0 environment=QEMU/kvm (not physical hardware)\n'

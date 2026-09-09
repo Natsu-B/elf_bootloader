@@ -3,14 +3,12 @@
 use crate::SerialPort;
 use crate::chainload::Error;
 use crate::chainload::ascii_uefi_path;
-use crate::chainload::boot_services;
 use crate::chainload::device_path_utilities_protocol;
-use crate::chainload::free_pool;
+use crate::chainload::load_image_from_other_filesystem;
 use crate::chainload::load_image_on_device;
 use crate::chainload::loaded_image_protocol;
 use crate::chainload::start_image;
 use core::fmt::Write;
-use core::ptr;
 use r_efi::efi;
 
 /// Payload staged by `run-uefi-smoke.sh`.
@@ -88,89 +86,6 @@ fn load_selected_guest(
         )),
         Err(error) => Err(error),
     }
-}
-
-/// Uses firmware order only for the existing outer-KVM test disks.
-fn load_image_from_other_filesystem(
-    parent_image: efi::Handle,
-    parent_device: efi::Handle,
-    system_table: *mut efi::SystemTable,
-    utilities: *mut efi::protocols::device_path_utilities::Protocol,
-    image_path: &[efi::Char16],
-) -> Result<efi::Handle, Error> {
-    let services = boot_services(system_table)?;
-    let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
-    let mut handle_count = 0;
-    let mut handles = ptr::null_mut();
-    // SAFETY: Boot Services are live and all output pointers name writable locals;
-    // the returned handle array belongs to the firmware pool until FreePool.
-    let status = unsafe {
-        ((*services).locate_handle_buffer)(
-            efi::BY_PROTOCOL,
-            &mut filesystem_guid,
-            ptr::null_mut(),
-            &mut handle_count,
-            &mut handles,
-        )
-    };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "LocateHandleBuffer(SimpleFileSystem)",
-            status.as_usize(),
-        ));
-    }
-    if handles.is_null() {
-        return Err(Error::Firmware(
-            "LocateHandleBuffer(SimpleFileSystem)",
-            efi::Status::DEVICE_ERROR.as_usize(),
-        ));
-    }
-    if handle_count > isize::MAX as usize / core::mem::size_of::<efi::Handle>() {
-        let _ = free_pool(services, handles.cast());
-        return Err(Error::Firmware(
-            "LocateHandleBuffer(SimpleFileSystem size)",
-            efi::Status::DEVICE_ERROR.as_usize(),
-        ));
-    }
-
-    let mut result = Err(Error::Firmware(
-        "LoadImage(other filesystem)",
-        efi::Status::NOT_FOUND.as_usize(),
-    ));
-    // ponytail: firmware order selects test disks only; the physical backend
-    // selects its source ESP explicitly and never calls this enumeration.
-    for index in 0..handle_count {
-        // SAFETY: LocateHandleBuffer returned this live array with handle_count
-        // entries, its byte length is representable, and index is in bounds.
-        let device_handle = unsafe { *handles.add(index) };
-        if device_handle != parent_device {
-            match load_image_on_device(
-                parent_image,
-                system_table,
-                device_handle,
-                utilities,
-                image_path,
-            ) {
-                Ok(image) => {
-                    result = Ok(image);
-                    break;
-                }
-                Err(error) if error.is_missing_image() => {}
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
-    }
-    let cleanup = free_pool(services, handles.cast());
-    if let (Ok(image), Err(error)) = (result, cleanup) {
-        // SAFETY: This LoadImage handle was never started or transferred; cleanup
-        // failed, so release our ownership before returning that primary error.
-        let _ = unsafe { ((*services).unload_image)(image) };
-        return Err(error);
-    }
-    result
 }
 
 #[cfg(test)]

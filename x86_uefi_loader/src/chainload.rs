@@ -1,4 +1,4 @@
-//! Firmware image-loading services shared by non-resident UEFI backends.
+//! Checked firmware image loading shared by chainloaders and Direct preparation.
 
 use core::ffi::c_void;
 use core::fmt;
@@ -70,7 +70,8 @@ pub(crate) fn boot_services(
     Ok(services)
 }
 
-/// Starts one loaded application and releases only firmware-owned exit data.
+/// Starts one loaded image and releases only firmware-owned exit data. A driver
+/// can remain registered after returning; its caller retains that responsibility.
 pub(crate) fn start_image(
     guest_image: efi::Handle,
     system_table: *mut efi::SystemTable,
@@ -239,9 +240,8 @@ pub(crate) fn load_image_on_device(
     let path_cleanup = free_pool(services, complete_path.cast());
     if status.is_error() {
         if status == efi::Status::SECURITY_VIOLATION && !guest_image.is_null() {
-            // SAFETY: SECURITY_VIOLATION may return a registered image that cannot
-            // be started; release that specific LoadImage-owned handle once.
-            let _ = unsafe { ((*services).unload_image)(guest_image) };
+            // SECURITY_VIOLATION may register an image without authorizing entry.
+            unload_image(services, guest_image)?;
         }
         return Err(Error::Firmware("LoadImage", status.as_usize()));
     }
@@ -252,9 +252,7 @@ pub(crate) fn load_image_on_device(
         ));
     }
     if let Err(error) = path_cleanup {
-        // SAFETY: The successful LoadImage handle has not been started or passed
-        // to another owner; release it because cleanup prevents returning it.
-        let _ = unsafe { ((*services).unload_image)(guest_image) };
+        unload_image(services, guest_image)?;
         return Err(error);
     }
     Ok(guest_image)
@@ -286,7 +284,7 @@ pub(crate) fn device_path_utilities_protocol(
     Ok(interface.cast())
 }
 
-/// Returns the firmware's metadata for one loaded image handle.
+/// Queries image metadata; an expired opaque handle returns the firmware error.
 pub(crate) fn loaded_image_protocol(
     image: efi::Handle,
     system_table: *mut efi::SystemTable,
@@ -300,8 +298,9 @@ pub(crate) fn loaded_image_protocol(
     }
     let mut guid = efi::protocols::loaded_image::PROTOCOL_GUID;
     let mut interface = ptr::null_mut();
-    // SAFETY: image is a live UEFI handle supplied by the firmware or LoadImage;
-    // the requested GUID and returned-interface slot are valid writable locals.
+    // SAFETY: image is an opaque handle originally supplied by firmware or
+    // LoadImage; Rust never dereferences it. HandleProtocol validates whether
+    // it is still registered. Boot Services, GUID and output storage remain live.
     let status = unsafe { ((*services).handle_protocol)(image, &mut guid, &mut interface) };
     if status.is_error() {
         return Err(Error::Firmware(
@@ -316,6 +315,28 @@ pub(crate) fn loaded_image_protocol(
         ));
     }
     Ok(interface.cast())
+}
+
+/// Releases a loaded image whose live ownership has not already ended at Exit.
+pub(crate) fn unload_image(
+    services: *mut efi::BootServices,
+    image: efi::Handle,
+) -> Result<(), Error> {
+    if services.is_null() || image.is_null() {
+        return Err(Error::Firmware(
+            "UnloadImage(arguments)",
+            efi::Status::INVALID_PARAMETER.as_usize(),
+        ));
+    }
+    // SAFETY: callers retain this live LoadImage-owned handle and invoke this
+    // helper only before StartImage, or after re-querying a returned driver's
+    // live LoadedImage protocol. No application handle is unloaded twice.
+    let status = unsafe { ((*services).unload_image)(image) };
+    if status.is_error() {
+        Err(Error::Firmware("UnloadImage", status.as_usize()))
+    } else {
+        Ok(())
+    }
 }
 
 /// Releases a pool buffer allocated by this firmware or one of its protocols.
@@ -337,6 +358,91 @@ pub(crate) fn free_pool(
     } else {
         Ok(())
     }
+}
+
+/// Firmware-order selection for explicit QEMU/research disks, never physical boot.
+#[cfg(any(
+    feature = "trusted-outer-kvm",
+    all(feature = "direct-vmx", not(feature = "physical-direct-vmx"))
+))]
+pub(crate) fn load_image_from_other_filesystem(
+    parent_image: efi::Handle,
+    parent_device: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    utilities: *mut efi::protocols::device_path_utilities::Protocol,
+    image_path: &[efi::Char16],
+) -> Result<efi::Handle, Error> {
+    let services = boot_services(system_table)?;
+    let mut filesystem_guid = efi::protocols::simple_file_system::PROTOCOL_GUID;
+    let mut handle_count = 0;
+    let mut handles = ptr::null_mut();
+    // SAFETY: Boot Services are live and all output pointers name writable locals;
+    // the returned handle array belongs to the firmware pool until FreePool.
+    let status = unsafe {
+        ((*services).locate_handle_buffer)(
+            efi::BY_PROTOCOL,
+            &mut filesystem_guid,
+            ptr::null_mut(),
+            &mut handle_count,
+            &mut handles,
+        )
+    };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "LocateHandleBuffer(SimpleFileSystem)",
+            status.as_usize(),
+        ));
+    }
+    if handles.is_null() {
+        return Err(Error::Firmware(
+            "LocateHandleBuffer(SimpleFileSystem)",
+            efi::Status::DEVICE_ERROR.as_usize(),
+        ));
+    }
+    if handle_count > isize::MAX as usize / core::mem::size_of::<efi::Handle>() {
+        let _ = free_pool(services, handles.cast());
+        return Err(Error::Firmware(
+            "LocateHandleBuffer(SimpleFileSystem size)",
+            efi::Status::DEVICE_ERROR.as_usize(),
+        ));
+    }
+
+    let mut result = Err(Error::Firmware(
+        "LoadImage(other filesystem)",
+        efi::Status::NOT_FOUND.as_usize(),
+    ));
+    // ponytail: firmware order selects test disks only; the physical backend
+    // selects its source ESP explicitly and never calls this enumeration.
+    for index in 0..handle_count {
+        // SAFETY: LocateHandleBuffer returned this live array with handle_count
+        // entries, its byte length is representable, and index is in bounds.
+        let device_handle = unsafe { *handles.add(index) };
+        if device_handle != parent_device {
+            match load_image_on_device(
+                parent_image,
+                system_table,
+                device_handle,
+                utilities,
+                image_path,
+            ) {
+                Ok(image) => {
+                    result = Ok(image);
+                    break;
+                }
+                Err(error) if error.is_missing_image() => {}
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+    }
+    let cleanup = free_pool(services, handles.cast());
+    if let (Ok(image), Err(error)) = (result, cleanup) {
+        unload_image(services, image)?;
+        return Err(error);
+    }
+    result
 }
 
 #[cfg(test)]

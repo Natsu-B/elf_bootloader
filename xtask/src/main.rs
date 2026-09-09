@@ -1153,6 +1153,51 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    for kind in ["image-type", "cross-mode"] {
+        eprintln!("\n--- Running QEMU/KVM runtime ownership rejection ({kind}) ---");
+        let loader = "bin/x86_64/x86-uefi-loader.efi";
+        let monitor = if kind == "image-type" {
+            loader
+        } else {
+            "bin/x86_64/x86-uefi-physical-direct-monitor.efi"
+        };
+        let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+            .args([loader, "bin/x86_64/x86_guest_uefi_test.efi"])
+            .envs([
+                ("X86_MONITOR_IMAGE", monitor),
+                ("X86_UEFI_RUNTIME_REJECT_TEST", kind),
+                ("X86_UEFI_BACKEND", "direct-vmx"),
+                ("X86_UEFI_DIRECT_MODE", "qemu-research"),
+                ("X86_UEFI_ACCEL", "kvm"),
+                ("X86_UEFI_CPU", "host,+vmx,-hypervisor"),
+                ("X86_UEFI_MEMORY", "256M"),
+                ("X86_UEFI_SMP", "1"),
+                ("X86_UEFI_TIMEOUT_SECONDS", "30"),
+                ("X86_UEFI_GUEST_LOCATION", "guest"),
+                ("X86_UEFI_PHYSICAL_POLICY", "0"),
+                ("X86_UEFI_HOST_EXCEPTION_TEST", "0"),
+                ("X86_UEFI_CPU_REJECT_TEST", "0"),
+                ("X86_UEFI_MSR_ABORT_TEST", "0"),
+                ("X86_UEFI_ACPI_S3", "0"),
+                ("X86_UEFI_WAKE_CYCLES", "0"),
+                ("X86_UEFI_ALLOW_REBOOT", "0"),
+                ("X86_UEFI_REQUIRE_POWEROFF", "0"),
+                ("X86_UEFI_USERNET", "0"),
+            ])
+            .env_remove("X86_UEFI_DATA_DISK")
+            .env_remove("X86_GUEST_FAILURE_MARKER")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| format!("Failed to run runtime rejection fixture: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "runtime ownership rejection ({kind}) failed: {status}"
+            ));
+        }
+    }
+
     for guest_location in ["guest", "windows", "both"] {
         eprintln!("\n--- Running QEMU/KVM outer-kvm / reference smoke test ({guest_location}) ---");
         let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
@@ -3612,6 +3657,79 @@ mod tests {
         ] {
             assert!(!check_reject("0", &invalid));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_ownership_gate_rejects_missing_cleanup_and_guest_execution() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-runtime-reject.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |kind: &str, status: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-runtime-reject-log", kind, status])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let header = "thin-hv: uefi entry\nthin-hv: backend=direct-vmx role=project-l0\n";
+        let research = "thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0\n";
+        let physical = "thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n";
+        let cpu = "thin-hv: CPUID VMX=1\nthin-hv: IA32_FEATURE_CONTROL=0x0000000000000005 lock=1 vmx_outside_smx=1\nthin-hv: IA32_VMX_BASIC=0x01d8100011e57ed0 revision=0x11e57ed0 region_size=4096 memory_type=6 true_controls=1\n";
+        let cleanup = "thin-hv: runtime handoff cleanup PASS guest=unstarted monitor=retired\n";
+        let prefix = format!("{header}{research}{cpu}thin-hv: loading runtime monitor\n");
+        let bad_type = format!(
+            "{prefix}{cleanup}thin-hv: vmx smoke FAIL: runtime monitor image types status=0x8000000000000003\n"
+        );
+        let cross = format!(
+            "{prefix}{header}{physical}{cpu}thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0\nthin-hv: runtime monitor active\nthin-hv: vmx smoke FAIL: runtime guest-image handoff status=0x8000000000000002\n{cleanup}thin-hv: vmx smoke FAIL: StartImage status=0x8000000000000007\n"
+        );
+        for (kind, valid) in [("image-type", &bad_type), ("cross-mode", &cross)] {
+            assert!(check(kind, "0", valid));
+            assert!(check(kind, "0", &valid.replace('\n', "\r\n")));
+            assert!(check(kind, "0", &valid.repeat(2)));
+            for status in ["1", "124", "137"] {
+                assert!(!check(kind, status, valid));
+            }
+            for invalid in [
+                valid.replace(cleanup, ""),
+                valid.replace("monitor=retired", "monitor=live"),
+                valid.replace("CPUID VMX=1", "CPUID VMX=0"),
+                valid.replace("role=project-l0", "role=reference"),
+                valid.replace("lock=1", "lock=0"),
+                valid.replace('\n', "\r\r\n"),
+                format!("{valid}{cleanup}"),
+                format!("{valid}thin-hv: vmx guest PASS\n"),
+                format!("{valid}thin-hv: direct platform EPT PASS\n"),
+                format!("{valid}thin-hv: guest uefi payload\n"),
+                format!("{valid}\0"),
+                format!("{valid}{header}"),
+                valid.repeat(65),
+            ] {
+                assert!(!check(kind, "0", &invalid), "{kind}: malformed fixture");
+            }
+            for other in ["unknown", "0"] {
+                assert!(!check(other, "0", valid));
+            }
+        }
+        assert!(!check("cross-mode", "0", &bad_type));
+        assert!(!check("image-type", "0", &cross));
     }
 
     #[cfg(unix)]

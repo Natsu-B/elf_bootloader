@@ -2915,3 +2915,103 @@ These small measured reductions are QEMU/KVM guest TSC results, not a
 physical-L0 performance claim. `/tmp/x86-empty-host-msr-ab-batch.log`,
 `/tmp/x86-idle-guest-ab.LflVd8`. Original-bound timing regressions remain
 required; no timeout change is part of the implementation.
+
+The frozen `05fa76d` follow-up still **FAILs** the unchanged 300-second,
+4,096-cycle default: 3,946 checked cycles at guest time 299.319313, QEMU
+status 124, no final completion marker. It ran without another project QEMU
+or heavy compilation. `/tmp/x86-empty-host-msr-4096-default.log`.
+The seven original Linux selftests plus S3 again give **5 PASS, 3 FAIL**:
+memslot_perf exits 142, invalid-guest-state exits 137 at its existing 600-second
+bound, and S3 loses VMX interception/produces a post-resume KVM Oops.
+`/tmp/x86-empty-host-msr-linux-batch.log`,
+`/tmp/x86-idle-guest-linux.pL2lBX`. No original timer or capability check was
+weakened; later functional tests overlapped the separate Windows fixtures.
+
+Windows on frozen `05fa76d`, no overlay and default q35 PCI layout:
+**normal boot PASS, Direct Hyper-V FAIL** at its unchanged 600-second bound.
+The final screenshot was inspected and shows **Please wait**, not a proven
+watchdog bugcheck. No live debugger pause was used. Source/EFI hashes, both
+qcow2 checks and original seed comparisons pass.
+`/tmp/x86-empty-host-msr-windows-batch.log`,
+`/tmp/x86-idle-guest-windows.QtKRzL`. The validated v4 record in
+`direct-hyperv/monitor-hyperv-failure-diagnostics.XyGGwe` contains 4,161,888
+L2 entries/reflections, zero entry failures, 20,919,177 VMPTRLDs,
+717,326,806 VMREADs and 153,511,535 VMWRITEs. This is functional/counter
+evidence, not a controlled wall-time comparison or a Hyper-V/WSL2 PASS.
+
+The original twelve VM-exit cases also complete **24 PASS, 0 FAIL** on frozen
+`05fa76d` (12 Direct, 12 reference).
+`/tmp/x86-empty-host-msr-full-vmexit-batch.log`. The ELF/UKI cases and original
+per-case timers were unchanged.
+
+## Share checked firmware image ownership before AP handoff work
+
+Inspection confirmed that Direct still duplicated weaker image-loading helpers:
+successful null interfaces/handles, unvalidated returned device-node length,
+unchecked handle-array length, ignored pool/image cleanup errors, leaked
+StartImage ExitData, and an unconditional second UnloadImage after a returning
+runtime driver. A boot application installed as MONITORX64.EFI could recursively
+load another application rather than being rejected before handoff.
+
+`vmx_smoke` now reuses `chainload`'s checked path/protocol/loading helpers.
+The existing reference-only filesystem enumerator is shared with the research
+Direct backend; it is compiled out of the physical backend, whose deterministic
+current-ESP selection is unchanged. `unload_image` propagates firmware failures.
+No new dependency, allocator or firmware hook is introduced.
+
+`start_runtime_monitor` checks both runtime code/data memory types before
+publishing its scoped handoff. On a returned StartImage it queries a fresh
+LoadedImage protocol: a returning error driver has already been unloaded,
+whereas a rejected-before-entry or successfully returning driver can remain
+registered. Only a newly confirmed live image is unloaded, and any retained
+load options are restored first. The still-unstarted guest is cleaned up even
+if monitor cleanup fails. An unexpected success return cannot claim resident
+Direct VMX. Both monitor and guest StartImage calls use the existing ExitData
+cleanup. This follows the [UEFI image-service lifecycle](https://uefi.org/specs/UEFI/2.10_A/07_Services_Boot_Services.html#image-services).
+
+The existing QEMU runner/xtask now includes two separately named ownership
+negatives: application-as-runtime and research-loader/physical-runtime mix.
+Their strict transcript gate requires complete ordered rejection and successful
+retirement of both images, rejects normal guest execution, extra VMX/overlay
+events, wrong errors, mixed backends, partial retries, NULs and timeouts.
+They are not alternative Direct boot successes. Pure loader tests check all
+code/data type combinations; xtask checks malformed negative transcripts.
+The two initial ordinary-runner invocations correctly returned FAIL rather
+than accepting these expected negatives as ordinary boot PASS.
+
+An exploratory EPT-disabled invocation did not reach complete return/cleanup
+evidence inside the ordinary runner's 10-second bound; it is **unverified**,
+not counted as a successful lifecycle test. The deterministic cross-mode
+fixture exercises an actual returning driver without relying on that timeout.
+`/tmp/x86-runtime-returned-error.log` retains this exploratory result.
+
+AP startup, physical SMP, root NMI forwarding and S3 VMX reconstruction remain
+unimplemented. This firmware ownership change does not remove the physical
+single-CPU gate or qualify an OEM Windows installation. No physical machine
+was tested; outer-KVM evidence remains reference-only.
+
+Firmware ownership validation commands (Nix development environment):
+
+```sh
+cargo xtest -p x86_uefi_loader
+cargo xtest -p xtask
+cargo xtest -p nested_vmx
+cargo xtest -p x86_64_hal
+cargo xtest -p x86_guest_uefi_test
+cargo xbuild x86
+cargo xrun x86 --release
+cargo xrun x86 --nested --release
+cargo fmt
+cargo fmt --check
+```
+
+**348 host PASS, 0 FAIL** (211 loader across six existing feature entries,
+37 xtask, 31 nested_vmx, 59 HAL, 10 guest); debug/release builds PASS.
+Standard QEMU **11 PASS, 0 FAIL** (9 KVM including two ownership negatives,
+2 TCG); nested **15 PASS, 5 FAIL / 20**, all **14 Direct PASS**, unchanged
+five reference differences. `/tmp/x86-runtime-ownership-regression.log`.
+Shell syntax and diff whitespace checks PASS. The changes are confined to
+x86 loader/runner/xtask and this evidence; no AArch64 implementation changed.
+Windows/full upstream timing/S3 results above identify the separately frozen
+`05fa76d` build; they are not silently attributed to the firmware ownership
+change, which does not modify VM-exit semantics or implement AP/S3 support.
