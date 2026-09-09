@@ -22,6 +22,7 @@ pub(crate) struct Tables {
     pub(crate) msdm: bool,
     pub(crate) mcfg: Option<u64>,
     pub(crate) madt: Option<u64>,
+    pub(crate) tpm2: Option<u64>,
 }
 
 impl Tables {
@@ -51,7 +52,7 @@ impl Tables {
             .transpose()
     }
 
-    /// Reads only the two allowlisted resource payloads and publishes no partial
+    /// Reads only allowlisted resource metadata and publishes no partial
     /// MMIO list on malformed tables. This never changes either firmware table.
     pub(crate) fn mmio(&self, map: &MemoryMap<'_>, width: PhysicalWidth) -> Result<MmioMap, Error> {
         let mut output = MmioMap::empty(width)?;
@@ -60,6 +61,10 @@ impl Tables {
         }
         if let Some(address) = self.madt {
             parse_madt(resource_payload(map, address, b"APIC")?, width, &mut output)?;
+        }
+        if let Some(address) = self.tpm2 {
+            let range = tpm2_crb_range(resource_payload(map, address, b"TPM2")?, width)?;
+            add_resource(&mut output, range, width)?;
         }
         Ok(output)
     }
@@ -72,7 +77,7 @@ fn resource_payload<'a>(
     address: u64,
     signature: &[u8; 4],
 ) -> Result<&'a [u8], Error> {
-    if !matches!(signature, b"MCFG" | b"APIC") {
+    if !matches!(signature, b"MCFG" | b"APIC" | b"TPM2") {
         return Err(malformed("ACPI payload outside MMIO allowlist"));
     }
     let header = map
@@ -94,6 +99,46 @@ fn checked_resource_table(bytes: &[u8], signature: &[u8; 4], minimum: usize) -> 
         return Err(malformed("ACPI MMIO signature/length/checksum"));
     }
     Ok(())
+}
+
+/// TCG ACPI revisions 4/5, start method 7, describe a PC-client CRB control
+/// register at locality-zero offset 0x40. PTP's five x86 locality banks occupy
+/// 4 KiB each. Derive the address from firmware, never a fixed q35 TPM address.
+/// This only maps register/buffer banks: no TPM command, locality request,
+/// register probe, event-log read or identity operation is performed.
+/// Other transports need their own resource discovery, not an assumed CRB map.
+/// RAM-backed control areas and additional non-PTP buffer apertures are not
+/// inferred; the shared platform union rejects MMIO/RAM conflicts before VMXON.
+/// References: TCG ACPI 1.2/1.4 TPM2 tables and PC Client PTP section 6.5.3.4.
+fn tpm2_crb_range(bytes: &[u8], width: PhysicalWidth) -> Result<PhysicalRange, Error> {
+    checked_resource_table(bytes, b"TPM2", 52)?;
+    let parameters_end = match bytes[8] {
+        4 if matches!(bytes.len(), 52 | 64 | 76) => 64,
+        5 if matches!(bytes.len(), 52 | 68 | 80) => 68,
+        _ => return Err(malformed("TPM2 revision/length")),
+    };
+    if read_u32(bytes, 36).is_none_or(|class_reserved| class_reserved > 1)
+        || bytes[52..bytes.len().min(parameters_end)]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(malformed("TPM2 platform class/reserved parameters"));
+    }
+    if read_u32(bytes, 48) != Some(7) {
+        return Err(Error::Firmware(
+            "TPM2 non-CRB resource discovery",
+            efi::Status::UNSUPPORTED.as_usize(),
+        ));
+    }
+    let control = read_u64(bytes, 40).ok_or_else(|| malformed("TPM2 control address"))?;
+    let base = control
+        .checked_sub(0x40)
+        .filter(|base| *base != 0 && base.is_multiple_of(4096))
+        .ok_or_else(|| malformed("TPM2 x86 CRB control alignment"))?;
+    let end = base
+        .checked_add(5 * 4096)
+        .ok_or_else(|| malformed("TPM2 CRB range overflow"))?;
+    PhysicalRange::new(base, end, width).map_err(|_| malformed("TPM2 CRB physical width"))
 }
 
 /// Separate ACPI-described devices must not alias each other's register space;
@@ -329,6 +374,7 @@ fn scan_root(
             }
             b"MCFG" => Some(&mut found.mcfg),
             b"APIC" => Some(&mut found.madt),
+            b"TPM2" => Some(&mut found.tpm2),
             _ => None,
         };
         if let Some(slot) = slot {
@@ -337,7 +383,7 @@ fn scan_root(
             }
         }
         // Discovery still reads only headers. Full payload reads are separately
-        // allowlisted to MCFG/APIC below; MSDM is never among those addresses.
+        // allowlisted to MCFG/APIC/TPM2; MSDM is never among those addresses.
     }
     Ok(found)
 }
@@ -537,20 +583,77 @@ mod tests {
     }
 
     #[test]
+    fn tpm2_crb_uses_firmware_address_and_checks_complete_locality_extent() {
+        let fixture = |revision, length, control: u64| {
+            let mut bytes = table(b"TPM2", &std::vec![0; length - ACPI_HEADER_BYTES]);
+            bytes[8] = revision;
+            bytes[40..48].copy_from_slice(&control.to_le_bytes());
+            bytes[48..52].copy_from_slice(&7_u32.to_le_bytes());
+            checksum(&mut bytes);
+            bytes
+        };
+        for (revision, length) in [(4, 52), (4, 64), (4, 76), (5, 52), (5, 68), (5, 80)] {
+            for base in [0xfed4_0000, 1 << 39, width().limit() - 5 * 4096] {
+                let bytes = fixture(revision, length, base + 0x40);
+                let range = tpm2_crb_range(&bytes, width()).unwrap();
+                assert_eq!(range.start(), base);
+                assert_eq!(range.end(), base + 5 * 4096);
+            }
+        }
+        let valid = fixture(4, 76, 0xfed4_0040);
+        for control in [
+            0,
+            0x40,
+            0xfed4_0041,
+            width().limit() - 4096 + 0x40,
+            u64::MAX - 4095 + 0x40,
+        ] {
+            assert!(tpm2_crb_range(&fixture(4, 76, control), width()).is_err());
+        }
+        for (offset, value) in [(0, b'X'), (8, 0), (8, 3), (8, 6), (36, 2), (38, 1), (52, 1)] {
+            let mut bad = valid.clone();
+            bad[offset] = value;
+            checksum(&mut bad);
+            assert!(tpm2_crb_range(&bad, width()).is_err());
+        }
+        for method in [0_u32, 2, 6, 8, 11, 13, 15, u32::MAX] {
+            let mut bad = valid.clone();
+            bad[48..52].copy_from_slice(&method.to_le_bytes());
+            checksum(&mut bad);
+            assert!(tpm2_crb_range(&bad, width()).is_err());
+        }
+        for length in [36, 51, 53, 63, 65, 75, 77, 81] {
+            let mut bad = valid.clone();
+            bad.resize(length, 0);
+            bad[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+            checksum(&mut bad);
+            assert!(tpm2_crb_range(&bad, width()).is_err());
+        }
+        let mut bad = valid.clone();
+        bad[9] ^= 1;
+        assert!(tpm2_crb_range(&bad, width()).is_err());
+        let range = tpm2_crb_range(&valid, width()).unwrap();
+        let mut output = MmioMap::empty(width()).unwrap();
+        add_resource(&mut output, range, width()).unwrap();
+        assert!(add_resource(&mut output, range, width()).is_err());
+    }
+
+    #[test]
     fn acpi_resource_discovery_keeps_headers_only_and_rejects_duplicates() {
         for pointer_bytes in [4_usize, 8] {
             let mut payload = std::vec::Vec::new();
-            for address in [0x1000_u64, 0x2000, 0x3000] {
+            for address in [0x1000_u64, 0x2000, 0x3000, 0x4000] {
                 payload.extend_from_slice(&address.to_le_bytes()[..pointer_bytes]);
             }
             let root = table(if pointer_bytes == 8 { b"XSDT" } else { b"RSDT" }, &payload);
             // Header-only fixtures: even the test does not construct an MSDM payload.
-            let mut headers = [[0_u8; ACPI_HEADER_BYTES]; 3];
-            for (header, (signature, length)) in
-                headers
-                    .iter_mut()
-                    .zip([(b"MSDM", 128_u32), (b"MCFG", 44), (b"APIC", 44)])
-            {
+            let mut headers = [[0_u8; ACPI_HEADER_BYTES]; 4];
+            for (header, (signature, length)) in headers.iter_mut().zip([
+                (b"MSDM", 128_u32),
+                (b"MCFG", 44),
+                (b"APIC", 44),
+                (b"TPM2", 76),
+            ]) {
                 header[..4].copy_from_slice(signature);
                 header[4..8].copy_from_slice(&length.to_le_bytes());
             }
@@ -565,11 +668,12 @@ mod tests {
                 |_, _| true,
             )
             .unwrap();
-            assert_eq!(reads, 3);
+            assert_eq!(reads, 4);
             assert!(found.msdm);
             assert_eq!(found.mcfg, Some(0x2000));
             assert_eq!(found.madt, Some(0x3000));
-            for duplicate in [1, 2] {
+            assert_eq!(found.tpm2, Some(0x4000));
+            for duplicate in [1, 2, 3] {
                 assert!(
                     scan_root(
                         &root,

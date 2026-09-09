@@ -2247,3 +2247,80 @@ runner's old cross-reference comment was corrected, without behavior change.
 actual array builder, exact default/fixture arguments and rejection before
 normal/Hyper-V/outer-reference runs. Windows QEMU revalidation follows this
 commit; this host check does not establish Windows boot or physical readiness.
+
+## Windows platform regression — discover TPM2 CRB resources
+
+Frozen commit `41f215d`, worktree `/tmp/x86-windows-platform-validation`,
+artifacts `/tmp/x86-windows-platform.FqD7UD`. The existing QEMU Windows runner
+used `WINDOWS_PCI_PROFILE=firmware-default`, `WINDOWS_MEMORY=4G`, separate
+`WINDOWS_TEST_DIR`s and disposable qcow2 overlays/copied TPM and variable
+stores. The base evaluation installation was not changed. These are **not**
+tests of the motherboard's original Windows installation.
+
+- `windows-test.sh monitor`: **FAIL**, runner exit **1**.
+- `windows-test.sh monitor-hyperv`: **FAIL**, runner exit **1**.
+- `windows-test.sh trusted-kvm-wsl`: **PASS**, runner exit **0**, exact stamped
+  WSL2 marker and final poweroff. This is **outer-KVM/reference only**.
+
+Both Direct boots stopped before the desktop at the same read of physical
+`0xfed40044`: exit reason `0x30` (EPT violation), qualification `0x181`.
+The platform inventory included the high PCI aperture
+`[0x380000000000,0x400000000000)`, but omitted TPM CRB registers. Inspection of
+both captured screens showed the TianoCore boot screen, not a Windows bugcheck.
+The terminal L0 failure preceded the runner result: both failed QEMUs were
+explicitly quit after screenshot capture instead of waiting 600/900 seconds.
+An auxiliary 176-byte HMP counter-save attempt failed command parsing
+(`invalid char 't' in expression`); **no valid counter capture is claimed**.
+The main matrix exited **0** because it records each independent case's status;
+the matrix is **1 PASS, 2 FAIL**, not an overall Direct PASS. All three qcow2
+checks passed, source EFI hashes matched, and before/after seed metadata and
+variable-store hashes were identical. `/tmp/x86-windows-platform-batch.log`.
+
+Confirmed cause in `platform_acpi::Tables`: only MCFG and MADT resource payloads
+were allowlisted. Added `tpm2`, duplicate/header discovery and
+`tpm2_crb_range`; `Tables::mmio` now contributes the firmware-derived CRB range
+to the existing GCD/PCI union and platform EPT materializer. There is no fixed
+TPM physical address, synthetic device, runtime mapping-on-fault or QEMU
+fallback. Existing conflict/private-region/physical-width checks still apply.
+
+The supported profile is x86 PC-client CRB start method 7, TPM2 table revisions
+4/5, with the control address at locality-zero offset `0x40` and five 4 KiB
+locality banks. Table checksum, permitted lengths, class/reserved fields,
+alignment, overflow and complete extent are checked before publication.
+Other start methods fail with `UNSUPPORTED`; RAM-backed control areas and
+additional non-PTP apertures are not inferred. This is not complete TPM
+transport discovery or physical qualification. Layout references:
+[TCG ACPI specification](https://trustedcomputinggroup.org/wp-content/uploads/TCG-ACPI-Specification-Version-1.4-Revision-14_28November23.pdf),
+[PC Client PTP §6.5.3.4](https://trustedcomputinggroup.org/wp-content/uploads/PC-Client-Specific-Platform-TPM-Profile-for-TPM-2p0-v1p07_rc1_12Dec2025.pdf).
+
+No TPM registers, buffers, event-log contents or keys are read by this
+discovery. Firmware tables and TPM/activation identity are not rewritten.
+The existing ACPI MMIO marker remains unchanged; a separate TPM2 marker records
+the source with `device_probes=0`. An initial attempt to add a field inside the
+existing marker failed the strict preflight transcript check despite the UEFI
+preflight itself returning PASS. That log-ABI mistake was corrected, not waived.
+`/tmp/x86-tpm2-crb-validation.log`: **323 host PASS, 0 FAIL**, debug build
+**PASS**, standard suite interrupted by that **1 transcript FAIL**; nested
+suite not reached in that invocation.
+
+Windows `serial_has_direct_failure` and its read-only CLI detect terminal L0
+failure records each polling iteration. `run_windows` now uses its existing
+diagnostic/screenshot/owned-process cleanup immediately on such failure.
+An unreadable failure log remains an error. xtask covers LF/CRLF terminal
+records, successful records and read errors; existing success gates/timeouts
+are unchanged. `tpm2_crb_uses_firmware_address_and_checks_complete_locality_extent`
+tests valid revisions/lengths, non-q35/high addresses, the last valid physical
+extent, malformed tables, unsupported transports and overlapping resources;
+root-discovery tests include duplicate TPM2 headers without any MSDM payload.
+
+Corrected validation, through Nix:
+`cargo fmt && cargo xtest -p x86_uefi_loader && cargo xtest -p xtask && cargo xbuild x86 && cargo xrun x86 --release && cargo xrun x86 --nested --release`.
+`/tmp/x86-tpm2-crb-regression.log`: loader **190 PASS**, xtask **35 PASS**,
+**0 host FAIL**; debug build **PASS**; standard smoke **9 PASS, 0 FAIL**
+(7 QEMU/KVM, 2 QEMU TCG); nested **15 PASS, 5 FAIL / 20**, exit **1**,
+all **14 Direct cases PASS**. The five unchanged outer-reference contract
+failures remain visible. Together with the unchanged-package results from
+`/tmp/x86-tpm2-crb-validation.log`, required host coverage is **323 PASS, 0 FAIL**.
+Both real failed Windows serial transcripts also pass the new failure-detector
+CLI (detector exit 0 means a failure was found, not a Windows PASS).
+Windows reruns on the CRB fix follow; no physical machine was tested.

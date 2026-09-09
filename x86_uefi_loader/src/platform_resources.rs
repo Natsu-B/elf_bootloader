@@ -329,6 +329,11 @@ pub(crate) fn platform_mmio(
         u8::from(tables.is_some_and(|tables| tables.madt.is_some())),
         resources.ranges().len()
     );
+    if tables.is_some_and(|tables| tables.tpm2.is_some()) {
+        serial.write_bytes(
+            b"thin-hv: preflight TPM2 MMIO source=acpi-crb localities=5 device_probes=0\n",
+        );
+    }
     let pci = platform_pci::collect(system_table, map, width, serial)?;
     for range in pci.ranges() {
         resources.insert(*range, width)?;

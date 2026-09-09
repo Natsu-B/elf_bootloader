@@ -66,6 +66,12 @@ serial_has_exact_marker() {
     LC_ALL=C grep -aFx -e "$expected" -e "$expected"$'\r' -- "$@" >/dev/null
 }
 
+serial_has_direct_failure() {
+    # L0 emits these only on terminal paths. Stop a failed disposable VM without
+    # spending its entire boot timeout at the frozen firmware/guest screen.
+    LC_ALL=C grep -aE '^thin-hv: (vmx guest FAIL:|vmx smoke FAIL:|resident VMX launch FAIL:|host exception FAIL:|nested VMX abort)' -- "$@" >/dev/null
+}
+
 first_file() {
     local candidate
     for candidate in "$@"; do
@@ -855,6 +861,13 @@ run_windows() {
     fi
 
     while ((elapsed < timeout_seconds)); do
+        if ((is_direct)); then
+            if serial_has_direct_failure "$serial_log"; then
+                die "terminal Direct-VMX failure; logs: $serial_log $qemu_log"
+            else
+                (($? == 1)) || die "cannot read Direct-VMX failure log: $serial_log"
+            fi
+        fi
         if ((is_physical_test)); then
             (($(host_uptime_seconds) - physical_started < timeout_seconds)) || break
             if grep -Fq -- "$physical_test_failure" "$marker_log"; then
@@ -1215,6 +1228,11 @@ case ${1:-} in
     check-wsl-soak) check_wsl_soak ;;
     check-physical-status) run_windows check-physical-status ;;
     physical-test-command) physical_test_command ;;
+    check-direct-failure)
+        (($# == 1 || $# == 2)) || die 'check-direct-failure takes an optional LOG'
+        shift
+        serial_has_direct_failure "$@"
+        ;;
     print-pci-args)
         (($# == 1)) || die 'print-pci-args takes no arguments'
         configure_pci_profile

@@ -4926,6 +4926,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn windows_direct_failure_gate_detects_terminal_project_records() {
+        use std::io::Write;
+
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/windows/windows-test.sh");
+        for (line, failure) in [
+            (
+                "thin-hv: vmx guest FAIL: unhandled VM exit reason=0x30",
+                true,
+            ),
+            ("thin-hv: vmx smoke FAIL: capability", true),
+            ("thin-hv: resident VMX launch FAIL: capability", true),
+            ("thin-hv: host exception FAIL: stopped", true),
+            ("thin-hv: nested VMX abort indicator=1", true),
+            ("thin-hv: direct platform EPT PASS", false),
+            ("thin-hv: runtime monitor active", false),
+            ("", false),
+        ] {
+            for ending in ["\n", "\r\n"] {
+                let mut child = Command::new("bash")
+                    .arg(&runner)
+                    .arg("check-direct-failure")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(format!("{line}{ending}").as_bytes())
+                    .unwrap();
+                assert_eq!(child.wait().unwrap().success(), failure, "{line:?}");
+            }
+        }
+        let output = Command::new("bash")
+            .arg(runner)
+            .args(["check-direct-failure", "/dev/null/not-a-log"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn windows_pci_profile_defaults_to_firmware_layout_without_fallback() {
         let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/x86_64/windows/windows-test.sh");
