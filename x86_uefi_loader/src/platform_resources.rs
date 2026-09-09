@@ -335,6 +335,10 @@ pub(crate) fn platform_mmio(
         );
     }
     let pci = platform_pci::collect(system_table, map, width, serial)?;
+    let aml = crate::platform_aml::collect(system_table, map, width, serial)?;
+    for range in aml.ranges() {
+        resources.insert(*range, width)?;
+    }
     for range in pci.ranges() {
         resources.insert(*range, width)?;
     }

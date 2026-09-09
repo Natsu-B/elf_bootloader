@@ -520,6 +520,12 @@ pub(crate) struct MemoryMap<'a> {
 }
 
 impl<'a> MemoryMap<'a> {
+    /// Uses the production validator for cross-module host fixtures.
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::new(bytes, 48, efi::MEMORY_DESCRIPTOR_VERSION, 48)
+    }
+
     /// Rejects malformed, overlapping, overflowing or unsupported descriptors.
     fn new(bytes: &'a [u8], stride: usize, version: u32, bits: u8) -> Result<Self, Error> {
         if version != efi::MEMORY_DESCRIPTOR_VERSION

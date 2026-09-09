@@ -44,6 +44,8 @@ mod physical_chainload;
 mod physical_preflight;
 #[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
 mod platform_acpi;
+#[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
+mod platform_aml;
 #[cfg(feature = "physical-preflight")]
 mod platform_ept_audit;
 #[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]

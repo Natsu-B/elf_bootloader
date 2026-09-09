@@ -2324,3 +2324,103 @@ failures remain visible. Together with the unchanged-package results from
 Both real failed Windows serial transcripts also pass the new failure-detector
 CLI (detector exit 0 means a failure was found, not a Windows PASS).
 Windows reruns on the CRB fix follow; no physical machine was tested.
+
+## Windows rerun at `773316d`: CRB fixed, PPI and Hyper-V boot still FAIL
+
+Frozen worktree `/tmp/x86-windows-crb-validation`, matrix
+`/tmp/x86-windows-crb.5IibIJ`, orchestration log
+`/tmp/x86-windows-crb-batch.log`. Release EFI build passed. The existing runner
+used `firmware-default` PCI, 4 GiB, separate fresh disposable disk overlays,
+copied firmware variables and software TPM state. No real OEM installation
+or physical TPM was involved.
+
+- `windows-test.sh monitor`: **FAIL**, exit **1**. The new failure gate stopped
+  promptly at the terminal EPT violation: reason `0x30`, qualification `0x181`,
+  GPA `0xfed45005`, Windows kernel RIP `0xfffff8048117c877`. CRB discovery and
+  the high PCI aperture passed; the new missing range belongs to TPM PPI.
+  Automatic diagnostics: `direct-normal/monitor-failure-diagnostics.m2nMdN`.
+  The validated 176-byte counter record has 390,806 L1 exits, 25,860 CPUID,
+  357,832 external-interrupt, 7,106 interrupt-window exits, no L2 entries and
+  no nested entry failures.
+  The final automatic screenshot was also inspected: the Windows desktop was
+  already visible when L0 stopped. Desktop visibility does not override the
+  terminal failure or establish successful startup validation.
+- `windows-test.sh monitor-hyperv`: **FAIL**, exit **1**, unchanged **600 s**
+  timeout without the required completion marker. No terminal L0 failure
+  marker was recorded. Automatic diagnostics:
+  `direct-hyperv/monitor-hyperv-failure-diagnostics.i4I80d`. The validated
+  counter record has 3,690,287 actual Direct L2 entries, 3,690,286 reflections,
+  zero nested entry failures, 32,851,561 L1 exits, 6,222 INVEPT and 5,694
+  INVVPID operations. It was captured during a nested RDMSR exit; one in-flight
+  entry is not a lost-reflection finding. A mid-run screenshot was inspected
+  and showed the TianoCore screen with Windows spinning dots, not a bugcheck.
+  This does **not** establish Hyper-V/WSL2 usability or a watchdog fix.
+  The final automatic screenshot was inspected separately: black background
+  with Windows spinning dots, still not a desktop or a bugcheck screen.
+
+Matrix **0 PASS, 2 FAIL**. Orchestration exit 0 only means the independent case
+results were recorded. Both qcow2 checks passed; EFI/script hashes matched;
+seed disk metadata and variable-store hashes were unchanged. Outer-KVM was
+not rerun in this matrix; its earlier success remains reference evidence only.
+
+Read-only TPM preflight found no UEFI descriptor covering the missing PPI page.
+The installed PI ACPI SDT protocol is present (version bitmap `0x3e`) in OVMF.
+Two initial diagnostic-wrapper runs reached firmware preflight PASS but ended
+with runner timeout 124 because the background wrapper dropped monitor stdin.
+Preserving its input FD fixed the wrapper; `/tmp/x86-tpm-sdt-preflight-fixed-wrapper.log`
+records runner **PASS**, without changing the production timeout or firmware.
+
+## Static ACPI SystemMemory resource discovery
+
+Confirmed that GCD, UEFI GetMemoryMap, PCI BARs and the TPM2 CRB table omit
+the PPI page in this QEMU configuration. The solution reuses the firmware's
+[PI ACPI SDT protocol](https://uefi.org/specs/PI/1.8/V5_ACPI_System_Desc_Table_Protocol.html),
+not a QEMU address constant or a new AML interpreter. The static `TPP2`/`TPP3`
+OperationRegions describe bytes in the same physical page accessed by PPI.
+[QEMU's TPM PPI definition](https://github.com/qemu/qemu/blob/master/hw/acpi/tpm.c)
+was used to diagnose that relationship, not as the mapping address source.
+
+`platform_aml::{Sdt,Inventory,literal,region_range,collect}` reads only DSDT/SSDT
+payloads through the installed parser. It validates protocol entry-point RAM,
+table lengths/checksums, option types and in-table bounds, arithmetic/physical
+width, maximum table/object/depth counts, and closes parser handles on success
+and error. The previous child stays live until GetChild obtains its successor.
+PI/EDK2 represents an integer TermArg as `CHILD=6`, not `OP=3`; the first probe
+rejected that distinction before EPT publication, and the corrected ABI now has
+an executable callback regression. No SetOption, notification registration,
+AML method, device register or TPM operation is called.
+
+Only literal SystemMemory regions in static Scope/Device/Processor/
+PowerResource/ThermalZone containers are mapped. Nonliteral static operands or
+a missing SDT protocol return explicit unsupported errors. Methods and
+conditional bodies remain unevaluated and are counted in the log; this is
+**not complete dynamic AML resource coverage or physical qualification**.
+No MSDM payload, key, SMBIOS identity or Secure Boot database is read/replaced.
+Normal/ACPI/runtime RAM keeps its existing map and memory types; only holes,
+reserved pages and MMIO become UC resources. Existing GCD conflicts, EPT
+private ownership and full materialization checks still run before VMXON.
+
+Shared `platform_resources::platform_mmio` now merges this inventory for both
+preflight and the active carrier. `main.rs` includes the module only for these
+backends. `MemoryMap::test_snapshot` is test-only and uses the unchanged
+production map validator. Three host tests cover all literal widths, malformed
+operands and extents, non-q35/high addresses, RAM/runtime/NVS preservation,
+unavailable memory types, actual PI callback types and handle cleanup.
+
+`/tmp/x86-aml-initial-preflight.log`: initial option-type **FAIL**, no fallback.
+`/tmp/x86-aml-child-preflight.log`: corrected TPM-equipped QEMU/KVM preflight
+**PASS**, 3 static regions, 2 normalized additional ranges, 71 unevaluated
+bodies. Final UC union includes `[0xfed40000,0xfed46000)` and the default high
+PCI aperture `[0x380000000000,0x400000000000)`.
+
+`nix develop --accept-flake-config --command bash -c 'cargo fmt && cargo xtest -p x86_uefi_loader && cargo xtest -p x86_64_hal && cargo xtest -p nested_vmx && cargo xtest -p x86_guest_uefi_test && cargo xtest -p xtask && cargo xbuild x86 && cargo xrun x86 --release && cargo xrun x86 --nested --release'`:
+`/tmp/x86-aml-full-regression.log`, **335 host PASS, 0 FAIL** (loader 202,
+HAL 59, nested policy 29, UEFI guest 10, xtask 35); debug build **PASS**;
+standard smoke **9 PASS, 0 FAIL** (7 QEMU/KVM, 2 TCG); nested **15 PASS,
+5 FAIL / 20**, all **14 Direct PASS**. The five existing outer-reference
+contract differences still make the combined command exit 1. They are not
+waived or confused with Direct results. AArch64 production code is unchanged.
+Windows revalidation on this map follows separately; no physical machine
+or original OEM installation has been tested.
+Final `cargo fmt --check`, `git diff --check` and TPM-equipped preflight passed
+again on the final code, `/tmp/x86-aml-final-preflight.log`.
