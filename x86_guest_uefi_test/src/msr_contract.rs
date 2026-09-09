@@ -832,6 +832,138 @@ unsafe fn exit_lists(
     Ok(())
 }
 
+/// Each successful control write must invalidate a previously warm policy
+/// cache. A null host CS independently prevents any invalid entry from running.
+unsafe fn control_cache(
+    base: u64,
+    region: VmcsPhys,
+    env: &HostEnvironment<'_>,
+    serial: &mut Serial,
+) -> Result<()> {
+    // SAFETY: this CPU owns the aligned VMCS and retained fixture pages. All
+    // successful entries run only guest(), with valid PAT/EFER and private
+    // descriptors; invalid attempts retain HOST_CS=0 until fully restored.
+    unsafe {
+        let original_pat = cpu::rdmsr(PAT);
+        let original_efer = cpu::rdmsr(EFER);
+        let mut frame = Frame {
+            fx: [0; 512],
+            original_pat,
+            original_efer,
+            inherited_pat: original_pat,
+            inherited_efer: original_efer,
+            l2_pat: original_pat,
+            l2_efer: original_efer,
+            entry_pat: 0,
+            entry_efer: 0,
+            exit_pat: 0,
+            exit_efer: 0,
+            l2_debugctl: 0,
+        };
+        success("control-cache-clear", vmx::vmclear(region))?;
+        success("control-cache-current", vmx::vmptrld(region))?;
+        let entry = controls(
+            vmx::IA32_VMX_ENTRY_CTLS,
+            vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+            vmcs::VM_ENTRY_IA32E_MODE
+                | vmcs::VM_ENTRY_LOAD_IA32_PAT
+                | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+        )?;
+        let exit = controls(
+            vmx::IA32_VMX_EXIT_CTLS,
+            vmx::IA32_VMX_TRUE_EXIT_CTLS,
+            vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                | vmcs::VM_EXIT_LOAD_IA32_PAT
+                | vmcs::VM_EXIT_LOAD_IA32_EFER,
+        )?;
+        configure(base, env, entry, exit)?;
+        // Warm the cache with secondary controls already active, so the later
+        // secondary-only write cannot rely on a primary write to invalidate it.
+        write(
+            vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            read_field("control-cache-primary", vmcs::CPU_BASED_VM_EXEC_CONTROL)? | (1 << 31),
+        )?;
+        for (field, value) in [
+            (vmcs::GUEST_IA32_PAT, original_pat),
+            (vmcs::HOST_IA32_PAT, original_pat),
+            (vmcs::GUEST_IA32_EFER, original_efer),
+            (vmcs::HOST_IA32_EFER, original_efer),
+        ] {
+            write(field, value)?;
+        }
+        equal("control-cache-warm-entry", enter(&mut frame, 0), 0)?;
+        equal(
+            "control-cache-warm-exit",
+            read_field("control-cache-warm-reason", vmcs::VM_EXIT_REASON)?,
+            18,
+        )?;
+        let basic = vmx::VmxBasic::from_msr(cpu::rdmsr(vmx::IA32_VMX_BASIC));
+        let fields = [
+            vmcs::PIN_BASED_VM_EXEC_CONTROL,
+            vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            vmcs::SECONDARY_VM_EXEC_CONTROL,
+            vmcs::VM_ENTRY_CONTROLS,
+            vmcs::VM_EXIT_CONTROLS,
+        ];
+        let capabilities = if basic.true_controls {
+            [
+                vmx::IA32_VMX_TRUE_PINBASED_CTLS,
+                vmx::IA32_VMX_TRUE_PROCBASED_CTLS,
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+                vmx::IA32_VMX_TRUE_EXIT_CTLS,
+            ]
+        } else {
+            [
+                vmx::IA32_VMX_PINBASED_CTLS,
+                vmx::IA32_VMX_PROCBASED_CTLS,
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                vmx::IA32_VMX_ENTRY_CTLS,
+                vmx::IA32_VMX_EXIT_CTLS,
+            ]
+        };
+        let preferred = [1 << 7, 1 << 17, 1 << 6, 1 << 16, 1 << 23];
+        let mut saved = [0; 5];
+        for (slot, field) in saved.iter_mut().zip(fields) {
+            *slot = read_field("control-cache-save", field)?;
+        }
+        let cs = read_field("control-cache-save-cs", vmcs::HOST_CS_SELECTOR)?;
+        for index in 0..fields.len() {
+            let unavailable = !(cpu::rdmsr(capabilities[index]) >> 32) as u32;
+            equal("control-cache-unavailable", u64::from(unavailable != 0), 1)?;
+            let bad = if unavailable & preferred[index] != 0 {
+                preferred[index]
+            } else {
+                1 << unavailable.trailing_zeros()
+            };
+            write(vmcs::HOST_CS_SELECTOR, 0)?;
+            write(fields[index], saved[index] | u64::from(bad))?;
+            let result = (|| {
+                equal("control-cache-invalid-flags", enter(&mut frame, 1), 0x40)?;
+                equal(
+                    "control-cache-invalid-error",
+                    read_field("control-cache-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                    7,
+                )
+            })();
+            for (field, value) in fields.into_iter().zip(saved) {
+                write(field, value)?;
+            }
+            write(vmcs::HOST_CS_SELECTOR, cs)?;
+            result?;
+            write(vmcs::GUEST_RIP, guest as *const () as usize as u64)?;
+            equal("control-cache-recovered-entry", enter(&mut frame, 1), 0)?;
+            equal(
+                "control-cache-recovered-exit",
+                read_field("control-cache-reason", vmcs::VM_EXIT_REASON)?,
+                18,
+            )?;
+        }
+        let _ = writeln!(serial, "thin-hv: MSR control cache PASS invalid=5 resume=5");
+        Ok(())
+    }
+}
+
 /// A malformed exit item must abort this virtual CPU, after earlier stores.
 /// The runner reads only the abort indicator and one PAT value through QEMU's
 /// physical-memory monitor; any return to this fixture is an explicit failure.
@@ -996,6 +1128,7 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
             } else {
                 matrix(base, region, &env, serial)
                     .and_then(|()| exit_lists(base, region, &env, serial))
+                    .and_then(|()| control_cache(base, region, &env, serial))
                     .and_then(|()| entry_lists(base, region, &env, serial))
             }
         };

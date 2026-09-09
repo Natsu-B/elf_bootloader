@@ -823,6 +823,7 @@ unsafe fn host_field_boundaries() -> Result<()> {
             )?;
             let priority = (|| {
                 msr_list_boundaries(physical_bits as u8)?;
+                control_bit_boundaries()?;
                 equal(
                     "host-check-resume-priority-flags",
                     rejected_entry(true)?,
@@ -880,6 +881,102 @@ unsafe fn host_field_boundaries() -> Result<()> {
         field_equal("host-check-restored-efer", vmcs::HOST_IA32_EFER, saved_efer)?;
     }
     result
+}
+
+/// Invalid advertised control bits must fail before the independent HOST_CS=0
+/// guard, including physical capabilities hidden by the project L0. VMRESUME
+/// of this clear VMCS still has priority; inactive secondary bits are ignored.
+unsafe fn control_bit_boundaries() -> Result<()> {
+    // SAFETY: the caller owns a clear current VMCS at CPL0 with HOST_CS=0. BASIC
+    // gates TRUE MSRs, and secondary controls are a tested VMX prerequisite.
+    unsafe {
+        let basic = vmx::VmxBasic::from_msr(cpu::rdmsr(vmx::IA32_VMX_BASIC));
+        let fields = [
+            vmcs::PIN_BASED_VM_EXEC_CONTROL,
+            vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            vmcs::SECONDARY_VM_EXEC_CONTROL,
+            vmcs::VM_ENTRY_CONTROLS,
+            vmcs::VM_EXIT_CONTROLS,
+        ];
+        let msrs = if basic.true_controls {
+            [
+                vmx::IA32_VMX_TRUE_PINBASED_CTLS,
+                vmx::IA32_VMX_TRUE_PROCBASED_CTLS,
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+                vmx::IA32_VMX_TRUE_EXIT_CTLS,
+            ]
+        } else {
+            [
+                vmx::IA32_VMX_PINBASED_CTLS,
+                vmx::IA32_VMX_PROCBASED_CTLS,
+                vmx::IA32_VMX_PROCBASED_CTLS2,
+                vmx::IA32_VMX_ENTRY_CTLS,
+                vmx::IA32_VMX_EXIT_CTLS,
+            ]
+        };
+        let preferred = [1 << 7, 1 << 17, 1 << 6, 1 << 16, 1 << 23];
+        let mut saved = [0; 5];
+        for (slot, field) in saved.iter_mut().zip(fields) {
+            *slot = read_field("control-save", field)?;
+        }
+        let result = (|| {
+            for index in 0..fields.len() {
+                let unavailable = !(cpu::rdmsr(msrs[index]) >> 32) as u32;
+                equal(
+                    "control-unavailable-bit-exists",
+                    u64::from(unavailable != 0),
+                    1,
+                )?;
+                let bad = if unavailable & preferred[index] != 0 {
+                    preferred[index]
+                } else {
+                    1 << unavailable.trailing_zeros()
+                };
+                if index == 2 {
+                    success(
+                        "control-activate-secondary",
+                        vmx::vmwrite(fields[1], saved[1] | (1 << 31)),
+                    )?;
+                }
+                success(
+                    "control-invalid-bit",
+                    vmx::vmwrite(fields[index], saved[index] | u64::from(bad)),
+                )?;
+                for (resume, error) in [(false, 7), (true, 5)] {
+                    equal("control-invalid-flags", rejected_entry(resume)?, FAIL_VALID)?;
+                    field_equal("control-invalid-error", vmcs::VM_INSTRUCTION_ERROR, error)?;
+                    field_equal(
+                        "control-original-retained",
+                        fields[index],
+                        saved[index] | u64::from(bad),
+                    )?;
+                }
+                success(
+                    "control-reset-word",
+                    vmx::vmwrite(fields[index], saved[index]),
+                )?;
+                success("control-reset-primary", vmx::vmwrite(fields[1], saved[1]))?;
+            }
+            success(
+                "control-inactive-primary",
+                vmx::vmwrite(fields[1], saved[1] & !(1 << 31)),
+            )?;
+            success(
+                "control-ignored-secondary",
+                vmx::vmwrite(fields[2], u64::from(u32::MAX)),
+            )?;
+            equal("control-ignored-flags", rejected_entry(false)?, FAIL_VALID)?;
+            field_equal("control-ignored-host-error", vmcs::VM_INSTRUCTION_ERROR, 8)
+        })();
+        // The invalid host field remains installed throughout restoration, even
+        // if an assertion failed; none of these values may actually be loaded.
+        for (field, value) in fields.into_iter().zip(saved) {
+            success("control-restore", vmx::vmwrite(field, value))?;
+            field_equal("control-restored", field, value)?;
+        }
+        result
+    }
 }
 
 /// Checks list controls before any list memory can be touched. The current
@@ -1448,7 +1545,7 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds={}",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds={}",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,

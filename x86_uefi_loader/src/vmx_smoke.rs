@@ -18,6 +18,7 @@ use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
 use mutex::SpinLock;
+use nested_vmx::ControlProvenance;
 use nested_vmx::DIRECT_VMCS_PATCH_MANIFEST;
 use nested_vmx::EXIT_ACKNOWLEDGE_INTERRUPT;
 use nested_vmx::PIN_EXTERNAL_INTERRUPT_EXITING;
@@ -3285,12 +3286,42 @@ fn handle_l1_vmentry(
             registers,
         );
     };
+    let cache_entry_policy = match *DIRECT_ENTRY_POLICY.lock() {
+        Some((address, controls)) if address == current.address() && controls == exit_controls => {
+            false
+        }
+        None => true,
+        Some(_) => stop_unexpected_exit(
+            b"cached entry policy does not match original controls",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        ),
+    };
+    let supported_controls = if cache_entry_policy {
+        let Some(supported) = l1_direct_controls_supported(&saved_direct) else {
+            stop_unexpected_exit(
+                b"reading original control capabilities failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        };
+        supported
+    } else {
+        true
+    };
+    let invalid_controls = msr_controls.is_err() || !supported_controls;
     let host_check = host_validation::validate(host_limits, exit_controls, |field| {
         direct_patch_value(&saved_direct, field)
     });
-    match (msr_controls, host_check) {
-        (Ok(()), Ok(())) => {}
-        (Err(_), _)
+    match (invalid_controls, host_check) {
+        (false, Ok(())) => {}
+        (true, _)
         | (_, Err(host_validation::Error::Field(_) | host_validation::Error::AddressSpaceSize)) => {
             // Restore originals before asking hardware to record a guaranteed
             // failed entry: otherwise L0's zeroed MSR-list counts could hide an
@@ -3313,7 +3344,7 @@ fn handle_l1_vmentry(
             // Hardware preserves launch-state/control/host error priority; the
             // helper restores its guard field before carrier selection.
             let result = unsafe {
-                let status = if msr_controls.is_err() {
+                let status = if invalid_controls {
                     vmx::reject_control_entry(instruction == VmEntryInstruction::Vmresume)
                 } else {
                     vmx::reject_host_entry(instruction == VmEntryInstruction::Vmresume)
@@ -3370,50 +3401,6 @@ fn handle_l1_vmentry(
                 registers,
             );
         }
-    }
-    let cached_exit_controls = match *DIRECT_ENTRY_POLICY.lock() {
-        Some((address, exit_controls)) if address == current.address() => Some(exit_controls),
-        Some(_) => stop_unexpected_exit(
-            b"cached entry policy does not match current pointer",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        ),
-        None => None,
-    };
-    let cache_entry_policy = cached_exit_controls.is_none();
-    let (exit_controls, supported_entry_policy) = if let Some(exit_controls) = cached_exit_controls
-    {
-        (exit_controls, true)
-    } else {
-        let exit_controls =
-            direct_patch_value(&saved_direct, VmcsField::VmExitControls).unwrap_or(u64::MAX);
-        let entry_controls =
-            direct_patch_value(&saved_direct, VmcsField::VmEntryControls).unwrap_or(u64::MAX);
-        // ponytail: keep PERF_GLOBAL_CTRL direct because L0 does not use the PMU;
-        // outer KVM advertises the VMCS pair even when direct MSR access would #GP.
-        let exit_perf_mask = u64::from(vmcs::VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
-        let entry_perf_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL);
-        let exit_pat_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_PAT);
-        let entry_pat_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PAT);
-        let exit_efer_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_EFER | vmcs::VM_EXIT_LOAD_IA32_EFER);
-        let entry_efer_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_EFER);
-        let supported = (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18
-            == 0
-            && (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 == 0;
-        (exit_controls, supported)
-    };
-    if !supported_entry_policy {
-        stop_unexpected_exit(
-            b"unsupported nested VM-entry state",
-            reason,
-            qualification,
-            guest_rip,
-            instruction_len,
-            registers,
-        );
     }
     if let Some(carrier_values) = carrier_values {
         if !patch_direct_vmcs(&saved_direct, &carrier_values) {
@@ -3499,6 +3486,67 @@ fn checked_direct_msr_lists(
         List::new(entry_address, entry_count, physical_bits)?;
         Ok(())
     })())
+}
+
+/// Hardware sees unmasked physical capabilities, so it cannot validate the
+/// narrower contract advertised to L1. Cache only a completely valid original
+/// set; every successful write of any of these five control words invalidates it.
+fn l1_direct_controls_supported(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> Option<bool> {
+    let true_controls = l1_vmx_capability(vmx::IA32_VMX_BASIC)? & (1 << 55) != 0;
+    // SAFETY: this CPU owns the current stopped Direct VMCS. Its execution
+    // controls are never patched by L0; hardware returns the original L1 word.
+    let primary =
+        u32::try_from(unsafe { vmx::vmread(vmcs::CPU_BASED_VM_EXEC_CONTROL) }.ok()?).ok()?;
+    for (field, legacy, true_msr) in [
+        (
+            vmcs::PIN_BASED_VM_EXEC_CONTROL,
+            vmx::IA32_VMX_PINBASED_CTLS,
+            vmx::IA32_VMX_TRUE_PINBASED_CTLS,
+        ),
+        (
+            vmcs::CPU_BASED_VM_EXEC_CONTROL,
+            vmx::IA32_VMX_PROCBASED_CTLS,
+            vmx::IA32_VMX_TRUE_PROCBASED_CTLS,
+        ),
+        (
+            vmcs::SECONDARY_VM_EXEC_CONTROL,
+            vmx::IA32_VMX_PROCBASED_CTLS2,
+            vmx::IA32_VMX_PROCBASED_CTLS2,
+        ),
+        (
+            vmcs::VM_ENTRY_CONTROLS,
+            vmx::IA32_VMX_ENTRY_CTLS,
+            vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+        ),
+        (
+            vmcs::VM_EXIT_CONTROLS,
+            vmx::IA32_VMX_EXIT_CTLS,
+            vmx::IA32_VMX_TRUE_EXIT_CTLS,
+        ),
+    ] {
+        if field == vmcs::SECONDARY_VM_EXEC_CONTROL
+            && primary & vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS == 0
+        {
+            continue; // Architecturally ignored, even if its stored bits are invalid.
+        }
+        let original = match field {
+            vmcs::VM_ENTRY_CONTROLS => direct_patch_value(saved, VmcsField::VmEntryControls)?,
+            vmcs::VM_EXIT_CONTROLS => direct_patch_value(saved, VmcsField::VmExitControls)?,
+            vmcs::CPU_BASED_VM_EXEC_CONTROL => u64::from(primary),
+            // SAFETY: the owned/current Direct VMCS retains these unpatched
+            // mandatory execution fields; no guest runs during the check.
+            _ => unsafe { vmx::vmread(field) }.ok()?,
+        };
+        let word = ControlProvenance::new(u32::try_from(original).ok()?, 0);
+        if !word.requested_supported(l1_vmx_capability(if true_controls {
+            true_msr
+        } else {
+            legacy
+        })?) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Captures CPU limits and the stopped L1's mode while its carrier is current.
@@ -3650,7 +3698,18 @@ fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool
 /// forced bits was required before the initial carrier launch.
 fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> Option<()> {
     let entry = u32::try_from(direct_patch_value(saved, VmcsField::VmEntryControls)?).ok()?;
-    let exit = direct_patch_value(saved, VmcsField::VmExitControls)?;
+    let exit = u32::try_from(direct_patch_value(saved, VmcsField::VmExitControls)?).ok()?;
+    let entry_controls = ControlProvenance::new(
+        entry,
+        vmcs::VM_ENTRY_LOAD_IA32_PAT | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+    );
+    let exit_controls = ControlProvenance::new(
+        exit,
+        vmcs::VM_EXIT_SAVE_IA32_PAT
+            | vmcs::VM_EXIT_SAVE_IA32_EFER
+            | vmcs::VM_EXIT_LOAD_IA32_PAT
+            | vmcs::VM_EXIT_LOAD_IA32_EFER,
+    );
     let guest = PatEfer {
         pat: direct_patch_value(saved, VmcsField::GuestIa32Pat)?,
         efer: direct_patch_value(saved, VmcsField::GuestIa32Efer)?,
@@ -3690,17 +3749,9 @@ fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) ->
         (vmcs::GUEST_IA32_EFER, loaded.efer),
         (
             vmcs::VM_ENTRY_CONTROLS,
-            u64::from(entry | vmcs::VM_ENTRY_LOAD_IA32_PAT | vmcs::VM_ENTRY_LOAD_IA32_EFER),
+            u64::from(entry_controls.effective()),
         ),
-        (
-            vmcs::VM_EXIT_CONTROLS,
-            exit | u64::from(
-                vmcs::VM_EXIT_SAVE_IA32_PAT
-                    | vmcs::VM_EXIT_SAVE_IA32_EFER
-                    | vmcs::VM_EXIT_LOAD_IA32_PAT
-                    | vmcs::VM_EXIT_LOAD_IA32_EFER,
-            ),
-        ),
+        (vmcs::VM_EXIT_CONTROLS, u64::from(exit_controls.effective())),
     ] {
         // SAFETY: only the owned Direct VMCS changes. Original fields remain in
         // the patch manifest; no hardware entry occurs until all writes succeed.
@@ -4351,7 +4402,12 @@ fn handle_l1_vmcs_access(
         && write_value.is_some()
         && matches!(
             field,
-            vmcs::VM_ENTRY_MSR_LOAD_COUNT | vmcs::VM_EXIT_CONTROLS | vmcs::VM_ENTRY_CONTROLS
+            vmcs::VM_ENTRY_MSR_LOAD_COUNT
+                | vmcs::VM_EXIT_CONTROLS
+                | vmcs::VM_ENTRY_CONTROLS
+                | vmcs::PIN_BASED_VM_EXEC_CONTROL
+                | vmcs::CPU_BASED_VM_EXEC_CONTROL
+                | vmcs::SECONDARY_VM_EXEC_CONTROL
         )
     {
         *DIRECT_ENTRY_POLICY.lock() = None;

@@ -56,7 +56,7 @@ check_backend_log() {
 check_nested_contract_log() {
     local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 clobber=0 expected_backends
     local valid invept invvpid readonly shadow ept_types vpid_types success descriptors pku ospke_toggles bit expected_success expected_descriptors LC_ALL=C
-    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04]) operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds=[04]$'
+    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04]) operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds=[04]$'
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     case "$cpu_profile" in native|readonly-vmcs) ;; host-xstate) [[ "$backend" == direct-vmx ]] || return 1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -138,7 +138,7 @@ check_nested_contract_log() {
 # Real L2 entries with every PAT/EFER control combination. This image deliberately
 # powers off instead of returning into disposable firmware descriptor state.
 check_msr_contract_log() {
-    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 exits=0 debug=0 entries=0 checked=0 backends=0 private=0 expected_backends
+    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 exits=0 debug=0 cache=0 entries=0 checked=0 backends=0 private=0 expected_backends
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
@@ -168,8 +168,11 @@ check_msr_contract_log() {
                 ((phase == 1 && exits == 7 && debug == 0)) || return 1
                 debug=1 ;;
             'thin-hv: MSR entry case='*)
-                ((phase == 1 && cases == 128 && exits == 12 && entries < 20)) && [[ "$line" == "thin-hv: MSR entry case=$entries" ]] || return 1
+                ((phase == 1 && cases == 128 && exits == 12 && cache == 1 && entries < 20)) && [[ "$line" == "thin-hv: MSR entry case=$entries" ]] || return 1
                 entries=$((entries + 1)) ;;
+            'thin-hv: MSR control cache PASS invalid=5 resume=5')
+                ((phase == 1 && exits == 12 && debug == 1 && cache == 0 && entries == 0)) || return 1
+                cache=1 ;;
             'thin-hv: MSR late-failure guest-field changes=0')
                 ((phase == 1 && cases == 128 && entries == 20 && checked == 0)) || return 1
                 checked=1 ;;

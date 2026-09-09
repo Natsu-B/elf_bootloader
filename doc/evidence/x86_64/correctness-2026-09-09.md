@@ -889,3 +889,82 @@ The current 8-GiB host map/RAM-snapshot backing ceiling remains explicit; unsupp
 is not converted into a forged architectural guest fault. No Windows/Hyper-V,
 S3 or physical machine was tested for this increment. Outer KVM remains
 reference evidence only. No AArch64 production path was changed.
+
+## Control provenance audit and original capability enforcement
+
+The audit found an additional real validation gap: original entry/exit words
+with unsupported MSR-state controls still reached a terminal `unsupported nested
+VM-entry state` path. Other physical control bits hidden by the advertised L1
+mask were delegated to hardware, which knows the physical capabilities, not the
+project's narrower virtual contract. This could report host error 8 instead of
+the higher-priority invalid-control error 7.
+
+* `nested_vmx::ControlProvenance::requested_supported` checks original L1 bits
+  against allowed-zero/one capabilities. Forced L0 bits cannot repair a missing
+  required L1 bit or authorize a hidden feature. Unit coverage includes shared
+  L0/L1 causing bits, L0-only bits, combined causes and invalid original words.
+* `vmx_smoke::l1_direct_controls_supported` validates all five control words
+  using the same masked capability function as L1 RDMSR. TRUE/legacy selection
+  follows VMX_BASIC, and inactive secondary controls remain ignored. The
+  existing guarded early-entry helper records error 7, preserving VMRESUME-on-
+  clear error 5 and control-before-host priority, without loading guest state or
+  MSRs. The terminal unsupported-control path was removed. No advertised
+  capability changed.
+* `DIRECT_ENTRY_POLICY` is invalidated on every successful write of pin,
+  primary, secondary, entry or exit controls. Only a fully checked set is
+  cached, with the original exit word and VMCS owner checked on cache hits.
+  `prepare_direct_msr_fields` uses `ControlProvenance::effective` for required
+  private PAT/EFER loads/saves; original values remain in the existing manifest.
+* `nested_contract::control_bit_boundaries` adds five invalid-word checks, five
+  clear-VMRESUME priority checks and one ignored-secondary check. A null
+  original HOST_CS independently guards every attempt. Preferred test bits
+  include WBINVD exiting, hidden by Direct while physical KVM may support it.
+  The exact FP-entry check count becomes 79. `msr_contract::control_cache`
+  warms a real launched VMCS, invalidates each word individually, requires error
+  7, restores valid controls, and successfully resumes after each failure.
+  Secondary controls are already enabled before warming, so that case cannot
+  accidentally rely on a primary-control write to invalidate the cache.
+* Existing runner/xtask gates require the new cold-boundary counts and the
+  complete five-case warm-cache/recovery marker. Missing or altered evidence
+  remains FAIL.
+
+The separate candidate claim that current Direct reflection exposes **L0-forced
+execution exits** was not confirmed. `configure_and_launch` and
+`set_carrier_interrupt_controls` set interrupt controls only on the carrier.
+`patch_direct_vmcs` does not copy those controls to L2. Its forced PAT/EFER save/
+load bits change state handling, not which L2 instructions/events cause an exit.
+Direct's pin/primary/secondary words and interception bitmaps remain L1-owned;
+its exits are therefore currently unconditional architectural exits or L1-owned
+conditions. The manifest regression now explicitly rejects execution-control,
+exception/MSR-bitmap and CR-mask fields. No new forced intercept was invented
+solely to make an L0-only branch reachable. **An L0-only Direct exit handler and
+end-to-end L2 test are not claimed**; introducing such controls later requires
+that handler and MSR-store discard behavior first. Existing carrier L0-only
+interrupt handling remains covered by the native interrupt/FP tests.
+
+Validation (cargo via the existing Nix environment):
+
+* Five required `cargo xtest -p` checks: **166 PASS, 0 FAIL** (nested 23, HAL 53,
+  loader 47, guest 10, xtask 33); `/tmp/x86-control-final-{nested,hal,loader,guest,xtask}.log`.
+  The final manifest addition was separately rerun: 23 PASS;
+  `/tmp/x86-control-manifest-unit.log`.
+* `LINUX_KVM_CYCLES=64 cargo xrun x86 --nested --release`: **9 PASS, 5 FAIL**,
+  exit 1; `/tmp/x86-control-nested-64.log`. All Direct profiles, including both
+  new boundary/cache checks, and all three Linux/S5 runs PASS. The five existing
+  reference-only failures are unchanged. This increment does not claim a new
+  4096-cycle measurement; the preceding MSR commit's measurement is above.
+* `cargo xrun x86 --release`: **9 PASS, 0 FAIL**, seven QEMU/KVM and two QEMU/TCG
+  profiles; `/tmp/x86-control-smoke.log`.
+* `cargo xbuild x86` and the release build performed by xrun: **PASS**;
+  `/tmp/x86-control-build-debug.log` and the xrun logs.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**.
+
+Before these control edits, the original unmodified
+`vmx_exception_with_invalid_guest_state` ELF was retested against `36283f6`
+using the same Direct selftest runner/name/path as earlier: **FAIL, process exit
+137**, `/tmp/x86-msr-exit-invalid-guest-state.log`. The runner's unchanged guest
+KILL bound is 600 seconds; its existing outer QEMU bound is 900 seconds. The
+upstream 200-microsecond signal interval was not modified. The MSR fixes do not
+resolve this timing-sensitive regression, and it remains on the performance/
+event-correctness work list. No Windows/Hyper-V, S3 or physical machine was
+tested here; outer-KVM evidence is reference only.

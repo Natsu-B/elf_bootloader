@@ -554,6 +554,16 @@ impl ControlProvenance {
         self.l1_requested | self.l0_required
     }
 
+    /// Checks L1's original word against its advertised allowed-zero/one MSR.
+    /// L0-forced bits cannot repair a missing required L1 bit or authorize a
+    /// hidden feature. Effective controls need separate hardware validation.
+    #[must_use]
+    pub const fn requested_supported(self, capability: u64) -> bool {
+        let required = capability as u32;
+        let allowed = (capability >> 32) as u32;
+        self.l1_requested & required == required && self.l1_requested & !allowed == 0
+    }
+
     /// Classifies an exit caused by one or more control bits.
     ///
     /// If L1 requested any causing bit, the exit is architecturally visible
@@ -1173,6 +1183,29 @@ mod tests {
     }
 
     #[test]
+    fn control_provenance_validates_original_not_forced_or_hidden_bits() {
+        let capability = (0b1110_u64 << 32) | 0b0010;
+        assert!(ControlProvenance::new(0b0110, 0b1000).requested_supported(capability));
+        assert!(!ControlProvenance::new(0b0100, 0b0010).requested_supported(capability));
+        assert!(!ControlProvenance::new(0b0011, 0).requested_supported(capability));
+        let shared = ControlProvenance::new(0b0010, 0b0110);
+        assert_eq!(shared.l1_requested(), 0b0010);
+        assert_eq!(shared.l0_required(), 0b0110);
+        assert_eq!(shared.effective(), 0b0110);
+        assert_eq!(
+            shared.exit_disposition(0b0010),
+            ExitDisposition::ReflectToL1
+        );
+        assert_eq!(shared.exit_disposition(0b0100), ExitDisposition::L0Only);
+        assert_eq!(
+            shared.exit_disposition(0b0110),
+            ExitDisposition::ReflectToL1
+        );
+        assert!(!ControlProvenance::new(u32::MAX, 0).requested_supported(capability));
+        assert!(ControlProvenance::new(0, u32::MAX).requested_supported(0));
+    }
+
+    #[test]
     fn patch_manifest_covers_every_host_and_exit_msr_field_once() {
         assert_eq!(
             DIRECT_VMCS_PATCH_MANIFEST
@@ -1209,6 +1242,20 @@ mod tests {
             );
         }
         for (index, patch) in DIRECT_VMCS_PATCH_MANIFEST.iter().enumerate() {
+            // The active Direct patch changes host/MSR state, not exit-causing
+            // execution controls. Carrier interrupt controls are a different
+            // VMCS. Adding a forced Direct exit needs an ownership handler first.
+            use x86_64_hal::vmcs;
+            assert!(!matches!(
+                patch.field as u32,
+                vmcs::PIN_BASED_VM_EXEC_CONTROL
+                    | vmcs::CPU_BASED_VM_EXEC_CONTROL
+                    | vmcs::SECONDARY_VM_EXEC_CONTROL
+                    | vmcs::EXCEPTION_BITMAP
+                    | vmcs::MSR_BITMAP
+                    | vmcs::CR0_GUEST_HOST_MASK
+                    | vmcs::CR4_GUEST_HOST_MASK
+            ));
             assert!(
                 DIRECT_VMCS_PATCH_MANIFEST[..index]
                     .iter()
