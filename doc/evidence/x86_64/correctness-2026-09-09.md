@@ -1664,6 +1664,45 @@ Validation, all through `nix develop --accept-flake-config --command`:
       scripts/x86_64/run-linux-kvm-test.sh
   ```
 
-The old unmodified timing-sensitive KVM failures still require replay against
-this increment; no claim that platform EPT fixes them is made. No Direct Windows
-Hyper-V or physical machine was tested. Outer-KVM results are reference-only.
+The subsequent fixed-commit replay below retains the unmodified timing-sensitive
+failures. No Direct Windows Hyper-V or physical machine was tested. Outer-KVM
+results are reference-only.
+
+### Platform carrier replay and host-map materializer
+
+The seven upstream selftests were replayed at detached commit `1c9ac1f` in an
+isolated temporary worktree, without editing its sources or running boot artifacts.
+Each invocation used the existing `scripts/x86_64/run-linux-selftest.sh` under
+`nix develop --accept-flake-config --command`, `LINUX_SELFTEST_BACKEND=direct-vmx`,
+`LINUX_SELFTEST_NAME=<basename>` and `LINUX_SELFTEST_ELF=<original built ELF>`.
+The ELF root was `/tmp/thin-hv-kvm-selftests-7.1.5.MUloxc/out/`.
+
+* **5 PASS**: `x86/xcr0_cpuid_test`, `x86/dirty_log_page_splitting_test`,
+  `x86/nx_huge_pages_test`, `memslot_modification_stress_test`,
+  `kvm_page_table_test`.
+* **2 FAIL**: `memslot_perf_test` still exits 142 under its original alarm;
+  `x86/vmx_exception_with_invalid_guest_state` still reaches the unchanged
+  guest 600-second kill (137). No timeout, signal interval or source was weakened.
+* Batch: `/tmp/x86-platform-carrier-selftest-batch.log`; individual logs:
+  `/tmp/x86-platform-carrier-direct-<basename>.log`. Host compilation overlapped
+  part of this replay, so these are correctness regressions, not isolated timing
+  benchmarks. The earlier timing failures are not claimed fixed.
+
+The HAL now reuses the checked EPT table materializer for a separate private
+host map. `PlatformMap::host_mappings`, `HostPagingPolicy`, `HostTables` and
+`build_host_identity` include RAM (including monitor reservations), omit guest
+MMIO apertures, preserve RAM RO/RP constraints, validate low-canonical four-level
+addresses, and use CPUID rather than VMX page-size capabilities. Captured PAT WB
+selection retains native MTRR typing (Intel SDM Vol. 3A table 12-7); no PAT write
+is performed. A private, initially absent strong-UC scratch PTE is provided for
+bounded later MMIO access; no hardware mapping is activated by the HAL builder.
+All construction errors leave an empty root. This commit is the testable
+materializer step, **not yet active HOST_CR3 integration**.
+
+`nix develop --accept-flake-config --command bash -c 'cargo fmt && cargo xtest -p
+x86_64_hal'`: **59 PASS, 0 FAIL**, including five new host-map tests (RAM above
+8 GiB, private RAM versus PCI exclusion, independent large-page/PAT encoding,
+canonical/physical boundaries, malformed PAT, scratch PTE, ownership/cache and
+capacity failures). `/tmp/x86-host-platform-window-tests.log`. The initial test
+fixture omitted EFI_MEMORY_RUNTIME and correctly failed with RuntimeAttribute;
+the fixture was corrected, not the validator. No AArch64 implementation changed.

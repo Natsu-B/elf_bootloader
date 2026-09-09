@@ -1,7 +1,12 @@
 //! Platform-derived identity EPT materialization and explicit QEMU smoke maps.
 
 use crate::addr::EptPhys;
+use crate::addr::HostPhys;
 use crate::platform_memory;
+use crate::platform_memory::Mapping;
+use crate::platform_memory::Mappings;
+use crate::platform_memory::MemoryType;
+use crate::platform_memory::PageCapabilities;
 use crate::platform_memory::PageSize;
 use crate::platform_memory::PhysicalRange;
 use crate::platform_memory::PlatformMap;
@@ -64,6 +69,156 @@ pub enum BuildError {
     Storage,
     /// A table link or leaf conflicts with the validated, ordered plan.
     Conflict,
+    /// Four-level host identity mapping cannot represent a noncanonical address.
+    HostAddress,
+    /// The captured host PAT is invalid or cannot select normal WB RAM.
+    HostPat,
+}
+
+/// Host leaf encoding under the captured PAT and independent CPU page-size
+/// capabilities. Selecting PAT WB lets physical MTRRs supply the native memory
+/// type; the planner still splits large leaves at every memory-type boundary.
+#[derive(Clone, Copy)]
+pub struct HostPagingPolicy {
+    pat: u64,
+    wb_index: u8,
+    uc_index: u8,
+    capabilities: PageCapabilities,
+}
+
+impl HostPagingPolicy {
+    /// Requires WB for RAM and strong UC for the scratch window, without WRMSR.
+    pub fn new(pat: u64, capabilities: PageCapabilities) -> Result<Self, BuildError> {
+        let mut wb = None;
+        let mut uc = None;
+        for (index, value) in pat.to_le_bytes().into_iter().enumerate() {
+            if !matches!(value, 0 | 1 | 4 | 5 | 6 | 7) {
+                return Err(BuildError::HostPat);
+            }
+            if value == 6 && wb.is_none() {
+                wb = Some(index as u8);
+            }
+            if value == 0 && uc.is_none() {
+                uc = Some(index as u8);
+            }
+        }
+        Ok(Self {
+            pat,
+            wb_index: wb.ok_or(BuildError::HostPat)?,
+            uc_index: uc.ok_or(BuildError::HostPat)?,
+            capabilities,
+        })
+    }
+}
+
+/// Completely built host tables; this does not load CR3 or change PAT. The
+/// caller must keep the physical backing resident and load `pat()` on VM exit.
+/// A/D bits are preset so page walks need not mutate the borrowed table entries.
+pub struct HostTables<'a> {
+    pages: &'a [EptPage],
+    physical: HostPhys,
+    policy: HostPagingPolicy,
+    leaves: u64,
+    width: platform_memory::PhysicalWidth,
+}
+
+impl HostTables<'_> {
+    /// Private four-level root, available only after complete construction.
+    #[must_use]
+    pub const fn cr3(&self) -> u64 {
+        self.physical.get()
+    }
+    /// Exact PAT value used to encode leaves; not the guest's dynamic PAT.
+    #[must_use]
+    pub const fn pat(&self) -> u64 {
+        self.policy.pat
+    }
+    /// Initialized paging-structure pages, excluding unused arena capacity.
+    #[must_use]
+    pub const fn table_pages(&self) -> usize {
+        self.pages.len()
+    }
+    /// Hardware leaf count, not the number of firmware regions.
+    #[must_use]
+    pub const fn leaf_count(&self) -> u64 {
+        self.leaves
+    }
+    /// An initially non-present, CPU-owned UC scratch leaf. Before modifying
+    /// its PTE, end all Rust table borrows; retain backing and serialize access
+    /// on the owning CPU, with INVLPG on every installation and removal.
+    #[must_use]
+    pub fn window(&self) -> HostWindow {
+        HostWindow {
+            pte: self.physical.get() + (self.pages.len() as u64 - 1) * EPT_PAGE_BYTES as u64,
+            uc_index: self.policy.uc_index,
+            width: self.width,
+        }
+    }
+}
+
+/// Validated metadata for one host scratch PTE, not permission to access a
+/// physical device. The monitor must validate the selected backing separately.
+#[derive(Clone, Copy)]
+pub struct HostWindow {
+    pte: u64,
+    uc_index: u8,
+    width: platform_memory::PhysicalWidth,
+}
+
+impl HostWindow {
+    /// PML4[511], outside every low-canonical RAM identity mapping.
+    pub const VIRTUAL_BASE: u64 = 0xffff_ff80_0000_0000;
+    /// Physical address of the writable PTE inside the retained private arena.
+    #[must_use]
+    pub const fn pte_address(self) -> u64 {
+        self.pte
+    }
+    /// Encodes a supervisor 4 KiB strong-UC leaf with preset accessed/dirty bits.
+    /// Clearing this PTE requires writing zero and invalidating VIRTUAL_BASE.
+    pub fn entry(self, physical: HostPhys) -> Result<u64, BuildError> {
+        if physical.get() >= self.width.limit() {
+            return Err(BuildError::Storage);
+        }
+        let index = u64::from(self.uc_index);
+        Ok(physical.get() | 3 | (1 << 5) | (1 << 6) | ((index & 3) << 3) | ((index >> 2) << 7))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Format {
+    Ept,
+    Host(HostPagingPolicy),
+}
+
+impl Format {
+    fn mappings<'p, 'd>(self, plan: &'p PlatformMap<'d>) -> Mappings<'p, 'd> {
+        match self {
+            Self::Ept => plan.mappings(),
+            Self::Host(policy) => plan.host_mappings(policy.capabilities),
+        }
+    }
+    fn table_flags(self) -> u64 {
+        match self {
+            Self::Ept => 7,
+            Self::Host(_) => 3 | (1 << 5),
+        }
+    }
+    fn leaf_flags(self, mapping: Mapping) -> u64 {
+        let large = mapping.page_size != PageSize::Base4K;
+        let flags = match self {
+            Self::Ept => 7 | ((mapping.memory_type as u64) << 3),
+            Self::Host(policy) => {
+                let index = u64::from(policy.wb_index);
+                let writable = mapping.attributes & 0x20000 == 0;
+                1 | (u64::from(writable) << 1)
+                    | (1 << 5)
+                    | (1 << 6)
+                    | ((index & 3) << 3)
+                    | ((index >> 2) << if large { 12 } else { 7 })
+            }
+        };
+        flags | if large { 1 << 7 } else { 0 }
+    }
 }
 
 /// A completely constructed EPT, borrowing its storage until the caller retires it.
@@ -104,15 +259,26 @@ impl PlatformEpt<'_> {
 /// Exhausts the fallible planner before returning. Adjacent segments sharing a
 /// table count that table once, even when their attributes differ.
 pub fn required_platform_pages(plan: &PlatformMap<'_>) -> Result<usize, BuildError> {
-    platform_layout(plan).map(|(pages, _)| pages)
+    platform_layout(plan, Format::Ept).map(|(pages, _)| pages)
 }
 
-fn platform_layout(plan: &PlatformMap<'_>) -> Result<(usize, u64), BuildError> {
+/// Sizes the private host map without copying the L1 MMIO apertures into it.
+pub fn required_host_pages(
+    plan: &PlatformMap<'_>,
+    policy: HostPagingPolicy,
+) -> Result<usize, BuildError> {
+    platform_layout(plan, Format::Host(policy)).map(|(pages, _)| pages)
+}
+
+fn platform_layout(plan: &PlatformMap<'_>, format: Format) -> Result<(usize, u64), BuildError> {
     let mut pages = 1_usize;
     let mut leaves = 0_u64;
     let mut last = [None; 3];
-    for mapping in plan.mappings() {
+    for mapping in format.mappings(plan) {
         let mapping = mapping.map_err(BuildError::Platform)?;
+        if matches!(format, Format::Host(_)) && mapping.range.end() > 1 << 47 {
+            return Err(BuildError::HostAddress);
+        }
         leaves = leaves
             .checked_add(mapping.range.bytes() / mapping.page_size.bytes())
             .ok_or(BuildError::Overflow)?;
@@ -134,6 +300,9 @@ fn platform_layout(plan: &PlatformMap<'_>) -> Result<(usize, u64), BuildError> {
     if leaves == 0 {
         Err(BuildError::Empty)
     } else {
+        if matches!(format, Format::Host(_)) {
+            pages = pages.checked_add(3).ok_or(BuildError::Overflow)?;
+        }
         Ok((pages, leaves))
     }
 }
@@ -148,34 +317,7 @@ pub fn build_platform_identity<'a>(
     pages: &'a mut [EptPage],
     physical: EptPhys,
 ) -> Result<PlatformEpt<'a>, BuildError> {
-    if let Some(root) = pages.first_mut() {
-        root.entries.fill(0);
-    }
-    let (required, leaves) = platform_layout(plan)?;
-    if pages.len() < required {
-        return Err(BuildError::Capacity);
-    }
-    let bytes = u64::try_from(pages.len())
-        .ok()
-        .and_then(|count| count.checked_mul(EPT_PAGE_BYTES as u64))
-        .ok_or(BuildError::Overflow)?;
-    let end = physical
-        .get()
-        .checked_add(bytes)
-        .ok_or(BuildError::Overflow)?;
-    let storage = PhysicalRange::new(physical.get(), end, plan.physical_width())
-        .map_err(|_| BuildError::Storage)?;
-    if !plan.owns_private_range(storage) {
-        return Err(BuildError::Storage);
-    }
-    for page in &mut pages[..required] {
-        page.entries.fill(0);
-    }
-    let result = fill_platform_tables(plan, &mut pages[..required], physical.get());
-    if let Err(error) = result {
-        pages[0].entries.fill(0);
-        return Err(error);
-    }
+    let (required, leaves) = build_identity(plan, pages, physical.get(), Format::Ept)?;
     Ok(PlatformEpt {
         pages: &pages[..required],
         physical,
@@ -183,17 +325,116 @@ pub fn build_platform_identity<'a>(
     })
 }
 
+/// Builds only identity-addressable RAM, including L0 reservations, in a private
+/// writable WB arena. No guest PCI aperture is mapped. Four-level canonical
+/// bounds, PAT, page sizes and all cache/layout errors precede publication.
+pub fn build_host_identity<'a>(
+    plan: &PlatformMap<'_>,
+    pages: &'a mut [EptPage],
+    physical: HostPhys,
+    policy: HostPagingPolicy,
+) -> Result<HostTables<'a>, BuildError> {
+    let (required, leaves) = build_identity(plan, pages, physical.get(), Format::Host(policy))?;
+    Ok(HostTables {
+        pages: &pages[..required],
+        physical,
+        policy,
+        leaves,
+        width: plan.physical_width(),
+    })
+}
+
+fn host_arena_is_wb(
+    plan: &PlatformMap<'_>,
+    storage: PhysicalRange,
+    policy: HostPagingPolicy,
+) -> Result<bool, BuildError> {
+    let mut cursor = storage.start();
+    for mapping in plan.host_mappings(policy.capabilities) {
+        let mapping = mapping.map_err(BuildError::Platform)?;
+        if mapping.range.end() <= cursor {
+            continue;
+        }
+        if mapping.range.start() > cursor
+            || mapping.memory_type != MemoryType::WriteBack
+            || mapping.attributes & 0x20000 != 0
+        {
+            return Ok(false);
+        }
+        cursor = storage.end().min(mapping.range.end());
+        if cursor == storage.end() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn build_identity(
+    plan: &PlatformMap<'_>,
+    pages: &mut [EptPage],
+    physical: u64,
+    format: Format,
+) -> Result<(usize, u64), BuildError> {
+    if let Some(root) = pages.first_mut() {
+        root.entries.fill(0);
+    }
+    let (required, leaves) = platform_layout(plan, format)?;
+    if pages.len() < required {
+        return Err(BuildError::Capacity);
+    }
+    let bytes = u64::try_from(pages.len())
+        .ok()
+        .and_then(|count| count.checked_mul(EPT_PAGE_BYTES as u64))
+        .ok_or(BuildError::Overflow)?;
+    let end = physical.checked_add(bytes).ok_or(BuildError::Overflow)?;
+    let storage = PhysicalRange::new(physical, end, plan.physical_width())
+        .map_err(|_| BuildError::Storage)?;
+    if !plan.owns_private_range(storage) {
+        return Err(BuildError::Storage);
+    }
+    if let Format::Host(policy) = format {
+        if !host_arena_is_wb(plan, storage, policy)? {
+            return Err(BuildError::Storage);
+        }
+    }
+    for page in &mut pages[..required] {
+        page.entries.fill(0);
+    }
+    let ram_pages = required
+        - if matches!(format, Format::Host(_)) {
+            3
+        } else {
+            0
+        };
+    let result = fill_platform_tables(plan, &mut pages[..ram_pages], physical, format);
+    if let Err(error) = result {
+        pages[0].entries.fill(0);
+        return Err(error);
+    }
+    if matches!(format, Format::Host(_)) {
+        // The low-canonical host check guarantees PML4[511] is unused. These
+        // three already zeroed private pages terminate at a non-present PTE.
+        let flags = format.table_flags();
+        pages[0].entries[511] = physical + ram_pages as u64 * EPT_PAGE_BYTES as u64 | flags;
+        pages[ram_pages].entries[0] =
+            physical + (ram_pages as u64 + 1) * EPT_PAGE_BYTES as u64 | flags;
+        pages[ram_pages + 1].entries[0] =
+            physical + (ram_pages as u64 + 2) * EPT_PAGE_BYTES as u64 | flags;
+    }
+    Ok((required, leaves))
+}
+
 /// Populates only an already sized arena; links are offsets into that same arena.
 fn fill_platform_tables(
     plan: &PlatformMap<'_>,
     pages: &mut [EptPage],
     physical: u64,
+    format: Format,
 ) -> Result<(), BuildError> {
-    const RWX: u64 = 7;
-    const LARGE: u64 = 1 << 7;
     const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
     let mut used = 1;
-    for mapping in plan.mappings() {
+    let table_flags = format.table_flags();
+    for mapping in format.mappings(plan) {
         let mapping = mapping.map_err(BuildError::Platform)?;
         let leaf_shift = match mapping.page_size {
             PageSize::Huge1G => 30,
@@ -210,10 +451,7 @@ fn fill_platform_tables(
                     if entry != 0 {
                         return Err(BuildError::Conflict);
                     }
-                    pages[table].entries[slot] = address
-                        | RWX
-                        | ((mapping.memory_type as u64) << 3)
-                        | if shift == 12 { 0 } else { LARGE };
+                    pages[table].entries[slot] = address | format.leaf_flags(mapping);
                     break;
                 }
                 table = if entry == 0 {
@@ -221,11 +459,11 @@ fn fill_platform_tables(
                         return Err(BuildError::Capacity);
                     }
                     pages[table].entries[slot] =
-                        physical + used as u64 * EPT_PAGE_BYTES as u64 | RWX;
+                        physical + used as u64 * EPT_PAGE_BYTES as u64 | table_flags;
                     used += 1;
                     used - 1
                 } else {
-                    if entry & !ADDRESS != RWX {
+                    if entry & !ADDRESS != table_flags {
                         return Err(BuildError::Conflict);
                     }
                     let offset = (entry & ADDRESS)
@@ -327,12 +565,17 @@ pub fn build_identity_8g(
 mod tests {
     use super::BuildError;
     use super::EptPage;
+    use super::HostPagingPolicy;
+    use super::HostTables;
     use super::PlatformEpt;
+    use super::build_host_identity;
     use super::build_identity_1g;
     use super::build_identity_8g;
     use super::build_platform_identity;
+    use super::required_host_pages;
     use super::required_platform_pages;
     use crate::addr::EptPhys;
+    use crate::addr::HostPhys;
     use crate::platform_memory::Error;
     use crate::platform_memory::FirmwareDescriptor;
     use crate::platform_memory::MemoryType;
@@ -425,6 +668,221 @@ mod tests {
 
     fn assert_root_empty(pages: &[EptPage]) {
         assert!(pages[0].entries().iter().all(|entry| *entry == 0));
+    }
+
+    fn host_leaf(host: &HostTables<'_>, address: u64) -> Option<(u64, u64)> {
+        let mut table = 0;
+        for shift in [39, 30, 21, 12] {
+            let entry = host.pages[table].entries[((address >> shift) & 511) as usize];
+            if entry == 0 {
+                return None;
+            }
+            assert_eq!(entry & 5, 1, "present supervisor mapping");
+            assert_ne!(entry & (1 << 5), 0, "preset accessed");
+            if shift == 12 || (shift != 39 && entry & (1 << 7) != 0) {
+                assert_ne!(entry & (1 << 6), 0, "preset dirty");
+                return Some((entry, 1 << shift));
+            }
+            assert_eq!(entry & !ADDRESS, 3 | (1 << 5));
+            table = ((entry & ADDRESS) - host.physical.get()) as usize / PAGE as usize;
+            assert!(table > 0 && table < host.table_pages());
+        }
+        panic!("unterminated host walk");
+    }
+
+    fn host_policy(pat: u64, features: u32, extended: u32) -> HostPagingPolicy {
+        HostPagingPolicy::new(pat, PageCapabilities::from_host_cpuid(features, extended)).unwrap()
+    }
+
+    #[test]
+    fn host_maps_private_runtime_and_high_ram_but_not_guest_pci_apertures() {
+        let mut runtime = ram(32 * GIB, 32 * GIB + 2 * MIB);
+        runtime.memory_type = 6;
+        runtime.attributes |= 1 << 63;
+        let mut acpi = ram(33 * GIB, 33 * GIB + PAGE);
+        acpi.memory_type = 10;
+        acpi.attributes |= 0x20000;
+        let descriptors = [ram(0, GIB), ram(ARENA, ARENA + 32 * PAGE), runtime, acpi];
+        let private = [range(ARENA, ARENA + 32 * PAGE)];
+        let mmio = [range(56 << 40, 64 << 40)];
+        let plan = plan(&descriptors, &private, &mmio, ALL_CAPS);
+        let policy = host_policy(6, 1 << 3, 1 << 26);
+        let mut pages = dirty_pages(32);
+        let host =
+            build_host_identity(&plan, &mut pages, HostPhys::new(ARENA).unwrap(), policy).unwrap();
+        assert_eq!(host.cr3(), ARENA);
+        assert_eq!(host.pat(), 6);
+        assert_eq!(
+            host.table_pages(),
+            required_host_pages(&plan, policy).unwrap()
+        );
+        assert!(host.table_pages() < required_platform_pages(&plan).unwrap());
+        assert!(host.leaf_count() > 0);
+        assert_eq!(host_leaf(&host, 0).unwrap().1, GIB);
+        assert!(host_leaf(&host, ARENA).is_some());
+        assert_eq!(host_leaf(&host, 32 * GIB).unwrap().1, 2 * MIB);
+        assert_eq!(
+            host_leaf(&host, 33 * GIB).unwrap().0 & 2,
+            0,
+            "UEFI RO preserved"
+        );
+        assert_eq!(host_leaf(&host, 56 << 40), None);
+        assert_eq!(host_leaf(&host, (64 << 40) - PAGE), None);
+        assert_eq!(host_leaf(&host, 2 * GIB), None);
+        let window = host.window();
+        assert_eq!(host_leaf(&host, super::HostWindow::VIRTUAL_BASE), None);
+        assert_eq!(
+            host_leaf(&host, super::HostWindow::VIRTUAL_BASE + PAGE),
+            None
+        );
+        assert_eq!(
+            window.pte_address(),
+            ARENA + (host.table_pages() as u64 - 1) * PAGE
+        );
+        let entry = window.entry(HostPhys::new(56 << 40).unwrap()).unwrap();
+        assert_eq!(entry & ADDRESS, 56 << 40);
+        assert_eq!(entry & !ADDRESS, 3 | (1 << 5) | (1 << 6) | (1 << 3)); // PAT[1]=UC
+        assert!(window.entry(HostPhys::new(1 << 52).unwrap()).is_err());
+        let mut guest_pages = dirty_pages(32);
+        let guest =
+            build_platform_identity(&plan, &mut guest_pages, EptPhys::new(ARENA).unwrap()).unwrap();
+        assert_eq!(leaf(&guest, ARENA), None);
+        assert!(leaf(&guest, 56 << 40).is_some());
+    }
+
+    #[test]
+    fn host_page_sizes_use_cpuid_and_pat_bits_follow_each_leaf_format() {
+        let descriptors = [ram(0, GIB), ram(ARENA, ARENA + 4 * MIB)];
+        let private = [range(ARENA, ARENA + 4 * MIB)];
+        let plan = plan(&descriptors, &private, &[], BASE_CAPS);
+        for (features, extended, bytes) in [(0, 0, PAGE), (1 << 3, 0, 2 * MIB), (0, 1 << 26, GIB)] {
+            let policy = host_policy(6 << 40, features, extended); // WB is PAT[5]
+            let required = required_host_pages(&plan, policy).unwrap();
+            let mut pages = dirty_pages(required);
+            let host =
+                build_host_identity(&plan, &mut pages, HostPhys::new(ARENA).unwrap(), policy)
+                    .unwrap();
+            let (entry, size) = host_leaf(&host, 0).unwrap();
+            assert_eq!(size, bytes);
+            let pat_bit = if bytes == PAGE { 7 } else { 12 };
+            assert_ne!(entry & (1 << pat_bit), 0);
+            assert_eq!(entry & ((1 << 3) | (1 << 4)), 1 << 3);
+            assert_eq!(entry & ADDRESS & !(bytes - 1), 0);
+        }
+    }
+
+    #[test]
+    fn host_pat_and_canonical_limits_are_checked_without_publishing_a_root() {
+        let capabilities = PageCapabilities::from_host_cpuid(1 << 3, 1 << 26);
+        assert!(matches!(
+            HostPagingPolicy::new(0, capabilities),
+            Err(BuildError::HostPat)
+        ));
+        assert!(matches!(
+            HostPagingPolicy::new(0x0606_0606_0606_0606, capabilities),
+            Err(BuildError::HostPat)
+        ));
+        for value in [2, 3, 8, 0xff] {
+            assert!(matches!(
+                HostPagingPolicy::new(6 | (value << 8), capabilities),
+                Err(BuildError::HostPat)
+            ));
+        }
+        let policy = host_policy(0x0007_0406_0007_0406, 1 << 3, 1 << 26);
+        let private = [range(ARENA, ARENA + 16 * PAGE)];
+        let descriptors = [
+            ram(ARENA, ARENA + 16 * PAGE),
+            ram((1 << 47) - PAGE, (1 << 47) + PAGE),
+        ];
+        let invalid = plan(&descriptors, &private, &[], ALL_CAPS);
+        let mut pages = dirty_pages(16);
+        assert!(matches!(
+            build_host_identity(&invalid, &mut pages, HostPhys::new(ARENA).unwrap(), policy),
+            Err(BuildError::HostAddress)
+        ));
+        assert_root_empty(&pages);
+        let valid_descriptors = [descriptors[0], ram((1 << 47) - PAGE, 1 << 47)];
+        let valid = plan(&valid_descriptors, &private, &[], ALL_CAPS);
+        let host =
+            build_host_identity(&valid, &mut pages, HostPhys::new(ARENA).unwrap(), policy).unwrap();
+        assert_eq!(host_leaf(&host, (1 << 47) - 1).unwrap().1, PAGE);
+    }
+
+    #[test]
+    fn host_arena_requires_complete_private_writable_wb_ram() {
+        let private = [range(ARENA, ARENA + 16 * PAGE)];
+        let policy = host_policy(6, 1 << 3, 1 << 26);
+        let ordinary = ram(0, PAGE);
+        for attributes in [8 | 0x2000, 8 | 0x20000] {
+            let mut arena = ram(ARENA, ARENA + 16 * PAGE);
+            arena.attributes = attributes;
+            let descriptors = [ordinary, arena];
+            let plan = plan(&descriptors, &private, &[], ALL_CAPS);
+            let mut pages = dirty_pages(16);
+            assert!(matches!(
+                build_host_identity(&plan, &mut pages, HostPhys::new(ARENA).unwrap(), policy),
+                Err(BuildError::Storage)
+            ));
+            assert_root_empty(&pages);
+        }
+        let descriptors = [ordinary];
+        let absent = plan(&descriptors, &private, &[], ALL_CAPS);
+        let mut pages = dirty_pages(16);
+        assert!(matches!(
+            build_host_identity(&absent, &mut pages, HostPhys::new(ARENA).unwrap(), policy),
+            Err(BuildError::Storage)
+        ));
+        assert_root_empty(&pages);
+        let mut arena = ram(ARENA, ARENA + 16 * PAGE);
+        arena.attributes = 9;
+        let mut low = ordinary;
+        low.attributes = 9;
+        let descriptors = [low, arena];
+        let uc = PlatformMap::new(
+            &descriptors,
+            &private,
+            &[],
+            Mtrrs::new(width(), 0, 1 << 11, None, &[]).unwrap(),
+            PageCapabilities::from_vmx_capability(ALL_CAPS).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            build_host_identity(&uc, &mut pages, HostPhys::new(ARENA).unwrap(), policy),
+            Err(BuildError::Storage)
+        ));
+        assert_root_empty(&pages);
+        let unowned = plan(&descriptors, &[], &[], ALL_CAPS);
+        assert!(matches!(
+            build_host_identity(&unowned, &mut pages, HostPhys::new(ARENA).unwrap(), policy),
+            Err(BuildError::Storage)
+        ));
+        assert_root_empty(&pages);
+    }
+
+    #[test]
+    fn host_capacity_and_late_cache_failure_clear_only_the_root_before_fill() {
+        let private = [range(ARENA, ARENA + 16 * PAGE)];
+        let descriptors = [ram(0, GIB), ram(ARENA, ARENA + 16 * PAGE)];
+        let good = plan(&descriptors, &private, &[], ALL_CAPS);
+        let policy = host_policy(6, 1 << 3, 1 << 26);
+        let required = required_host_pages(&good, policy).unwrap();
+        let mut small = dirty_pages(required - 1);
+        assert!(matches!(
+            build_host_identity(&good, &mut small, HostPhys::new(ARENA).unwrap(), policy),
+            Err(BuildError::Capacity)
+        ));
+        assert_root_empty(&small);
+        let mut late_region = ram(2 * ARENA, 2 * ARENA + PAGE);
+        late_region.attributes = 1; // UC-only capability conflicts with WB MTRR
+        let bad_descriptors = [descriptors[0], descriptors[1], late_region];
+        let bad = plan(&bad_descriptors, &private, &[], ALL_CAPS);
+        let mut pages = dirty_pages(16);
+        assert!(matches!(
+            build_host_identity(&bad, &mut pages, HostPhys::new(ARENA).unwrap(), policy),
+            Err(BuildError::Platform(Error::CacheConflict))
+        ));
+        assert_root_empty(&pages);
+        assert!(pages[1].entries().iter().all(|&entry| entry == u64::MAX));
     }
 
     #[test]

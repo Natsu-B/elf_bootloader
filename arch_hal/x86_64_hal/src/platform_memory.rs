@@ -561,7 +561,7 @@ fn fixed_position(address: u64) -> (usize, usize, u64) {
     (register, byte, base + (byte as u64 + 1) * size)
 }
 
-/// Hardware-approved page sizes for the currently supported four-level EPT walk.
+/// Hardware-approved leaf sizes for a four-level EPT or host walk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageCapabilities {
     two_mib: bool,
@@ -569,6 +569,15 @@ pub struct PageCapabilities {
 }
 
 impl PageCapabilities {
+    /// Captured CPUID.1:EDX and CPUID.80000001:EDX, not VMX capabilities.
+    #[must_use]
+    pub const fn from_host_cpuid(features: u32, extended_features: u32) -> Self {
+        Self {
+            two_mib: features & (1 << 3) != 0,
+            one_gib: extended_features & (1 << 26) != 0,
+        }
+    }
+
     /// Reads allowed EPT page-size bits from captured IA32_VMX_EPT_VPID_CAP.
     pub fn from_vmx_capability(capability: u64) -> Result<Self, Error> {
         if capability & ((1 << 6) | (1 << 14)) != ((1 << 6) | (1 << 14)) {
@@ -624,7 +633,7 @@ pub struct Mapping {
     pub range: PhysicalRange,
     /// EPT memory type derived from MTRRs or forced UC for MMIO.
     pub memory_type: MemoryType,
-    /// Ownership metadata, never monitor-private.
+    /// Original firmware class; host mappings may include monitor reservations.
     pub kind: RegionKind,
     /// Original numeric UEFI memory type; explicit holes use MMIO type 11.
     pub firmware_type: u32,
@@ -707,6 +716,23 @@ impl<'a> PlatformMap<'a> {
             plan: self,
             cursor: 0,
             failed: false,
+            host: false,
+            capabilities: self.capabilities,
+        }
+    }
+
+    /// Host identity mappings include reserved monitor RAM but no PCI/MMIO
+    /// aperture or read-protected RAM. L0 needs RAM for checked guest page walks
+    /// and operands; rare MMIO accesses require a separately owned mapping window.
+    /// CPU page-size support is independent of EPT page-size capabilities.
+    #[must_use]
+    pub fn host_mappings(&self, capabilities: PageCapabilities) -> Mappings<'_, 'a> {
+        Mappings {
+            plan: self,
+            cursor: 0,
+            failed: false,
+            host: true,
+            capabilities,
         }
     }
 
@@ -789,6 +815,8 @@ pub struct Mappings<'plan, 'data> {
     plan: &'plan PlatformMap<'data>,
     cursor: u64,
     failed: bool,
+    host: bool,
+    capabilities: PageCapabilities,
 }
 
 impl Mappings<'_, '_> {
@@ -798,11 +826,21 @@ impl Mappings<'_, '_> {
             let Some(start) = self.plan.next_start(self.cursor)? else {
                 return Ok(None);
             };
-            if let Some(private) = self.plan.private.iter().find(|range| range.contains(start)) {
+            if let Some(private) = self
+                .plan
+                .private
+                .iter()
+                .find(|range| !self.host && range.contains(start))
+            {
                 self.cursor = private.end;
                 continue;
             }
             let (kind, firmware_type, attributes) = self.plan.source(start)?;
+            let boundary = self.plan.boundary(start)?;
+            if self.host && (kind == RegionKind::Mmio || attributes & 0x2000 != 0) {
+                self.cursor = boundary;
+                continue;
+            }
             let memory_type = if kind == RegionKind::Mmio {
                 MemoryType::Uncacheable
             } else {
@@ -811,8 +849,7 @@ impl Mappings<'_, '_> {
             if kind != RegionKind::Mmio && !memory_type.supported_by(attributes) {
                 return Err(Error::CacheConflict);
             }
-            let boundary = self.plan.boundary(start)?;
-            let (end, page_size) = leaf_segment(start, boundary, self.plan.capabilities);
+            let (end, page_size) = leaf_segment(start, boundary, self.capabilities);
             let range = PhysicalRange::new(start, end, self.plan.mtrrs.width)?;
             self.cursor = end;
             return Ok(Some(Mapping {
