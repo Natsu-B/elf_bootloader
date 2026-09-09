@@ -3152,3 +3152,40 @@ above. `/tmp/x86-rflags-contract-baseline.log`. All commands use Nix. The
 baseline monitor code is still `f86c587`; only the native fixture and gate
 changed. Its two release EFI artifacts were retained outside Git in
 `/tmp/x86-rflags-baseline-images` for a subsequent measured comparison.
+
+### Elide only identical VMX-completion RFLAGS writes
+
+`complete_vmx_instruction` already reads the current carrier's GUEST_RFLAGS.
+It now compares the computed completion flags with that same live value and
+writes only when different. There is no cache, no extra VMREAD, and no VMCS
+switch or guest execution between comparison and write. VM_INSTRUCTION_ERROR
+publication, mandatory read failures, changed-write failures and RIP advancement
+are unchanged. This applies to all callers of the shared completion function.
+
+`/tmp/x86-rflags-regression.log`: the five required `cargo xtest -p` packages
+give **349 host PASS, 0 FAIL**; `cargo xbuild x86` and release builds PASS.
+Standard release QEMU gives **11 PASS, 0 FAIL** (9 KVM, 2 TCG). The release
+nested suite remains **15 PASS, 5 FAIL / 20**, all **14 Direct PASS**, with
+the same five reference differences. All 192 native flag cases pass on every
+Direct native-contract profile. Formatting and diff whitespace checks PASS.
+In the native profile, VMREAD/VMPTRLD counts remain exactly 13,908/2,086 while
+VMWRITEs decrease from 6,335 to 6,275. That is a measured operation reduction,
+not proof of a meaningful wall-time improvement.
+
+The immutable three-pair benchmark comparison completes **18 PASS, 0 FAIL**;
+all artifact/UKI hashes remain unchanged. Median reported cycles are:
+
+| Existing benchmark | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| CPUID | 297,605 | 298,916 | +0.44% |
+| VMCALL | 937,936 | 935,915 | -0.22% |
+| PM timer INL | 356,943 | 359,248 | +0.65% |
+
+This is **not a consistent measured speedup**; the small mixed differences
+cannot establish a performance fix. The independent full KVM unit matrix was
+also running. `/tmp/x86-rflags-ab.log`, `/tmp/x86-idle-guest-ab.JK0hIU`;
+`BASELINE_IMAGES=/tmp/x86-rflags-baseline-images`
+`OPTIMIZED_IMAGES=/tmp/x86-rflags-optimized-images`
+`nix develop --accept-flake-config --command bash /tmp/x86-idle-guest-ab.sh`.
+The original Linux timing/S3 and Windows Direct runs after this change remain
+pending; the earlier frozen runs are not silently attributed to this code.

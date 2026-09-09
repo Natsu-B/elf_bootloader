@@ -5864,6 +5864,8 @@ fn complete_vmx_instruction(
             );
         }
     }
+    // SAFETY: instruction/error completion has restored this CPU's stopped
+    // carrier. This is its current L1 flags value, never a previous-exit cache.
     let Some(rflags) = (unsafe { vmcs_read(vmcs::GUEST_RFLAGS) }).ok() else {
         stop_unexpected_exit(
             b"VMREAD(GUEST_RFLAGS) failed",
@@ -5874,8 +5876,13 @@ fn complete_vmx_instruction(
             registers,
         );
     };
-    if unsafe { vmcs_write(vmcs::GUEST_RFLAGS, result.apply_to_rflags(rflags)) }
-        != VmxStatus::Success
+    let completed = result.apply_to_rflags(rflags);
+    // SAFETY: no guest execution or VMCS switch occurs after the read above.
+    // GUEST_RFLAGS is a mandatory supported field; an identical write has no
+    // architectural side effect. Error publication and RIP advancement remain
+    // unconditional, and changed flags still take the hardware error path.
+    if completed != rflags
+        && unsafe { vmcs_write(vmcs::GUEST_RFLAGS, completed) } != VmxStatus::Success
     {
         stop_unexpected_exit(
             b"VMWRITE(GUEST_RFLAGS) failed",
