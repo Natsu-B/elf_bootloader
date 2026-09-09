@@ -1451,3 +1451,17 @@ GCD alone cannot establish complete device coverage. Markers retain
 successful Direct Linux high-BAR boot. Active EPT/HOST_CR3 integration, bootstrap
 separation, pCPU/AP ownership, root NMI, S3 and Windows remain pending.
 Outer-KVM remains reference evidence only.
+
+### Frozen-runner XSTATE replay
+
+After commit `c0540c1`, the interrupted profile was replayed with source, runner
+and boot artifacts fixed for the whole run:
+`LINUX_KVM_BACKEND=direct-vmx LINUX_KVM_HOST_XSTATE_TEST=1
+LINUX_KVM_CYCLES=4096 LINUX_KVM_TIMEOUT_SECONDS=600 nix develop
+--accept-flake-config --command bash scripts/x86_64/run-linux-kvm-test.sh`.
+**PASS**, process exit 0; all 4096 ordered cycle records and the explicit XSTATE
+clobber-arm marker are present. Guest completion time is 323.355 seconds.
+`/tmp/x86-gcd-direct-clobber-4096-replay.log` contains the full transcript.
+This supplies the missing Direct profile result, but does not rewrite the
+earlier full-suite infrastructure failure into a clean suite run. The unmodified
+invalid-guest-state and memslot RW timing failures remain unresolved.
