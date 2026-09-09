@@ -4015,7 +4015,8 @@ mod tests {
                     "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds=4\n"
                 );
                 let diagnostics = "thin-hv: native L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores=0\nthin-hv: native L1 original host validation PASS invalid=34 priority=2 restored=1\n";
-                let valid = format!("{provenance}{start}{diagnostics}{pass}{terminal}");
+                let cr4_guard = "thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2\n";
+                let valid = format!("{provenance}{start}{cr4_guard}{diagnostics}{pass}{terminal}");
                 if ept_types & 2 == 0 || vpid_types & 4 == 0 {
                     assert!(!check(backend, &valid));
                     continue;
@@ -4062,6 +4063,13 @@ mod tests {
                 assert!(check(backend, &valid.replace('\n', "\r\n")));
                 for invalid in [
                     valid.replace(start, ""),
+                    valid.replace(cr4_guard, ""),
+                    valid.replace(cr4_guard, &cr4_guard.repeat(2)),
+                    valid.replace("guard PASS probes=2", "guard PASS probes=1"),
+                    valid.replace("state_preserved=2", "state_preserved=0"),
+                    valid.replace(cr4_guard, &cr4_guard.replace('\n', "\r\r\n")),
+                    format!("{cr4_guard}{valid}"),
+                    format!("{}{cr4_guard}", valid.replace(cr4_guard, "")),
                     valid.replace(&pass, ""),
                     valid.replace(terminal, ""),
                     format!("{valid}{pass}"),

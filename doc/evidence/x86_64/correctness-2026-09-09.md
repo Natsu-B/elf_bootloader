@@ -2116,3 +2116,55 @@ AP initialization, INIT/SIPI delivery and cross-pCPU lifecycle qualification are
 still pending. The physical multi-CPU rejection gate stays enabled. This step
 does not claim SMP, S3, Direct Hyper-V/WSL2 or physical readiness. No physical
 machine or Windows installation was tested. Outer KVM remains reference-only.
+
+## Step 12b — preserve virtual VMX operation on intercepted CR4 writes
+
+Additional finding confirmed at `53cf4d1`: `dispatch_l1_exit` accepted an L1
+write clearing CR4.VMXE while its CPU-local `VcpuState` was still in VMX
+operation. It forced hardware VMXE back on but cleared the L1 read shadow,
+omitting the architectural #GP. The L0 hardware bit cannot validate the L1
+state that the mask/shadow hides. [Intel SDM volume 3C, section 24.7](https://cdrdv2-public.intel.com/671506/326019-sdm-vol-3c.pdf)
+requires VMXOFF before clearing VMXE.
+
+* `x86_uefi_loader/src/vmx_smoke.rs`, `dispatch_l1_exit`: checks the calling
+  CPU's nested VMX lifecycle before changing either CR4 field. An attempted
+  clear inside VMX operation injects #GP(0) with RIP and CR4 unchanged. Outside
+  VMX operation the existing successful write path remains. This targeted fix
+  is not a claim of complete CR0/CR4 or AP reset emulation.
+* `x86_guest_uefi_test/src/nested_contract.rs`, `vmxe_cannot_clear_in_vmx`,
+  `instructions`: uses the existing exact-RIP L1 fault fixture twice, without
+  and with a current VMCS. It validates exception vector/error and unchanged
+  visible CR4, then continues the ordinary VMX contract and VMXOFF cleanup.
+  On assertion failure it first restores the known-valid VMXE-enabled CR4 so
+  cleanup remains executable. No alternate test framework or L2-only CPUID
+  route is used.
+* `scripts/x86_64/run-uefi-smoke.sh`, `check_nested_contract_log`, and
+  `xtask/src/main.rs`: require the exact two-probe/state-preserved marker
+  between contract start and final PASS. Host tests reject missing, duplicated,
+  malformed, wrong-count and reordered evidence.
+
+The focused pre-fix QEMU/KVM Direct run **FAILed as intended**, exit **1**:
+`cr4-vmxe-guard-vector actual=0xffffffffffffffff expected=0xd` (no exception).
+The test recovered, completed VMX cleanup and returned; it did not crash L0.
+Command, through Nix: `cargo xbuild x86 --release`, then the existing
+`run-uefi-smoke.sh` with the normal Direct loader/native-contract EFI,
+`host,+vmx,-hypervisor,kvm=off`, one CPU, 256 MiB and the existing 30-second bound.
+Log: `/tmp/x86-cr4-vmxe-before.log`.
+
+After the fix, through `nix develop --accept-flake-config --command`:
+
+* All five requested package-specific host tests: **314 PASS, 0 FAIL**
+  (nested_vmx 29, x86_64_hal 59, x86_uefi_loader 183,
+  x86_guest_uefi_test 10, xtask 33).
+* `cargo xrun x86 --nested --release`: **15 PASS, 5 FAIL / 20**, exit **1**;
+  all **14 Direct cases PASS**, including the negative CPU gate. The new CR4
+  probe also passes on the outer-KVM reference before its unrelated existing
+  operand-contract failure. `/tmp/x86-cr4-vmxe-after.log`.
+* `cargo xbuild x86`, `cargo xrun x86 --release`: **PASS**, the latter **9 PASS,
+  0 FAIL** (7 KVM/2 TCG including the expected root exception).
+  `/tmp/x86-cr4-vmxe-core.log`. Formatting and diff checks: **PASS**.
+
+No capability bits, timeouts, Windows installation or AArch64 implementation
+were changed. AP/INIT/SIPI, root NMI and S3 lifecycle work, the two Direct
+timing-sensitive failures and Direct Windows/Hyper-V/WSL2 revalidation remain.
+No physical hardware was tested; outer KVM is reference evidence only.

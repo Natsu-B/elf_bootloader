@@ -3176,6 +3176,13 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
                 registers,
             );
         };
+        // VMXON creates architectural state on this L1 CPU, even with no
+        // current VMCS. Hardware sees L0's forced VMXE=1 and cannot enforce
+        // this check after shadowing; only VMXOFF permits L1 to clear VMXE.
+        if value & CR4_VMX_ENABLE == 0 && current_cpu().vcpu.lock().in_vmx_operation() {
+            inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+            return VMEXIT_ACTION_RESUME;
+        }
         let fixed = (value | CR4_VMX_ENABLE | unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED0) })
             & unsafe { cpu::rdmsr(vmx::IA32_VMX_CR4_FIXED1) };
         for (field, field_value) in [(vmcs::GUEST_CR4, fixed), (vmcs::CR4_READ_SHADOW, value)] {

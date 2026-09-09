@@ -1202,6 +1202,43 @@ unsafe fn pointer_equal(stage: &'static str, expected: u64) -> Result<()> {
     equal(stage, physical, expected)
 }
 
+/// MOV to CR4 must not leave architectural VMX operation without VMXOFF.
+/// Exercise the L1 instruction, both with and without a current nested VMCS.
+fn vmxe_cannot_clear_in_vmx() -> Result<()> {
+    l1_fault::with_handler(|| {
+        let original = cpu::read_cr4();
+        equal("cr4-vmxe-guard-active", original & (1 << 13), 1 << 13)?;
+        let fault = l1_fault::probe(|record| {
+            // SAFETY: this one-CPU CPL0 fixture has entered VMX and installed
+            // exact-RIP #GP recovery with IF clear. Only VMXE changes; neither
+            // code nor stack mappings change even if a broken L0 accepts it.
+            // R10 is the live, writable fault record throughout the assembly.
+            unsafe {
+                asm!(
+                    "lea r8, [rip + 2f]", "mov [r10], r8",
+                    "lea r8, [rip + 3f]", "mov [r10 + 8], r8",
+                    "2:", "mov cr4, r11", "3:",
+                    in("r10") record, in("r11") original & !(1 << 13),
+                    out("r8") _, options(nostack, preserves_flags),
+                );
+            }
+        });
+        let observed = cpu::read_cr4();
+        // SAFETY: the exact original valid CR4 has VMXE set and preserves all
+        // paging/extended-state settings. Restore it before any failed assertion
+        // returns so the enclosing VMCLEAR/VMXOFF cleanup remains executable.
+        unsafe { cpu::write_cr4(original) };
+        equal(
+            "cr4-vmxe-guard-instruction",
+            u64::from(fault.instruction != 0),
+            1,
+        )?;
+        equal("cr4-vmxe-guard-vector", fault.vector, 13)?;
+        equal("cr4-vmxe-guard-error", fault.error, 0)?;
+        equal("cr4-vmxe-guard-preserves-state", observed, original)
+    })
+}
+
 /// No guest entries occur, so field contents are independent of launch validity.
 unsafe fn instructions(
     vmxon: VmxonPhys,
@@ -1210,6 +1247,7 @@ unsafe fn instructions(
     capabilities: &Prerequisites,
     serial: &mut Serial,
 ) -> Result<()> {
+    vmxe_cannot_clear_in_vmx()?;
     l1_memory::without_current(vmxon.get() + (4 * PAGE) as u64)?;
     // SAFETY: VMXON succeeded and no VMPTRLD has executed in this session.
     unsafe {
@@ -1256,6 +1294,11 @@ unsafe fn instructions(
         success("write-first-rip", vmx::vmwrite(vmcs::GUEST_RIP, 0x1000))?;
         success("write-first-rsp", vmx::vmwrite(vmcs::GUEST_RSP, 0x8000))?;
     }
+    vmxe_cannot_clear_in_vmx()?;
+    let _ = writeln!(
+        serial,
+        "thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2"
+    );
     let partial_stores = l1_memory::in_vmx(vmxon.get() + (4 * PAGE) as u64, serial)?;
     // SAFETY: first is current, second was cleared and has not been loaded.
     // The header helper restores ordinary second/first ownership before return.
