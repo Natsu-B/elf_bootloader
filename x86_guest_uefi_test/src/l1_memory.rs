@@ -109,46 +109,12 @@ fn with_pages<T>(
         let original_cr3 = cpu::read_cr3();
         let cr0 = cpu::read_cr0();
         let five = cpu::read_cr4() & (1 << 12) != 0;
-        let levels = if five { 5 } else { 4 };
-        let top = base as *mut u64;
-        // SAFETY: caller supplies seven exclusive low WB pages, checked by the
-        // enclosing UEFI allocation_map. Firmware's current top-level CR3 is
-        // identity mapped and remains live; no Boot Services exit occurs here.
+        // SAFETY: the caller reserves PAGES WB pages checked by allocation_map;
+        // firmware CR3 and every copied mapping stay live in this scoped probe.
+        let (virtual_base, pt, data) = unsafe { prepare_pages(base, original_cr3, five) }?;
+        // SAFETY: both CR3 values map the live fixture code, stack and private
+        // descriptors; the copied root preserves the entire firmware map.
         unsafe {
-            ptr::write_bytes(base as *mut u8, 0, PAGES * PAGE);
-            ptr::copy_nonoverlapping(
-                (original_cr3 & 0x000f_ffff_ffff_f000) as *const u64,
-                top,
-                512,
-            );
-        }
-        let slot = (1..256)
-            .find(|&index| {
-                // SAFETY: index is within the exclusive copied 512-entry root.
-                unsafe { ptr::read_volatile(top.add(index)) & 1 == 0 }
-            })
-            .ok_or(Failure {
-                stage: "l1-operand-free-root-slot",
-                actual: 0,
-                expected: 1,
-            })?;
-        let shift = if five { 48 } else { 39 };
-        let virtual_base = (slot as u64) << shift;
-        let pt = (base + ((levels - 1) * PAGE) as u64) as *mut u64;
-        // Reverse the physical payload order so crossing requires two walks.
-        let data = base + (6 * PAGE) as u64;
-        // SAFETY: all links name distinct aligned pages within this allocation;
-        // entries are supervisor RW WB RAM. No existing root slot is replaced.
-        unsafe {
-            ptr::write_volatile(top.add(slot), (base + PAGE as u64) | 3);
-            for level in 1..levels - 1 {
-                ptr::write_volatile(
-                    (base + (level * PAGE) as u64) as *mut u64,
-                    (base + ((level + 1) * PAGE) as u64) | 3,
-                );
-            }
-            ptr::write_volatile(pt, data | 3);
-            ptr::write_volatile(pt.add(1), (data - PAGE as u64) | 3);
             cpu::write_cr0(cr0 | (1 << 16));
             asm!("mov cr3, {}", in(reg) base | (original_cr3 & (0xfff | (3 << 61))), options(nostack, preserves_flags));
         }
@@ -161,6 +127,62 @@ fn with_pages<T>(
         }
         result
     })
+}
+
+/// Copies a root and adds two private discontiguous test leaves, without loading
+/// CR3. Shared by operand-fault and tagged-L2 translation probes.
+///
+/// # Safety
+/// `base` owns PAGES aligned, writable WB pages, disjoint from the identity-
+/// mapped live `original_cr3` root. `five` must match its paging depth. No CPU
+/// may use the new tables while they are built; all inherited mappings stay live.
+pub(super) unsafe fn prepare_pages(
+    base: u64,
+    original_cr3: u64,
+    five: bool,
+) -> Result<(u64, *mut u64, u64)> {
+    let levels = if five { 5 } else { 4 };
+    let top = base as *mut u64;
+    // SAFETY: caller supplies seven exclusive low WB pages, checked by the
+    // enclosing UEFI allocation_map. Firmware's current top-level CR3 is
+    // identity mapped and remains live; no Boot Services exit occurs here.
+    unsafe {
+        ptr::write_bytes(base as *mut u8, 0, PAGES * PAGE);
+        ptr::copy_nonoverlapping(
+            (original_cr3 & 0x000f_ffff_ffff_f000) as *const u64,
+            top,
+            512,
+        );
+    }
+    let slot = (1..256)
+        .find(|&index| {
+            // SAFETY: index is within the exclusive copied 512-entry root.
+            unsafe { ptr::read_volatile(top.add(index)) & 1 == 0 }
+        })
+        .ok_or(Failure {
+            stage: "l1-operand-free-root-slot",
+            actual: 0,
+            expected: 1,
+        })?;
+    let shift = if five { 48 } else { 39 };
+    let virtual_base = (slot as u64) << shift;
+    let pt = (base + ((levels - 1) * PAGE) as u64) as *mut u64;
+    // Reverse the physical payload order so crossing requires two walks.
+    let data = base + (6 * PAGE) as u64;
+    // SAFETY: all links name distinct aligned pages within this allocation;
+    // entries are supervisor RW WB RAM. No existing root slot is replaced.
+    unsafe {
+        ptr::write_volatile(top.add(slot), (base + PAGE as u64) | 3);
+        for level in 1..levels - 1 {
+            ptr::write_volatile(
+                (base + (level * PAGE) as u64) as *mut u64,
+                (base + ((level + 1) * PAGE) as u64) | 3,
+            );
+        }
+        ptr::write_volatile(pt, data | 3);
+        ptr::write_volatile(pt.add(1), (data - PAGE as u64) | 3);
+    }
+    Ok((virtual_base, pt, data))
 }
 
 /// One #PF and one #GP before VMXON; neither may create a VMX session.

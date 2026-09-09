@@ -968,3 +968,98 @@ upstream 200-microsecond signal interval was not modified. The MSR fixes do not
 resolve this timing-sensitive regression, and it remains on the performance/
 event-correctness work list. No Windows/Hyper-V, S3 or physical machine was
 tested here; outer-KVM evidence is reference only.
+
+## Exclusive per-CPU VPID namespace lifetime
+
+Confirmed: Direct accepted L1 tags unchanged without an explicit L0 lifetime.
+The carrier already has VPID disabled, so its untagged translations do not need
+a nonzero tag. The minimum trusted policy is therefore an exclusive namespace
+lease, not per-VMCS tag substitution: VPIDs identify address spaces, and L1 may
+legitimately share one between VMCSes.
+
+* `nested_vmx::vpid::Namespace` owns tags 1..65535 for one L1 VMX execution
+  period on its pinned CPU. Acquire and release publish no ownership change
+  unless a local all-context INVVPID succeeds. Reusing the same VMXON address
+  advances a checked generation; wrong owner, duplicate acquisition, failed
+  invalidation and generation exhaustion have tested error paths. Independent
+  CPU metadata cannot transfer another CPU's lease. No heap is used.
+* The private GS-bound `CpuRuntimeState` (renamed from `DirectMsrState`) stores
+  the lease beside existing per-CPU MSR mirrors. `handle_l1_vmxon` acquires it,
+  `handle_l1_vmxoff` releases it, and nested entry/INVVPID check it. Setup rejects
+  a tagged carrier. `invalidate_namespace` uses advertised hardware type 2 on
+  the owning root CPU, with the carrier current and no guest executing.
+* L1 VPIDs and all four advertised INVVPID types remain unchanged hardware
+  operands. This preserves descriptor faults, VPID-zero rules and invalidation
+  scope. L1 remains responsible for its own address-space reuse **within** a
+  lease. The monitor invalidates the entire namespace between unrelated leases;
+  Intel does not require VMXON/VMXOFF themselves to invalidate translations.
+  This stronger boundary is an L0 ownership rule, not a new claim about Intel
+  instruction semantics. Add real remapping before a tagged carrier or another
+  L1 shares this namespace. No capability was hidden or newly advertised.
+* `msr_contract::vpid_lifetime` executes actual tagged L2 loads using VPIDs 1
+  and 65535, rejects enabled VPID 0 with error 7, and changes a leaf followed by
+  each of four INVVPID types. It then reuses the exact VMXON/VMCS/CR3/VPID
+  addresses over 64 VMXOFF/VMXON cycles, replacing the leaf without an L1
+  invalidation between periods. Direct must observe the new page 64/64 times.
+  The reference may retain or invalidate at this boundary; its observation is
+  recorded but is not a Direct guarantee. Both observed 64/64 on this machine.
+  An unsuccessful VMXON restart does not execute cleanup VMX instructions while
+  outside VMX operation.
+* `l1_memory::prepare_pages` factors the existing copied-root/absent-slot helper
+  for both operand-fault and L2 translation probes; existing firmware mappings
+  are untouched. HAL adds the checked `VIRTUAL_PROCESSOR_ID` encoding. The
+  existing runner and xtask require the complete new markers, rejecting absent,
+  malformed, duplicated or insufficient Direct lease evidence.
+
+This is **not physical SMP support**: most carrier/VMXON/nested/cache/diagnostic
+globals still require the later pCPU conversion. GS-based ownership applies
+only to the current pinned CPU; no VMCS migration or AP launch is claimed.
+
+Validation so far (cargo via `nix develop --accept-flake-config --command`):
+
+* `cargo xtest -p x86_uefi_loader -p x86_guest_uefi_test -p xtask` and
+  `cargo xtest -p nested_vmx -p x86_64_hal`: **169 PASS, 0 FAIL**, comprising
+  nested 26, HAL 53, loader 47, guest 10 and xtask 33;
+  `/tmp/x86-vpid-host-initial.log`, `/tmp/x86-vpid-host-policy-hal.log`.
+  The standalone policy iteration also passed 26 tests.
+* Debug and release `cargo xbuild x86`: **PASS**;
+  `/tmp/x86-vpid-build-{debug,release}.log`.
+* `cargo xrun x86 --release`: **9 PASS, 0 FAIL**, seven QEMU/KVM and two TCG
+  profiles; `/tmp/x86-vpid-smoke.log`.
+* The 64-cycle nested iteration reported **9 PASS, 5 FAIL** (the same five
+  reference failures); `/tmp/x86-vpid-nested-64.log`. A concurrent debug build
+  could restage its shared EFI artifacts, so this iteration is **not used as
+  final release provenance**. The final 4096-cycle matrix is run without any
+  concurrent artifact-producing build or QEMU runner.
+* An initial manual MSR invocation produced all VPID/MSR PASS markers but used
+  ordinary return-marker/shutdown defaults and ended as a harness FAIL (124,
+  missing `vmx guest PASS`); `/tmp/x86-vpid-direct-msr.log`. The existing xtask
+  profile supplies the correct poweroff/marker gates; no timeout was increased
+  and the failed manual invocation is not counted as a passing test.
+
+No Windows/Hyper-V, S3 or physical hardware validation is claimed here.
+
+Final serialized release result:
+
+* `LINUX_KVM_CYCLES=4096 LINUX_KVM_TIMEOUT_SECONDS=600 nix develop
+  --accept-flake-config --command cargo xrun x86 --nested --release`:
+  **9 PASS, 5 FAIL**, process exit 1; `/tmp/x86-vpid-nested-4096.log`.
+  All six Direct native profiles and all three Linux profiles PASS. The five
+  reference-only failures remain the two cross-page partial-store cases, the
+  late-entry PAT-field case, and the two missing physical VMX-abort indicators.
+  No Direct failure was replaced by reference success.
+* 4096-cycle lifecycle PASS timestamps: reference **38.476460 s**, Direct
+  **328.492424 s**, Direct host-XSTATE-clobber **328.499646 s**. These are the
+  existing end markers, not an isolated VM-exit benchmark or an optimization
+  claim. The substantial-cycle profile retains its existing 600-second bound.
+* The final common MSR marker is clarified to `final_vmxoff=1`; it counts only
+  final cleanup, separate from the 64 lease-boundary VMXOFF/VMXON pairs. The
+  program's assertions and monitor runtime are unchanged by this label edit.
+  Release rebuild, the Direct MSR fixture with the xtask-equivalent 30-second
+  poweroff/marker settings, and `--check-msr-contract-log direct-vmx` all PASS;
+  `/tmp/x86-vpid-final-build.log`, `/tmp/x86-vpid-final-direct-msr.log`.
+  `cargo xtest -p xtask` also passes all 33 tests after the label change;
+  `/tmp/x86-vpid-final-gates.log`.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**. Only x86
+  runtime/HAL, nested policy, x86 test/runner, xtask and this evidence changed.
+  The user's unrelated `AGENTS.md` edit remains unstaged.

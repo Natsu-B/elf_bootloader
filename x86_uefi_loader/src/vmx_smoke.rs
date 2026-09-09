@@ -46,6 +46,7 @@ use nested_vmx::msr_list::PatEfer;
 use nested_vmx::msr_list::exit_store_source;
 use nested_vmx::restrict_vmx_capability;
 use nested_vmx::vmcs_revision_is_supported;
+use nested_vmx::vpid::Namespace as VpidNamespace;
 use r_efi::efi;
 use uefi_variable_overlay::ProfileId;
 use x86_64_hal::addr::EptPhys;
@@ -70,7 +71,7 @@ use x86_64_hal::xstate;
 use x86_64_hal::xstate::XsetbvFault;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES + MSR_STATE_PAGES;
+const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES + CPU_STATE_PAGES;
 /// First of eight page directories mapping the low eight gibibytes.
 const EPT_PD_FIRST_PAGE: u64 = 4;
 /// L1 MSR bitmap, including conservative VMX capability interception.
@@ -92,9 +93,9 @@ const HOST_ENVIRONMENT_FIRST_PAGE: u64 = 91;
 /// Inactive, deliberately invalid-revision page used only to record VMX error 11.
 const ERROR_REVISION_PAGE: u64 =
     HOST_ENVIRONMENT_FIRST_PAGE + host_state::HOST_ENVIRONMENT_PAGES as u64;
-/// CPU-owned inherited MSR state, separate from descriptors and ordinary stack.
-const MSR_STATE_FIRST_PAGE: u64 = ERROR_REVISION_PAGE + 1;
-const MSR_STATE_PAGES: usize = core::mem::size_of::<SpinLock<DirectMsrState>>().div_ceil(4096);
+/// CPU-owned MSR mirrors and VPID lease, separate from descriptors and stack.
+const CPU_STATE_FIRST_PAGE: u64 = ERROR_REVISION_PAGE + 1;
+const CPU_STATE_PAGES: usize = core::mem::size_of::<SpinLock<CpuRuntimeState>>().div_ceil(4096);
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
 /// Upper bound of the smoke monitor's identity-mapped physical space.
@@ -517,7 +518,7 @@ fn log_diagnostic_summary(serial: &mut SerialPort) {
 }
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == HOST_ENVIRONMENT_FIRST_PAGE);
-const _: () = assert!(ERROR_REVISION_PAGE + 1 == MSR_STATE_FIRST_PAGE);
+const _: () = assert!(ERROR_REVISION_PAGE + 1 == CPU_STATE_FIRST_PAGE);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
 const RUNTIME_MODE: u32 = 0;
@@ -565,10 +566,12 @@ struct NestedRun {
     outer_instruction_len: u64,
 }
 
-/// Reserved per-CPU inherited state, selected through private GS. No mutable
-/// reference is shared with another CPU or held across hardware entry.
+/// Per-CPU MSR mirrors and VPID lifetime state, selected through private GS.
+/// No mutable reference spans guest entry. Carrier/VMXON/other VMX globals
+/// remain BSP-only; this partial ownership conversion does not establish SMP.
 #[repr(C, align(16))]
-struct DirectMsrState {
+struct CpuRuntimeState {
+    vpids: VpidNamespace,
     ram: FirmwareMap<205>,
     private: [(u64, u64); 2],
     entry: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
@@ -583,10 +586,11 @@ struct DirectMsrState {
     entry_loaded: PatEfer,
 }
 
-impl DirectMsrState {
+impl CpuRuntimeState {
     /// Initial state is overwritten by a carrier snapshot before nested entry.
     fn new(ram: FirmwareMap<205>, private: [(u64, u64); 2]) -> Self {
         Self {
+            vpids: VpidNamespace::new(),
             ram,
             private,
             entry: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
@@ -738,16 +742,16 @@ impl DirectMsrState {
     }
 }
 
-const _: () = assert!(core::mem::align_of::<SpinLock<DirectMsrState>>() <= 4096);
-const _: () = assert!(MSR_STATE_FIRST_PAGE as usize + MSR_STATE_PAGES == MONITOR_PAGES);
+const _: () = assert!(core::mem::align_of::<SpinLock<CpuRuntimeState>>() <= 4096);
+const _: () = assert!(CPU_STATE_FIRST_PAGE as usize + CPU_STATE_PAGES == MONITOR_PAGES);
 
-/// Borrows only the current CPU's mirror metadata, never across hardware entry.
+/// Borrows only the current CPU's runtime metadata, never across hardware entry.
 /// The callback cannot return a reference derived from the short lock guard.
-fn with_direct_msr_state<T>(inspect: impl FnOnce(&mut DirectMsrState) -> T) -> Option<T> {
+fn with_cpu_runtime<T>(inspect: impl FnOnce(&mut CpuRuntimeState) -> T) -> Option<T> {
     // SAFETY: only post-VM-exit paths call this helper. HOST_GS_BASE is private
     // and bind_monitor_data points to this CPU's initialized, immovable runtime
     // lock. No migration occurs, and terminal paths never free the backing.
-    let pointer = unsafe { host_state::monitor_data() }?.cast::<SpinLock<DirectMsrState>>();
+    let pointer = unsafe { host_state::monitor_data() }?.cast::<SpinLock<CpuRuntimeState>>();
     // SAFETY: the pointer has the exact initialized type/alignment above. This
     // shared reference accesses only the lock; a short guard owns each mutable
     // metadata borrow, and no hardware entry occurs while the guard exists.
@@ -1069,10 +1073,10 @@ fn run_direct_monitor(
         }
         .map_err(Error::HostState)?;
         let msr_state = ptr::NonNull::new(
-            (block + MSR_STATE_FIRST_PAGE * PAGE_SIZE) as *mut SpinLock<DirectMsrState>,
+            (block + CPU_STATE_FIRST_PAGE * PAGE_SIZE) as *mut SpinLock<CpuRuntimeState>,
         )
         .ok_or(Error::Firmware(
-            "CPU MSR state address",
+            "CPU runtime state address",
             efi::Status::COMPROMISED_DATA.as_usize(),
         ))?;
         // SAFETY: the checked runtime allocation includes this disjoint,
@@ -1080,7 +1084,7 @@ fn run_direct_monitor(
         // state. No CPU or VMCS references it yet. The object never moves; all
         // post-entry terminal paths retain its pages and private HOST_CR3 map.
         unsafe {
-            msr_state.as_ptr().write(SpinLock::new(DirectMsrState::new(
+            msr_state.as_ptr().write(SpinLock::new(CpuRuntimeState::new(
                 ram,
                 [(block, block_end), (image_base, image_end)],
             )));
@@ -1733,6 +1737,14 @@ fn configure_and_launch(
             | vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE,
         unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) },
     );
+    // ponytail: this CPU grants the complete nonzero namespace to one trusted
+    // L1. Add tag remapping before a tagged carrier or second L1 shares it.
+    if !VpidNamespace::carrier_supported(secondary) {
+        return Err(Error::Capability(
+            "VPID-tagged carrier",
+            u64::from(secondary),
+        ));
+    }
     // L0 always restores private PAT/EFER. Direct entry explicitly reconstructs
     // L1's inherited values; neither guest may supply L0's execution environment.
     let exit_capability = unsafe { cpu::rdmsr(exit_msr) };
@@ -2740,6 +2752,18 @@ fn handle_l1_vmxon(
                     registers,
                 );
             }
+            if with_cpu_runtime(|runtime| runtime.vpids.acquire(region, invalidate_namespace))
+                .is_none_or(|result| result.is_err())
+            {
+                stop_unexpected_exit(
+                    b"acquiring CPU VPID namespace failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
             L1_VCPU_STATE.lock().record_vmxon_success(region);
             VmInstructionResult::Vmsucceed
         },
@@ -2777,6 +2801,20 @@ fn handle_l1_vmxoff(
     if !materialize_direct_patch(None) {
         stop_unexpected_exit(
             b"restoring direct VMCS before VMXOFF failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    let released = state.vmxon_region().is_some_and(|owner| {
+        with_cpu_runtime(|runtime| runtime.vpids.release(owner, invalidate_namespace))
+            .is_some_and(|result| result.is_ok())
+    });
+    if !released {
+        stop_unexpected_exit(
+            b"releasing CPU VPID namespace failed",
             reason,
             qualification,
             guest_rip,
@@ -3125,6 +3163,16 @@ fn handle_l1_vmentry(
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return VMEXIT_ACTION_RESUME;
     }
+    if !owns_l1_vpid_namespace(&state) {
+        stop_unexpected_exit(
+            b"nested entry has no CPU VPID namespace lease",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
     let Some(current) = state.current_vmcs() else {
         complete_vmx_instruction(
             VmInstructionResult::VmfailInvalid,
@@ -3223,7 +3271,7 @@ fn handle_l1_vmentry(
     };
     if inherited
         .and_then(|(pat, efer)| {
-            with_direct_msr_state(|state| {
+            with_cpu_runtime(|state| {
                 state.inherited = PatEfer { pat, efer };
             })
         })
@@ -3722,7 +3770,7 @@ fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) ->
     let store_count =
         u32::try_from(direct_patch_value(saved, VmcsField::VmExitMsrStoreCount)?).ok()?;
     let (loaded, mirror_address, mirror_count, capture_address, capture_count) =
-        with_direct_msr_state(|state| {
+        with_cpu_runtime(|state| {
             let list = MsrList::new(
                 entry_address,
                 entry_count,
@@ -3778,12 +3826,12 @@ fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
         match reason & 0xffff {
             // Guest checking/loading is concurrent. A not-yet-loaded original
             // L1 value is a valid deterministic choice for undefined components.
-            33 => with_direct_msr_state(|state| state.inherited)?,
+            33 => with_cpu_runtime(|state| state.inherited)?,
             34 => {
                 // SAFETY: this CPU owns the failed-entry Direct VMCS; hardware
                 // supplies the one-based index of the first failing list item.
                 let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.ok()?;
-                with_direct_msr_state(|state| {
+                with_cpu_runtime(|state| {
                     state
                         .entry_loaded
                         .failed_load(&state.entry[..state.entry_count as usize], qualification)
@@ -3868,7 +3916,7 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
             registers,
         );
     };
-    let mirrors = with_direct_msr_state(|state| {
+    let mirrors = with_cpu_runtime(|state| {
         let list = |address, count| {
             MsrList::new(
                 direct_patch_value(&run.saved_direct, address)?,
@@ -3933,7 +3981,7 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
 /// A deferred L1 host list belongs to one reflection, not every carrier entry.
 /// Hardware's failed list load becomes the original L1 VMCS's VMX abort 4.
 fn complete_reflected_msr_load(reason: u64, registers: &GuestRegisters) {
-    let Some(owner) = with_direct_msr_state(|state| state.host_owner) else {
+    let Some(owner) = with_cpu_runtime(|state| state.host_owner) else {
         stop_unexpected_exit(b"missing per-CPU MSR state", reason, 0, 0, 0, registers);
     };
     let Some(owner) = owner else {
@@ -3959,7 +4007,7 @@ fn complete_reflected_msr_load(reason: u64, registers: &GuestRegisters) {
             stop_nested_exit(b"clearing reflected MSR list failed", owner, registers);
         }
     }
-    if with_direct_msr_state(|state| {
+    if with_cpu_runtime(|state| {
         state.host_owner = None;
         state.host_count = 0;
     })
@@ -3973,7 +4021,7 @@ fn complete_reflected_msr_load(reason: u64, registers: &GuestRegisters) {
 /// Record the architectural indicator, retain all private state and park this
 /// BSP until reset. No VMCS may be used again on this aborted virtual CPU.
 fn nested_vmx_abort(direct: VmcsPhys, code: u32, registers: &GuestRegisters) -> ! {
-    let recorded = with_direct_msr_state(|state| {
+    let recorded = with_cpu_runtime(|state| {
         let Some(address) = direct.get().checked_add(4) else {
             return false;
         };
@@ -4639,8 +4687,19 @@ fn handle_l1_invvpid(
             return;
         }
     };
-    // ponytail: VPID tags are direct and globally shared with this trusted
-    // one-vCPU L1; add per-pCPU VPID ownership before monitor SMP.
+    if !owns_l1_vpid_namespace(&state) {
+        stop_unexpected_exit(
+            b"INVVPID has no CPU namespace lease",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    // This CPU's entire nonzero namespace belongs to the current trusted L1.
+    // No translation is needed; hardware retains all advertised type, reserved
+    // operand, canonical-address and VPID-zero behavior. The carrier is untagged.
     let Some(result) = execute_l1_vmx_instruction(&state, || {
         // SAFETY: L0 remains in VMX root operation; supported INVVPID receives a
         // local aligned descriptor. Hardware validates reserved bits and VPID
@@ -4664,6 +4723,24 @@ fn handle_l1_invvpid(
         instruction_len,
         registers,
     );
+}
+
+/// Local invalidation at an exclusive namespace boundary, not an L1 instruction.
+/// Called only with the carrier current and all guest execution stopped.
+fn invalidate_namespace() -> bool {
+    // SAFETY: this CPU remains at CPL0 in VMX root with its owned carrier
+    // current. Setup forbids a tagged carrier and requires INVVPID all-context
+    // support. The aligned all-zero descriptor is valid for type 2; no other
+    // owner shares nonzero tags on this CPU, and no guest runs during reuse.
+    unsafe { vmx::invvpid(2, &vmx::InvvpidDescriptor::default()) == VmxStatus::Success }
+}
+
+/// The private GS binding identifies the owning pinned physical CPU. VMXON
+/// and VMXOFF transfer its namespace only after complete hardware invalidation.
+fn owns_l1_vpid_namespace(state: &VcpuState) -> bool {
+    state
+        .vmxon_region()
+        .is_some_and(|owner| with_cpu_runtime(|runtime| runtime.vpids.owns(owner)) == Some(true))
 }
 
 /// Runs an operation with L1's current VMCS selected and restores the carrier.
@@ -5512,9 +5589,9 @@ mod tests {
         region.physical_start = 1 << 32;
         assert!(super::monitor_allocation_is_wb(&[region], 1 << 32));
         assert!(super::ERROR_REVISION_PAGE > 1);
-        assert_eq!(super::ERROR_REVISION_PAGE + 1, super::MSR_STATE_FIRST_PAGE);
+        assert_eq!(super::ERROR_REVISION_PAGE + 1, super::CPU_STATE_FIRST_PAGE);
         assert_eq!(
-            super::MSR_STATE_FIRST_PAGE + super::MSR_STATE_PAGES as u64,
+            super::CPU_STATE_FIRST_PAGE + super::CPU_STATE_PAGES as u64,
             super::MONITOR_PAGES as u64
         );
     }
@@ -5532,7 +5609,7 @@ mod tests {
                 super::PhysicalWidth::new(48).unwrap(),
             )
             .unwrap();
-            super::DirectMsrState::new(ram, [(0x3000, 0x4000), (0x5000, 0x5101)])
+            super::CpuRuntimeState::new(ram, [(0x3000, 0x4000), (0x5000, 0x5101)])
         };
         let mut first = make();
         let second = make();
@@ -5573,8 +5650,8 @@ mod tests {
         );
         assert_ne!(first.entry.as_ptr(), second.entry.as_ptr());
         assert!(
-            core::mem::size_of::<mutex::SpinLock<super::DirectMsrState>>()
-                <= super::MSR_STATE_PAGES * 4096
+            core::mem::size_of::<mutex::SpinLock<super::CpuRuntimeState>>()
+                <= super::CPU_STATE_PAGES * 4096
         );
     }
 

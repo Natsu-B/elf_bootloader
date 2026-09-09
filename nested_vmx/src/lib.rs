@@ -9,6 +9,7 @@
 
 pub mod host_validation;
 pub mod msr_list;
+pub mod vpid;
 
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;

@@ -40,6 +40,7 @@ macro_rules! vmcs_fields {
 }
 
 vmcs_fields! {
+    VIRTUAL_PROCESSOR_ID = 0x0000 => (WIDTH_16, CONTROL, 0);
     GUEST_ES_SELECTOR = 0x0800 => (WIDTH_16, GUEST_STATE, 0);
     GUEST_CS_SELECTOR = 0x0802 => (WIDTH_16, GUEST_STATE, 1);
     GUEST_SS_SELECTOR = 0x0804 => (WIDTH_16, GUEST_STATE, 2);

@@ -3618,10 +3618,29 @@ mod tests {
                 })
                 .collect::<String>();
             let msr = format!(
-                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\n{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1\n"
+                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}thin-hv: MSR control cache PASS invalid=5 resume=5\nthin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\nthin-hv: MSR VPID lease cycles=64 fresh=64\n{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1\n"
             );
             assert!(check_profile(backend, "msr", &msr));
+            for fresh in [0, 1, 63] {
+                assert_eq!(
+                    check_profile(
+                        backend,
+                        "msr",
+                        &msr.replace("fresh=64", &format!("fresh={fresh}"))
+                    ),
+                    backend == "outer-kvm",
+                );
+            }
             for broken in [
+                msr.replace(
+                    "thin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8\n",
+                    "",
+                ),
+                msr.replace("thin-hv: MSR VPID lease cycles=64 fresh=64\n", ""),
+                msr.replace("fresh=64", "fresh=65"),
+                msr.replace("fresh=64", "fresh=064"),
+                msr.replace("fresh=64", "fresh=-1"),
+                msr.replace("types=4 invalidations=8", "types=3 invalidations=8"),
                 msr.replace("thin-hv: MSR matrix case=63\n", ""),
                 msr.replace("case=63\n", "case=62\n"),
                 msr.replace("matrix=128", "matrix=127"),

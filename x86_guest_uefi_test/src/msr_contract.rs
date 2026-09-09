@@ -25,7 +25,8 @@ use x86_64_hal::vmx;
 const ENV_PAGE: usize = 4;
 const STACK_PAGE: usize = ENV_PAGE + HOST_ENVIRONMENT_PAGES;
 const LIST_PAGE: usize = STACK_PAGE + 2;
-const PAGES: usize = LIST_PAGE + 6;
+const VPID_PAGE: usize = LIST_PAGE + 6;
+const PAGES: usize = VPID_PAGE + super::l1_memory::PAGES;
 const PAT: u32 = 0x277;
 const EFER: u32 = 0xc000_0080;
 
@@ -964,6 +965,168 @@ unsafe fn control_cache(
     }
 }
 
+/// Real tagged translations, all advertised invalidation types, and repeated
+/// VMX periods reusing the same VMXON/VMCS/CR3/VPID. Intel does not require
+/// VMXOFF/VMXON to flush; only the Direct runner requires lease_fresh=64.
+unsafe fn vpid_lifetime(
+    base: u64,
+    region: VmcsPhys,
+    env: &HostEnvironment<'_>,
+    serial: &mut Serial,
+    vmx_active: &mut bool,
+) -> Result<()> {
+    // SAFETY: the checked retained fixture owns the WB VMX regions and seven
+    // disjoint paging/payload pages. Only this CPU accesses them, with IF=0.
+    // Every entry uses copied live firmware mappings plus two owned leaves;
+    // no firmware call or free occurs after the private host tables are loaded.
+    unsafe {
+        let original_pat = cpu::rdmsr(PAT);
+        let original_efer = cpu::rdmsr(EFER);
+        let cr3 = cpu::read_cr3();
+        let root = base + (VPID_PAGE * PAGE) as u64;
+        let (linear, pte, data) =
+            super::l1_memory::prepare_pages(root, cr3, cpu::read_cr4() & (1 << 12) != 0)?;
+        let a = 0x1234_5678_9abc_def0;
+        let b = 0xfedc_ba98_7654_3210;
+        (data as *mut u64).write_volatile(a);
+        ((data - PAGE as u64) as *mut u64).write_volatile(b);
+        let mut frame = Frame {
+            fx: [0; 512],
+            original_pat,
+            original_efer,
+            inherited_pat: original_pat,
+            inherited_efer: original_efer,
+            l2_pat: original_pat,
+            l2_efer: original_efer,
+            entry_pat: 0,
+            entry_efer: 0,
+            exit_pat: 0,
+            exit_efer: 0,
+            // The dedicated assembly uses this slot as its input address and
+            // entry_pat as the observed load, without executing the MSR guest.
+            l2_debugctl: linear,
+        };
+        let entry = controls(
+            vmx::IA32_VMX_ENTRY_CTLS,
+            vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+            vmcs::VM_ENTRY_IA32E_MODE
+                | vmcs::VM_ENTRY_LOAD_IA32_PAT
+                | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+        )?;
+        let exit = controls(
+            vmx::IA32_VMX_EXIT_CTLS,
+            vmx::IA32_VMX_TRUE_EXIT_CTLS,
+            vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                | vmcs::VM_EXIT_LOAD_IA32_PAT
+                | vmcs::VM_EXIT_LOAD_IA32_EFER,
+        )?;
+        let secondary = controls(
+            vmx::IA32_VMX_PROCBASED_CTLS2,
+            vmx::IA32_VMX_PROCBASED_CTLS2,
+            1 << 5,
+        )?;
+        equal(
+            "vpid-all-types",
+            cpu::rdmsr(vmx::IA32_VMX_EPT_VPID_CAP) >> 40 & 15,
+            15,
+        )?;
+        let prepare = |tag| -> Result<()> {
+            success("vpid-clear", vmx::vmclear(region))?;
+            success("vpid-current", vmx::vmptrld(region))?;
+            configure(base, env, entry, exit)?;
+            write(
+                vmcs::CPU_BASED_VM_EXEC_CONTROL,
+                read_field("vpid-primary", vmcs::CPU_BASED_VM_EXEC_CONTROL)? | (1 << 31),
+            )?;
+            for (field, value) in [
+                (vmcs::SECONDARY_VM_EXEC_CONTROL, u64::from(secondary)),
+                (vmcs::VIRTUAL_PROCESSOR_ID, tag),
+                (vmcs::GUEST_CR3, root | (cr3 & (0xfff | (3 << 61)))),
+                (vmcs::GUEST_RIP, vpid_guest as *const () as usize as u64),
+                (vmcs::GUEST_IA32_PAT, original_pat),
+                (vmcs::HOST_IA32_PAT, original_pat),
+                (vmcs::GUEST_IA32_EFER, original_efer),
+                (vmcs::HOST_IA32_EFER, original_efer),
+            ] {
+                write(field, value)?;
+            }
+            Ok(())
+        };
+        let invalidate = |kind, tag| {
+            success(
+                "vpid-invalidate",
+                vmx::invvpid(
+                    kind,
+                    &vmx::InvvpidDescriptor {
+                        vpid: tag,
+                        linear_address: linear,
+                        ..vmx::InvvpidDescriptor::default()
+                    },
+                ),
+            )
+        };
+        let run = |frame: &mut Frame, resume| -> Result<u64> {
+            write(vmcs::GUEST_RIP, vpid_guest as *const () as usize as u64)?;
+            equal("vpid-entry", enter(frame, resume), 0)?;
+            equal(
+                "vpid-exit",
+                read_field("vpid-reason", vmcs::VM_EXIT_REASON)?,
+                18,
+            )?;
+            Ok(frame.entry_pat)
+        };
+        prepare(0)?;
+        equal("vpid-zero-flags", enter(&mut frame, 0), 0x40)?;
+        equal(
+            "vpid-zero-error",
+            read_field("vpid-error", vmcs::VM_INSTRUCTION_ERROR)?,
+            7,
+        )?;
+        for tag in [1, u16::MAX] {
+            for kind in 0..4 {
+                prepare(u64::from(tag))?;
+                pte.write_volatile(data | 3);
+                invalidate(1, tag)?;
+                equal("vpid-initial-load", run(&mut frame, 0)?, a)?;
+                pte.write_volatile((data - PAGE as u64) | 3);
+                invalidate(kind, if kind == 2 { 0 } else { tag })?;
+                equal("vpid-invalidated-load", run(&mut frame, 1)?, b)?;
+            }
+        }
+        let owner = VmxonPhys::new(base).ok_or(failure("vpid-vmxon-address"))?;
+        let mut fresh = 0;
+        for cycle in 0..64 {
+            let tag = if cycle & 1 == 0 { 1 } else { u16::MAX };
+            prepare(u64::from(tag))?;
+            pte.write_volatile(data | 3);
+            invalidate(1, tag)?;
+            equal("vpid-lease-initial-load", run(&mut frame, 0)?, a)?;
+            pte.write_volatile((data - PAGE as u64) | 3);
+            success("vpid-lease-clear", vmx::vmclear(region))?;
+            success("vpid-lease-off", vmx::vmxoff())?;
+            *vmx_active = false;
+            success("vpid-lease-on", vmx::vmxon(owner))?;
+            *vmx_active = true;
+            prepare(u64::from(tag))?;
+            let observed = run(&mut frame, 0)?;
+            // A reference may retain or invalidate: both are architectural.
+            // The backend-specific log gate enforces Direct's stronger lease.
+            equal(
+                "vpid-lease-value",
+                u64::from(observed == a || observed == b),
+                1,
+            )?;
+            fresh += u32::from(observed == b);
+        }
+        let _ = writeln!(
+            serial,
+            "thin-hv: MSR VPID PASS tags=2 invalid=1 types=4 invalidations=8"
+        );
+        let _ = writeln!(serial, "thin-hv: MSR VPID lease cycles=64 fresh={fresh}");
+        Ok(())
+    }
+}
+
 /// A malformed exit item must abort this virtual CPU, after earlier stores.
 /// The runner reads only the abort indicator and one PAT value through QEMU's
 /// physical-memory monitor; any return to this fixture is an explicit failure.
@@ -1121,6 +1284,7 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
         }
         // SAFETY: the owned aligned WB region has the advertised revision.
         success("msr-vmxon", unsafe { vmx::vmxon(vmxon) })?;
+        let mut vmx_active = true;
         // SAFETY: this CPU now owns VMX operation and its private VMCS/pages.
         let result = unsafe {
             if cfg!(any(feature = "msr-abort-store", feature = "msr-abort-load")) {
@@ -1129,14 +1293,17 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
                 matrix(base, region, &env, serial)
                     .and_then(|()| exit_lists(base, region, &env, serial))
                     .and_then(|()| control_cache(base, region, &env, serial))
+                    .and_then(|()| vpid_lifetime(base, region, &env, serial, &mut vmx_active))
                     .and_then(|()| entry_lists(base, region, &env, serial))
             }
         };
         // SAFETY: no L2 remains running; even failed attempts return here in L1
         // root. Clear the owned VMCS before VMXOFF; retain pages on any failure.
         unsafe {
-            success("msr-final-clear", vmx::vmclear(region))?;
-            success("msr-vmxoff", vmx::vmxoff())?;
+            if vmx_active {
+                success("msr-final-clear", vmx::vmclear(region))?;
+                success("msr-vmxoff", vmx::vmxoff())?;
+            }
             cpu::write_cr4(caps.cr4);
         }
         result
@@ -1145,7 +1312,7 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
         Ok(()) => {
             let _ = writeln!(
                 serial,
-                "thin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1"
+                "thin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 final_vmxoff=1"
             );
         }
         Err(error) => {
@@ -1285,6 +1452,20 @@ unsafe extern "sysv64" fn guest() -> ! {
         "shr rdx, 32",
         "mov ecx, 0xc0000080",
         "wrmsr",
+        "vmcall",
+        "ud2",
+    );
+}
+
+// SAFETY: only vpid_lifetime enters with CPL0, IF=0 and RDI pointing at its
+// retained Frame. Slot 592 names a present owned leaf in the private L2 root;
+// slot 560 is the writable result. No stack or MSR state is changed.
+#[unsafe(naked)]
+unsafe extern "sysv64" fn vpid_guest() -> ! {
+    core::arch::naked_asm!(
+        "mov rax, [rdi + 592]",
+        "mov rax, [rax]",
+        "mov [rdi + 560], rax",
         "vmcall",
         "ud2",
     );
