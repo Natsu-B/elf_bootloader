@@ -1824,3 +1824,25 @@ fixture commit is recorded; its result is not presumed.
 These are QEMU/KVM results, not physical-machine or Hyper-V qualification. The
 live scratch probe establishes MMIO reads/remapping/cleanup, not a device-write
 transaction. No AArch64 implementation or third-party dependency changed.
+
+The fixed-`611bc3c` batch subsequently completed: **6 PASS, 2 FAIL** across the
+4096-cycle run plus seven upstream selftests. The original 600-second
+`vmx_exception_with_invalid_guest_state` limit again killed the guest test (137),
+so neither timing-sensitive Direct failure is fixed. Batch exit **1**;
+`/tmp/x86-host-platform-frozen-batch.log` and
+`/tmp/x86-host-platform-direct-vmx_exception_with_invalid_guest_state.log`.
+No live files in that worktree were edited. Main-worktree QEMU work overlapped;
+this is not an isolated performance comparison.
+
+Before removing the overlay or excluding all L0 image pages, audit the runtime
+PE's own lifetime, not just its host tables. EDK2 registers runtime image bases
+and relocation data while loading them
+([Core/Dxe/Image/Image.c](https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Core/Dxe/Image/Image.c))
+and applies runtime relocations during `SetVirtualAddressMap`
+([Core/RuntimeDxe/Runtime.c](https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Core/RuntimeDxe/Runtime.c)).
+The checked-out monitor still executes a firmware-loaded runtime PE through an
+identity HOST_CR3. Whether this rewrites particular monitor pointers in the
+current QEMU run needs direct measurement; it is not yet asserted as the cause
+of either KVM timing failure or the old Windows watchdog. Bootstrap separation
+and an independently owned L0 code copy remain architectural work, not merely a
+variable-overlay switch.
