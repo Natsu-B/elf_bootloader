@@ -138,6 +138,7 @@ fn image_file_path(bytes: &[u8]) -> Result<ImagePath, Error> {
 }
 
 /// Starts exactly one selected image from the firmware-identified current ESP.
+#[cfg(feature = "physical-chainload")]
 pub(crate) fn run(
     image: efi::Handle,
     system_table: *mut efi::SystemTable,
@@ -149,6 +150,20 @@ pub(crate) fn run(
         serial,
         "thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0"
     );
+    let guest = load_selected(image, system_table, serial)?;
+    let status = chainload::start_image(guest, system_table)?;
+    let _ = writeln!(serial, "thin-hv: physical chainload PASS");
+    Ok(status)
+}
+
+/// Loads only the checked existing path on the current image's ESP. The caller
+/// owns the resulting handle until StartImage or an explicit failure cleanup.
+/// Shared by the nonresident baseline and the no-overlay Direct launch path.
+pub(crate) fn load_selected(
+    image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    serial: &mut SerialPort,
+) -> Result<efi::Handle, Error> {
     let loaded = chainload::loaded_image_protocol(image, system_table)?;
     // SAFETY: HandleProtocol succeeded with a non-null, live LoadedImage interface.
     let (device, current_path, options, options_size) = unsafe {
@@ -218,11 +233,120 @@ pub(crate) fn run(
         "thin-hv: physical chainload scope=current-esp explicit_path={}",
         u8::from(!bytes.is_empty())
     );
-    let guest =
-        chainload::load_image_on_device(image, system_table, device, utilities, target.as_slice())?;
-    let status = chainload::start_image(guest, system_table)?;
-    let _ = writeln!(serial, "thin-hv: physical chainload PASS");
-    Ok(status)
+    chainload::load_image_on_device(image, system_table, device, utilities, target.as_slice())
+}
+
+/// Conservative qualification gate, not SMP support. Even disabled additional
+/// processors are rejected: L1 must not later bring an unowned physical CPU up.
+#[cfg(feature = "physical-direct-vmx")]
+fn single_bsp(total: usize, enabled: usize, current: usize, flags: u32) -> bool {
+    use efi::protocols::mp_services as mp;
+    total == 1
+        && enabled == 1
+        && current == 0
+        && flags
+            == mp::PROCESSOR_AS_BSP_BIT
+                | mp::PROCESSOR_ENABLED_BIT
+                | mp::PROCESSOR_HEALTH_STATUS_BIT
+}
+
+/// Read-only MP Services inventory before loading an OS or entering project VMX.
+/// No AP startup, disable, switch-BSP or firmware topology operation is issued.
+#[cfg(feature = "physical-direct-vmx")]
+pub(crate) fn require_single_cpu(
+    system_table: *mut efi::SystemTable,
+    serial: &mut SerialPort,
+) -> Result<(), Error> {
+    use efi::protocols::mp_services as mp;
+    let services = chainload::boot_services(system_table)?;
+    let mut guid = mp::PROTOCOL_GUID;
+    let mut interface = ptr::null_mut();
+    // SAFETY: the live Boot Services table and bounded writable output are
+    // valid for this synchronous protocol lookup; no firmware state changes.
+    let status =
+        unsafe { ((*services).locate_protocol)(&mut guid, ptr::null_mut(), &mut interface) };
+    if status.is_error() {
+        return Err(Error::Firmware(
+            "physical MP Services unavailable",
+            status.as_usize(),
+        ));
+    }
+    if interface.is_null() {
+        return Err(invalid("physical MP Services null interface"));
+    }
+    let protocol = interface.cast::<mp::Protocol>();
+    let mut total = 0;
+    let mut enabled = 0;
+    let mut current = usize::MAX;
+    // SAFETY: firmware returned this live MP Services interface; outputs are
+    // initialized stack scalars. Both functions only query this CPU/topology.
+    let (count_status, who_status) = unsafe {
+        (
+            ((*protocol).get_number_of_processors)(protocol, &mut total, &mut enabled),
+            ((*protocol).who_am_i)(protocol, &mut current),
+        )
+    };
+    if count_status.is_error() {
+        return Err(Error::Firmware(
+            "physical GetNumberOfProcessors",
+            count_status.as_usize(),
+        ));
+    }
+    if who_status.is_error() {
+        return Err(Error::Firmware("physical WhoAmI", who_status.as_usize()));
+    }
+    let mut flags = 0;
+    if current < total {
+        let mut info = core::mem::MaybeUninit::<mp::ProcessorInformation>::zeroed();
+        // SAFETY: the validated current processor index and complete aligned
+        // output storage satisfy GetProcessorInfo. Only its initialized legacy
+        // status prefix is read, never an unrequested extended-information union.
+        let status =
+            unsafe { ((*protocol).get_processor_info)(protocol, current, info.as_mut_ptr()) };
+        if status.is_error() {
+            return Err(Error::Firmware(
+                "physical GetProcessorInfo",
+                status.as_usize(),
+            ));
+        }
+        // SAFETY: successful firmware output initialized this u32 prefix field;
+        // the allocation remains live, aligned, and unaliased on this stack.
+        flags = unsafe { ptr::addr_of!((*info.as_ptr()).status_flag).read() };
+    }
+    if !single_bsp(total, enabled, current, flags) {
+        let _ = writeln!(
+            serial,
+            "thin-hv: physical CPU ownership REJECT total={total} enabled={enabled} current={current} scope=bsp-only project_vmx=0"
+        );
+        return Err(Error::Firmware(
+            "physical SMP ownership is not implemented",
+            efi::Status::UNSUPPORTED.as_usize(),
+        ));
+    }
+    serial.write_bytes(b"thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0\n");
+    Ok(())
+}
+
+#[cfg(all(test, feature = "physical-direct-vmx"))]
+#[test]
+fn physical_cpu_gate_never_treats_disabled_aps_as_owned() {
+    assert!(single_bsp(1, 1, 0, 7));
+    for (total, enabled, current, flags) in [
+        (0, 0, 0, 7),
+        (1, 0, 0, 7),
+        (2, 1, 0, 7),
+        (2, 2, 0, 7),
+        (1, 2, 0, 7),
+        (1, 1, 1, 7),
+        (usize::MAX, 1, 0, 7),
+        (1, 1, usize::MAX, 7),
+        (1, 1, 0, 0),
+        (1, 1, 0, 3),
+        (1, 1, 0, 6),
+        (1, 1, 0, 15),
+    ] {
+        assert!(!single_bsp(total, enabled, current, flags));
+    }
 }
 
 #[cfg(test)]

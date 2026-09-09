@@ -38,7 +38,7 @@ compile_error!("x86 UEFI backends are mutually exclusive");
 compile_error!("select one x86 UEFI backend");
 
 mod chainload;
-#[cfg(feature = "physical-chainload")]
+#[cfg(any(feature = "physical-chainload", feature = "physical-direct-vmx"))]
 mod physical_chainload;
 #[cfg(feature = "physical-preflight")]
 mod physical_preflight;
@@ -55,7 +55,7 @@ mod platform_snapshot;
 
 #[cfg(feature = "direct-vmx")]
 mod resident_image;
-#[cfg(feature = "direct-vmx")]
+#[cfg(all(feature = "direct-vmx", not(feature = "physical-direct-vmx")))]
 mod runtime_variables;
 #[cfg(feature = "trusted-outer-kvm")]
 mod trusted_outer_kvm;
@@ -195,6 +195,10 @@ pub extern "efiapi" fn efi_main(
         serial.init();
         let _ = writeln!(serial, "thin-hv: uefi entry");
         let _ = writeln!(serial, "thin-hv: backend=direct-vmx role=project-l0");
+        #[cfg(feature = "physical-direct-vmx")]
+        serial.write_bytes(b"thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n");
+        #[cfg(not(feature = "physical-direct-vmx"))]
+        serial.write_bytes(b"thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0\n");
     }
     #[cfg(feature = "direct-vmx")]
     let vmx_present = cpu::has_vmx();

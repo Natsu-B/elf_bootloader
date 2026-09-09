@@ -371,6 +371,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("trusted-outer-kvm")
             || arg.contains("physical-chainload")
             || arg.contains("physical-preflight")
+            || arg.contains("physical-direct-vmx")
             || arg.contains("physical-policy")
             || arg.contains("host-exception-test")
             || arg.contains("host-xstate-test")
@@ -576,8 +577,21 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         })?;
     }
     for fixture in ["host-exception", "host-xstate"] {
-        build_x86_host_fixture(args, &workspace, &artifact, fixture)?;
+        build_x86_direct_variant(
+            args,
+            &workspace,
+            &artifact,
+            fixture,
+            &format!("{fixture}-test"),
+        )?;
     }
+    build_x86_direct_variant(
+        args,
+        &workspace,
+        &artifact,
+        "physical-direct",
+        "physical-direct-vmx",
+    )?;
     for (feature, filename) in [
         ("nested-contract", "x86-uefi-nested-contract.efi"),
         ("msr-contract", "x86-uefi-msr-contract.efi"),
@@ -619,23 +633,20 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
     Ok(destination.to_string_lossy().into_owned())
 }
 
-/// Builds QEMU-only host fixtures without replacing normal backend images.
-fn build_x86_host_fixture(
+/// Builds explicitly named Direct variants without replacing other backends.
+fn build_x86_direct_variant(
     args: &[String],
     workspace: &Path,
     artifact: &Path,
     fixture: &str,
+    feature: &str,
 ) -> Result<(), String> {
-    eprintln!("\n--- Building test-only Direct-VMX {fixture} fixture ---");
+    eprintln!("\n--- Building Direct-VMX variant {fixture} feature={feature} ---");
     let status = Command::new("cargo")
         .args(["build", "-p", "x86_uefi_loader", "--bin", "x86-uefi-loader"])
         .args(["--target", "x86_64-unknown-uefi"])
         .args(args)
-        .args([
-            "--no-default-features",
-            "--features",
-            &format!("{fixture}-test"),
-        ])
+        .args(["--no-default-features", "--features", feature])
         .env("XTASK_BUILD", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -821,6 +832,8 @@ fn run_x86_nested() -> Result<(), String> {
         ("outer-kvm", "readonly-vmcs"),
         ("direct-vmx", "readonly-vmcs"),
         ("direct-vmx", "host-xstate"),
+        ("direct-vmx", "physical-uefi"),
+        ("direct-vmx", "physical-smp-reject"),
         ("outer-kvm", "msr"),
         ("direct-vmx", "msr"),
         ("outer-kvm", "msr-abort-store"),
@@ -829,6 +842,8 @@ fn run_x86_nested() -> Result<(), String> {
         ("direct-vmx", "msr-abort-load"),
     ] {
         let msr = cpu_profile.starts_with("msr");
+        let physical = cpu_profile.starts_with("physical-");
+        let cpu_reject = cpu_profile == "physical-smp-reject";
         let abort = match cpu_profile {
             "msr-abort-store" => "1",
             "msr-abort-load" => "4",
@@ -846,6 +861,11 @@ fn run_x86_nested() -> Result<(), String> {
             (
                 "x86-uefi-host-xstate-loader.efi",
                 "bin/x86_64/x86-uefi-host-xstate-monitor.efi",
+            )
+        } else if physical {
+            (
+                "x86-uefi-physical-direct-loader.efi",
+                "bin/x86_64/x86-uefi-physical-direct-monitor.efi",
             )
         } else if backend == "direct-vmx" {
             ("x86-uefi-loader.efi", "bin/x86_64/x86-uefi-monitor.efi")
@@ -867,9 +887,21 @@ fn run_x86_nested() -> Result<(), String> {
                 "bin/x86_64/x86-uefi-nested-contract.efi"
             })
             .env("X86_UEFI_BACKEND", backend)
+            .env(
+                "X86_UEFI_DIRECT_MODE",
+                if physical {
+                    "physical-uefi"
+                } else {
+                    "qemu-research"
+                },
+            )
             .env("X86_MONITOR_IMAGE", monitor)
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
             .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
+            .env(
+                "X86_UEFI_CPU_REJECT_TEST",
+                if cpu_reject { "1" } else { "0" },
+            )
             .env("X86_UEFI_MSR_ABORT_TEST", abort)
             .env("X86_UEFI_ACCEL", "kvm")
             .env(
@@ -881,12 +913,19 @@ fn run_x86_nested() -> Result<(), String> {
                 },
             )
             .env("X86_UEFI_MEMORY", "256M")
-            .env("X86_UEFI_SMP", "1")
+            .env("X86_UEFI_SMP", if cpu_reject { "2" } else { "1" })
             .env(
                 "X86_UEFI_TIMEOUT_SECONDS",
-                if abort == "0" { "30" } else { "10" },
+                if abort == "0" && !cpu_reject {
+                    "30"
+                } else {
+                    "10"
+                },
             )
-            .env("X86_UEFI_GUEST_LOCATION", "guest")
+            .env(
+                "X86_UEFI_GUEST_LOCATION",
+                if physical { "windows" } else { "guest" },
+            )
             .env("X86_UEFI_ACPI_S3", "0")
             .env("X86_UEFI_WAKE_CYCLES", "0")
             .env("X86_UEFI_ALLOW_REBOOT", "0")
@@ -928,7 +967,7 @@ fn run_x86_nested() -> Result<(), String> {
             .stderr(Stdio::inherit())
             .status();
         let result = match result {
-            Ok(status) if status.success() && abort == "0" => Command::new("bash")
+            Ok(status) if status.success() && abort == "0" && !cpu_reject => Command::new("bash")
                 .arg("./scripts/x86_64/run-uefi-smoke.sh")
                 .args(if msr {
                     vec!["--check-msr-contract-log", backend, "bin/x86_64/serial.log"]
@@ -936,7 +975,11 @@ fn run_x86_nested() -> Result<(), String> {
                     vec![
                         "--check-nested-contract-log",
                         backend,
-                        cpu_profile,
+                        if cpu_profile == "physical-uefi" {
+                            "native"
+                        } else {
+                            cpu_profile
+                        },
                         "bin/x86_64/serial.log",
                     ]
                 })
@@ -965,12 +1008,14 @@ fn run_x86_nested() -> Result<(), String> {
             }
         }
     }
-    for (backend, host_xstate, memory) in [
-        ("outer-kvm", "0", "2G"),
-        ("direct-vmx", "0", "2G"),
-        ("direct-vmx", "1", "2G"),
-        ("direct-vmx", "0", "4G"),
-        ("direct-vmx", "0", "12G"),
+    for (backend, host_xstate, memory, direct_mode) in [
+        ("outer-kvm", "0", "2G", "qemu-research"),
+        ("direct-vmx", "0", "2G", "qemu-research"),
+        ("direct-vmx", "1", "2G", "qemu-research"),
+        ("direct-vmx", "0", "4G", "qemu-research"),
+        ("direct-vmx", "0", "12G", "qemu-research"),
+        ("direct-vmx", "0", "2G", "physical-uefi"),
+        ("direct-vmx", "0", "12G", "physical-uefi"),
     ] {
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
@@ -981,10 +1026,11 @@ fn run_x86_nested() -> Result<(), String> {
             }
         }
         eprintln!(
-            "\n--- Nested Linux state/lifetime backend={backend} host_xstate={host_xstate} memory={memory} environment=QEMU/kvm ---"
+            "\n--- Nested Linux state/lifetime backend={backend} mode={direct_mode} host_xstate={host_xstate} memory={memory} environment=QEMU/kvm ---"
         );
         let result = Command::new("./scripts/x86_64/run-linux-kvm-test.sh")
             .env("LINUX_KVM_BACKEND", backend)
+            .env("LINUX_KVM_DIRECT_MODE", direct_mode)
             .env("LINUX_KVM_HOST_XSTATE_TEST", host_xstate)
             .env("LINUX_KVM_MEMORY", memory)
             .env("X86_UEFI_PCI_PROFILE", "firmware-default")
@@ -1001,10 +1047,10 @@ fn run_x86_nested() -> Result<(), String> {
             .status();
         match result {
             Ok(status) if status.success() => {
-                eprintln!("nested Linux: PASS backend={backend} host_xstate={host_xstate} memory={memory}")
+                eprintln!("nested Linux: PASS backend={backend} mode={direct_mode} host_xstate={host_xstate} memory={memory}")
             }
             other => failures.push(format!(
-                "nested Linux backend={backend} host_xstate={host_xstate} memory={memory}: {other:?}"
+                "nested Linux backend={backend} mode={direct_mode} host_xstate={host_xstate} memory={memory}: {other:?}"
             )),
         }
         let suffix = if memory == "12G" {
@@ -1016,7 +1062,12 @@ fn run_x86_nested() -> Result<(), String> {
         } else {
             ""
         };
-        let evidence = format!("bin/x86_64/nested-linux-{backend}{suffix}.log");
+        let mode_suffix = if direct_mode == "physical-uefi" {
+            "-physical-uefi"
+        } else {
+            ""
+        };
+        let evidence = format!("bin/x86_64/nested-linux-{backend}{mode_suffix}{suffix}.log");
         if let Err(error) = fs::copy("bin/x86_64/serial.log", &evidence) {
             failures.push(format!("Failed to preserve {evidence}: {error}"));
         }
@@ -3474,6 +3525,92 @@ mod tests {
                 "1",
                 &format!("{gcd}{direct}").replace("0x0000380000001000", end)
             ));
+        }
+        let check_mode = |mode: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-direct-mode-log", mode])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let physical_mode = "thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n";
+        let research_mode = "thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0\n";
+        let cpu = "thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0\n";
+        let selected = "thin-hv: physical chainload scope=current-esp explicit_path=0\n";
+        let overlay = "thin-hv: variable overlay profile=2 mat_patches=3\n";
+        let physical = format!("{physical_mode}{cpu}{selected}{physical_mode}{cpu}{direct}");
+        let research = format!("{research_mode}{research_mode}{overlay}{direct}");
+        for (mode, valid, other) in [
+            ("physical-uefi", &physical, &research),
+            ("qemu-research", &research, &physical),
+        ] {
+            assert!(check_mode(mode, valid));
+            assert!(check_mode(mode, &valid.replace('\n', "\r\n")));
+            assert!(check_mode(mode, &valid.repeat(64)));
+            assert!(!check_mode(mode, &valid.repeat(65)));
+            assert!(!check_mode(mode, other));
+            assert!(!check_mode(mode, ""));
+            assert!(!check_mode(mode, &valid.replace('\n', "\r\r\n")));
+            assert!(!check_mode(mode, &format!("{valid}\0")));
+            assert!(!check_mode("unknown", valid));
+        }
+        for invalid in [
+            physical.replace(cpu, ""),
+            physical.replace(selected, ""),
+            physical.replace("total=1", "total=2"),
+            physical.replace("physical_smp=0", "physical_smp=1"),
+            physical.replace("ownership PASS", "ownership REJECT"),
+            format!("{physical}{overlay}"),
+            format!("{physical}{research_mode}"),
+            format!("{physical}thin-hv: uefi variable overlay PASS\n"),
+        ] {
+            assert!(!check_mode("physical-uefi", &invalid));
+        }
+        assert!(!check_mode("qemu-research", &research.replace(overlay, "")));
+        let check_reject = |status: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-cpu-ownership-reject-log", status])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let rejected = format!(
+            "thin-hv: uefi entry\nthin-hv: backend=direct-vmx role=project-l0\n{physical_mode}thin-hv: CPUID VMX=1\nthin-hv: physical CPU ownership REJECT total=2 enabled=2 current=0 scope=bsp-only project_vmx=0\nthin-hv: vmx smoke FAIL: platform map: physical SMP ownership is not implemented status=0x8000000000000003\n"
+        );
+        assert!(check_reject("0", &rejected));
+        assert!(check_reject("0", &rejected.replace('\n', "\r\n")));
+        assert!(check_reject("0", &rejected.repeat(2)));
+        assert!(check_reject("0", &rejected.repeat(64)));
+        assert!(!check_reject("124", &rejected));
+        assert!(!check_reject("1", &rejected));
+        assert!(!check_reject("0", &physical));
+        assert!(!check_mode("physical-uefi", &rejected));
+        assert!(!check_direct("0", &rejected));
+        for invalid in [
+            rejected.repeat(65),
+            format!("{rejected}thin-hv: uefi entry\n"),
+            rejected.replace("thin-hv: CPUID VMX=1\n", "thin-hv: uefi entry\n"),
+            rejected.replace("total=2", "total=1"),
+            rejected.replace("project_vmx=0", "project_vmx=1"),
+            rejected.replace("CPUID VMX=1", "CPUID VMX=0"),
+            rejected.replace("0x8000000000000003", "0x8000000000000002"),
+            rejected.replace('\n', "\r\r\n"),
+            format!("{rejected}{direct}"),
+            format!("{rejected}{overlay}"),
+            format!("{rejected}thin-hv: guest uefi payload\n"),
+            format!("{rejected}\0"),
+        ] {
+            assert!(!check_reject("0", &invalid));
         }
     }
 

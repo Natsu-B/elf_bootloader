@@ -61,6 +61,9 @@ fi
 [[ $# == 0 ]] || die 'configure with LINUX_KVM_BACKEND, LINUX_KVM_CYCLES, and LINUX_KVM_TIMEOUT_SECONDS'
 
 backend=${LINUX_KVM_BACKEND:-direct-vmx}
+direct_mode=${LINUX_KVM_DIRECT_MODE:-qemu-research}
+case "$direct_mode" in qemu-research|physical-uefi) ;; *) die 'LINUX_KVM_DIRECT_MODE must be qemu-research or physical-uefi' ;; esac
+[[ "$direct_mode" == qemu-research || "$backend" == direct-vmx ]] || die 'physical-uefi mode requires project Direct L0'
 cycles=${LINUX_KVM_CYCLES:-64}
 timeout_seconds=${LINUX_KVM_TIMEOUT_SECONDS:-300}
 memory=${LINUX_KVM_MEMORY:-2G}
@@ -85,8 +88,17 @@ case "$backend" in
     *) die 'LINUX_KVM_BACKEND must be direct-vmx or outer-kvm; no backend fallback exists' ;;
 esac
 if ((host_xstate_test)); then
+    [[ "$direct_mode" == qemu-research ]] || die 'the live-clobber fixture is a separate research-mode image'
     loader="$repo_root/bin/x86_64/x86-uefi-host-xstate-loader.efi"
     monitor="$repo_root/bin/x86_64/x86-uefi-host-xstate-monitor.efi"
+fi
+guest_location=guest
+if [[ "$direct_mode" == physical-uefi ]]; then
+    loader="$repo_root/bin/x86_64/x86-uefi-physical-direct-loader.efi"
+    monitor="$repo_root/bin/x86_64/x86-uefi-physical-direct-monitor.efi"
+    # Linux is a test EFI at the default same-ESP path, not a Windows test or
+    # a physical Windows disk. The loader itself never knows this QEMU staging.
+    guest_location=windows
 fi
 output="$repo_root/bin/x86_64/linux-l1-kvm-$backend.efi"
 serial_log="$repo_root/bin/x86_64/serial.log"
@@ -102,12 +114,13 @@ env \
 
 env \
     X86_UEFI_BACKEND="$backend" \
+    X86_UEFI_DIRECT_MODE="$direct_mode" \
     X86_UEFI_ACCEL=kvm \
     X86_MONITOR_IMAGE="$monitor" \
     X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
     X86_UEFI_MEMORY="$memory" \
     X86_UEFI_SMP=1 \
-    X86_UEFI_GUEST_LOCATION=guest \
+    X86_UEFI_GUEST_LOCATION="$guest_location" \
     X86_UEFI_ALLOW_REBOOT=0 \
     X86_UEFI_REQUIRE_POWEROFF=1 \
     X86_UEFI_ACPI_S3=0 \

@@ -27,6 +27,7 @@ std nested_vmx
 std uefi_variable_overlay
 std x86_uefi_loader --bin x86-uefi-loader
 std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features host-exception-test
+std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features physical-direct-vmx
 std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features trusted-outer-kvm
 std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features physical-chainload
 std x86_uefi_loader --bin x86-uefi-loader --no-default-features --features physical-preflight

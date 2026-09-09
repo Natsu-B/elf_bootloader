@@ -12,6 +12,7 @@ use crate::platform_resources;
 use crate::platform_resources::MmioMap;
 use crate::platform_snapshot;
 use crate::resident_image;
+#[cfg(not(feature = "physical-direct-vmx"))]
 use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
@@ -175,6 +176,7 @@ const CR4_CET: u64 = 1 << 23;
 /// Marker written in non-root mode before VMCALL.
 const GUEST_MARKER: u64 = 0x7468_696e_6876_4d58;
 /// Payload staged by `run-uefi-smoke.sh`.
+#[cfg(not(feature = "physical-direct-vmx"))]
 const GUEST_IMAGE_PATH: [efi::Char16; 23] = [
     b'\\' as u16,
     b'E' as u16,
@@ -229,13 +231,17 @@ const MONITOR_IMAGE_PATH: [efi::Char16; 25] = [
     0,
 ];
 /// Windows boot manager on a profile-owned EFI System Partition.
+#[cfg(not(feature = "physical-direct-vmx"))]
 const WINDOWS_BOOT_IMAGE_PATH: [efi::Char16; 33] =
     ascii_uefi_path(b"\\EFI\\Microsoft\\Boot\\bootmgfw.efi\0");
 /// Stable profile selected when the staged Linux/test payload is present.
+#[cfg(not(feature = "physical-direct-vmx"))]
 const LINUX_PROFILE: ProfileId = ProfileId(2);
 /// Stable profile selected when chainloading the installed Windows ESP.
+#[cfg(not(feature = "physical-direct-vmx"))]
 const WINDOWS_PROFILE: ProfileId = ProfileId(1);
 
+#[cfg(not(feature = "physical-direct-vmx"))]
 const fn ascii_uefi_path<const N: usize>(ascii: &[u8; N]) -> [efi::Char16; N] {
     let mut path = [0; N];
     let mut index = 0;
@@ -636,7 +642,11 @@ const _: () =
 const _: () = assert!(ERROR_REVISION_PAGE + 1 == CPU_STATE_FIRST_PAGE);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
-const RUNTIME_MODE: u32 = 0;
+const RUNTIME_MODE: u32 = if cfg!(feature = "physical-direct-vmx") {
+    1
+} else {
+    0
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1064,6 +1074,7 @@ pub(crate) enum Error {
 }
 
 impl Error {
+    #[cfg(not(feature = "physical-direct-vmx"))]
     fn is_missing_image(self) -> bool {
         matches!(
             self,
@@ -1104,6 +1115,8 @@ pub(crate) fn run(
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
+    #[cfg(feature = "physical-direct-vmx")]
+    crate::physical_chainload::require_single_cpu(system_table, serial).map_err(Error::Platform)?;
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
     if loaded_image.is_null() {
         return Err(Error::Firmware(
@@ -1193,10 +1206,13 @@ fn start_resident_core(
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
-    let (guest, profile) = runtime_handoff(loaded_image).ok_or(Error::Firmware(
+    let handoff = runtime_handoff(loaded_image).ok_or(Error::Firmware(
         "runtime guest-image handoff",
         efi::Status::INVALID_PARAMETER.as_usize(),
     ))?;
+    let guest = handoff.0;
+    #[cfg(not(feature = "physical-direct-vmx"))]
+    let profile = handoff.1;
     // SAFETY: run validated this live protocol for the executing runtime image.
     let (source, size, data_type) = unsafe {
         (
@@ -1243,10 +1259,12 @@ fn start_resident_core(
                     // republishes its MAT when runtime memory changes; installing earlier
                     // would lose the original image's narrowly scoped executable fixup.
                     // Hooks remain in that registered image, never in the private L0 copy.
+                    #[cfg(not(feature = "physical-direct-vmx"))]
                     let overlay = runtime_variables::install(system_table, profile, source, size)
                         .map_err(|status| {
                         Error::Firmware("install variable overlay", status.as_usize())
                     })?;
+                    #[cfg(not(feature = "physical-direct-vmx"))]
                     let _ = writeln!(
                         serial,
                         "thin-hv: variable overlay profile={} mat_patches={}",
@@ -1381,6 +1399,7 @@ fn start_resident_core(
                     })();
                     // Rollback runs in the original image with its original statics. It
                     // precedes FreePages, which may replace the MAT whose edits it restores.
+                    #[cfg(not(feature = "physical-direct-vmx"))]
                     overlay.rollback().map_err(|status| {
                         Error::Firmware("restore variable overlay", status.as_usize())
                     })?;
@@ -1701,6 +1720,7 @@ fn leave_failed_launch(serial: &mut SerialPort) {
 }
 
 /// Loads the staged test/Linux image, or Windows from another filesystem.
+#[cfg(not(feature = "physical-direct-vmx"))]
 fn load_selected_guest(
     parent_image: efi::Handle,
     parent_device: efi::Handle,
@@ -1746,8 +1766,15 @@ fn start_runtime_monitor(
     system_table: *mut efi::SystemTable,
 ) -> Result<(), Error> {
     let utilities = device_path_utilities_protocol(system_table)?;
+    #[cfg(not(feature = "physical-direct-vmx"))]
     let (guest, profile) =
         load_selected_guest(parent_image, parent_device, system_table, utilities)?;
+    #[cfg(feature = "physical-direct-vmx")]
+    let (guest, profile) = (
+        crate::physical_chainload::load_selected(parent_image, system_table, &mut SerialPort)
+            .map_err(Error::Platform)?,
+        ProfileId(0),
+    );
     let monitor = match load_image_on_device(
         parent_image,
         system_table,
@@ -1800,24 +1827,48 @@ fn start_runtime_monitor(
 fn runtime_handoff(
     loaded_image: *mut efi::protocols::loaded_image::Protocol,
 ) -> Option<(efi::Handle, ProfileId)> {
-    if unsafe { (*loaded_image).load_options_size } as usize
-        != core::mem::size_of::<RuntimeHandoff>()
-        || unsafe { (*loaded_image).load_options }.is_null()
+    // SAFETY: run obtained and checked this live, non-null LoadedImage protocol
+    // before selecting the runtime path. Copy metadata before dereferencing the
+    // caller-owned handoff, which remains live for the complete StartImage call.
+    let (size, options) = unsafe {
+        (
+            (*loaded_image).load_options_size as usize,
+            (*loaded_image).load_options,
+        )
+    };
+    if size != core::mem::size_of::<RuntimeHandoff>()
+        || options.is_null()
+        || (options as usize).checked_add(size).is_none()
     {
         return None;
     }
     // SAFETY: the application copy keeps this fixed handoff live for the
     // complete nested StartImage call.
-    let handoff =
-        unsafe { ptr::read_unaligned((*loaded_image).load_options.cast::<RuntimeHandoff>()) };
+    let handoff = unsafe { ptr::read_unaligned(options.cast::<RuntimeHandoff>()) };
+    validated_runtime_handoff(handoff)
+}
+
+/// Reject mixed physical/research components before any allocation or VMXON.
+fn validated_runtime_handoff(handoff: RuntimeHandoff) -> Option<(efi::Handle, ProfileId)> {
     let profile = ProfileId(handoff.profile);
-    (!handoff.guest.is_null()
-        && handoff.mode == RUNTIME_MODE
-        && matches!(profile, WINDOWS_PROFILE | LINUX_PROFILE))
-    .then_some((handoff.guest, profile))
+    (!handoff.guest.is_null() && handoff.mode == RUNTIME_MODE && valid_runtime_profile(profile))
+        .then_some((handoff.guest, profile))
+}
+
+/// Physical handoffs carry no variable profile and cannot consume research mode.
+fn valid_runtime_profile(profile: ProfileId) -> bool {
+    #[cfg(feature = "physical-direct-vmx")]
+    {
+        profile.0 == 0
+    }
+    #[cfg(not(feature = "physical-direct-vmx"))]
+    {
+        matches!(profile, WINDOWS_PROFILE | LINUX_PROFILE)
+    }
 }
 
 /// Loads one image from a filesystem other than the monitor's own ESP.
+#[cfg(not(feature = "physical-direct-vmx"))]
 fn load_image_from_other_filesystem<const PATH_SIZE: usize>(
     parent_image: efi::Handle,
     parent_device: efi::Handle,
@@ -6247,6 +6298,40 @@ fn leave_vmx() -> VmxStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_handoff_rejects_cross_backend_profiles_and_null_guest() {
+        for mode in [0, 1, 2, u32::MAX] {
+            for profile in [0, 1, 2, 3, u32::MAX] {
+                // Opaque non-null token only: this pure validator never accesses
+                // the represented image, protocol, or any physical memory.
+                let guest = 1_usize as super::efi::Handle;
+                let valid = mode == super::RUNTIME_MODE
+                    && if cfg!(feature = "physical-direct-vmx") {
+                        profile == 0
+                    } else {
+                        matches!(profile, 1 | 2)
+                    };
+                assert_eq!(
+                    super::validated_runtime_handoff(super::RuntimeHandoff {
+                        guest,
+                        profile,
+                        mode
+                    })
+                    .is_some(),
+                    valid
+                );
+                assert!(
+                    super::validated_runtime_handoff(super::RuntimeHandoff {
+                        guest: core::ptr::null_mut(),
+                        profile,
+                        mode
+                    })
+                    .is_none()
+                );
+            }
+        }
+    }
+
     #[test]
     fn monitor_error_page_requires_disjoint_complete_writable_runtime_ram() {
         use super::FirmwareDescriptor;

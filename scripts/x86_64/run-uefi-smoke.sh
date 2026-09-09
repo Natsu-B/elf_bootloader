@@ -51,6 +51,68 @@ check_backend_log() {
     ((seen))
 }
 
+# Mode provenance is separate from acceleration: physical-selection code is
+# tested under QEMU, never reported as physical-machine validation.
+check_direct_mode_log() {
+    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 expected
+    case "$mode" in
+        qemu-research) expected='thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0' ;;
+        physical-uefi) expected='thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0' ;;
+        *) return 1 ;;
+    esac
+    [[ -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 2097152)) || return 1
+    if IFS= read -r -d '' -n 2097153 transcript <"$log"; then return 1; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        case "$line" in
+            'thin-hv: direct mode='*) [[ "$line" == "$expected" ]] || return 1; ((modes += 1)) ;;
+            'thin-hv: variable overlay profile='*)
+                [[ "$mode" == qemu-research && "$line" =~ ^thin-hv:\ variable\ overlay\ profile=[12]\ mat_patches=[0-9]+$ ]] || return 1
+                ((overlays += 1)) ;;
+            'thin-hv: uefi variable overlay PASS'*) [[ "$mode" == qemu-research ]] || return 1 ;;
+            'thin-hv: physical CPU ownership '*)
+                [[ "$mode" == physical-uefi && "$line" == 'thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0' ]] || return 1
+                ((cpus += 1)) ;;
+            'thin-hv: physical chainload scope='*)
+                [[ "$mode" == physical-uefi && "$line" =~ ^thin-hv:\ physical\ chainload\ scope=current-esp\ explicit_path=[01]$ ]] || return 1
+                ((selections += 1)) ;;
+        esac
+    done <<<"$transcript"
+    ((modes >= 2 && modes <= 128 && modes % 2 == 0)) || return 1
+    if [[ "$mode" == physical-uefi ]]; then
+        ((cpus == modes && selections * 2 == modes && overlays == 0))
+    else
+        ((cpus == 0 && selections == 0 && overlays * 2 == modes))
+    fi
+}
+
+# An explicit negative fixture, never an alternative Direct success condition.
+check_cpu_ownership_reject_log() {
+    local status=$1 log=$2 bytes transcript line phase=0 attempts=0
+    [[ "$status" == 0 && -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 65536)) || return 1
+    if IFS= read -r -d '' -n 65537 transcript <"$log"; then return 1; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        case "$line" in
+            # OVMF may retry the same rejected loader via another Boot####.
+            # Accept only complete, bounded attempts; no partial-marker retries.
+            'thin-hv: uefi entry') ((phase == 0 && attempts < 64)) || return 1; phase=1 ;;
+            'thin-hv: backend=direct-vmx role=project-l0') ((phase == 1)) || return 1; phase=2 ;;
+            'thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0') ((phase == 2)) || return 1; phase=3 ;;
+            'thin-hv: CPUID VMX=1') ((phase == 3)) || return 1; phase=4 ;;
+            'thin-hv: IA32_FEATURE_CONTROL='*|'thin-hv: IA32_VMX_BASIC='*) ((phase == 4)) || return 1 ;;
+            'thin-hv: physical CPU ownership REJECT total=2 enabled=2 current=0 scope=bsp-only project_vmx=0') ((phase == 4)) || return 1; phase=5 ;;
+            'thin-hv: vmx smoke FAIL: platform map: physical SMP ownership is not implemented status=0x8000000000000003') ((phase == 5)) || return 1; phase=0; ((attempts+=1)) ;;
+            *'thin-hv:'*) return 1 ;; # no load, allocation, VMX, guest, overlay or other backend
+        esac
+    done <<<"$transcript"
+    ((phase == 0 && attempts > 0))
+}
+
 # Hardware-backed instruction assertions must precede a successful guest return.
 # Optional capability checks remain explicit in the evidence, never implied PASS.
 check_nested_contract_log() {
@@ -594,11 +656,24 @@ if [[ ${1:-} == --check-direct-platform-log ]]; then
     check_direct_platform_log "$3" "$2" || die 'Direct platform EPT evidence rejected'
     exit 0
 fi
+if [[ ${1:-} == --check-direct-mode-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-direct-mode-log MODE LOG'
+    check_direct_mode_log "$2" "$3" || die 'Direct mode provenance rejected'
+    exit 0
+fi
+if [[ ${1:-} == --check-cpu-ownership-reject-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-cpu-ownership-reject-log QEMU_STATUS LOG'
+    check_cpu_ownership_reject_log "$2" "$3" || die 'CPU ownership rejection evidence rejected'
+    exit 0
+fi
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
+direct_mode=${X86_UEFI_DIRECT_MODE:-qemu-research}
+case "$direct_mode" in qemu-research|physical-uefi) ;; *) die 'X86_UEFI_DIRECT_MODE must be qemu-research or physical-uefi' ;; esac
+[[ "$direct_mode" == qemu-research || "$backend" == direct-vmx ]] || die 'physical-uefi mode requires project Direct L0'
 pci_profile=${X86_UEFI_PCI_PROFILE:-firmware-default}
 require_high_pci=${X86_UEFI_REQUIRE_HIGH_PCI:-0}
 [[ "$require_high_pci" =~ ^[01]$ ]] || die 'X86_UEFI_REQUIRE_HIGH_PCI must be 0 or 1'
@@ -618,6 +693,8 @@ esac
 printf 'x86 UEFI smoke: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
 physical_policy=${X86_UEFI_PHYSICAL_POLICY:-0}
 host_exception_test=${X86_UEFI_HOST_EXCEPTION_TEST:-0}
+cpu_reject_test=${X86_UEFI_CPU_REJECT_TEST:-0}
+[[ "$cpu_reject_test" =~ ^[01]$ ]] || die 'X86_UEFI_CPU_REJECT_TEST must be 0 or 1'
 msr_abort_test=${X86_UEFI_MSR_ABORT_TEST:-0}
 [[ "$msr_abort_test" =~ ^[014]$ ]] || die 'X86_UEFI_MSR_ABORT_TEST must be 0, 1 or 4'
 [[ "$physical_policy" =~ ^[01]$ ]] || die 'X86_UEFI_PHYSICAL_POLICY must be 0 or 1'
@@ -648,6 +725,10 @@ payload_marker=${X86_GUEST_MARKER-'thin-hv: guest uefi payload'}
 failure_marker=${X86_GUEST_FAILURE_MARKER-}
 variable_marker=${X86_VARIABLE_MARKER-}
 guest_location=${X86_UEFI_GUEST_LOCATION:-guest}
+if ((cpu_reject_test)); then
+    [[ "$backend" == direct-vmx && "$direct_mode" == physical-uefi && "$physical_policy" == 0 && "$host_exception_test" == 0 && "$msr_abort_test" == 0 ]] || die 'CPU rejection requires its own physical-selection Direct fixture'
+    [[ ${X86_UEFI_SMP:-1} == 2 && ${X86_UEFI_ACCEL:-kvm} == kvm ]] || die 'CPU rejection fixture requires exactly two QEMU/KVM CPUs'
+fi
 trusted_chainload_marker=
 case "$backend" in
     direct-vmx) ;;
@@ -1001,8 +1082,14 @@ set -e
 qemu_pid=
 
 cat -- "$serial_log"
+if ((cpu_reject_test)); then
+    check_cpu_ownership_reject_log "$qemu_status" "$serial_log" || die 'CPU ownership rejection fixture failed'
+    printf 'x86 UEFI CPU ownership rejection fixture: PASS backend=direct-vmx cpus=2 project_vmx=0 physical_smp=0 environment=QEMU/kvm (not physical hardware)\n'
+    exit 0
+fi
 if [[ "$backend" == direct-vmx ]]; then
     check_direct_platform_log "$serial_log" "$require_high_pci" || die 'Direct platform EPT evidence missing or malformed'
+    check_direct_mode_log "$direct_mode" "$serial_log" || die 'Direct mode provenance missing or contradictory'
 fi
 if ((qemu_status != 0)); then
     cat -- "$qemu_log" >&2

@@ -1952,3 +1952,89 @@ this step. The original firmware/Windows installation was not touched. The two
 timing-sensitive Direct selftest failures remain open pending a new frozen-code
 replay. Physical selection/no-overlay, full pCPU/AP ownership, root NMI and S3
 lifecycle work remain. Outer-KVM results are reference evidence only.
+
+## Step 11 — Direct physical selection without a variable overlay
+
+The checked-out code still installed `runtime_variables::install` for every
+Direct launch. Added the explicit `physical-direct-vmx` build variant without
+compiling that module. Its `physical-uefi` log mode is separate from the retained
+`qemu-research` mode; neither can pass the other's runner gate. This is a
+physical-path implementation **tested in QEMU, not physical qualification**.
+
+Changed files and major symbols:
+
+* `x86_uefi_loader/Cargo.toml`, `src/main.rs`: the feature, module exclusion and
+  explicit mode markers. No Runtime Services overlay, MAT hook adjustment,
+  identity synthesis, product-key handling or outer-KVM fallback in this mode.
+* `src/physical_chainload.rs`: extracted `load_selected` from the existing
+  baseline. Both callers use its checked UTF-16 path/current-ESP selection,
+  self-reference rejection and normal firmware LoadImage; no enumeration-first
+  filesystem fallback. `require_single_cpu` queries MP Services read-only before
+  OS loading or VMXON. `single_bsp` rejects all additional processors, including
+  disabled APs, until real pCPU ownership/AP startup exists. Missing or malformed
+  inventory also fails. No processor is disabled or hidden by this gate.
+* `src/vmx_smoke.rs`: selects the shared physical loader or retained research
+  loader at build time. `runtime_handoff`, `validated_runtime_handoff` and
+  `valid_runtime_profile` reject null guests and mixed physical/research handoffs
+  before allocation/VMX. Only research builds install/roll back the old overlay.
+* `xtest.txt`, `xtask/src/main.rs`: package-filtered physical-variant host tests;
+  `build_x86_direct_variant` reuses the existing build/copy/ISA audit pipeline;
+  `run_x86_nested` adds physical native, 2/12-GiB Linux and 2-CPU rejection cases.
+* `scripts/x86_64/run-linux-kvm-test.sh`: `LINUX_KVM_DIRECT_MODE` chooses explicit
+  artifacts; the test UKI is staged at the same-ESP default path. Its Windows
+  filename is **not a Windows installation test**.
+* `scripts/x86_64/run-uefi-smoke.sh`: `check_direct_mode_log` rejects missing,
+  mixed, malformed, excess and overlay-contaminated evidence.
+  `check_cpu_ownership_reject_log` accepts only bounded complete pre-VMX rejection
+  attempts with QEMU exit 0; timeout, partial attempts, successful guest/runtime
+  markers and wrong CPU counts fail. OVMF can retry via another Boot####, so
+  complete retries are checked individually, not ignored. The ordinary Direct
+  success gate still rejects this negative fixture.
+
+### Completed validation (2026-09-10 local date)
+
+All Cargo commands used `nix develop --accept-flake-config --command`.
+
+* `cargo fmt`, `cargo fmt --check`; `cargo xtest -p nested_vmx`,
+  `-p x86_64_hal`, `-p x86_uefi_loader`, `-p x86_guest_uefi_test`, `-p xtask`:
+  **314 PASS, 0 FAIL** = 29 + 59 + 183 + 10 + 33.
+* `cargo xbuild x86`: **PASS**. `cargo xrun x86 --release`: **9 PASS, 0 FAIL**
+  (7 QEMU/KVM, including the expected root-fault case; 2 QEMU TCG).
+* `cargo xrun x86 --nested --release`: **15 PASS, 5 FAIL / 20**, exit **1**.
+  All **14 Direct cases PASS**, including the explicitly negative CPU gate;
+  this is not 14 proofs of successful SMP/nested execution. The existing five
+  outer-KVM contract differences remain FAIL. Complete log:
+  `/tmp/x86-physical-direct-core-validation.log`.
+* Existing Linux runner, `LINUX_KVM_BACKEND=direct-vmx`,
+  `LINUX_KVM_DIRECT_MODE=physical-uefi`, `LINUX_KVM_CYCLES=64`,
+  `LINUX_KVM_MEMORY=4G`, `X86_UEFI_PCI_PROFILE=firmware-default`,
+  `X86_UEFI_REQUIRE_HIGH_PCI=1`: **PASS**, including KVM_RUN, state/lifetime
+  checks and poweroff. `/tmp/x86-physical-direct-linux-first.log`.
+* Explicit 2-CPU KVM rejection fixture: **PASS**, project VMX never started;
+  `/tmp/x86-physical-direct-smp-reject-retries.log`. Its earlier checker rejected
+  two valid OVMF retry attempts; the bounded retry regression now covers that
+  behavior without accepting partial or post-VMX failures.
+
+### Frozen step-10c replay, separate from this variant
+
+Detached worktree `/tmp/x86-resident-regressions.x35Iff`, commit `8598e86`,
+completed **6 PASS, 2 FAIL / 8**; `/tmp/x86-resident-frozen-batch.log`.
+
+* Direct Linux live-XSTATE-clobber **4096 cycles**, 12 GiB/default high PCI:
+  **PASS**, unchanged 600-second bound. `/tmp/x86-resident-clobber-4096.log`.
+* Original pinned 7.1.5 test ELFs: **PASS** `x86/xcr0_cpuid_test`,
+  `x86/dirty_log_page_splitting_test`, `x86/nx_huge_pages_test`,
+  `memslot_modification_stress_test`, `kvm_page_table_test`.
+* **FAIL** `memslot_perf_test` (original alarm, status 142) and
+  `x86/vmx_exception_with_invalid_guest_state` (original 600-second bound,
+  killed status 137). No test changes or timeout increases. Logs:
+  `/tmp/x86-resident-direct-memslot_perf_test.log` and
+  `/tmp/x86-resident-direct-vmx_exception_with_invalid_guest_state.log`.
+
+This replay overlapped other QEMU work and is not an isolated performance
+benchmark. No Direct Windows/Hyper-V/WSL2, S3 or physical-machine retest was
+performed in step 11. pCPU/AP ownership, root NMI, S3 lifecycle and the two
+timing-sensitive Direct failures remain open. Multicore physical boot remains
+deliberately gated; do not try the original OEM Windows installation yet.
+Outer-KVM evidence is reference-only. No AArch64 implementation or pre-existing
+user `AGENTS.md` changes are part of this step.
