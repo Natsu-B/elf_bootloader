@@ -2168,3 +2168,61 @@ No capability bits, timeouts, Windows installation or AArch64 implementation
 were changed. AP/INIT/SIPI, root NMI and S3 lifecycle work, the two Direct
 timing-sensitive failures and Direct Windows/Hyper-V/WSL2 revalidation remain.
 No physical hardware was tested; outer KVM is reference evidence only.
+
+## Step 12c — atomic foreign page-table A/D updates before AP enablement
+
+Confirmed at `b222219`: `CpuRuntimeState::paging_word` read a foreign paging
+word, ORed A/D bits in software and stored the entire old word. Another CPU's
+concurrent PFN/permission update could be overwritten. This was protected only
+by the old one-L1-CPU assumption, not a cross-CPU atomic operation.
+
+`x86_uefi_loader/src/vmx_smoke.rs`, `paging_word`, now uses x86 `LOCK OR` for
+nonzero A/D updates and an aligned scalar load for reads. It rejects bits other
+than A/D before accessing memory, retains the existing RAM/permission/private-
+ownership checks and never applies an atomic update to MMIO. The operation
+preserves concurrently changed non-A/D bits rather than writing a stale PFN.
+The guest page-table/TLB invalidation protocol remains L1's responsibility;
+this change alone does not establish SMP support or a new page-table snapshot.
+
+`paging_ad_update_preserves_concurrent_foreign_word_updates` exercises the
+actual scalar helper on a host-owned atomic word while a second host thread
+performs 65536 atomic non-A/D changes. It also covers unsupported update bits,
+unaligned access and unchanged memory on rejection. No VMX, privileged register
+instruction, firmware or guest image runs in this test.
+
+Pre-fix command, through Nix:
+`cargo xtest -p x86_uefi_loader -- paging_ad_update_preserves_concurrent_foreign_word_updates`.
+Result: **1 FAIL, 2 PASS** across the three Direct feature variants, overall exit
+**1**. One execution observed `267173987` instead of `268435555`, losing 308
+concurrent increments. Scheduling let two other executions pass; the reproduced
+lost update is the failure, not a claim that every schedule reproduces it.
+`/tmp/x86-paging-ad-before.log`.
+
+Post-fix validation, all through
+`nix develop --accept-flake-config --command bash -c`:
+
+```sh
+cargo fmt
+cargo xtest -p x86_uefi_loader
+cargo xtest -p x86_64_hal
+cargo xtest -p nested_vmx
+cargo xtest -p x86_guest_uefi_test
+cargo xtest -p xtask
+cargo xbuild x86
+cargo xrun x86 --release
+cargo xrun x86 --nested --release
+```
+
+`/tmp/x86-paging-ad-after.log`: host tests **317 PASS, 0 FAIL** (loader
+186, HAL 59, nested policy 29, guest 10, xtask 33); debug build **PASS**;
+standard smoke **9 PASS, 0 FAIL** (7 QEMU/KVM, 2 QEMU TCG); release nested
+suite **15 PASS, 5 FAIL / 20**, overall exit **1**. All **14 Direct cases PASS**,
+including the physical-mode two-CPU rejection test (not SMP execution).
+The five unchanged outer-KVM contract failures remain the native/read-only
+partial operand stores, late MSR-entry PAT visibility and store/load abort
+indicator cases. They are not waived. The atomic regression passes in all
+three Direct host feature configurations.
+
+No AP is enabled by this change. Windows/Hyper-V, root NMI and S3 work and
+the two timing-sensitive Direct failures remain unverified/unresolved.
+No physical hardware was tested. Outer KVM is reference evidence only.

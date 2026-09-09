@@ -900,22 +900,28 @@ impl CpuRuntimeState {
         Some(result)
     }
 
-    /// Page tables must be RAM, never MMIO. A/D updates use the same checked
-    /// ownership/permissions as payload accesses, with no host-null pointer UB.
+    /// Page tables must be RAM, never MMIO. A/D changes are atomic with foreign
+    /// CPU writes; never replace a newly installed PFN/permission with an old
+    /// read-modify-write snapshot. PA zero remains valid without Rust null UB.
     fn paging_word(&self, physical: u64, update: u64) -> Option<u64> {
-        if !physical.is_multiple_of(8) || !self.allows_operand_ram(physical, 8, update != 0) {
+        if update & !((1 << 5) | (1 << 6)) != 0
+            || !physical.is_multiple_of(8)
+            || !self.allows_operand_ram(physical, 8, update != 0)
+        {
             return None;
         }
-        // SAFETY: the complete aligned word is accessible foreign RAM and L1
-        // is stopped on this only virtualized CPU. The walker supplies only
-        // architectural A/D bits. Assembly handles RAM at physical zero too.
+        // SAFETY: the complete aligned 8-byte word is accessible foreign RAM,
+        // never MMIO or Rust-owned monitor storage. Only architectural A/D bits
+        // can be ORed. LOCK OR atomically preserves other CPUs' concurrent bit,
+        // PFN and permission changes; the aligned MOV is an atomic x86-64 load.
+        // No non-atomic Rust data aliases the word. Both operations declare memory
+        // effects, and LOCK OR declares its flags clobber. PA zero is allowed.
         unsafe {
-            let mut value: u64;
-            core::arch::asm!("mov {value}, [{address}]", value = out(reg) value, address = in(reg) physical, options(nostack, preserves_flags));
             if update != 0 {
-                value |= update;
-                core::arch::asm!("mov [{address}], {value}", address = in(reg) physical, value = in(reg) value, options(nostack, preserves_flags));
+                core::arch::asm!("lock or qword ptr [{address}], {bits}", address = in(reg) physical, bits = in(reg) update, options(nostack));
             }
+            let value: u64;
+            core::arch::asm!("mov {value}, [{address}]", value = out(reg) value, address = in(reg) physical, options(nostack, preserves_flags));
             Some(value)
         }
     }
@@ -6651,6 +6657,60 @@ mod tests {
         assert_ne!(
             core::ptr::from_ref(&*first.diagnostics.lock()),
             core::ptr::from_ref(&*second.diagnostics.lock())
+        );
+    }
+
+    #[test]
+    fn paging_ad_update_preserves_concurrent_foreign_word_updates() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        // A host-owned atomic word stands in for foreign aligned RAM. This test
+        // executes only the scalar memory-access helper, never VMX/CR/MSR/GS.
+        let word = AtomicU64::new(3);
+        let address = core::ptr::from_ref(&word) as usize as u64;
+        let width = super::PhysicalWidth::new(48).unwrap();
+        let ram = super::FirmwareMap::new(
+            &[super::FirmwareDescriptor {
+                memory_type: 7,
+                physical_start: address & !4095,
+                number_of_pages: 1,
+                attributes: super::efi::MEMORY_WB,
+            }],
+            width,
+        )
+        .unwrap();
+        let state = super::CpuRuntimeState::new(
+            ram,
+            super::vmx::VmxBasic::from_msr(0),
+            [(0x1000, 0x2000), (0x3000, 0x4000)],
+            super::MmioMap::empty(width).unwrap(),
+            None,
+            None,
+        );
+        const ITERATIONS: u64 = 65_536;
+        assert_eq!(state.paging_word(address, 1), None);
+        assert_eq!(state.paging_word(address, u64::MAX), None);
+        assert_eq!(state.paging_word(address + 1, 1 << 5), None);
+        assert_eq!(word.load(Ordering::SeqCst), 3);
+        let start = Barrier::new(2);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                start.wait();
+                for _ in 0..ITERATIONS {
+                    word.fetch_add(1 << 12, Ordering::SeqCst);
+                }
+            });
+            start.wait();
+            for _ in 0..ITERATIONS {
+                assert!(state.paging_word(address, (1 << 5) | (1 << 6)).is_some());
+            }
+        });
+        assert_eq!(word.load(Ordering::SeqCst), (ITERATIONS << 12) | 0x63);
+        assert_eq!(
+            state.paging_word(address, 0),
+            Some((ITERATIONS << 12) | 0x63)
         );
     }
 
