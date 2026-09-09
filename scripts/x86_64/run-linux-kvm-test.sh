@@ -125,6 +125,8 @@ check_log "$backend" "$cycles" "$serial_log" || die 'lifecycle evidence rejected
 if ((host_xstate_test)); then
     [[ $(grep -Fxc $'thin-hv: host xstate clobber fixture armed\r' "$serial_log") == 1 ]] \
         || die 'host XSTATE clobber fixture did not run exactly once'
+    [[ $(grep -Fxc $'thin-hv: host MMIO window PASS reads=12 mappings=12 pages=2 returns=1 pte_clear=1\r' "$serial_log") == 1 ]] \
+        || die 'host MMIO window fixture did not run exactly once'
 fi
 printf 'x86 Linux KVM lifecycle: PASS backend=%s role=%s cycles=%s environment=QEMU/kvm (not physical hardware)\n' \
     "$backend" "$role" "$cycles"

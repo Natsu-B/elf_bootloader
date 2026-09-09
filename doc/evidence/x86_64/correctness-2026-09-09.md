@@ -1778,3 +1778,49 @@ bootstrap/overlay, full private-page reservation, post-launch MTRR/UEFI memory
 permission lifecycle, AP ownership, root NMI and S3 re-entry. The previous two
 timing-sensitive Direct KVM failures await replay at this new increment. No
 Windows/Hyper-V/WSL2 or physical hardware was tested; outer-KVM is reference only.
+
+### Live host MMIO-window regression fixture
+
+`probe_q35_host_window` runs only in the existing explicitly QEMU-only
+`host-xstate-test` build, on its first intercepted L1 CPUID. It reads the immutable
+q35 host-bridge header and an absent PCI function through two different scratch
+mappings, returns to the first page, and verifies that each of 12 accesses left
+the private PTE non-present. The firmware-derived MMIO inventory must separately
+authorize each byte; there is no direct identity-map fallback. No PCI write or
+device/firmware identity modification occurs. The q35 ECAM fixture addresses are
+compiled out of production, and neither observed value is logged. Guest XSTATE
+is protected by the normal exit bracket throughout the test.
+
+Native and Linux XSTATE fixture transcript gates now require exactly one
+`host MMIO window PASS reads=12 mappings=12 pages=2 returns=1 pte_clear=1` record.
+Unit coverage rejects missing/duplicate/malformed/early records and double-CR
+line endings, while accepting ordinary LF and CRLF. The first actual probe
+passed but emitted CRCRLF because the existing serial writer already expands LF;
+its strict gate correctly rejected the extra CR. The emitter was fixed, not the
+gate. Initial command: **155 host tests PASS; nested 9 PASS, 7 FAIL** (two new
+transcript failures plus five known reference failures),
+`/tmp/x86-host-window-live-fixture.log`.
+
+After the newline fix, under Nix: `cargo fmt`, `cargo xtest -p xtask` (**33 PASS**)
+and `cargo xrun x86 --nested --release`: **11 PASS, 5 FAIL**, all ten Direct cases
+PASS. The live MMIO proof appears once in native/XSTATE and once in Linux/XSTATE,
+with the full existing guest-state/lifecycle tests still passing.
+`/tmp/x86-host-window-live-fixture-fixed.log`. `cargo fmt --check` and
+`cargo xbuild x86`: **PASS**, `/tmp/x86-host-window-debug-format.log`.
+
+In parallel, the preceding production commit `611bc3c` is frozen in a separate
+temporary worktree (no running source/artifact edits). Its **12-GiB, default high
+PCI, live-XSTATE-clobber 4096-cycle Direct lifecycle PASS** is recorded in
+`/tmp/x86-host-platform-clobber-4096.log`; clean guest poweroff at 337.431829s.
+The command uses the existing runner with `LINUX_KVM_CYCLES=4096`, unchanged
+bounded `LINUX_KVM_TIMEOUT_SECONDS=600`, `LINUX_KVM_MEMORY=12G`,
+`LINUX_KVM_BACKEND=direct-vmx`, `LINUX_KVM_HOST_XSTATE_TEST=1`,
+`X86_UEFI_PCI_PROFILE=firmware-default`, `X86_UEFI_REQUIRE_HIGH_PCI=1`.
+The five previously passing upstream KVM regressions also pass at `611bc3c`;
+`memslot_perf_test` still fails with its original alarm/exit 142. The final
+`vmx_exception_with_invalid_guest_state` replay remains running when this
+fixture commit is recorded; its result is not presumed.
+
+These are QEMU/KVM results, not physical-machine or Hyper-V qualification. The
+live scratch probe establishes MMIO reads/remapping/cleanup, not a device-write
+transaction. No AArch64 implementation or third-party dependency changed.

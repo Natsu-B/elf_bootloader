@@ -2697,6 +2697,17 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_CPUID {
+        #[cfg(feature = "host-xstate-test")]
+        if cpuid_exit_count() == 1 && !probe_q35_host_window() {
+            stop_unexpected_exit(
+                b"QEMU host MMIO window probe failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
         let leaf = registers.rax as u32;
         let subleaf = registers.rcx as u32;
         let mut result = if (0x4000_0000..=0x4fff_ffff).contains(&leaf) {
@@ -5892,6 +5903,50 @@ unsafe extern "sysv64" fn vmresume_failed(registers: *const GuestRegisters, rfla
 #[unsafe(naked)]
 extern "sysv64" fn halt_with_guest_xstate() -> ! {
     core::arch::naked_asm!("fxrstor64 gs:[0]", "cli", "2:", "hlt", "jmp 2b");
+}
+
+/// Tests the live scratch map while the assembly stub protects guest XSTATE.
+/// Reads only q35's immutable host-bridge identity and an absent PCI function.
+/// This explicit QEMU-only fixture must never run on a physical motherboard.
+#[cfg(feature = "host-xstate-test")]
+fn probe_q35_host_window() -> bool {
+    let passed = with_cpu_runtime(|state| {
+        let window = state.window?;
+        // q35/OVMF regression layout only, not a production resource discovery
+        // rule. The real inventory must independently classify each byte MMIO.
+        for (address, expected) in [
+            (0xe000_0000, 0x29c0_8086_u32),
+            (0xe000_1000, u32::MAX),
+            (0xe000_0000, 0x29c0_8086),
+        ] {
+            let mut value = 0_u32;
+            for index in 0..4 {
+                let physical = address + index;
+                if state.operand_backing(physical, false) != Some(true) {
+                    return None;
+                }
+                value |= u32::from(state.operand_byte(physical, None)?) << (index * 8);
+                // SAFETY: the owning CPU retains this aligned WB private PTE;
+                // operand_byte ended its temporary mapping and no table borrow
+                // or other CPU aliases the entry. This checks cleanup, not MMIO.
+                if unsafe { ptr::read_volatile(window.pte_address() as *const u64) } != 0 {
+                    return None;
+                }
+            }
+            if value != expected {
+                return None;
+            }
+        }
+        Some(())
+    }) == Some(Some(()));
+    if passed {
+        // One fixed record on the first CPUID of an explicit test build only.
+        // No product identifiers or device contents are emitted or modified.
+        SerialPort.write_bytes(
+            b"thin-hv: host MMIO window PASS reads=12 mappings=12 pages=2 returns=1 pte_clear=1\n",
+        );
+    }
+    passed
 }
 
 /// Test-only deliberate corruption after the assembly stub saved live XSTATE.

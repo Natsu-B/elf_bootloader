@@ -3867,15 +3867,30 @@ mod tests {
                     continue;
                 }
                 assert!(check(backend, &valid));
+                let window = "thin-hv: host MMIO window PASS reads=12 mappings=12 pages=2 returns=1 pte_clear=1\n";
                 let clobber_log = valid.replace(
                     start,
-                    &format!("thin-hv: host xstate clobber fixture armed\n{start}"),
+                    &format!("thin-hv: host xstate clobber fixture armed\n{window}{start}"),
                 );
                 assert_eq!(
                     check_profile(backend, "host-xstate", &clobber_log),
                     backend == "direct-vmx"
                 );
+                assert_eq!(
+                    check_profile(backend, "host-xstate", &clobber_log.replace('\n', "\r\n")),
+                    backend == "direct-vmx"
+                );
                 assert!(!check_profile(backend, "host-xstate", &valid));
+                for invalid in [
+                    clobber_log.replace(window, ""),
+                    clobber_log.replace(window, &window.repeat(2)),
+                    format!("{window}{clobber_log}"),
+                    clobber_log.replace("pte_clear=1", "pte_clear=0"),
+                    clobber_log.replace("mappings=12", "mappings=11"),
+                    clobber_log.replace(window, &window.replace('\n', "\r\r\n")),
+                ] {
+                    assert!(!check_profile(backend, "host-xstate", &invalid));
+                }
                 assert!(!check(backend, &clobber_log));
                 assert!(check(
                     backend,
