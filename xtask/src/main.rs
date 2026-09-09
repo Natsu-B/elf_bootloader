@@ -5099,6 +5099,91 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn windows_cpu_selection_keeps_direct_single_cpu_and_allows_matched_reference() {
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/windows/windows-test.sh");
+        let check = |mode: &str, requested: Option<&str>| {
+            let mut command = Command::new("bash");
+            command
+                .arg(&runner)
+                .args(["print-smp", mode])
+                .env_remove("WINDOWS_SMP");
+            if let Some(value) = requested {
+                command.env("WINDOWS_SMP", value);
+            }
+            command.output().unwrap()
+        };
+        for (mode, default, permits_one, permits_two) in [
+            ("monitor", 1, true, false),
+            ("monitor-hyperv", 1, true, false),
+            ("hyperv", 2, true, true),
+            ("trusted-kvm-hyperv", 2, true, true),
+            ("wsl", 2, false, true),
+            ("wsl-s4", 2, false, true),
+            ("trusted-kvm-wsl", 2, false, true),
+            ("trusted-kvm-wsl-soak", 2, false, true),
+            ("trusted-kvm-s4", 2, false, true),
+            ("install", 2, true, true),
+            ("boot", 2, true, true),
+            ("check-physical-status", 2, true, true),
+        ] {
+            for requested in [None, Some("")] {
+                let output = check(mode, requested);
+                assert!(output.status.success(), "{mode}");
+                assert_eq!(output.stdout, format!("{default}\n").as_bytes());
+            }
+            for (requested, allowed) in [("1", permits_one), ("2", permits_two)] {
+                let output = check(mode, Some(requested));
+                assert_eq!(output.status.success(), allowed, "{mode}: {requested}");
+                assert_eq!(
+                    output.stdout,
+                    if allowed {
+                        format!("{requested}\n").into_bytes()
+                    } else {
+                        vec![]
+                    }
+                );
+            }
+            for invalid in ["0", "-1", "+1", "01", "1\n", "1,cores=1", "one"] {
+                let output = check(mode, Some(invalid));
+                assert!(!output.status.success(), "{mode}: {invalid:?}");
+                assert!(output.stdout.is_empty());
+            }
+        }
+        for mode in [
+            "monitor",
+            "monitor-hyperv",
+            "hyperv",
+            "trusted-kvm-hyperv",
+            "wsl",
+        ] {
+            assert!(!check(mode, Some("3")).status.success());
+        }
+        assert_eq!(check("boot", Some("4")).stdout, b"4\n");
+        assert!(!check("unknown", None).status.success());
+        // The live runner must reject unsupported overrides before compiling,
+        // starting QEMU, creating a test disk or touching firmware variable files.
+        for (mode, cpus) in [
+            ("monitor", "2"),
+            ("monitor-hyperv", "2"),
+            ("trusted-kvm-wsl", "1"),
+        ] {
+            let output = Command::new("bash")
+                .arg(&runner)
+                .arg(mode)
+                .env("WINDOWS_SMP", cpus)
+                .env_remove("WINDOWS_DIRECT_MODE")
+                .env_remove("WINDOWS_PCI_PROFILE")
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("WINDOWS_SMP is unsupported"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn windows_physical_direct_fixture_never_falls_back_to_research_or_reference() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let runner = root.join("scripts/x86_64/windows/windows-test.sh");

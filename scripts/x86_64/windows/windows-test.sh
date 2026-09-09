@@ -435,6 +435,27 @@ configure_direct_mode() {
     esac
 }
 
+# One-CPU Hyper-V reference is an explicit A/B control, never project SMP proof.
+# Keep WSL/S4/soak at their qualified two-CPU setting and reject ignored overrides.
+windows_smp() {
+    local mode=$1 requested=$2 selected
+    case "$mode" in
+        monitor|monitor-hyperv)
+            selected=${requested:-1}
+            [[ "$selected" == 1 ]] || return 1 ;;
+        hyperv|trusted-kvm-hyperv)
+            selected=${requested:-2}
+            [[ "$selected" == 1 || "$selected" == 2 ]] || return 1 ;;
+        wsl|wsl-s4|trusted-kvm-wsl|trusted-kvm-wsl-soak|trusted-kvm-s4)
+            selected=${requested:-2}
+            [[ "$selected" == 2 ]] || return 1 ;;
+        install|boot|check-physical-status) selected=${requested:-2} ;;
+        *) return 1 ;;
+    esac
+    [[ "$selected" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$selected"
+}
+
 run_windows() {
     local mode=$1
     local s4_phase=${2:-}
@@ -463,6 +484,7 @@ run_windows() {
 
     configure_pci_profile
     configure_direct_mode "$mode"
+    smp=$(windows_smp "$mode" "${WINDOWS_SMP-}") || die "WINDOWS_SMP is unsupported for $mode"
     valid_poweroff_timeout "$poweroff_timeout_seconds" || die 'poweroff timeout must be 1..1800 seconds'
 
     [[ "$mode" == check-physical-status ]] && is_physical_test=1
@@ -508,20 +530,15 @@ run_windows() {
         is_direct=1
         backend_label='direct-vmx / project L0'
         [[ "$memory" == 4G ]] || die 'monitor mode currently requires WINDOWS_MEMORY=4G'
-        smp=1
     elif [[ "$mode" == hyperv || "$mode" == wsl || "$mode" == wsl-s4 || \
         "$mode" == trusted-kvm-hyperv || \
         "$mode" == trusted-kvm-wsl || "$mode" == trusted-kvm-wsl-soak || \
         "$mode" == trusted-kvm-s4 ]]; then
         [[ "$memory" == 4G ]] || die 'Hyper-V control currently requires WINDOWS_MEMORY=4G'
-        smp=2
-    else
-        smp=${WINDOWS_SMP:-2}
     fi
     [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'WINDOWS_MEMORY must be a QEMU size such as 4G'
-    [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'WINDOWS_SMP must be a positive integer'
-    printf 'Windows x86 test: backend=%s mode=%s environment=QEMU/KVM (not physical hardware)\n' \
-        "$backend_label" "$mode"
+    printf 'Windows x86 test: backend=%s mode=%s l1_cpus=%s environment=QEMU/KVM (not physical hardware)\n' \
+        "$backend_label" "$mode" "$smp"
     printf 'Windows x86 test: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
     if ((is_direct)); then
         printf 'Windows x86 test: Direct mode=%s environment=QEMU (not physical hardware)\n' "$direct_mode"
@@ -1313,6 +1330,7 @@ usage() {
     printf '       %s check-physical-status (disposable QEMU eval SelfTest only)\n' "$0"
     printf '       WINDOWS_PCI_PROFILE=firmware-default (default) or q35-smoke-1g (explicit QEMU A/B fixture)\n'
     printf '       WINDOWS_DIRECT_MODE=qemu-research (default) or physical-uefi (no-overlay same-ESP QEMU fixture)\n'
+    printf '       WINDOWS_SMP=1 or 2 for Hyper-V reference A/B; Direct requires 1, WSL/S4/soak requires 2\n'
 }
 
 case ${1:-} in
@@ -1341,6 +1359,10 @@ case ${1:-} in
     check-poweroff-timeout)
         (($# == 2)) || die 'check-poweroff-timeout requires SECONDS'
         valid_poweroff_timeout "$2"
+        ;;
+    print-smp)
+        (($# == 2)) || die 'print-smp requires MODE'
+        windows_smp "$2" "${WINDOWS_SMP-}"
         ;;
     check-serial-marker)
         (($# == 2 || $# == 3)) || die 'check-serial-marker requires MARKER and optional LOG'

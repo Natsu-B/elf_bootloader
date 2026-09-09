@@ -3015,3 +3015,47 @@ x86 loader/runner/xtask and this evidence; no AArch64 implementation changed.
 Windows/full upstream timing/S3 results above identify the separately frozen
 `05fa76d` build; they are not silently attributed to the firmware ownership
 change, which does not modify VM-exit semantics or implement AP/S3 support.
+
+### Frozen firmware-ownership Linux and Windows follow-up
+
+Frozen `f01e1a5` repeats the original seven Linux cases plus S3 with
+**5 PASS, 3 FAIL**. The failures remain memslot_perf (142), invalid guest state
+(137 at the original 600-second guest bound), and post-S3 loss of interception
+with a KVM Oops. `/tmp/x86-runtime-ownership-linux-batch.log`,
+`/tmp/x86-idle-guest-linux.Jm7ec4`.
+
+The first concurrent Windows batch (`/tmp/x86-idle-guest-windows.5MQYq1`)
+returned normal=0/Hyper-V=1, but its source-artifact check detected two changed
+EFI files while the separate Linux runner rebuilt that worktree. It is **not
+accepted as an artifact-stable Windows result**. No seed was intentionally
+modified; this batch stopped before its final seed comparison. The frozen
+worktree must not be rebuilt while its Windows validation is running.
+
+A fresh sequential replay with no concurrent build in that worktree gives
+**normal Windows PASS, Direct Hyper-V FAIL** at its unchanged 600-second
+bound. All four source/EFI hashes, both qcow2 checks and before/after seed
+comparisons pass. `/tmp/x86-runtime-ownership-windows-stable-batch.log`,
+`/tmp/x86-idle-guest-windows.869Vbc`. The final Hyper-V screen was inspected:
+black background with a boot spinner, not a visible watchdog bugcheck or the
+earlier Please wait screen. Serial contains two complete firmware/Direct boot
+sequences. The diagnostics parser correctly rejects the repeated backend
+markers; no counter record from an ambiguous pre-reset lifetime was read.
+The cause of this reboot/stall is unresolved. This is not Hyper-V/WSL2 PASS.
+
+### Make Windows Hyper-V CPU-count comparisons explicit
+
+Inspection confirmed that `windows-test.sh::run_windows` ignored
+`WINDOWS_SMP` in Hyper-V modes: Direct always used one CPU, while the reference
+always used two. Previous two-CPU reference success was not a CPU-count-matched
+control for Direct. The shared `windows_smp` selection now allows an explicit
+one- or two-CPU Hyper-V reference, retains defaults, and rejects unsupported
+overrides before compilation or disk/firmware operations. Direct remains
+strictly one CPU; WSL/S4/soak retain their qualified two-CPU configuration.
+Startup logs record the selected L1 CPU count. This does not implement SMP.
+
+The existing xtask host tests exercise every mode, malformed values, explicit
+overrides and early rejection in the live runner: **38 PASS, 0 FAIL**.
+`nix develop --accept-flake-config --command cargo xtest -p xtask`,
+`/tmp/x86-windows-cpu-policy-host.log`; shell syntax, formatting and diff
+whitespace checks PASS. Actual matched one-/two-CPU reference runs are pending;
+no conclusion about Hyper-V's CPU requirements is drawn from runner tests.
