@@ -137,7 +137,7 @@ check_nested_contract_log() {
 # Real L2 entries with every PAT/EFER control combination. This image deliberately
 # powers off instead of returning into disposable firmware descriptor state.
 check_msr_contract_log() {
-    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 backends=0 private=0 expected_backends
+    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 entries=0 checked=0 backends=0 private=0 expected_backends
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
@@ -158,16 +158,22 @@ check_msr_contract_log() {
                 [[ "$backend" != direct-vmx || "$private" == 1 ]] || return 1
                 phase=1 ;;
             'thin-hv: MSR matrix case='*)
-                ((phase == 1 && cases < 128)) && [[ "$line" == "thin-hv: MSR matrix case=$cases" ]] || return 1
+                ((phase == 1 && cases < 128 && entries == 0)) && [[ "$line" == "thin-hv: MSR matrix case=$cases" ]] || return 1
                 cases=$((cases + 1)) ;;
-            'thin-hv: MSR contract PASS matrix=128 vmxoff=1')
-                ((phase == 1 && cases == 128)) || return 1
+            'thin-hv: MSR entry case='*)
+                ((phase == 1 && cases == 128 && entries < 20)) && [[ "$line" == "thin-hv: MSR entry case=$entries" ]] || return 1
+                entries=$((entries + 1)) ;;
+            'thin-hv: MSR late-failure guest-field changes=0')
+                ((phase == 1 && cases == 128 && entries == 20 && checked == 0)) || return 1
+                checked=1 ;;
+            'thin-hv: MSR contract PASS matrix=128 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1')
+                ((phase == 1 && cases == 128 && entries == 20 && checked == 1)) || return 1
                 phase=2 ;;
             *'FAIL'* | *'panic'* | 'thin-hv: MSR '* | 'thin-hv: private host state'* | \
             'thin-hv: vmx guest PASS'* | 'thin-hv: trusted outer KVM guest PASS'*) return 1 ;;
         esac
     done <<<"$transcript"
-    ((phase == 2 && cases == 128 && backends == expected_backends))
+    ((phase == 2 && cases == 128 && entries == 20 && backends == expected_backends))
 }
 
 # This is a separate negative fixture, never a relaxed ordinary backend gate.

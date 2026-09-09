@@ -37,6 +37,8 @@ use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
 use nested_vmx::host_validation;
+use nested_vmx::msr_list::Entry as MsrEntry;
+use nested_vmx::msr_list::List as MsrList;
 use nested_vmx::msr_list::PatEfer;
 use nested_vmx::restrict_vmx_capability;
 use nested_vmx::vmcs_revision_is_supported;
@@ -55,6 +57,8 @@ use x86_64_hal::paging::DataAccess;
 use x86_64_hal::paging::DataFault;
 use x86_64_hal::platform_memory;
 use x86_64_hal::platform_memory::FirmwareDescriptor;
+use x86_64_hal::platform_memory::FirmwareMap;
+use x86_64_hal::platform_memory::PhysicalWidth;
 use x86_64_hal::vmcs;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::VmxStatus;
@@ -561,15 +565,62 @@ struct NestedRun {
 /// reference is shared with another CPU or held across hardware entry.
 #[repr(C, align(16))]
 struct DirectMsrState {
+    ram: FirmwareMap<205>,
+    private: [(u64, u64); 2],
+    entry: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
+    entry_count: u32,
     inherited: PatEfer,
+    entry_loaded: PatEfer,
 }
 
 impl DirectMsrState {
     /// Initial state is overwritten by a carrier snapshot before nested entry.
-    const fn new() -> Self {
+    fn new(ram: FirmwareMap<205>, private: [(u64, u64); 2]) -> Self {
         Self {
+            ram,
+            private,
+            entry: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
+            entry_count: 0,
             inherited: PatEfer { pat: 0, efer: 0 },
+            entry_loaded: PatEfer { pat: 0, efer: 0 },
         }
+    }
+
+    /// Requires actual firmware RAM, current host-map coverage and exclusion of
+    /// all Rust-owned monitor storage before creating a physical pointer.
+    fn allows_list_access(&self, address: u64, bytes: u64, write: bool) -> bool {
+        let Some(end) = address.checked_add(bytes) else {
+            return false;
+        };
+        end <= IDENTITY_MAP_LIMIT
+            && self
+                .private
+                .iter()
+                .all(|&(start, limit)| end <= start || limit <= address)
+            && self.ram.allows_ram_access(address, bytes, write)
+    }
+
+    /// Captures ordinary RAM without performing a guest-visible MSR write.
+    /// Hardware still checks contents/value faults at the actual entry stage.
+    fn prepare_entry(&mut self, list: MsrList) -> Option<(u64, u32)> {
+        self.entry_count = 0;
+        if list.count() == 0 {
+            return Some((0, 0));
+        }
+        if !self.allows_list_access(list.address(), u64::from(list.count()) * 16, false) {
+            return None;
+        }
+        for index in 0..list.count() {
+            let source = list.entry_address(index)?;
+            // SAFETY: List checked alignment/count/physical width. Complete
+            // readable RAM and L0 ownership exclusions were checked above.
+            // This BSP is the only running L1 CPU and is stopped; the source is
+            // not MMIO or any Rust-owned monitor object. The private destination
+            // is not published to hardware until the loop and lock complete.
+            self.entry[index as usize] = unsafe { ptr::read_volatile(source as *const MsrEntry) };
+        }
+        self.entry_count = list.count();
+        Some((self.entry.as_ptr() as usize as u64, self.entry_count))
     }
 }
 
@@ -803,7 +854,7 @@ fn run_direct_monitor(
         {
             return Err(Error::OutsideIdentityMap(block_end));
         }
-        validate_monitor_allocation(system_table, block)?;
+        let ram = validate_monitor_allocation(system_table, block)?;
         // Resolve fallible typed addresses before changing CR0/CR4. Any rejection
         // therefore returns through allocation cleanup without a CPU-state restore.
         let vmxon = VmxonPhys::new(block).ok_or(Error::Firmware(
@@ -915,9 +966,10 @@ fn run_direct_monitor(
         // state. No CPU or VMCS references it yet. The object never moves; all
         // post-entry terminal paths retain its pages and private HOST_CR3 map.
         unsafe {
-            msr_state
-                .as_ptr()
-                .write(SpinLock::new(DirectMsrState::new()));
+            msr_state.as_ptr().write(SpinLock::new(DirectMsrState::new(
+                ram,
+                [(block, block_end), (image_base, image_end)],
+            )));
             host_environment.bind_monitor_data(msr_state.cast());
         }
         for address in host_environment.required_image_addresses() {
@@ -1378,7 +1430,7 @@ fn free_pool(boot_services: *mut efi::BootServices, buffer: *mut c_void) {
 fn validate_monitor_allocation(
     system_table: *mut efi::SystemTable,
     base: u64,
-) -> Result<(), Error> {
+) -> Result<FirmwareMap<205>, Error> {
     let mut storage = [0_u64; 1024];
     let mut length = core::mem::size_of_val(&storage);
     let mut key = 0;
@@ -1422,7 +1474,15 @@ fn validate_monitor_allocation(
             efi::Status::UNSUPPORTED.as_usize(),
         ));
     }
-    Ok(())
+    let width = max_physical_address_bits()
+        .and_then(|bits| PhysicalWidth::new(bits).ok())
+        .ok_or(Error::Capability("RAM map physical width", 0))?;
+    FirmwareMap::new(&regions[..count], width).map_err(|_| {
+        Error::Firmware(
+            "unsupported MSR RAM map",
+            efi::Status::UNSUPPORTED.as_usize(),
+        )
+    })
 }
 
 /// Requires unique runtime RAM coverage inside the QEMU backend's WB buckets.
@@ -3216,9 +3276,6 @@ fn handle_l1_vmentry(
     {
         (exit_controls, true)
     } else {
-        // SAFETY: the owned Direct VMCS is current; its entry-list count has
-        // not yet been redirected. Control words come from original shadows.
-        let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
         let exit_controls =
             direct_patch_value(&saved_direct, VmcsField::VmExitControls).unwrap_or(u64::MAX);
         let entry_controls =
@@ -3231,14 +3288,13 @@ fn handle_l1_vmentry(
         let entry_pat_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PAT);
         let exit_efer_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_EFER | vmcs::VM_EXIT_LOAD_IA32_EFER);
         let entry_efer_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_EFER);
-        let supported = entry_load_count == Some(0)
-            && (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18 == 0
+        let supported = (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18
+            == 0
             && (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 == 0;
         (exit_controls, supported)
     };
     if exit_store_count != Some(0) || exit_load_count != Some(0) || !supported_entry_policy {
-        // Nonempty list execution is integrated separately from the completed
-        // original-control validation and PAT/EFER shadowing below.
+        // Nonempty exit lists are integrated after hardware entry-list coverage.
         stop_unexpected_exit(
             b"unsupported nested VM-entry state",
             reason,
@@ -3322,14 +3378,9 @@ fn checked_direct_msr_lists(
     let load_address = direct_patch_value(saved, VmcsField::VmExitMsrLoadAddress)?;
     let load_count =
         u32::try_from(direct_patch_value(saved, VmcsField::VmExitMsrLoadCount)?).ok()?;
-    // SAFETY: the owning BSP selected L1's live Direct VMCS. These mandatory
-    // controls have not been patched; VMREAD never dereferences list contents.
-    let (entry_address, entry_count) = unsafe {
-        (
-            vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_ADDR).ok()?,
-            u32::try_from(vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT).ok()?).ok()?,
-        )
-    };
+    let entry_address = direct_patch_value(saved, VmcsField::VmEntryMsrLoadAddress)?;
+    let entry_count =
+        u32::try_from(direct_patch_value(saved, VmcsField::VmEntryMsrLoadCount)?).ok()?;
     Some((|| {
         let metadata = MsrMirrorMetadata::new(store_address, store_count, load_address, load_count)
             .ok_or(Error::Count)?;
@@ -3461,7 +3512,7 @@ fn patch_direct_vmcs(
         let value = match patch.kind {
             PatchKind::HostState => carrier_values[index],
             PatchKind::ExitMsrStore | PatchKind::ExitMsrLoad => 0,
-            PatchKind::MsrControls | PatchKind::GuestMsrState => continue,
+            PatchKind::MsrControls | PatchKind::GuestMsrState | PatchKind::EntryMsrLoad => continue,
         };
         if saved_direct[index] == value {
             continue;
@@ -3495,8 +3546,23 @@ fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) ->
     };
     // SAFETY: this CPU owns the current Direct VMCS; guest CR0 is not patched.
     let cr0 = unsafe { vmx::vmread(vmcs::GUEST_CR0) }.ok()?;
-    let loaded = with_direct_msr_state(|state| state.inherited.entry(guest, entry, cr0))?;
+    let entry_address = direct_patch_value(saved, VmcsField::VmEntryMsrLoadAddress)?;
+    let entry_count =
+        u32::try_from(direct_patch_value(saved, VmcsField::VmEntryMsrLoadCount)?).ok()?;
+    let (loaded, mirror_address, mirror_count) = with_direct_msr_state(|state| {
+        let list = MsrList::new(
+            entry_address,
+            entry_count,
+            state.ram.physical_width().bits(),
+        )
+        .ok()?;
+        let (address, count) = state.prepare_entry(list)?;
+        state.entry_loaded = state.inherited.entry(guest, entry, cr0);
+        Some((state.entry_loaded, address, count))
+    })??;
     for (field, value) in [
+        (vmcs::VM_ENTRY_MSR_LOAD_ADDR, mirror_address),
+        (vmcs::VM_ENTRY_MSR_LOAD_COUNT, u64::from(mirror_count)),
         (vmcs::GUEST_IA32_PAT, loaded.pat),
         (vmcs::GUEST_IA32_EFER, loaded.efer),
         (
@@ -3539,8 +3605,16 @@ fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
             // Guest checking/loading is concurrent. A not-yet-loaded original
             // L1 value is a valid deterministic choice for undefined components.
             33 => with_direct_msr_state(|state| state.inherited)?,
-            // Nonempty MSR lists are still rejected before entry; reason 34
-            // therefore cannot be produced by this zero-list runtime yet.
+            34 => {
+                // SAFETY: this CPU owns the failed-entry Direct VMCS; hardware
+                // supplies the one-based index of the first failing list item.
+                let qualification = unsafe { vmx::vmread(vmcs::EXIT_QUALIFICATION) }.ok()?;
+                with_direct_msr_state(|state| {
+                    state
+                        .entry_loaded
+                        .failed_load(&state.entry[..state.entry_count as usize], qualification)
+                })??
+            }
             _ => return None,
         }
     } else {
@@ -5153,13 +5227,57 @@ mod tests {
 
     #[test]
     fn cpu_msr_state_is_bounded_disjoint_and_initially_empty() {
-        let first = super::DirectMsrState::new();
-        let second = super::DirectMsrState::new();
+        let make = || {
+            let ram = super::FirmwareMap::new(
+                &[super::FirmwareDescriptor {
+                    memory_type: 7,
+                    physical_start: 0,
+                    number_of_pages: 16,
+                    attributes: super::efi::MEMORY_WB,
+                }],
+                super::PhysicalWidth::new(48).unwrap(),
+            )
+            .unwrap();
+            super::DirectMsrState::new(ram, [(0x3000, 0x4000), (0x5000, 0x5101)])
+        };
+        let mut first = make();
+        let second = make();
         assert!(!core::ptr::eq(&first, &second));
         for state in [&first, &second] {
             assert_eq!(state.inherited, super::PatEfer { pat: 0, efer: 0 });
+            assert_eq!(state.entry_count, 0);
+            assert_eq!(state.entry.as_ptr() as usize & 15, 0);
+            assert!(
+                state
+                    .entry
+                    .iter()
+                    .all(|entry| *entry == super::MsrEntry::new(0, 0))
+            );
+            for (address, bytes) in [(0, 16), (0x2ff0, 16), (0x4000, 16), (0x5110, 16)] {
+                assert!(state.allows_list_access(address, bytes, false));
+            }
+            for (address, bytes) in [
+                (0, 0),
+                (0x2ff0, 32),
+                (0x3000, 16),
+                (0x5000, 16),
+                (0x5100, 16),
+                (0x10000, 16),
+                (u64::MAX, 2),
+                (super::IDENTITY_MAP_LIMIT, 16),
+            ] {
+                assert!(!state.allows_list_access(address, bytes, false));
+            }
         }
-        assert_eq!(super::MSR_STATE_PAGES, 1);
+        assert_eq!(
+            first.prepare_entry(super::MsrList::new(u64::MAX, 0, 48).unwrap()),
+            Some((0, 0))
+        );
+        assert_eq!(
+            first.prepare_entry(super::MsrList::new(0x3000, 1, 48).unwrap()),
+            None
+        );
+        assert_ne!(first.entry.as_ptr(), second.entry.as_ptr());
         assert!(
             core::mem::size_of::<mutex::SpinLock<super::DirectMsrState>>()
                 <= super::MSR_STATE_PAGES * 4096

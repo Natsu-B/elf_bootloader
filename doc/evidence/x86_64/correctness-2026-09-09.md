@@ -703,3 +703,85 @@ this patch. The mistaken default-300-second run remains a recorded FAIL.
 These are QEMU/KVM results only. No Windows, S3 or physical hardware run is
 implied by this follow-up. Nonempty-list implementation work is subsequent to
 the tested `c044844` snapshot.
+
+## Stage 5: bounded nonempty VM-entry MSR lists
+
+The entry-list half now executes; nonempty **exit** store/load lists remain
+gated until the next increment. The architecture remains Direct-VMCS.
+
+* `arch_hal/x86_64_hal/src/platform_memory.rs`: `FirmwareMap<N>` owns a bounded
+  validated descriptor copy. Shared `validate_firmware_descriptors` preserves
+  the EPT planner's existing format/type/overlap checks; EPT-specific limits
+  remain in `PlatformMap::new`. `allows_ram_access` checks full contiguous RAM
+  coverage, read/RO permissions, overflow and physical-width boundaries. It
+  distinguishes the UEFI WP cache capability from RO protection. Two host tests
+  cover holes, MMIO, unusable/unaccepted RAM, read-only/protected pages, physical
+  zero, adjacent descriptors, overlap and addresses at the 52-bit limit.
+* `nested_vmx/src/lib.rs`: original entry-list address/count join the patch
+  manifest (`EntryMsrLoad`, 35 fields). VMREAD/VMWRITE and materialization retain
+  L1's original values rather than exposing private list addresses.
+* `x86_uefi_loader/src/vmx_smoke.rs`: the CPU's GS-bound `DirectMsrState` owns
+  512 aligned entry slots and an immutable 205-descriptor firmware snapshot.
+  `prepare_entry` validates backing/ownership before copying ordinary RAM, never
+  MMIO or monitor-private image/block storage. Every VMLAUNCH/VMRESUME recopies
+  current source contents and publishes only the completely prepared mirror.
+  Hardware performs entry MSR loads in order, including model-specific/value
+  checks, after architectural entry checks. Invalid contents cause late reason
+  34 and its one-based qualification, not VMfail 7 or a root WRMSR exception.
+  `reflected_direct_msrs` reconstructs PAT/EFER from only the successful prefix;
+  neither original guest-field shadows nor exit stores change on late failure.
+  No mutable Rust borrow crosses entry and no per-exit heap allocation is used.
+* `x86_guest_uefi_test/src/msr_contract.rs`: 20 additional cases cover one/many/
+  512 items, duplicates, unsupported indices, reserved bits, invalid PAT, FS/GS,
+  x2APIC and SMM-only exclusions, failure at item 512, preserved prefix state,
+  ignored EFER.LMA writes, ignored zero-count address, early errors 5/8, late
+  guest-state error 33, late MSR error 34, and recovery. One extra VMRESUME changes
+  the source without rewriting list controls and requires the new value.
+  Coverage is 7 normal entries (including the empty-list case and one resume),
+  10 late MSR failures, 2 early failures and 2 late guest-state failures.
+* `scripts/x86_64/run-uefi-smoke.sh`, `xtask/src/main.rs`: require ordered entry
+  cases, exact counts and `MSR late-failure guest-field changes=0`. All deferred
+  mismatches remain a final FAIL; no reference exception is accepted as PASS.
+
+Additional reference finding, verified against Intel SDM 29.8 and the pinned
+Linux 7.1.5 source: after a later item fails, successful earlier PAT list loads
+change `guest_ia32_pat` on outer KVM when SAVE_PAT is set. In
+`arch/x86/kvm/vmx/vmx.c`, the `MSR_IA32_CR_PAT` write case eagerly updates the
+VMCS12 guest PAT field in guest mode. `nested_vmx_enter_non_root_mode` has already
+entered guest mode before `nested_vmx_load_msr`; the late failure does not undo
+this change. Intel specifies that the guest-state area is unchanged on these
+failures. The fixture observes **3 changes on reference, 0 on Direct**. Direct's
+original-field shadow avoids this visible corruption. Physical Intel behavior
+has not been tested. Only safe field comparisons are deferred so both backends
+execute all 20 cases; each subsequent case explicitly resets both fields.
+
+Validation (all cargo commands through the existing Nix environment):
+
+* Five package `cargo xtest -p` runs: **163 PASS, 0 FAIL** (nested 21, HAL 53,
+  loader 47, guest 10, xtask 32). Logs: `/tmp/x86-msr-entry-policy.log`,
+  `...-hal.log`, `...-loader2.log`, `...-guest.log`, `...-final-xtask.log`.
+  The first loader host compile failed on a test-only unqualified `efi` name;
+  this was fixed and both affected feature variants rerun successfully.
+* `LINUX_KVM_CYCLES=64 cargo xrun x86 --nested --release`: **7 PASS, 3 FAIL**,
+  process exit 1; `/tmp/x86-msr-entry-nested-final.log`. All Direct cases and all
+  three Linux runs PASS with the unchanged default 300-second bound. Failures:
+  two known reference partial-store assertions, plus the new reference PAT
+  shadow assertion above. Earlier one-cycle / resume-development runs retained
+  the same reference failure; they did not establish reference MSR PASS.
+* `cargo xbuild x86` and `cargo xbuild x86 --release`: **PASS**;
+  `/tmp/x86-msr-entry-xbuild-debug.log`, `...-xbuild.log`.
+* `cargo xrun x86 --release`: **9 PASS, 0 FAIL**, including the expected private
+  root-exception stop; `/tmp/x86-msr-entry-smoke.log`. Seven QEMU/KVM cases and
+  two QEMU/TCG cases, never physical-machine results.
+* `LINUX_SELFTEST_BACKEND=direct-vmx LINUX_SELFTEST_NAME=xcr0_cpuid_test
+  LINUX_SELFTEST_ELF=/tmp/thin-hv-kvm-selftests-7.1.5.MUloxc/out/x86/xcr0_cpuid_test
+  ./scripts/x86_64/run-linux-selftest.sh`: **PASS**, unmodified upstream ELF,
+  process exit 0; `/tmp/x86-msr-entry-xcr0.log`.
+* `cargo fmt`, `cargo fmt --check`, `git diff --check`: **PASS**.
+
+Remaining ceiling: a list outside retained firmware RAM or the current fixed
+8-GiB host map is an explicit unsupported L0 backing-layout error, not a forged
+guest #PF/VMfail result and not a QEMU fallback. The physical map is still not
+wired, exit MSR lists still require implementation, and this is not physical
+qualification. No AArch64 production path, Windows/activation state, firmware
+identity, S3 or physical device was modified or tested in this increment.

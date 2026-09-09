@@ -176,6 +176,109 @@ impl FirmwareDescriptor {
     }
 }
 
+/// Owned, checked firmware descriptors for bounded physical RAM access.
+/// This validates metadata only: callers must separately establish their CPU
+/// mapping, memory types, ownership exclusions and absence of concurrent writes.
+pub struct FirmwareMap<const N: usize> {
+    descriptors: [FirmwareDescriptor; N],
+    count: usize,
+    width: PhysicalWidth,
+}
+
+impl<const N: usize> FirmwareMap<N> {
+    /// Rejects malformed/overlapping descriptors without sorting or allocating.
+    pub fn new(descriptors: &[FirmwareDescriptor], width: PhysicalWidth) -> Result<Self, Error> {
+        if descriptors.len() > N {
+            return Err(Error::OutputCapacity);
+        }
+        validate_firmware_descriptors(descriptors, width)?;
+        let mut map = Self {
+            descriptors: [FirmwareDescriptor::default(); N],
+            count: descriptors.len(),
+            width,
+        };
+        map.descriptors[..map.count].copy_from_slice(descriptors);
+        Ok(map)
+    }
+
+    /// Original validated descriptor order, excluding unused capacity.
+    #[must_use]
+    pub fn descriptors(&self) -> &[FirmwareDescriptor] {
+        &self.descriptors[..self.count]
+    }
+
+    /// Physical width captured with this immutable firmware snapshot.
+    #[must_use]
+    pub const fn physical_width(&self) -> PhysicalWidth {
+        self.width
+    }
+
+    /// Tests complete RAM coverage, including adjacent descriptors. Holes,
+    /// MMIO, unusable/unaccepted memory and read protection deny access. Writes
+    /// additionally reject UEFI read-only memory. UEFI's WP *cache capability*
+    /// is not confused with the RO permission bit. Physical address zero is
+    /// legal when firmware actually describes accessible RAM there.
+    #[must_use]
+    pub fn allows_ram_access(&self, address: u64, bytes: u64, write: bool) -> bool {
+        let Some(end) = address
+            .checked_add(bytes)
+            .filter(|&end| bytes != 0 && end <= self.width.limit())
+        else {
+            return false;
+        };
+        let mut cursor = address;
+        while cursor < end {
+            let Some(descriptor) = self.descriptors().iter().find(|descriptor| {
+                // Constructor checked both arithmetic and non-overlap.
+                descriptor.physical_start <= cursor
+                    && cursor < descriptor.physical_start + descriptor.number_of_pages * PAGE
+            }) else {
+                return false;
+            };
+            if !matches!(descriptor.memory_type, 1..=7 | 9 | 10 | 14)
+                || descriptor.attributes & (0x2000 | if write { 0x20000 } else { 0 }) != 0
+            {
+                return false;
+            }
+            cursor = end.min(descriptor.physical_start + descriptor.number_of_pages * PAGE);
+        }
+        true
+    }
+}
+
+/// Shared metadata checks; the EPT planner adds its own materialization limits.
+fn validate_firmware_descriptors(
+    descriptors: &[FirmwareDescriptor],
+    width: PhysicalWidth,
+) -> Result<(), Error> {
+    if descriptors.is_empty() || descriptors.len() > MAX_DESCRIPTORS {
+        return Err(Error::InputCapacity);
+    }
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let range = descriptor.range(width)?;
+        if descriptor.memory_type > 15 {
+            return Err(Error::FirmwareMemoryType);
+        }
+        if descriptor.attributes & MEMORY_ISA != 0 || descriptor.attributes & !KNOWN_ATTRIBUTES != 0
+        {
+            return Err(Error::MemoryType);
+        }
+        let is_runtime = descriptor.attributes & MEMORY_RUNTIME != 0;
+        if (matches!(descriptor.memory_type, 5 | 6) && !is_runtime)
+            || (is_runtime && descriptor.kind().is_none())
+        {
+            return Err(Error::RuntimeAttribute);
+        }
+        // Bounded O(n²) validation preserves the original firmware order.
+        for previous in &descriptors[..index] {
+            if range.overlaps(previous.range(width)?) {
+                return Err(Error::Overlap);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Decodes the standard UEFI descriptor prefix using the firmware-provided stride.
 ///
 /// Version 1 and 40..=256-byte, 8-byte-aligned strides are accepted. No typed
@@ -553,40 +656,14 @@ impl<'a> PlatformMap<'a> {
         mtrrs: Mtrrs<'a>,
         capabilities: PageCapabilities,
     ) -> Result<Self, Error> {
-        if descriptors.is_empty()
-            || descriptors.len() > MAX_DESCRIPTORS
-            || private.len() > MAX_OVERRIDES
-            || mmio.len() > MAX_OVERRIDES
-        {
+        if private.len() > MAX_OVERRIDES || mmio.len() > MAX_OVERRIDES {
             return Err(Error::InputCapacity);
         }
-        for (index, descriptor) in descriptors.iter().enumerate() {
+        validate_firmware_descriptors(descriptors, mtrrs.width)?;
+        for descriptor in descriptors {
             let range = descriptor.range(mtrrs.width)?;
-            if descriptor.memory_type > 15 {
-                return Err(Error::FirmwareMemoryType);
-            }
-            if descriptor.attributes & MEMORY_ISA != 0
-                || descriptor.attributes & !KNOWN_ATTRIBUTES != 0
-            {
-                return Err(Error::MemoryType);
-            }
-            let is_runtime = descriptor.attributes & MEMORY_RUNTIME != 0;
-            if (matches!(descriptor.memory_type, 5 | 6) && !is_runtime)
-                || (is_runtime && descriptor.kind().is_none())
-            {
-                // A declared runtime span must have a supported mapping policy;
-                // never silently omit it or map unusable memory to preserve it.
-                return Err(Error::RuntimeAttribute);
-            }
             if descriptor.kind().is_some() && range.end > (1 << 48) {
                 return Err(Error::EptAddressWidth);
-            }
-            // ponytail: bounded O(n²) validation avoids a heap or in-place sorting;
-            // add a caller-owned index buffer only if measured firmware size needs it.
-            for previous in &descriptors[..index] {
-                if range.overlaps(previous.range(mtrrs.width)?) {
-                    return Err(Error::Overlap);
-                }
             }
         }
         for ranges in [private, mmio] {
@@ -808,6 +885,63 @@ fn leaf_segment(start: u64, end: u64, capabilities: PageCapabilities) -> (u64, P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_ram_access_requires_complete_permitted_firmware_coverage() {
+        let first = ram(0, 0x1000);
+        let mut second = ram(0x1000, 0x2000);
+        for write in [false, true] {
+            let descriptors = [second, first];
+            let map = FirmwareMap::<2>::new(&descriptors, width()).unwrap();
+            assert!(map.allows_ram_access(0, 16, write));
+            assert!(map.allows_ram_access(0xff8, 16, write));
+            assert!(map.allows_ram_access(0, 0x2000, write));
+            assert!(!map.allows_ram_access(0, 0x2001, write));
+            assert!(!map.allows_ram_access(0x2000, 1, write));
+            assert!(!map.allows_ram_access(0, 0, write));
+            assert!(!map.allows_ram_access(u64::MAX, 2, write));
+        }
+        for kind in [0, 8, 11, 12, 13, 15] {
+            second.memory_type = kind;
+            let descriptors = [first, second];
+            let map = FirmwareMap::<2>::new(&descriptors, width()).unwrap();
+            assert!(!map.allows_ram_access(0xff8, 16, false));
+            assert!(!map.allows_ram_access(0xff8, 16, true));
+        }
+        second = ram(0x1000, 0x2000);
+        second.attributes |= 0x20000;
+        let descriptors = [first, second];
+        let map = FirmwareMap::<2>::new(&descriptors, width()).unwrap();
+        assert!(map.allows_ram_access(0xff8, 16, false));
+        assert!(!map.allows_ram_access(0xff8, 16, true));
+        second.attributes |= 0x2000;
+        let descriptors = [first, second];
+        assert!(
+            !FirmwareMap::<2>::new(&descriptors, width())
+                .unwrap()
+                .allows_ram_access(0xff8, 16, false)
+        );
+        second.attributes = CACHE_WB | CACHE_WP;
+        let descriptors = [first, second];
+        assert!(
+            FirmwareMap::<2>::new(&descriptors, width())
+                .unwrap()
+                .allows_ram_access(0xff8, 16, true)
+        );
+    }
+
+    #[test]
+    fn physical_ram_metadata_checks_actual_width_without_an_ept_fallback() {
+        let width = PhysicalWidth::new(52).unwrap();
+        let descriptor = ram(width.limit() - PAGE, width.limit());
+        let descriptors = [descriptor];
+        let map = FirmwareMap::<2>::new(&descriptors, width).unwrap();
+        assert!(map.allows_ram_access(width.limit() - 16, 16, false));
+        assert!(!map.allows_ram_access(width.limit() - 16, 17, false));
+        assert!(FirmwareMap::<2>::new(&descriptors, PhysicalWidth::new(48).unwrap()).is_err());
+        assert!(FirmwareMap::<2>::new(&[descriptor, descriptor], width).is_err());
+        assert!(FirmwareMap::<2>::new(&[], width).is_err());
+    }
 
     fn width() -> PhysicalWidth {
         PhysicalWidth::new(36).unwrap()

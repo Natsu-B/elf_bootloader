@@ -687,6 +687,8 @@ pub enum VmcsField {
     VmExitMsrStoreAddress = 0x2006,
     /// L1's VM-exit MSR-load address.
     VmExitMsrLoadAddress = 0x2008,
+    /// Original VM-entry MSR-load address, before redirecting to a private copy.
+    VmEntryMsrLoadAddress = 0x200a,
     /// Original guest PAT field, distinct from a forced L0 save/load image.
     GuestIa32Pat = 0x2804,
     /// Original guest EFER field, distinct from a forced L0 save/load image.
@@ -703,6 +705,8 @@ pub enum VmcsField {
     VmExitMsrLoadCount = 0x4010,
     /// Original VM-entry controls, before L0 forces inherited MSR loading.
     VmEntryControls = 0x4012,
+    /// Original VM-entry MSR-load count.
+    VmEntryMsrLoadCount = 0x4014,
     /// Host `IA32_SYSENTER_CS`.
     HostIa32SysenterCs = 0x4c00,
     /// Host CR0.
@@ -750,6 +754,8 @@ pub enum PatchKind {
     MsrControls,
     /// Hide forced saves when L1 did not request saving the guest MSR field.
     GuestMsrState,
+    /// Publish a bounded immutable entry-list copy without changing L1 fields.
+    EntryMsrLoad,
 }
 
 /// One entry in the direct-VMCS patch manifest.
@@ -787,11 +793,11 @@ impl DirectVmcsPatch {
     }
 }
 
-/// Direct-VMCS host and VM-exit-MSR fields L0 must replace.
+/// Direct-VMCS host, MSR-control and MSR-list fields L0 must replace.
 ///
 /// `HOST_IA32_PERF_GLOBAL_CTRL` stays direct because L0 does not use the PMU;
 /// a trusted L1 may therefore count or interrupt monitor execution.
-pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 33] = [
+pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 35] = [
     DirectVmcsPatch::host(VmcsField::HostEsSelector),
     DirectVmcsPatch::host(VmcsField::HostCsSelector),
     DirectVmcsPatch::host(VmcsField::HostSsSelector),
@@ -836,6 +842,14 @@ pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 33] = [
     DirectVmcsPatch {
         field: VmcsField::GuestIa32Efer,
         kind: PatchKind::GuestMsrState,
+    },
+    DirectVmcsPatch {
+        field: VmcsField::VmEntryMsrLoadAddress,
+        kind: PatchKind::EntryMsrLoad,
+    },
+    DirectVmcsPatch {
+        field: VmcsField::VmEntryMsrLoadCount,
+        kind: PatchKind::EntryMsrLoad,
     },
 ];
 
@@ -1181,7 +1195,11 @@ mod tests {
                 .count(),
             2
         );
-        for kind in [PatchKind::MsrControls, PatchKind::GuestMsrState] {
+        for kind in [
+            PatchKind::MsrControls,
+            PatchKind::GuestMsrState,
+            PatchKind::EntryMsrLoad,
+        ] {
             assert_eq!(
                 DIRECT_VMCS_PATCH_MANIFEST
                     .iter()

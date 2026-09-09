@@ -24,7 +24,8 @@ use x86_64_hal::vmx;
 // VMXON, VMCS, zero MSR bitmap, guest stack, host/IST environment and host stack.
 const ENV_PAGE: usize = 4;
 const STACK_PAGE: usize = ENV_PAGE + HOST_ENVIRONMENT_PAGES;
-const PAGES: usize = STACK_PAGE + 2;
+const LIST_PAGE: usize = STACK_PAGE + 2;
+const PAGES: usize = LIST_PAGE + 2;
 const PAT: u32 = 0x277;
 const EFER: u32 = 0xc000_0080;
 
@@ -252,7 +253,7 @@ unsafe fn matrix(
             write(vmcs::GUEST_IA32_EFER, guest_efer)?;
             write(vmcs::HOST_IA32_EFER, guest_efer)?;
             let _ = writeln!(serial, "thin-hv: MSR matrix case={variant}");
-            let flags = enter(&mut frame);
+            let flags = enter(&mut frame, 0);
             if flags != 0 {
                 return Err(Failure {
                     stage: "msr-entry-flags",
@@ -310,6 +311,258 @@ unsafe fn matrix(
         }
     }
     Ok(())
+}
+
+/// Hardware list loading, exact early/late error priority, ordered prefix
+/// effects, ignored zero-count addresses and recovery after every failure.
+unsafe fn entry_lists(
+    base: u64,
+    region: VmcsPhys,
+    env: &HostEnvironment<'_>,
+    serial: &mut Serial,
+) -> Result<()> {
+    // SAFETY: the VMX CPU supports these mandatory long-mode/PAT MSRs at CPL0.
+    let (original_pat, original_efer) = unsafe { (cpu::rdmsr(PAT), cpu::rdmsr(EFER)) };
+    let pat = |kind: u64| (original_pat & !(0xff << 32)) | (kind << 32);
+    let address = base + (LIST_PAGE * PAGE) as u64;
+    let mut late_field_changes = 0;
+    for case in 0..20 {
+        let mut count = match case {
+            1 | 7 => 3,
+            2 | 12 => 512,
+            6 => 2,
+            19 => 0,
+            _ => 1,
+        };
+        let mut frame = Frame {
+            fx: [0; 512],
+            original_pat,
+            original_efer,
+            inherited_pat: pat(6),
+            inherited_efer: original_efer,
+            l2_pat: pat(5),
+            l2_efer: original_efer,
+            entry_pat: 0,
+            entry_efer: 0,
+            exit_pat: 0,
+            exit_efer: 0,
+        };
+        let guest_pat = if case == 16 { u64::MAX } else { pat(0) };
+        let mut expected_pat = pat(1);
+        let mut expected_efer = original_efer;
+        let mut failure_index = 0;
+        // SAFETY: these two private fixture pages are exclusive aligned WB RAM;
+        // only this L1 writes them. No L2 or hardware list processing runs while
+        // they are prepared; counts never exceed the allocated 512 items.
+        unsafe {
+            core::ptr::write_bytes(address as *mut u8, 0, 2 * PAGE);
+            for index in 0..count {
+                let slot = (address as *mut u64).add(index * 2);
+                slot.write(u64::from(PAT));
+                slot.add(1).write(pat(if index & 1 == 0 { 1 } else { 4 }));
+            }
+            let item = |index: usize, msr: u64, value: u64| {
+                let slot = (address as *mut u64).add(index * 2);
+                slot.write(msr);
+                slot.add(1).write(value);
+            };
+            match case {
+                1 => {
+                    item(1, u64::from(EFER), original_efer ^ 1);
+                    item(2, u64::from(PAT), pat(4));
+                    expected_pat = pat(4);
+                    expected_efer ^= 1;
+                }
+                2 => expected_pat = pat(4),
+                3 => {
+                    item(0, (1 << 32) | u64::from(PAT), pat(1));
+                    failure_index = 1;
+                }
+                4 => {
+                    item(0, u64::from(u32::MAX), 0);
+                    failure_index = 1;
+                }
+                5 => {
+                    item(0, u64::from(PAT), u64::MAX);
+                    failure_index = 1;
+                }
+                6 => {
+                    item(1, u64::from(PAT), u64::MAX);
+                    failure_index = 2;
+                }
+                7 => {
+                    // WRMSR/list loading ignores the supplied read-only LMA bit.
+                    item(1, u64::from(EFER), (original_efer ^ 1) & !(1 << 10));
+                    item(2, u64::from(u32::MAX), 0);
+                    expected_efer ^= 1;
+                    failure_index = 3;
+                }
+                8..=11 => {
+                    item(0, [0xc000_0101, 0xc000_0100, 0x802, 0x9b][case - 8], 0);
+                    failure_index = 1;
+                }
+                12 => {
+                    item(511, u64::from(u32::MAX), 0);
+                    failure_index = 512;
+                }
+                19 => {
+                    count = 0;
+                    expected_pat = guest_pat;
+                }
+                _ => {}
+            }
+            if failure_index == 1 {
+                expected_pat = guest_pat;
+            }
+            success("entry-list-clear", vmx::vmclear(region))?;
+            success("entry-list-current", vmx::vmptrld(region))?;
+            let entry = controls(
+                vmx::IA32_VMX_ENTRY_CTLS,
+                vmx::IA32_VMX_TRUE_ENTRY_CTLS,
+                vmcs::VM_ENTRY_IA32E_MODE
+                    | vmcs::VM_ENTRY_LOAD_IA32_PAT
+                    | vmcs::VM_ENTRY_LOAD_IA32_EFER,
+            )?;
+            let host_load = case == 16 || case == 17;
+            let exit = controls(
+                vmx::IA32_VMX_EXIT_CTLS,
+                vmx::IA32_VMX_TRUE_EXIT_CTLS,
+                vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
+                    | vmcs::VM_EXIT_SAVE_IA32_PAT
+                    | vmcs::VM_EXIT_SAVE_IA32_EFER
+                    | if host_load {
+                        vmcs::VM_EXIT_LOAD_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_EFER
+                    } else {
+                        0
+                    },
+            )?;
+            configure(base, env, entry, exit)?;
+            write(vmcs::GUEST_IA32_PAT, guest_pat)?;
+            write(vmcs::GUEST_IA32_EFER, original_efer)?;
+            write(vmcs::HOST_IA32_PAT, pat(5))?;
+            write(vmcs::HOST_IA32_EFER, original_efer)?;
+            let list_address = if count == 0 { u64::MAX } else { address };
+            write(vmcs::VM_ENTRY_MSR_LOAD_ADDR, list_address)?;
+            write(vmcs::VM_ENTRY_MSR_LOAD_COUNT, count as u64)?;
+            if case == 15 {
+                write(vmcs::HOST_CS_SELECTOR, 0)?;
+            }
+            if case == 17 {
+                write(vmcs::GUEST_CR0, cpu::read_cr0() & !(1 << 31))?;
+            }
+            let _ = writeln!(serial, "thin-hv: MSR entry case={case}");
+            let flags = enter(&mut frame, u64::from(case == 14));
+            if case == 14 || case == 15 {
+                equal("entry-list-early-flags", flags, 0x40)?;
+                equal(
+                    "entry-list-early-error",
+                    read_field("entry-list-error", vmcs::VM_INSTRUCTION_ERROR)?,
+                    if case == 14 { 5 } else { 8 },
+                )?;
+                equal(
+                    "entry-list-no-early-load",
+                    frame.exit_pat,
+                    frame.inherited_pat,
+                )?;
+                equal(
+                    "entry-list-no-early-efer",
+                    frame.exit_efer,
+                    frame.inherited_efer,
+                )?;
+            } else {
+                equal("entry-list-flags", flags, 0)?;
+                let reason = read_field("entry-list-reason", vmcs::VM_EXIT_REASON)?;
+                if failure_index != 0 || host_load {
+                    equal(
+                        "entry-list-late-reason",
+                        reason,
+                        (1 << 31) | if host_load { 33 } else { 34 },
+                    )?;
+                    if !host_load {
+                        equal(
+                            "entry-list-failed-index",
+                            read_field("entry-list-qualification", vmcs::EXIT_QUALIFICATION)?,
+                            failure_index,
+                        )?;
+                    }
+                    equal(
+                        "entry-list-guest-not-run",
+                        frame.entry_pat | frame.entry_efer,
+                        0,
+                    )?;
+                    equal(
+                        "entry-list-prefix-pat",
+                        frame.exit_pat,
+                        if host_load { pat(5) } else { expected_pat },
+                    )?;
+                    equal(
+                        "entry-list-prefix-efer",
+                        frame.exit_efer,
+                        if host_load {
+                            original_efer
+                        } else {
+                            expected_efer
+                        },
+                    )?;
+                    // SDM 29.8 leaves the guest-state area unchanged on late
+                    // entry failure. Continue only these field comparisons:
+                    // the next case overwrites both fields before any entry.
+                    // This records reference-KVM's eager PAT shadow update
+                    // without dropping later tests or accepting the mismatch.
+                    late_field_changes += u32::from(
+                        read_field("entry-list-shadow-pat", vmcs::GUEST_IA32_PAT)? != guest_pat,
+                    );
+                    late_field_changes += u32::from(
+                        read_field("entry-list-shadow-efer", vmcs::GUEST_IA32_EFER)?
+                            != original_efer,
+                    );
+                } else {
+                    equal("entry-list-normal-reason", reason, 18)?;
+                    equal("entry-list-loaded-pat", frame.entry_pat, expected_pat)?;
+                    equal("entry-list-loaded-efer", frame.entry_efer, expected_efer)?;
+                    equal("entry-list-reflected-pat", frame.exit_pat, frame.l2_pat)?;
+                    equal("entry-list-reflected-efer", frame.exit_efer, frame.l2_efer)?;
+                }
+            }
+            equal(
+                "entry-list-original-address",
+                read_field("entry-list-address", vmcs::VM_ENTRY_MSR_LOAD_ADDR)?,
+                list_address,
+            )?;
+            equal(
+                "entry-list-original-count",
+                read_field("entry-list-count", vmcs::VM_ENTRY_MSR_LOAD_COUNT)?,
+                count as u64,
+            )?;
+            if case == 0 {
+                // The source changes without VMCLEAR or any list-control write.
+                // VMRESUME must load a fresh mirror, not the previous copy.
+                (address as *mut u64).add(1).write(pat(4));
+                write(vmcs::GUEST_RIP, guest as *const () as usize as u64)?;
+                equal("entry-list-resume-flags", enter(&mut frame, 1), 0)?;
+                equal(
+                    "entry-list-resume-reason",
+                    read_field("entry-list-resume-exit", vmcs::VM_EXIT_REASON)?,
+                    18,
+                )?;
+                equal("entry-list-resume-fresh", frame.entry_pat, pat(4))?;
+                equal(
+                    "entry-list-resume-count",
+                    read_field("entry-list-resume-list", vmcs::VM_ENTRY_MSR_LOAD_COUNT)?,
+                    1,
+                )?;
+            }
+        }
+    }
+    let _ = writeln!(
+        serial,
+        "thin-hv: MSR late-failure guest-field changes={late_field_changes}"
+    );
+    equal(
+        "entry-list-no-failed-save-fields",
+        u64::from(late_field_changes),
+        0,
+    )
 }
 
 /// No return after selecting private host tables; all pages stay allocated
@@ -381,7 +634,10 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
         // SAFETY: the owned aligned WB region has the advertised revision.
         success("msr-vmxon", unsafe { vmx::vmxon(vmxon) })?;
         // SAFETY: this CPU now owns VMX operation and its private VMCS/pages.
-        let result = unsafe { matrix(base, region, &env, serial) };
+        let result = unsafe {
+            matrix(base, region, &env, serial)
+                .and_then(|()| entry_lists(base, region, &env, serial))
+        };
         // SAFETY: no L2 remains running; even failed attempts return here in L1
         // root. Clear the owned VMCS before VMXOFF; retain pages on any failure.
         unsafe {
@@ -393,7 +649,10 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
     })();
     match result {
         Ok(()) => {
-            let _ = writeln!(serial, "thin-hv: MSR contract PASS matrix=128 vmxoff=1");
+            let _ = writeln!(
+                serial,
+                "thin-hv: MSR contract PASS matrix=128 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1"
+            );
         }
         Err(error) => {
             let _ = writeln!(
@@ -419,7 +678,7 @@ pub(super) fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> ! {
 // SysV callee registers and FP image are restored on every immediate failure
 // or nested exit; no Rust executes before restoring original PAT/EFER.
 #[unsafe(naked)]
-unsafe extern "sysv64" fn enter(_frame: *mut Frame) -> u64 {
+unsafe extern "sysv64" fn enter(_frame: *mut Frame, _resume: u64) -> u64 {
     core::arch::naked_asm!(
         "push rbp",
         "push rbx",
@@ -448,7 +707,13 @@ unsafe extern "sysv64" fn enter(_frame: *mut Frame) -> u64 {
         "shr rdx, 32",
         "mov ecx, 0xc0000080",
         "wrmsr",
+        "test rsi, rsi",
+        "jnz 6f",
         "vmlaunch",
+        "jmp 7f",
+        "6:",
+        "vmresume",
+        "7:",
         "pushfq",
         "pop r8",
         "and r8d, 0x41",

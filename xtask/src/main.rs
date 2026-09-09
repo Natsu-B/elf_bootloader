@@ -3472,14 +3472,23 @@ mod tests {
             let matrix = (0..128)
                 .map(|case| format!("thin-hv: MSR matrix case={case}\n"))
                 .collect::<String>();
+            let entries = (0..20)
+                .map(|case| format!("thin-hv: MSR entry case={case}\n"))
+                .collect::<String>();
             let msr = format!(
-                "{provenance}thin-hv: MSR contract START\n{matrix}thin-hv: MSR contract PASS matrix=128 vmxoff=1\n"
+                "{provenance}thin-hv: MSR contract START\n{matrix}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1\n"
             );
             assert!(check_profile(backend, "msr", &msr));
             for broken in [
                 msr.replace("thin-hv: MSR matrix case=63\n", ""),
                 msr.replace("case=63\n", "case=62\n"),
                 msr.replace("matrix=128", "matrix=127"),
+                msr.replace("entry_cases=20", "entry_cases=19"),
+                msr.replace("entry_fail=10", "entry_fail=9"),
+                msr.replace("guest-field changes=0", "guest-field changes=1"),
+                msr.replace("thin-hv: MSR late-failure guest-field changes=0\n", ""),
+                msr.replace("MSR entry case=19\n", "MSR entry case=18\n"),
+                msr.replace("thin-hv: MSR entry case=2\n", ""),
                 msr.replace("vmxoff=1", "vmxoff=0"),
                 msr.replace("MSR contract START", "MSR contract FAIL"),
                 msr.replace(
