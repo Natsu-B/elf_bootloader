@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Shared by transcript validation and the live runner; a halted monitor cannot
 # recover by waiting for an unrelated guest success marker.
-direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|host exception |panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
+direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|nested VMX abort|host exception |panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
 
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
@@ -36,6 +36,7 @@ check_backend_log() {
             case "$line" in
                 *'thin-hv: loading runtime monitor'* | *'thin-hv: runtime monitor active'* | \
                 *'thin-hv: private host state'* | *'thin-hv: host exception '* | \
+                *'thin-hv: nested VMX abort'* | \
                 *'thin-hv: variable overlay profile='* | *'thin-hv: uefi variable overlay PASS'* | \
                 *'thin-hv: L1 '* | *'thin-hv: vmx '*) return 1 ;;
             esac
@@ -137,7 +138,7 @@ check_nested_contract_log() {
 # Real L2 entries with every PAT/EFER control combination. This image deliberately
 # powers off instead of returning into disposable firmware descriptor state.
 check_msr_contract_log() {
-    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 entries=0 checked=0 backends=0 private=0 expected_backends
+    local backend=$1 log=$2 line transcript bytes phase=0 cases=0 exits=0 debug=0 entries=0 checked=0 backends=0 private=0 expected_backends
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
@@ -158,22 +159,97 @@ check_msr_contract_log() {
                 [[ "$backend" != direct-vmx || "$private" == 1 ]] || return 1
                 phase=1 ;;
             'thin-hv: MSR matrix case='*)
-                ((phase == 1 && cases < 128 && entries == 0)) && [[ "$line" == "thin-hv: MSR matrix case=$cases" ]] || return 1
+                ((phase == 1 && cases < 128 && exits == 0 && entries == 0)) && [[ "$line" == "thin-hv: MSR matrix case=$cases" ]] || return 1
                 cases=$((cases + 1)) ;;
+            'thin-hv: MSR exit case='*)
+                ((phase == 1 && cases == 128 && exits < 12 && entries == 0)) && [[ "$line" == "thin-hv: MSR exit case=$exits" ]] || return 1
+                exits=$((exits + 1)) ;;
+            'thin-hv: MSR debugctl requested=2 observed=0' | 'thin-hv: MSR debugctl requested=2 observed=2')
+                ((phase == 1 && exits == 7 && debug == 0)) || return 1
+                debug=1 ;;
             'thin-hv: MSR entry case='*)
-                ((phase == 1 && cases == 128 && entries < 20)) && [[ "$line" == "thin-hv: MSR entry case=$entries" ]] || return 1
+                ((phase == 1 && cases == 128 && exits == 12 && entries < 20)) && [[ "$line" == "thin-hv: MSR entry case=$entries" ]] || return 1
                 entries=$((entries + 1)) ;;
             'thin-hv: MSR late-failure guest-field changes=0')
                 ((phase == 1 && cases == 128 && entries == 20 && checked == 0)) || return 1
                 checked=1 ;;
-            'thin-hv: MSR contract PASS matrix=128 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1')
-                ((phase == 1 && cases == 128 && entries == 20 && checked == 1)) || return 1
+            'thin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1')
+                ((phase == 1 && cases == 128 && exits == 12 && debug == 1 && entries == 20 && checked == 1)) || return 1
                 phase=2 ;;
             *'FAIL'* | *'panic'* | 'thin-hv: MSR '* | 'thin-hv: private host state'* | \
             'thin-hv: vmx guest PASS'* | 'thin-hv: trusted outer KVM guest PASS'*) return 1 ;;
         esac
     done <<<"$transcript"
-    ((phase == 2 && cases == 128 && entries == 20 && backends == expected_backends))
+    ((phase == 2 && cases == 128 && exits == 12 && entries == 20 && backends == expected_backends))
+}
+
+# A VMX abort is terminal for L1. Require its physical VMCS indicator and the
+# preceding successful MSR store, not just a timeout or an L0 diagnostic string.
+check_msr_abort_log() {
+    local backend=$1 code=$2 status=$3 log=$4 monitor_log=$5 line transcript bytes
+    local phase=0 backends=0 private=0 aborts=0 expected_backends vmcs_address= store= value=
+    local armed='^thin-hv: MSR abort armed code=([14]) vmcs=(0x[0-9a-f]{16}) store=(0x[0-9a-f]{16}) value=(0x[0-9a-f]{16})$'
+    [[ "$code" == 1 || "$code" == 4 ]] && [[ "$status" == 124 ]] || return 1
+    case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
+    for line in "$log" "$monitor_log"; do
+        [[ -f "$line" && -r "$line" ]] || return 1
+        bytes=$(wc -c <"$line") || return 1
+        [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 262144)) || return 1
+        if IFS= read -r -d '' transcript <"$line"; then return 1; fi
+    done
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" =~ $armed ]]; then
+            ((phase == 1)) && [[ ${BASH_REMATCH[1]} == "$code" ]] || return 1
+            vmcs_address=${BASH_REMATCH[2]} store=${BASH_REMATCH[3]} value=${BASH_REMATCH[4]}
+            [[ "$vmcs_address" == 0x00000000* && "$store" == 0x00000000* ]] || return 1
+            ((vmcs_address > 0 && (vmcs_address & 4095) == 0 && store > 0 && (store & 7) == 0)) || return 1
+            phase=2
+            continue
+        fi
+        case "$line" in
+            'thin-hv: backend='*)
+                ((phase == 0 && backends < expected_backends)) || return 1
+                if [[ "$backend" == direct-vmx ]]; then
+                    [[ "$line" == 'thin-hv: backend=direct-vmx role=project-l0' ]] || return 1
+                else
+                    [[ "$line" == 'thin-hv: backend=outer-kvm role=reference' ]] || return 1
+                fi
+                backends=$((backends + 1)) ;;
+            'thin-hv: private host state PASS')
+                [[ "$backend" == direct-vmx ]] && ((phase == 0 && private == 0)) || return 1
+                private=1 ;;
+            'thin-hv: MSR contract START')
+                ((phase == 0 && backends == expected_backends)) || return 1
+                [[ "$backend" != direct-vmx || "$private" == 1 ]] || return 1
+                phase=1 ;;
+            'thin-hv: nested VMX abort '*)
+                [[ "$backend" == direct-vmx ]] && ((phase == 2 && aborts == 0)) || return 1
+                printf -v transcript 'thin-hv: nested VMX abort code=0x%016x vmcs=%s' "$code" "$vmcs_address"
+                [[ "$line" == "$transcript" ]] || return 1
+                aborts=1
+                continue ;;
+            *'FAIL'* | *'panic'* | *'thin-hv: VMXOFF status='* | 'thin-hv: MSR '* | \
+            'thin-hv: host exception '* | 'thin-hv: vmx guest PASS'* | \
+            'thin-hv: trusted outer KVM guest PASS'*) return 1 ;;
+        esac
+        [[ ! "$line" =~ $direct_failure_pattern ]] || return 1
+        if [[ "$backend" == direct-vmx ]]; then
+            [[ "$line" != *'thin-hv: trusted outer KVM'* ]] || return 1
+        else
+            case "$line" in
+                *'thin-hv: loading runtime monitor'* | *'thin-hv: runtime monitor active'* | \
+                *'thin-hv: variable overlay profile='* | *'thin-hv: uefi variable overlay PASS'*) return 1 ;;
+            esac
+        fi
+    done <"$log"
+    ((phase == 2)) && [[ "$backend" != direct-vmx || "$aborts" == 1 ]] || return 1
+    # HMP prints physical addresses without 0x; remove terminal editing escapes.
+    transcript=$(sed -E $'s/\x1b\\[[0-9;?]*[[:alpha:]]//g' "$monitor_log" | tr '\r' '\n') || return 1
+    printf -v line '%016x: 0x%08x' "$((vmcs_address + 4))" "$code"
+    [[ $(grep -Fxc -- "$line" <<<"$transcript") == 1 ]] || return 1
+    printf -v line '%016x: %s' "$store" "$value"
+    [[ $(grep -Fxc -- "$line" <<<"$transcript") == 1 ]]
 }
 
 # This is a separate negative fixture, never a relaxed ordinary backend gate.
@@ -383,6 +459,11 @@ if [[ ${1:-} == --check-msr-contract-log ]]; then
     check_msr_contract_log "$2" "$3" || die 'nested MSR contract transcript check failed'
     exit 0
 fi
+if [[ ${1:-} == --check-msr-abort-log ]]; then
+    [[ $# == 6 ]] || die 'usage: --check-msr-abort-log BACKEND CODE STATUS LOG MONITOR_LOG'
+    check_msr_abort_log "$2" "$3" "$4" "$5" "$6" || die 'MSR abort transcript/memory check failed'
+    exit 0
+fi
 if [[ ${1:-} == --check-physical-policy-log ]]; then
     [[ $# == 2 ]] || die 'usage: --check-physical-policy-log LOG'
     check_physical_policy_log "$2" || die 'physical-chainload policy transcript check failed'
@@ -417,11 +498,17 @@ esac
 printf 'x86 UEFI smoke: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
 physical_policy=${X86_UEFI_PHYSICAL_POLICY:-0}
 host_exception_test=${X86_UEFI_HOST_EXCEPTION_TEST:-0}
+msr_abort_test=${X86_UEFI_MSR_ABORT_TEST:-0}
+[[ "$msr_abort_test" =~ ^[014]$ ]] || die 'X86_UEFI_MSR_ABORT_TEST must be 0, 1 or 4'
 [[ "$physical_policy" =~ ^[01]$ ]] || die 'X86_UEFI_PHYSICAL_POLICY must be 0 or 1'
 [[ "$host_exception_test" =~ ^[01]$ ]] || die 'X86_UEFI_HOST_EXCEPTION_TEST must be 0 or 1'
 if ((host_exception_test)); then
     [[ "$backend" == direct-vmx && "$physical_policy" == 0 ]] || \
         die 'host-exception fixtures require the explicit direct-vmx backend and no physical policy fixture'
+fi
+if ((msr_abort_test)); then
+    [[ "$backend" == direct-vmx || "$backend" == outer-kvm ]] && \
+        [[ "$physical_policy" == 0 && "$host_exception_test" == 0 ]] || die 'MSR abort fixture requires its own VMX test mode'
 fi
 if ((physical_policy)); then
     [[ "$backend" == physical-chainload ]] || die 'physical policy fixtures require the explicit physical-chainload backend'
@@ -558,6 +645,17 @@ if ((host_exception_test)); then
 elif [[ ${loader##*/} == x86-uefi-host-exception-loader.efi || \
         ${monitor##*/} == x86-uefi-host-exception-monitor.efi ]]; then
     die 'test-only host-exception artifacts must not run as an ordinary smoke backend'
+fi
+if ((msr_abort_test)); then
+    [[ "$accel" == kvm && "$smp" == 1 && "$memory" == 256M && "$acpi_s3" == 0 && \
+        "$wake_cycles" == 0 && "$allow_reboot" == 0 && "$require_poweroff" == 0 && \
+        "$usernet" == 0 && -z "$data_disk" && "$guest_location" == guest ]] || die 'MSR abort fixture requires one disposable QEMU/KVM CPU without extra modes/devices'
+    [[ "$timeout_seconds" =~ ^([1-9]|[1-5][0-9]|60)$ ]] || die 'MSR abort timeout must be bounded to 1..60 seconds'
+    abort_image=x86-uefi-msr-abort-store.efi
+    ((msr_abort_test == 4)) && abort_image=x86-uefi-msr-abort-load.efi
+    [[ ${guest##*/} == "$abort_image" ]] || die 'MSR abort mode and separate fixture image must match'
+elif [[ ${guest##*/} == x86-uefi-msr-abort-*.efi ]]; then
+    die 'terminal MSR fixtures must not run as ordinary smoke tests'
 fi
 command -v timeout >/dev/null || die "GNU timeout is required"
 
@@ -719,7 +817,20 @@ set -e
 wake_cycle=0
 wake_marker_seen=0
 suspended_baseline=0
+abort_memory_requested=0
 for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
+    if ((msr_abort_test && !abort_memory_requested)); then
+        armed_line=$(grep -E '^thin-hv: MSR abort armed code=[14] vmcs=0x00000000[0-9a-f]{8} store=0x00000000[0-9a-f]{8} value=0x[0-9a-f]{16}' "$serial_log" || true)
+        if [[ -n "$armed_line" ]]; then
+            printf 'info status\n' >&9
+            if { [[ "$backend" == direct-vmx ]] && grep -Fq 'thin-hv: nested VMX abort ' "$serial_log"; } || \
+                { [[ "$backend" == outer-kvm ]] && grep -Fq 'VM status: paused (shutdown)' "$qemu_log"; }; then
+                read -r abort_vmcs abort_store < <(sed -E 's/.* vmcs=(0x[0-9a-f]+) store=(0x[0-9a-f]+).*/\1 \2/' <<<"$armed_line")
+                printf 'xp /1wx 0x%x\nxp /1gx %s\n' "$((abort_vmcs + 4))" "$abort_store" >&9
+                abort_memory_requested=1
+            fi
+        fi
+    fi
     if ((wake_cycle < wake_cycles)); then
         wake_marker="thin-hv: linux S3 suspend begin cycle=$((wake_cycle + 1))"
         if ((wake_marker_seen == 0)) && grep -Fq -- "$wake_marker" "$serial_log"; then
@@ -744,12 +855,12 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
         printf 'quit\n' >&9
         break
     fi
-    if [[ "$backend" == direct-vmx ]] && ((!host_exception_test)) &&
+    if [[ "$backend" == direct-vmx ]] && ((!host_exception_test && !msr_abort_test)) &&
         grep -Eq -- "$direct_failure_pattern" "$serial_log"; then
         printf 'quit\n' >&9
         break
     fi
-    if ((!host_exception_test)) && grep -Fq -- "$marker" "$serial_log" &&
+    if ((!host_exception_test && !msr_abort_test)) && grep -Fq -- "$marker" "$serial_log" &&
         { [[ -z "$return_marker" ]] || grep -Fq -- "$return_marker" "$serial_log"; } &&
         { [[ -z "$payload_marker" ]] || grep -Fq -- "$payload_marker" "$serial_log"; } &&
         { [[ -z "$variable_marker" ]] || grep -Fq -- "$variable_marker" "$serial_log"; } &&
@@ -777,6 +888,12 @@ if ((host_exception_test)); then
     check_host_exception_log "$qemu_status" "$serial_log" || \
         die 'root host-exception fixture transcript/status check failed'
     printf 'x86 UEFI host-exception fixture: PASS backend=direct-vmx environment=QEMU/KVM expected_stop=124 (not physical hardware)\n'
+    exit 0
+fi
+if ((msr_abort_test)); then
+    check_msr_abort_log "$backend" "$msr_abort_test" "$qemu_status" "$serial_log" "$qemu_log" || \
+        die 'MSR abort fixture transcript/status/physical-memory check failed'
+    printf 'x86 UEFI MSR-abort fixture: PASS backend=%s code=%s environment=QEMU/KVM expected_stop=124 (not physical hardware)\n' "$backend" "$msr_abort_test"
     exit 0
 fi
 if [[ -n "$failure_marker" ]] && grep -Fq -- "$failure_marker" "$serial_log"; then

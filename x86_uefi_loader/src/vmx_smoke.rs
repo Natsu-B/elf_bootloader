@@ -38,8 +38,11 @@ use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
 use nested_vmx::host_validation;
 use nested_vmx::msr_list::Entry as MsrEntry;
+use nested_vmx::msr_list::ExitStoreSource;
 use nested_vmx::msr_list::List as MsrList;
+use nested_vmx::msr_list::Operation as MsrOperation;
 use nested_vmx::msr_list::PatEfer;
+use nested_vmx::msr_list::exit_store_source;
 use nested_vmx::restrict_vmx_capability;
 use nested_vmx::vmcs_revision_is_supported;
 use r_efi::efi;
@@ -569,6 +572,12 @@ struct DirectMsrState {
     private: [(u64, u64); 2],
     entry: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
     entry_count: u32,
+    exit_capture: [MsrEntry; 2],
+    capture_count: u32,
+    host_load: [MsrEntry; nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
+    host_count: u32,
+    host_owner: Option<VmcsPhys>,
+    aborted: bool,
     inherited: PatEfer,
     entry_loaded: PatEfer,
 }
@@ -581,6 +590,12 @@ impl DirectMsrState {
             private,
             entry: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
             entry_count: 0,
+            exit_capture: [MsrEntry::new(0x1d9, 0), MsrEntry::new(0x38f, 0)],
+            capture_count: 0,
+            host_load: [MsrEntry::new(0, 0); nested_vmx::MAX_MSR_MIRROR_ENTRIES as usize],
+            host_count: 0,
+            host_owner: None,
+            aborted: false,
             inherited: PatEfer { pat: 0, efer: 0 },
             entry_loaded: PatEfer { pat: 0, efer: 0 },
         }
@@ -621,6 +636,104 @@ impl DirectMsrState {
         }
         self.entry_count = list.count();
         Some((self.entry.as_ptr() as usize as u64, self.entry_count))
+    }
+
+    /// Only architecturally known readable capture MSRs reach hardware's exit
+    /// store list. Arbitrary L1 store items are handled after L0 is safely entered.
+    fn prepare_capture(&mut self, store_count: u32) -> Option<(u64, u32)> {
+        self.capture_count = 0;
+        if store_count == 0 {
+            return Some((0, 0));
+        }
+        // SAFETY: this CPU runs in its private GS/IDT/IST environment, with IF
+        // clear and no active guest. Absent MSRs return None, never a root fault.
+        // DEBUGCTL is the mandatory VMX debug MSR; readable PERF_GLOBAL_CTRL
+        // supports VMX automatic storage on the Intel VMX CPU used here.
+        unsafe {
+            host_state::try_rdmsr(0x1d9)?;
+            self.capture_count = if host_state::try_rdmsr(0x38f).is_some() {
+                2
+            } else {
+                1
+            };
+        }
+        Some((
+            self.exit_capture.as_ptr() as usize as u64,
+            self.capture_count,
+        ))
+    }
+
+    /// Reads one original list item, only while the owning L1/L2 is stopped.
+    fn list_item(&self, list: MsrList, index: u32) -> Option<MsrEntry> {
+        let source = list.entry_address(index)?;
+        if !self.allows_list_access(source, 16, false) {
+            return None;
+        }
+        // SAFETY: List and the complete RAM/ownership check establish alignment,
+        // initialized foreign RAM and current host-map coverage. No other guest
+        // CPU runs; the source cannot alias any Rust-owned monitor object.
+        Some(unsafe { ptr::read_volatile(source as *const MsrEntry) })
+    }
+
+    /// Stores only the value half, preserving L1's index and reserved word.
+    fn store_value(&self, list: MsrList, index: u32, value: u64) -> Option<()> {
+        let destination = list.entry_address(index)?.checked_add(8)?;
+        if !self.allows_list_access(destination, 8, true) {
+            return None;
+        }
+        // SAFETY: this aligned value slot is writable foreign RAM inside the
+        // host map, outside all monitor-owned pages. L1/L2 is stopped and no
+        // Rust borrow aliases the destination. Earlier stores remain visible.
+        unsafe { ptr::write_volatile(destination as *mut u64, value) };
+        Some(())
+    }
+
+    /// Copies L1 host loads only after all original exit stores have completed.
+    fn prepare_host_load(&mut self, list: MsrList, owner: VmcsPhys) -> Option<(u64, u32)> {
+        if self.host_owner.is_some() || self.host_count != 0 {
+            return None;
+        }
+        if list.count() == 0 {
+            return Some((0, 0));
+        }
+        for index in 0..list.count() {
+            self.host_load[index as usize] = self.list_item(list, index)?;
+        }
+        self.host_count = list.count();
+        self.host_owner = Some(owner);
+        Some((self.host_load.as_ptr() as usize as u64, self.host_count))
+    }
+
+    /// Processes the original store list in order, never exposing private host
+    /// replacements. None means unsupported L0 backing; Err means VMX abort 1.
+    fn store_guest_msrs(&self, list: MsrList) -> Option<Result<(), ()>> {
+        for index in 0..list.count() {
+            let item = self.list_item(list, index)?;
+            if !item.format_valid(MsrOperation::ExitStore) {
+                return Some(Err(()));
+            }
+            let value = match exit_store_source(item.index) {
+                // SAFETY: the stopped L2's Direct VMCS is current on its owning
+                // CPU. These mandatory fields hold hardware-saved guest values.
+                ExitStoreSource::GuestField(field) => Some(unsafe { vmx::vmread(field) }.ok()?),
+                ExitStoreSource::PrivateDebugCapture => {
+                    (self.capture_count >= 1).then_some(self.exit_capture[0].value)
+                }
+                ExitStoreSource::PrivatePerfCapture => {
+                    (self.capture_count == 2).then_some(self.exit_capture[1].value)
+                }
+                ExitStoreSource::VmxCapability => l1_vmx_capability(item.index),
+                // SAFETY: private GS/IDT/IST and IF=0 satisfy the guarded read
+                // contract. This MSR is neither switched by VMX nor used by L0;
+                // unsupported model-specific reads return None rather than #GP.
+                ExitStoreSource::Live => unsafe { host_state::try_rdmsr(item.index) },
+            };
+            let Some(value) = value else {
+                return Some(Err(()));
+            };
+            self.store_value(list, index, value)?;
+        }
+        Some(Ok(()))
     }
 }
 
@@ -2153,6 +2266,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
 
     // SAFETY: the hardware exit selected the live carrier VMCS for this BSP.
     let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
+    complete_reflected_msr_load(reason, registers);
     record_diagnostic(DiagnosticEvent::L1Exit(reason));
     let action = dispatch_l1_exit(registers, reason);
     record_diagnostic(DiagnosticEvent::L0Handled { reason, action });
@@ -3257,8 +3371,6 @@ fn handle_l1_vmentry(
             );
         }
     }
-    let exit_store_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrStoreCount);
-    let exit_load_count = direct_patch_value(&saved_direct, VmcsField::VmExitMsrLoadCount);
     let cached_exit_controls = match *DIRECT_ENTRY_POLICY.lock() {
         Some((address, exit_controls)) if address == current.address() => Some(exit_controls),
         Some(_) => stop_unexpected_exit(
@@ -3293,8 +3405,7 @@ fn handle_l1_vmentry(
             && (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 == 0;
         (exit_controls, supported)
     };
-    if exit_store_count != Some(0) || exit_load_count != Some(0) || !supported_entry_policy {
-        // Nonempty exit lists are integrated after hardware entry-list coverage.
+    if !supported_entry_policy {
         stop_unexpected_exit(
             b"unsupported nested VM-entry state",
             reason,
@@ -3549,20 +3660,32 @@ fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) ->
     let entry_address = direct_patch_value(saved, VmcsField::VmEntryMsrLoadAddress)?;
     let entry_count =
         u32::try_from(direct_patch_value(saved, VmcsField::VmEntryMsrLoadCount)?).ok()?;
-    let (loaded, mirror_address, mirror_count) = with_direct_msr_state(|state| {
-        let list = MsrList::new(
-            entry_address,
-            entry_count,
-            state.ram.physical_width().bits(),
-        )
-        .ok()?;
-        let (address, count) = state.prepare_entry(list)?;
-        state.entry_loaded = state.inherited.entry(guest, entry, cr0);
-        Some((state.entry_loaded, address, count))
-    })??;
+    let store_count =
+        u32::try_from(direct_patch_value(saved, VmcsField::VmExitMsrStoreCount)?).ok()?;
+    let (loaded, mirror_address, mirror_count, capture_address, capture_count) =
+        with_direct_msr_state(|state| {
+            let list = MsrList::new(
+                entry_address,
+                entry_count,
+                state.ram.physical_width().bits(),
+            )
+            .ok()?;
+            let (address, count) = state.prepare_entry(list)?;
+            let (capture_address, capture_count) = state.prepare_capture(store_count)?;
+            state.entry_loaded = state.inherited.entry(guest, entry, cr0);
+            Some((
+                state.entry_loaded,
+                address,
+                count,
+                capture_address,
+                capture_count,
+            ))
+        })??;
     for (field, value) in [
         (vmcs::VM_ENTRY_MSR_LOAD_ADDR, mirror_address),
         (vmcs::VM_ENTRY_MSR_LOAD_COUNT, u64::from(mirror_count)),
+        (vmcs::VM_EXIT_MSR_STORE_ADDR, capture_address),
+        (vmcs::VM_EXIT_MSR_STORE_COUNT, u64::from(capture_count)),
         (vmcs::GUEST_IA32_PAT, loaded.pat),
         (vmcs::GUEST_IA32_EFER, loaded.efer),
         (
@@ -3694,6 +3817,36 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
             registers,
         );
     };
+    let mirrors = with_direct_msr_state(|state| {
+        let list = |address, count| {
+            MsrList::new(
+                direct_patch_value(&run.saved_direct, address)?,
+                u32::try_from(direct_patch_value(&run.saved_direct, count)?).ok()?,
+                state.ram.physical_width().bits(),
+            )
+            .ok()
+        };
+        let store = list(
+            VmcsField::VmExitMsrStoreAddress,
+            VmcsField::VmExitMsrStoreCount,
+        )?;
+        let load = list(
+            VmcsField::VmExitMsrLoadAddress,
+            VmcsField::VmExitMsrLoadCount,
+        )?;
+        // Late failed entry loads host state/MSRs, but must not store guest MSRs.
+        if reason & (1 << 31) == 0 && state.store_guest_msrs(store)?.is_err() {
+            return Some(Err(()));
+        }
+        // The lists may overlap: read host items only after all stores finished.
+        Some(Ok(state.prepare_host_load(load, run.direct)?))
+    })
+    .flatten();
+    let (host_address, host_count) = match mirrors {
+        Some(Ok(mirror)) => mirror,
+        Some(Err(())) => nested_vmx_abort(run.direct, 1, registers),
+        None => stop_nested_exit(b"unsupported exit MSR-list backing", run.direct, registers),
+    };
     if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
         stop_nested_exit(
             b"restoring carrier after L2 exit failed",
@@ -3705,11 +3858,96 @@ fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
     if write_reflected_l1_state(run, l1_msrs.pat, l1_msrs.efer).is_none() {
         stop_nested_exit(b"reflecting L1 host state failed", run.direct, registers);
     }
+    for (field, value) in [
+        (vmcs::VM_ENTRY_MSR_LOAD_ADDR, host_address),
+        (vmcs::VM_ENTRY_MSR_LOAD_COUNT, u64::from(host_count)),
+    ] {
+        // SAFETY: the owned carrier is current. The stable per-CPU mirror is
+        // published only after its complete copy; no lock spans hardware entry.
+        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+            stop_nested_exit(
+                b"publishing reflected host MSR list failed",
+                run.direct,
+                registers,
+            );
+        }
+    }
 
     // VMX does not switch CR2 or XSTATE between L1 and L2. The exit stub protects
     // the live extended state from L0; it must not restore an older L1 image.
     // L0 does not touch CR2 except to deliver an intentional L1 #PF. Genuine
     // root page faults never resume, so no stale snapshot may erase guest CR2.
+}
+
+/// A deferred L1 host list belongs to one reflection, not every carrier entry.
+/// Hardware's failed list load becomes the original L1 VMCS's VMX abort 4.
+fn complete_reflected_msr_load(reason: u64, registers: &GuestRegisters) {
+    let Some(owner) = with_direct_msr_state(|state| state.host_owner) else {
+        stop_unexpected_exit(b"missing per-CPU MSR state", reason, 0, 0, 0, registers);
+    };
+    let Some(owner) = owner else {
+        return;
+    };
+    if reason & (1 << 31) != 0 && reason & 0xffff == 34 {
+        nested_vmx_abort(owner, 4, registers);
+    }
+    if reason & (1 << 31) != 0 {
+        stop_unexpected_exit(
+            b"invalid reflected carrier state",
+            reason,
+            0,
+            0,
+            0,
+            registers,
+        );
+    }
+    for field in [vmcs::VM_ENTRY_MSR_LOAD_COUNT, vmcs::VM_ENTRY_MSR_LOAD_ADDR] {
+        // SAFETY: this is the first exit of the owned carrier after the list was
+        // consumed. No guest executes while its next entry is being prepared.
+        if unsafe { vmx::vmwrite(field, 0) } != VmxStatus::Success {
+            stop_nested_exit(b"clearing reflected MSR list failed", owner, registers);
+        }
+    }
+    if with_direct_msr_state(|state| {
+        state.host_owner = None;
+        state.host_count = 0;
+    })
+    .is_none()
+    {
+        stop_nested_exit(b"clearing reflected MSR owner failed", owner, registers);
+    }
+}
+
+/// Intel VMX abort is an L1 terminal CPU state, not VMfail or a root exception.
+/// Record the architectural indicator, retain all private state and park this
+/// BSP until reset. No VMCS may be used again on this aborted virtual CPU.
+fn nested_vmx_abort(direct: VmcsPhys, code: u32, registers: &GuestRegisters) -> ! {
+    let recorded = with_direct_msr_state(|state| {
+        let Some(address) = direct.get().checked_add(4) else {
+            return false;
+        };
+        if state.aborted || !state.allows_list_access(address, 4, true) {
+            return false;
+        }
+        state.aborted = true;
+        // SAFETY: the aligned abort indicator is foreign writable VMCS RAM,
+        // outside L0 storage. Its sole L1 CPU is stopped permanently; no later
+        // hardware entry or Rust VMCS access can race this terminal publication.
+        unsafe { ptr::write_volatile(address as *mut u32, code) };
+        true
+    });
+    if recorded != Some(true) {
+        stop_nested_exit(b"recording nested VMX abort failed", direct, registers);
+    }
+    let mut serial = SerialPort;
+    serial.init();
+    serial.write_bytes(b"thin-hv: nested VMX abort");
+    write_raw_field(&mut serial, b"code", u64::from(code));
+    write_raw_field(&mut serial, b"vmcs", direct.get());
+    write_raw_newline(&mut serial);
+    // No lock is held, VMX remains active, and no guest instruction can run.
+    // NMI/root-event support is a separate physical-qualification requirement.
+    halt_with_guest_xstate()
 }
 
 /// Stops after recovering L2's exit diagnostics only on an error path.

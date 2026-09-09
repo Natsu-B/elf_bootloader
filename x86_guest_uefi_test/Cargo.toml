@@ -9,6 +9,8 @@ physical-policy-driver = ["physical-policy"]
 physical-policy-payload = ["physical-policy"]
 nested-contract = []
 msr-contract = ["nested-contract"]
+msr-abort-store = ["msr-contract"]
+msr-abort-load = ["msr-contract"]
 
 [[bin]]
 name = "x86-uefi-nested-contract"

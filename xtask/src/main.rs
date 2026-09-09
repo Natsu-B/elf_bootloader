@@ -376,6 +376,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("host-xstate-test")
             || arg.contains("nested-contract")
             || arg.contains("msr-contract")
+            || arg.contains("msr-abort")
     }) {
         return Err(
             "x86 builds all backend artifacts; do not select an alternate backend feature explicitly"
@@ -580,6 +581,8 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
     for (feature, filename) in [
         ("nested-contract", "x86-uefi-nested-contract.efi"),
         ("msr-contract", "x86-uefi-msr-contract.efi"),
+        ("msr-abort-store", "x86-uefi-msr-abort-store.efi"),
+        ("msr-abort-load", "x86-uefi-msr-abort-load.efi"),
     ] {
         let status = Command::new("cargo")
             .args([
@@ -820,8 +823,17 @@ fn run_x86_nested() -> Result<(), String> {
         ("direct-vmx", "host-xstate"),
         ("outer-kvm", "msr"),
         ("direct-vmx", "msr"),
+        ("outer-kvm", "msr-abort-store"),
+        ("direct-vmx", "msr-abort-store"),
+        ("outer-kvm", "msr-abort-load"),
+        ("direct-vmx", "msr-abort-load"),
     ] {
-        let msr = cpu_profile == "msr";
+        let msr = cpu_profile.starts_with("msr");
+        let abort = match cpu_profile {
+            "msr-abort-store" => "1",
+            "msr-abort-load" => "4",
+            _ => "0",
+        };
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -845,7 +857,11 @@ fn run_x86_nested() -> Result<(), String> {
         );
         let result = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
             .arg(Path::new("bin/x86_64").join(loader))
-            .arg(if msr {
+            .arg(if abort == "1" {
+                "bin/x86_64/x86-uefi-msr-abort-store.efi"
+            } else if abort == "4" {
+                "bin/x86_64/x86-uefi-msr-abort-load.efi"
+            } else if msr {
                 "bin/x86_64/x86-uefi-msr-contract.efi"
             } else {
                 "bin/x86_64/x86-uefi-nested-contract.efi"
@@ -854,6 +870,7 @@ fn run_x86_nested() -> Result<(), String> {
             .env("X86_MONITOR_IMAGE", monitor)
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
             .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
+            .env("X86_UEFI_MSR_ABORT_TEST", abort)
             .env("X86_UEFI_ACCEL", "kvm")
             .env(
                 "X86_UEFI_CPU",
@@ -865,12 +882,18 @@ fn run_x86_nested() -> Result<(), String> {
             )
             .env("X86_UEFI_MEMORY", "256M")
             .env("X86_UEFI_SMP", "1")
-            .env("X86_UEFI_TIMEOUT_SECONDS", "30")
+            .env(
+                "X86_UEFI_TIMEOUT_SECONDS",
+                if abort == "0" { "30" } else { "10" },
+            )
             .env("X86_UEFI_GUEST_LOCATION", "guest")
             .env("X86_UEFI_ACPI_S3", "0")
             .env("X86_UEFI_WAKE_CYCLES", "0")
             .env("X86_UEFI_ALLOW_REBOOT", "0")
-            .env("X86_UEFI_REQUIRE_POWEROFF", if msr { "1" } else { "0" })
+            .env(
+                "X86_UEFI_REQUIRE_POWEROFF",
+                if msr && abort == "0" { "1" } else { "0" },
+            )
             .env("X86_UEFI_USERNET", "0")
             .env_remove("X86_UEFI_DATA_DISK")
             .env(
@@ -905,7 +928,7 @@ fn run_x86_nested() -> Result<(), String> {
             .stderr(Stdio::inherit())
             .status();
         let result = match result {
-            Ok(status) if status.success() => Command::new("bash")
+            Ok(status) if status.success() && abort == "0" => Command::new("bash")
                 .arg("./scripts/x86_64/run-uefi-smoke.sh")
                 .args(if msr {
                     vec!["--check-msr-contract-log", backend, "bin/x86_64/serial.log"]
@@ -934,6 +957,13 @@ fn run_x86_nested() -> Result<(), String> {
         if let Err(error) = fs::copy("bin/x86_64/serial.log", &evidence) {
             failures.push(format!("Failed to preserve {evidence}: {error}"));
         }
+        if abort != "0" {
+            let memory_evidence =
+                format!("bin/x86_64/nested-contract-{backend}-{cpu_profile}-memory.log");
+            if let Err(error) = fs::copy("bin/x86_64/qemu.log", &memory_evidence) {
+                failures.push(format!("Failed to preserve {memory_evidence}: {error}"));
+            }
+        }
     }
     for (backend, host_xstate) in [("outer-kvm", "0"), ("direct-vmx", "0"), ("direct-vmx", "1")] {
         match fs::remove_file("bin/x86_64/serial.log") {
@@ -950,6 +980,7 @@ fn run_x86_nested() -> Result<(), String> {
         let result = Command::new("./scripts/x86_64/run-linux-kvm-test.sh")
             .env("LINUX_KVM_BACKEND", backend)
             .env("LINUX_KVM_HOST_XSTATE_TEST", host_xstate)
+            .env("X86_UEFI_MSR_ABORT_TEST", "0")
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
             .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
             .stdin(Stdio::null())
@@ -3422,6 +3453,105 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn nested_msr_abort_gate_requires_terminal_status_and_physical_indicator() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let make_log = || {
+            let output = Command::new("mktemp")
+                .args(["-t", "thin-hv-msr-abort-log.XXXXXX"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            FixtureLog(String::from_utf8(output.stdout).unwrap().trim().into())
+        };
+        let serial = make_log();
+        let memory = make_log();
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |backend: &str, code: &str, status: &str, log: &str, physical: &str| {
+            fs::write(&serial.0, log).unwrap();
+            fs::write(&memory.0, physical).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-msr-abort-log", backend, code, status])
+                .arg(&serial.0)
+                .arg(&memory.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        for backend in ["direct-vmx", "outer-kvm"] {
+            for code in ["1", "4"] {
+                let provenance = if backend == "direct-vmx" {
+                    "thin-hv: backend=direct-vmx role=project-l0\nthin-hv: backend=direct-vmx role=project-l0\nthin-hv: private host state PASS\n"
+                } else {
+                    "thin-hv: backend=outer-kvm role=reference\n"
+                };
+                let arm = format!(
+                    "thin-hv: MSR abort armed code={code} vmcs=0x0000000000010000 store=0x0000000000020008 value=0x0007040500070406\n"
+                );
+                let terminal = if backend == "direct-vmx" {
+                    format!(
+                        "thin-hv: nested VMX abort code=0x000000000000000{code} vmcs=0x0000000000010000\n"
+                    )
+                } else {
+                    String::new()
+                };
+                let log = format!("{provenance}thin-hv: MSR contract START\n{arm}{terminal}");
+                let physical = format!(
+                    "0000000000010004: 0x0000000{code}\n0000000000020008: 0x0007040500070406\n"
+                );
+                assert!(check(backend, code, "124", &log, &physical));
+                for status in ["0", "1", "137", "143"] {
+                    assert!(!check(backend, code, status, &log, &physical));
+                }
+                for broken in [
+                    log.replace(&arm, ""),
+                    log.replace(&arm, &format!("{arm}{arm}")),
+                    log.replace("vmcs=0x0000000000010000", "vmcs=0x0000000000010008"),
+                    log.replace("vmcs=0x0000000000010000", "vmcs=0xffff800000010000"),
+                    format!("{log}thin-hv: MSR contract PASS\n"),
+                    format!("{log}thin-hv: host exception FAIL: stopped\n"),
+                    format!("{log}thin-hv: vmx guest FAIL\n"),
+                    format!("{log}thin-hv: CPUID VMX=0\n"),
+                    format!("{log}\0"),
+                ] {
+                    assert!(!check(backend, code, "124", &broken, &physical));
+                }
+                for broken in [
+                    physical.replace(&format!("0x0000000{code}"), "0x00000000"),
+                    physical.replace("0007040500070406", "0007040600070406"),
+                    physical.replace("0000000000010004", "0000000000010000"),
+                    format!("{physical}{physical}"),
+                    format!("{physical}\0"),
+                    String::new(),
+                ] {
+                    assert!(!check(backend, code, "124", &log, &broken));
+                }
+                if backend == "direct-vmx" {
+                    assert!(!check(
+                        backend,
+                        code,
+                        "124",
+                        &log.replace(&terminal, ""),
+                        &physical
+                    ));
+                    assert!(!check("outer-kvm", code, "124", &log, &physical));
+                } else {
+                    assert!(!check("direct-vmx", code, "124", &log, &physical));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn nested_contract_gate_requires_complete_architectural_and_cleanup_evidence() {
         struct FixtureLog(std::path::PathBuf);
         impl Drop for FixtureLog {
@@ -3475,14 +3605,33 @@ mod tests {
             let entries = (0..20)
                 .map(|case| format!("thin-hv: MSR entry case={case}\n"))
                 .collect::<String>();
+            let exits = (0..12)
+                .map(|case| {
+                    format!(
+                        "thin-hv: MSR exit case={case}\n{}",
+                        if case == 6 {
+                            "thin-hv: MSR debugctl requested=2 observed=0\n"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect::<String>();
             let msr = format!(
-                "{provenance}thin-hv: MSR contract START\n{matrix}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1\n"
+                "{provenance}thin-hv: MSR contract START\n{matrix}{exits}{entries}thin-hv: MSR late-failure guest-field changes=0\nthin-hv: MSR contract PASS matrix=128 exit_cases=12 exit_resume=1 entry_cases=20 entry_load=7 entry_resume=1 entry_fail=10 early_fail=2 guest_fail=2 vmxoff=1\n"
             );
             assert!(check_profile(backend, "msr", &msr));
             for broken in [
                 msr.replace("thin-hv: MSR matrix case=63\n", ""),
                 msr.replace("case=63\n", "case=62\n"),
                 msr.replace("matrix=128", "matrix=127"),
+                msr.replace("exit_cases=12", "exit_cases=11"),
+                msr.replace("exit_resume=1", "exit_resume=0"),
+                msr.replace("thin-hv: MSR debugctl requested=2 observed=0\n", ""),
+                msr.replace("requested=2 observed=0", "requested=2 observed=1"),
+                msr.replace("thin-hv: MSR exit case=6\n", ""),
+                msr.replace("MSR exit case=11\n", "MSR exit case=10\n"),
+                format!("{msr}thin-hv: nested VMX abort code=1\n"),
                 msr.replace("entry_cases=20", "entry_cases=19"),
                 msr.replace("entry_fail=10", "entry_fail=9"),
                 msr.replace("guest-field changes=0", "guest-field changes=1"),

@@ -137,6 +137,42 @@ impl Entry {
     }
 }
 
+/// Where to obtain a normal L2 exit's L1-visible MSR-store value. Reading the
+/// live root MSR for an automatically switched register would expose L0 state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitStoreSource {
+    /// Hardware saved the L2 register into this mandatory guest VMCS field.
+    GuestField(u32),
+    /// DEBUGCTL is cleared on VM exit, even when SAVE_DEBUG_CONTROLS is clear.
+    PrivateDebugCapture,
+    /// A requested HOST_PERF_GLOBAL_CTRL load can overwrite the live value.
+    PrivatePerfCapture,
+    /// Match the capability policy presented to the virtual L1 CPU by RDMSR.
+    VmxCapability,
+    /// Neither VMX nor L0 changes this MSR; a guarded root read is required.
+    Live,
+}
+
+/// Classifies value ownership, not access validity. Format checks and guarded
+/// RDMSR/model validation remain necessary; late entry failure performs no store.
+#[must_use]
+pub const fn exit_store_source(index: u32) -> ExitStoreSource {
+    use x86_64_hal::vmcs;
+    match index {
+        0x277 => ExitStoreSource::GuestField(vmcs::GUEST_IA32_PAT),
+        0xc000_0080 => ExitStoreSource::GuestField(vmcs::GUEST_IA32_EFER),
+        0xc000_0100 => ExitStoreSource::GuestField(vmcs::GUEST_FS_BASE),
+        0xc000_0101 => ExitStoreSource::GuestField(vmcs::GUEST_GS_BASE),
+        0x174 => ExitStoreSource::GuestField(vmcs::GUEST_SYSENTER_CS),
+        0x175 => ExitStoreSource::GuestField(vmcs::GUEST_SYSENTER_ESP),
+        0x176 => ExitStoreSource::GuestField(vmcs::GUEST_SYSENTER_EIP),
+        0x1d9 => ExitStoreSource::PrivateDebugCapture,
+        0x38f => ExitStoreSource::PrivatePerfCapture,
+        0x480..=0x492 => ExitStoreSource::VmxCapability,
+        _ => ExitStoreSource::Live,
+    }
+}
+
 /// The two MSRs whose L0-private restoration can hide inherited guest values.
 /// These values are architectural images, not an L1/L2 software context switch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +261,55 @@ impl PatEfer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_store_ownership_never_reads_private_host_replacements() {
+        use x86_64_hal::vmcs;
+        for (index, field) in [
+            (0x277, vmcs::GUEST_IA32_PAT),
+            (0xc000_0080, vmcs::GUEST_IA32_EFER),
+            (0xc000_0100, vmcs::GUEST_FS_BASE),
+            (0xc000_0101, vmcs::GUEST_GS_BASE),
+            (0x174, vmcs::GUEST_SYSENTER_CS),
+            (0x175, vmcs::GUEST_SYSENTER_ESP),
+            (0x176, vmcs::GUEST_SYSENTER_EIP),
+        ] {
+            assert_eq!(exit_store_source(index), ExitStoreSource::GuestField(field));
+        }
+        assert_eq!(
+            exit_store_source(0x1d9),
+            ExitStoreSource::PrivateDebugCapture
+        );
+        assert_eq!(
+            exit_store_source(0x38f),
+            ExitStoreSource::PrivatePerfCapture
+        );
+        for index in 0x480..=0x492 {
+            assert_eq!(exit_store_source(index), ExitStoreSource::VmxCapability);
+        }
+        for index in [
+            0x10,
+            0x479,
+            0x493,
+            0xc000_0082,
+            0xc000_0102,
+            0xc000_0103,
+            u32::MAX,
+        ] {
+            assert_eq!(exit_store_source(index), ExitStoreSource::Live);
+        }
+        // Classification is not a permission: malformed entries must fail
+        // before a value source (including a harmless VMCS field) is consumed.
+        assert!(
+            !Entry {
+                index: 0x277,
+                reserved: 1,
+                value: 0
+            }
+            .format_valid(Operation::ExitStore)
+        );
+        assert!(!Entry::new(0x800, 0).format_valid(Operation::ExitStore));
+    }
 
     #[test]
     fn pat_efer_inherit_only_architecturally_unloaded_state() {

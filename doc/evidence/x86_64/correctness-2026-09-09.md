@@ -785,3 +785,107 @@ guest #PF/VMfail result and not a QEMU fallback. The physical map is still not
 wired, exit MSR lists still require implementation, and this is not physical
 qualification. No AArch64 production path, Windows/activation state, firmware
 identity, S3 or physical device was modified or tested in this increment.
+
+## Stage 5: ordered VM-exit MSR stores and L1 host loads
+
+Nonzero exit-list counts no longer stop Direct entry. No VMCS12/VMCS02 layer,
+new capability bit or external dependency was introduced.
+
+* `nested_vmx/src/msr_list.rs`: `ExitStoreSource` identifies hardware-saved guest
+  fields, private DEBUGCTL/PERF captures, masked VMX capability MSRs, and live
+  registers not modified by VMX/L0. Its host test prevents reading private L0
+  PAT/EFER/FS/GS/SYSENTER values as if they belonged to L2.
+* `x86_uefi_loader/src/vmx_smoke.rs`: the GS-owned `DirectMsrState` now contains
+  two bounded capture slots and 512 aligned L1 host-load slots. Hardware stores
+  only known-readable DEBUGCTL and, if available, PERF_GLOBAL_CTRL to private
+  storage before host loading overwrites them. `store_guest_msrs` reads L1's
+  original store list at the actual reflected exit, validates each item, and
+  writes only its value half in order. A model-specific read is guarded; invalid
+  items cannot raise a root #GP. Earlier stores remain visible on later failure.
+  `reflect_l2_vmexit` skips stores on late failed entry, then copies the host
+  list **after** all stores, including when the two original lists overlap.
+  It publishes the host mirror as the carrier's next entry list. Hardware
+  therefore applies L1's ordered MSR writes only after L0 Rust has finished;
+  arbitrary L1 host MSRs never run as an L0 WRMSR loop. The first carrier exit
+  removes that one-use list via `complete_reflected_msr_load`.
+* Invalid exit stores and host loads become `nested_vmx_abort` code 1 or 4,
+  respectively. The original VMCS abort indicator is written and this virtual
+  CPU is parked with no locks held; private state and VMX ownership stay alive.
+  No VMfail, guest instruction advance, firmware return or generic L0 panic is
+  substituted. This is still the existing BSP-only monitor; root NMI handling
+  and complete physical reset/S3 lifecycle qualification remain separate work.
+* `x86_guest_uefi_test/src/msr_contract.rs`: 12 live exit-list cases plus one
+  extra VMRESUME cover one/multiple/512 items, duplicates, overlapping lists,
+  PAT/EFER and FS/GS/SYSENTER values, DEBUGCTL, capability-mask visibility,
+  combined entry/store/host lists, ignored empty addresses, no replay on the
+  next CPUID, fresh source reads, and no stores on late failures 33/34.
+  Separate `msr-abort-store`/`msr-abort-load` feature images never return from
+  their intentionally invalid second item. Only the earlier PAT store and
+  four-byte VMCS abort indicator are inspected from outside QEMU.
+* `scripts/x86_64/run-uefi-smoke.sh` / `xtask/src/main.rs`: the existing runner
+  requires ordered cases and exact counts. Ordinary tests reject all nested
+  aborts. The separate terminal fixtures require timeout status 124, matching
+  backend provenance, no L1 continuation/root-failure markers, and matching
+  physical values read through the existing QEMU monitor. Transcript host tests
+  reject wrong/missing/duplicate addresses, codes, values, status, NULs and
+  contradictory backend/terminal evidence. Both serial and memory-read evidence
+  are retained under ignored `bin/x86_64/` paths. No new test framework or sudo.
+
+Two additional observations must not be mistaken for Direct implementation
+success on physical hardware:
+
+1. The first exit-list fixture assumed DEBUGCTL.BTF=2 remained enabled. Both
+   Direct and reference observed 0. Pinned Linux 7.1.5
+   `prepare_vmcs02_full` / `vmx_get_supported_debugctl` mask unsupported BTF/LBR
+   state. The fixture now compares the MSR-store result with an actual L2 RDMSR,
+   and prints `requested=2 observed=0` explicitly. This verifies capture of the
+   live virtual register, **not** nonzero BTF preservation on physical Intel.
+   The first two runs remain recorded FAILs; no existing test was weakened.
+2. Reference KVM stops on both invalid exit lists but leaves the VMCS abort
+   indicator zero. Its `nested_vmx_abort` only requests a triple fault and logs
+   the supplied indicator; it does not write the architectural header. Direct
+   writes 1/4 and preserves the earlier PAT store. The strict reference tests
+   remain FAIL; the expected value was not changed to zero.
+
+Validation so far (all cargo commands use `nix develop --accept-flake-config
+--command`):
+
+* Five package `cargo xtest -p` checks: **165 PASS, 0 FAIL** (nested 22, HAL 53,
+  loader 47, guest 10, xtask 33). Logs `/tmp/x86-msr-exit-{nested,hal,loader,guest}-unit.log`
+  and `/tmp/x86-msr-exit-xtask-final.log`. The first xtask iteration had one gate
+  failure because an impossible reference log containing a project abort marker
+  was accepted; the shared backend check was corrected and rerun successfully.
+* `cargo xbuild x86 --release`: **PASS**, including baseline-ISA checks;
+  `/tmp/x86-msr-abort-build.log` and the nested-suite rebuild.
+* Direct standalone positive fixture: **PASS**, matrix 128 + entry 20 + exit 12
+  + two extra resumes; `/tmp/x86-msr-exit-direct-second.log`.
+* `LINUX_KVM_CYCLES=64 cargo xrun x86 --nested --release`: **9 PASS, 5 FAIL**,
+  exit 1; `/tmp/x86-msr-exit-nested-64.log`. All six Direct native profiles and
+  all three Linux lifecycle/S5 runs PASS. The five FAILs are reference-only:
+  two existing partial-operand-store cases, one existing late-entry PAT shadow
+  case, and the two newly checked missing VMX-abort indicators.
+* `cargo fmt --check`, `git diff --check`: **PASS**.
+
+* `LINUX_KVM_CYCLES=4096 LINUX_KVM_TIMEOUT_SECONDS=600 cargo xrun x86 --nested
+  --release`: **9 PASS, 5 FAIL**, exit 1; `/tmp/x86-msr-exit-nested-4096.log`.
+  The same five reference failures persist; every Direct profile and all three
+  4096-cycle Linux/S5 runs PASS. Guest cycle-4096 timestamps: reference
+  **38.433422s**, Direct **324.798553s**, Direct FP-clobber **323.960386s**.
+  The established extended-test bound remains 600 seconds, unchanged. These
+  timings are correctness baselines, not a claim of improved performance.
+* `cargo xrun x86 --release`: **9 PASS, 0 FAIL**; `/tmp/x86-msr-exit-smoke.log`.
+  Seven QEMU/KVM profiles (including the intentional root-exception fixture)
+  and two QEMU/TCG profiles. `cargo xbuild x86`: **PASS**;
+  `/tmp/x86-msr-exit-build-debug.log`.
+* The original unmodified `xcr0_cpuid_test`, using the exact Direct selftest
+  command and ELF from the previous increment: **PASS**, exit 0;
+  `/tmp/x86-msr-exit-xcr0.log`.
+* Final reason classification masks the basic exit reason and entry-failure
+  flag instead of comparing the entire reason word. The code-4 Direct fixture
+  was rebuilt and rerun afterward: **PASS**, including physical-header readback;
+  `/tmp/x86-msr-abort-load-direct-final.log`. Final format/diff checks PASS.
+
+The current 8-GiB host map/RAM-snapshot backing ceiling remains explicit; unsupported physical backing
+is not converted into a forged architectural guest fault. No Windows/Hyper-V,
+S3 or physical machine was tested for this increment. Outer KVM remains
+reference evidence only. No AArch64 production path was changed.
