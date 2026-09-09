@@ -687,14 +687,22 @@ pub enum VmcsField {
     VmExitMsrStoreAddress = 0x2006,
     /// L1's VM-exit MSR-load address.
     VmExitMsrLoadAddress = 0x2008,
+    /// Original guest PAT field, distinct from a forced L0 save/load image.
+    GuestIa32Pat = 0x2804,
+    /// Original guest EFER field, distinct from a forced L0 save/load image.
+    GuestIa32Efer = 0x2806,
     /// Host `IA32_PAT`.
     HostIa32Pat = 0x2c00,
     /// Host `IA32_EFER`.
     HostIa32Efer = 0x2c02,
+    /// Original VM-exit controls, before L0 forces private MSR restoration.
+    VmExitControls = 0x400c,
     /// L1's VM-exit MSR-store count.
     VmExitMsrStoreCount = 0x400e,
     /// L1's VM-exit MSR-load count.
     VmExitMsrLoadCount = 0x4010,
+    /// Original VM-entry controls, before L0 forces inherited MSR loading.
+    VmEntryControls = 0x4012,
     /// Host `IA32_SYSENTER_CS`.
     HostIa32SysenterCs = 0x4c00,
     /// Host CR0.
@@ -738,6 +746,10 @@ pub enum PatchKind {
     ExitMsrStore,
     /// Ensure hardware restores L0 MSRs before executing L0 code.
     ExitMsrLoad,
+    /// Retain original MSR control bits separately from L0-required bits.
+    MsrControls,
+    /// Hide forced saves when L1 did not request saving the guest MSR field.
+    GuestMsrState,
 }
 
 /// One entry in the direct-VMCS patch manifest.
@@ -779,7 +791,7 @@ impl DirectVmcsPatch {
 ///
 /// `HOST_IA32_PERF_GLOBAL_CTRL` stays direct because L0 does not use the PMU;
 /// a trusted L1 may therefore count or interrupt monitor execution.
-pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 29] = [
+pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 33] = [
     DirectVmcsPatch::host(VmcsField::HostEsSelector),
     DirectVmcsPatch::host(VmcsField::HostCsSelector),
     DirectVmcsPatch::host(VmcsField::HostSsSelector),
@@ -809,6 +821,22 @@ pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 29] = [
     DirectVmcsPatch::store(VmcsField::VmExitMsrStoreCount),
     DirectVmcsPatch::load(VmcsField::VmExitMsrLoadAddress),
     DirectVmcsPatch::load(VmcsField::VmExitMsrLoadCount),
+    DirectVmcsPatch {
+        field: VmcsField::VmExitControls,
+        kind: PatchKind::MsrControls,
+    },
+    DirectVmcsPatch {
+        field: VmcsField::VmEntryControls,
+        kind: PatchKind::MsrControls,
+    },
+    DirectVmcsPatch {
+        field: VmcsField::GuestIa32Pat,
+        kind: PatchKind::GuestMsrState,
+    },
+    DirectVmcsPatch {
+        field: VmcsField::GuestIa32Efer,
+        kind: PatchKind::GuestMsrState,
+    },
 ];
 
 #[cfg(test)]
@@ -1153,6 +1181,15 @@ mod tests {
                 .count(),
             2
         );
+        for kind in [PatchKind::MsrControls, PatchKind::GuestMsrState] {
+            assert_eq!(
+                DIRECT_VMCS_PATCH_MANIFEST
+                    .iter()
+                    .filter(|patch| patch.kind == kind)
+                    .count(),
+                2
+            );
+        }
         for (index, patch) in DIRECT_VMCS_PATCH_MANIFEST.iter().enumerate() {
             assert!(
                 DIRECT_VMCS_PATCH_MANIFEST[..index]

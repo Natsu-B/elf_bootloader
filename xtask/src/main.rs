@@ -375,6 +375,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("host-exception-test")
             || arg.contains("host-xstate-test")
             || arg.contains("nested-contract")
+            || arg.contains("msr-contract")
     }) {
         return Err(
             "x86 builds all backend artifacts; do not select an alternate backend feature explicitly"
@@ -576,37 +577,42 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
     for fixture in ["host-exception", "host-xstate"] {
         build_x86_host_fixture(args, &workspace, &artifact, fixture)?;
     }
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            guest_pkg,
-            "--bin",
-            "x86-uefi-nested-contract",
-        ])
-        .args(["--target", "x86_64-unknown-uefi"])
-        .args(args)
-        .args(["--no-default-features", "--features", "nested-contract"])
-        .env("XTASK_BUILD", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| format!("Failed to build nested VMX contract fixture: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "nested VMX contract fixture build failed: {status}"
-        ));
+    for (feature, filename) in [
+        ("nested-contract", "x86-uefi-nested-contract.efi"),
+        ("msr-contract", "x86-uefi-msr-contract.efi"),
+    ] {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                guest_pkg,
+                "--bin",
+                "x86-uefi-nested-contract",
+            ])
+            .args(["--target", "x86_64-unknown-uefi"])
+            .args(args)
+            .args(["--no-default-features", "--features", feature])
+            .env("XTASK_BUILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| format!("Failed to build nested VMX contract fixture: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "nested VMX contract fixture build failed: {status}"
+            ));
+        }
+        let contract_artifact = workspace
+            .join("target/x86_64-unknown-uefi")
+            .join(resolve_profile(args))
+            .join("x86-uefi-nested-contract.efi");
+        fs::copy(
+            &contract_artifact,
+            workspace.join("bin/x86_64").join(filename),
+        )
+        .map_err(|error| format!("Failed to stage nested VMX contract fixture: {error}"))?;
     }
-    let contract_artifact = workspace
-        .join("target/x86_64-unknown-uefi")
-        .join(resolve_profile(args))
-        .join("x86-uefi-nested-contract.efi");
-    fs::copy(
-        &contract_artifact,
-        workspace.join("bin/x86_64/x86-uefi-nested-contract.efi"),
-    )
-    .map_err(|error| format!("Failed to stage nested VMX contract fixture: {error}"))?;
     Ok(destination.to_string_lossy().into_owned())
 }
 
@@ -812,7 +818,10 @@ fn run_x86_nested() -> Result<(), String> {
         ("outer-kvm", "readonly-vmcs"),
         ("direct-vmx", "readonly-vmcs"),
         ("direct-vmx", "host-xstate"),
+        ("outer-kvm", "msr"),
+        ("direct-vmx", "msr"),
     ] {
+        let msr = cpu_profile == "msr";
         match fs::remove_file("bin/x86_64/serial.log") {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -836,7 +845,11 @@ fn run_x86_nested() -> Result<(), String> {
         );
         let result = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
             .arg(Path::new("bin/x86_64").join(loader))
-            .arg("bin/x86_64/x86-uefi-nested-contract.efi")
+            .arg(if msr {
+                "bin/x86_64/x86-uefi-msr-contract.efi"
+            } else {
+                "bin/x86_64/x86-uefi-nested-contract.efi"
+            })
             .env("X86_UEFI_BACKEND", backend)
             .env("X86_MONITOR_IMAGE", monitor)
             .env("X86_UEFI_PHYSICAL_POLICY", "0")
@@ -857,13 +870,36 @@ fn run_x86_nested() -> Result<(), String> {
             .env("X86_UEFI_ACPI_S3", "0")
             .env("X86_UEFI_WAKE_CYCLES", "0")
             .env("X86_UEFI_ALLOW_REBOOT", "0")
-            .env("X86_UEFI_REQUIRE_POWEROFF", "0")
+            .env("X86_UEFI_REQUIRE_POWEROFF", if msr { "1" } else { "0" })
             .env("X86_UEFI_USERNET", "0")
             .env_remove("X86_UEFI_DATA_DISK")
-            .env_remove("X86_RETURN_MARKER")
+            .env(
+                "X86_RETURN_MARKER",
+                if msr {
+                    ""
+                } else if backend == "direct-vmx" {
+                    "thin-hv: vmx guest PASS"
+                } else {
+                    "thin-hv: trusted outer KVM guest PASS"
+                },
+            )
             .env("X86_VARIABLE_MARKER", "")
-            .env("X86_GUEST_MARKER", "thin-hv: nested contract PASS")
-            .env("X86_GUEST_FAILURE_MARKER", "thin-hv: nested contract FAIL")
+            .env(
+                "X86_GUEST_MARKER",
+                if msr {
+                    "thin-hv: MSR contract PASS"
+                } else {
+                    "thin-hv: nested contract PASS"
+                },
+            )
+            .env(
+                "X86_GUEST_FAILURE_MARKER",
+                if msr {
+                    "thin-hv: MSR contract FAIL"
+                } else {
+                    "thin-hv: nested contract FAIL"
+                },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -871,12 +907,16 @@ fn run_x86_nested() -> Result<(), String> {
         let result = match result {
             Ok(status) if status.success() => Command::new("bash")
                 .arg("./scripts/x86_64/run-uefi-smoke.sh")
-                .args([
-                    "--check-nested-contract-log",
-                    backend,
-                    cpu_profile,
-                    "bin/x86_64/serial.log",
-                ])
+                .args(if msr {
+                    vec!["--check-msr-contract-log", backend, "bin/x86_64/serial.log"]
+                } else {
+                    vec![
+                        "--check-nested-contract-log",
+                        backend,
+                        cpu_profile,
+                        "bin/x86_64/serial.log",
+                    ]
+                })
                 .status()
                 .map_err(|error| error.to_string()),
             Ok(status) => Ok(status),
@@ -3401,7 +3441,11 @@ mod tests {
             fs::write(&log.0, contents).unwrap();
             Command::new("bash")
                 .arg(&runner)
-                .args(["--check-nested-contract-log", backend, cpu_profile])
+                .args(if cpu_profile == "msr" {
+                    vec!["--check-msr-contract-log", backend]
+                } else {
+                    vec!["--check-nested-contract-log", backend, cpu_profile]
+                })
                 .arg(&log.0)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -3425,6 +3469,39 @@ mod tests {
                 )
             };
             let start = "thin-hv: nested contract START\n";
+            let matrix = (0..128)
+                .map(|case| format!("thin-hv: MSR matrix case={case}\n"))
+                .collect::<String>();
+            let msr = format!(
+                "{provenance}thin-hv: MSR contract START\n{matrix}thin-hv: MSR contract PASS matrix=128 vmxoff=1\n"
+            );
+            assert!(check_profile(backend, "msr", &msr));
+            for broken in [
+                msr.replace("thin-hv: MSR matrix case=63\n", ""),
+                msr.replace("case=63\n", "case=62\n"),
+                msr.replace("matrix=128", "matrix=127"),
+                msr.replace("vmxoff=1", "vmxoff=0"),
+                msr.replace("MSR contract START", "MSR contract FAIL"),
+                msr.replace(
+                    "MSR contract START",
+                    "MSR contract START\nthin-hv: MSR contract START",
+                ),
+                format!("{msr}{terminal}"),
+                format!("{msr}thin-hv: host exception FAIL: stopped\n"),
+                msr.replace("MSR contract START", "MSR contract START\0"),
+            ] {
+                assert!(!check_profile(backend, "msr", &broken));
+            }
+            if backend == "direct-vmx" {
+                assert!(!check_profile(
+                    backend,
+                    "msr",
+                    &msr.replace("thin-hv: private host state PASS\n", "")
+                ));
+                assert!(!check_profile("outer-kvm", "msr", &msr));
+            } else {
+                assert!(!check_profile("direct-vmx", "msr", &msr));
+            }
             let cases = (0_u32..16)
                 .map(|bits| {
                     (
@@ -3445,7 +3522,7 @@ mod tests {
                     + (vpid_types & 11).count_ones();
                 let count = 14 - shadow + invept + invvpid + readonly + descriptors;
                 let pass = format!(
-                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds=4\n"
+                    "thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid={count} invept={invept} invvpid={invvpid} readonly={readonly} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={shadow} invept_types={ept_types} invvpid_types={vpid_types} invalidation_success={success} descriptor_failures={descriptors} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=1 ospke_toggles=4 operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds=4\n"
                 );
                 let diagnostics = "thin-hv: native L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores=0\nthin-hv: native L1 original host validation PASS invalid=34 priority=2 restored=1\n";
                 let valid = format!("{provenance}{start}{diagnostics}{pass}{terminal}");
@@ -3511,6 +3588,7 @@ mod tests {
                     valid.replace("msr_invalid=12", "msr_invalid=11"),
                     valid.replace("msr_priority=12", "msr_priority=0"),
                     valid.replace("msr_ignored=3", "msr_ignored=2"),
+                    valid.replace("guest_msr_shadow=2", "guest_msr_shadow=0"),
                     valid.replace("fx_cpuid=6", "fx_cpuid=0"),
                     valid.replace("fx_xsetbv=12", "fx_xsetbv=11"),
                     valid.replace("fx_entry=68", "fx_entry=67"),

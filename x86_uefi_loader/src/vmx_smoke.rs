@@ -37,6 +37,7 @@ use nested_vmx::VmEntryInstruction;
 use nested_vmx::VmInstructionResult;
 use nested_vmx::VmcsField;
 use nested_vmx::host_validation;
+use nested_vmx::msr_list::PatEfer;
 use nested_vmx::restrict_vmx_capability;
 use nested_vmx::vmcs_revision_is_supported;
 use r_efi::efi;
@@ -61,7 +62,7 @@ use x86_64_hal::xstate;
 use x86_64_hal::xstate::XsetbvFault;
 
 /// Pages allocated as one reserved monitor block.
-const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES;
+const MONITOR_PAGES: usize = 92 + host_state::HOST_ENVIRONMENT_PAGES + MSR_STATE_PAGES;
 /// First of eight page directories mapping the low eight gibibytes.
 const EPT_PD_FIRST_PAGE: u64 = 4;
 /// L1 MSR bitmap, including conservative VMX capability interception.
@@ -83,6 +84,9 @@ const HOST_ENVIRONMENT_FIRST_PAGE: u64 = 91;
 /// Inactive, deliberately invalid-revision page used only to record VMX error 11.
 const ERROR_REVISION_PAGE: u64 =
     HOST_ENVIRONMENT_FIRST_PAGE + host_state::HOST_ENVIRONMENT_PAGES as u64;
+/// CPU-owned inherited MSR state, separate from descriptors and ordinary stack.
+const MSR_STATE_FIRST_PAGE: u64 = ERROR_REVISION_PAGE + 1;
+const MSR_STATE_PAGES: usize = core::mem::size_of::<SpinLock<DirectMsrState>>().div_ceil(4096);
 /// One architectural page.
 const PAGE_SIZE: u64 = 4096;
 /// Upper bound of the smoke monitor's identity-mapped physical space.
@@ -505,7 +509,7 @@ fn log_diagnostic_summary(serial: &mut SerialPort) {
 }
 
 const _: () = assert!(HOST_PD_FIRST_PAGE + 8 == HOST_ENVIRONMENT_FIRST_PAGE);
-const _: () = assert!(ERROR_REVISION_PAGE as usize + 1 == MONITOR_PAGES);
+const _: () = assert!(ERROR_REVISION_PAGE + 1 == MSR_STATE_FIRST_PAGE);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
 const RUNTIME_MODE: u32 = 0;
@@ -546,13 +550,44 @@ struct NestedRun {
     carrier: VmcsPhys,
     direct: VmcsPhys,
     saved_direct: [u64; DIRECT_VMCS_PATCH_MANIFEST.len()],
-    exit_loaded_l1_pat: Option<u64>,
-    exit_loaded_l1_efer: Option<u64>,
     l1_interruptibility: u64,
     outer_reason: u64,
     outer_qualification: u64,
     outer_rip: u64,
     outer_instruction_len: u64,
+}
+
+/// Reserved per-CPU inherited state, selected through private GS. No mutable
+/// reference is shared with another CPU or held across hardware entry.
+#[repr(C, align(16))]
+struct DirectMsrState {
+    inherited: PatEfer,
+}
+
+impl DirectMsrState {
+    /// Initial state is overwritten by a carrier snapshot before nested entry.
+    const fn new() -> Self {
+        Self {
+            inherited: PatEfer { pat: 0, efer: 0 },
+        }
+    }
+}
+
+const _: () = assert!(core::mem::align_of::<SpinLock<DirectMsrState>>() <= 4096);
+const _: () = assert!(MSR_STATE_FIRST_PAGE as usize + MSR_STATE_PAGES == MONITOR_PAGES);
+
+/// Borrows only the current CPU's mirror metadata, never across hardware entry.
+/// The callback cannot return a reference derived from the short lock guard.
+fn with_direct_msr_state<T>(inspect: impl FnOnce(&mut DirectMsrState) -> T) -> Option<T> {
+    // SAFETY: only post-VM-exit paths call this helper. HOST_GS_BASE is private
+    // and bind_monitor_data points to this CPU's initialized, immovable runtime
+    // lock. No migration occurs, and terminal paths never free the backing.
+    let pointer = unsafe { host_state::monitor_data() }?.cast::<SpinLock<DirectMsrState>>();
+    // SAFETY: the pointer has the exact initialized type/alignment above. This
+    // shared reference accesses only the lock; a short guard owns each mutable
+    // metadata borrow, and no hardware entry occurs while the guard exists.
+    let mut state = unsafe { pointer.as_ref() }.try_lock()?;
+    Some(inspect(&mut state))
 }
 
 /// Failure from the bounded VMX smoke launch.
@@ -857,7 +892,7 @@ fn run_direct_monitor(
         // CPU/VMCS uses this storage yet; CR4.CET/LA57 were rejected above. After a
         // successful entry all terminal paths retain the pages and never return to
         // firmware. Immediate VMfail does not install these host descriptor fields.
-        let host_environment = unsafe {
+        let mut host_environment = unsafe {
             HostEnvironment::initialize(
                 core::slice::from_raw_parts_mut(
                     (block + HOST_ENVIRONMENT_FIRST_PAGE * PAGE_SIZE) as *mut u8,
@@ -868,6 +903,23 @@ fn run_direct_monitor(
             )
         }
         .map_err(Error::HostState)?;
+        let msr_state = ptr::NonNull::new(
+            (block + MSR_STATE_FIRST_PAGE * PAGE_SIZE) as *mut SpinLock<DirectMsrState>,
+        )
+        .ok_or(Error::Firmware(
+            "CPU MSR state address",
+            efi::Status::COMPROMISED_DATA.as_usize(),
+        ))?;
+        // SAFETY: the checked runtime allocation includes this disjoint,
+        // page-aligned final arena with enough space for the complete lock and
+        // state. No CPU or VMCS references it yet. The object never moves; all
+        // post-entry terminal paths retain its pages and private HOST_CR3 map.
+        unsafe {
+            msr_state
+                .as_ptr()
+                .write(SpinLock::new(DirectMsrState::new()));
+            host_environment.bind_monitor_data(msr_state.cast());
+        }
         for address in host_environment.required_image_addresses() {
             if address < image_base || address >= image_end {
                 return Err(Error::OutsideIdentityMap(address));
@@ -1507,19 +1559,34 @@ fn configure_and_launch(
             | vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE,
         unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) },
     );
-    // ponytail: keep the trusted L1 PAT and non-mode EFER bits live across
-    // carrier exits so all-clear direct controls retain native semantics.
+    // L0 always restores private PAT/EFER. Direct entry explicitly reconstructs
+    // L1's inherited values; neither guest may supply L0's execution environment.
     let exit_capability = unsafe { cpu::rdmsr(exit_msr) };
     let exit = vmx::adjust_controls(
         vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE
             | vmcs::VM_EXIT_SAVE_IA32_PAT
-            | vmcs::VM_EXIT_SAVE_IA32_EFER,
+            | vmcs::VM_EXIT_SAVE_IA32_EFER
+            | vmcs::VM_EXIT_LOAD_IA32_PAT
+            | vmcs::VM_EXIT_LOAD_IA32_EFER,
         exit_capability,
     );
     let entry = vmx::adjust_controls(
         vmcs::VM_ENTRY_IA32E_MODE | vmcs::VM_ENTRY_LOAD_IA32_PAT | vmcs::VM_ENTRY_LOAD_IA32_EFER,
         unsafe { cpu::rdmsr(entry_msr) },
     );
+    let required_exit_msrs = vmcs::VM_EXIT_SAVE_IA32_PAT
+        | vmcs::VM_EXIT_SAVE_IA32_EFER
+        | vmcs::VM_EXIT_LOAD_IA32_PAT
+        | vmcs::VM_EXIT_LOAD_IA32_EFER;
+    let required_entry_msrs = vmcs::VM_ENTRY_LOAD_IA32_PAT | vmcs::VM_ENTRY_LOAD_IA32_EFER;
+    if exit & required_exit_msrs != required_exit_msrs
+        || entry & required_entry_msrs != required_entry_msrs
+    {
+        return Err(Error::Capability(
+            "private PAT/EFER controls",
+            u64::from(exit),
+        ));
+    }
     if primary & vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS == 0
         || primary & vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_EPT == 0
@@ -1534,14 +1601,7 @@ fn configure_and_launch(
         || exit & vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0
         || exit & EXIT_ACKNOWLEDGE_INTERRUPT != 0
         || (exit_capability >> 32) as u32 & EXIT_ACKNOWLEDGE_INTERRUPT == 0
-        || exit & vmcs::VM_EXIT_SAVE_IA32_PAT == 0
-        || exit & vmcs::VM_EXIT_LOAD_IA32_PAT != 0
-        || (exit_capability >> 32) as u32 & vmcs::VM_EXIT_LOAD_IA32_PAT == 0
-        || exit & vmcs::VM_EXIT_SAVE_IA32_EFER == 0
-        || exit & vmcs::VM_EXIT_LOAD_IA32_EFER != 0
         || entry & vmcs::VM_ENTRY_IA32E_MODE == 0
-        || entry & vmcs::VM_ENTRY_LOAD_IA32_PAT == 0
-        || entry & vmcs::VM_ENTRY_LOAD_IA32_EFER == 0
     {
         return Err(Error::Capability(
             "VM-entry controls",
@@ -2026,7 +2086,7 @@ unsafe extern "sysv64" fn vmexit_dispatch(registers: *mut GuestRegisters) -> u64
         // read-only telemetry access neither changes fields nor emulation policy.
         let reason = unsafe { vmx::vmread(vmcs::VM_EXIT_REASON) }.unwrap_or(u64::MAX);
         record_diagnostic(DiagnosticEvent::NestedExit(reason));
-        reflect_l2_vmexit(&run, registers);
+        reflect_l2_vmexit(&run, reason, registers);
         record_diagnostic(DiagnosticEvent::Reflected(reason));
         return VMEXIT_ACTION_RESUME;
     }
@@ -2979,6 +3039,30 @@ fn handle_l1_vmentry(
             registers,
         );
     };
+    // SAFETY: the owning CPU's carrier is still current. These are the stopped
+    // L1's saved MSRs, not the private host values installed for Rust execution.
+    let inherited = unsafe {
+        vmx::vmread(vmcs::GUEST_IA32_PAT)
+            .ok()
+            .zip(vmx::vmread(vmcs::GUEST_IA32_EFER).ok())
+    };
+    if inherited
+        .and_then(|(pat, efer)| {
+            with_direct_msr_state(|state| {
+                state.inherited = PatEfer { pat, efer };
+            })
+        })
+        .is_none()
+    {
+        stop_unexpected_exit(
+            b"capturing inherited L1 MSRs failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
 
     if unsafe { vmx::vmptrld(current.address()) } != VmxStatus::Success {
         stop_unexpected_exit(
@@ -3005,10 +3089,7 @@ fn handle_l1_vmentry(
         };
         values
     };
-    // SAFETY: L1's direct VMCS is current, owned by this BSP. Its original host
-    // fields are either still materialized or retained in saved_direct; the
-    // exit controls themselves are not replaced by the current patch manifest.
-    let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.ok();
+    let exit_controls = direct_patch_value(&saved_direct, VmcsField::VmExitControls);
     let Some(exit_controls) = exit_controls else {
         stop_unexpected_exit(
             b"reading L1 host exit controls failed",
@@ -3135,42 +3216,29 @@ fn handle_l1_vmentry(
     {
         (exit_controls, true)
     } else {
+        // SAFETY: the owned Direct VMCS is current; its entry-list count has
+        // not yet been redirected. Control words come from original shadows.
         let entry_load_count = unsafe { vmx::vmread(vmcs::VM_ENTRY_MSR_LOAD_COUNT) }.ok();
-        let exit_controls = unsafe { vmx::vmread(vmcs::VM_EXIT_CONTROLS) }.unwrap_or(u64::MAX);
-        let entry_controls = unsafe { vmx::vmread(vmcs::VM_ENTRY_CONTROLS) }.unwrap_or(u64::MAX);
+        let exit_controls =
+            direct_patch_value(&saved_direct, VmcsField::VmExitControls).unwrap_or(u64::MAX);
+        let entry_controls =
+            direct_patch_value(&saved_direct, VmcsField::VmEntryControls).unwrap_or(u64::MAX);
         // ponytail: keep PERF_GLOBAL_CTRL direct because L0 does not use the PMU;
         // outer KVM advertises the VMCS pair even when direct MSR access would #GP.
         let exit_perf_mask = u64::from(vmcs::VM_EXIT_LOAD_IA32_PERF_GLOBAL_CTRL);
         let entry_perf_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PERF_GLOBAL_CTRL);
         let exit_pat_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_PAT | vmcs::VM_EXIT_LOAD_IA32_PAT);
         let entry_pat_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_PAT);
-        let exit_pat_controls = exit_controls & exit_pat_mask;
-        let entry_pat_controls = entry_controls & entry_pat_mask;
-        let supported_pat_controls = (exit_pat_controls == 0 && entry_pat_controls == 0)
-            || (exit_pat_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_PAT) != 0
-                && entry_pat_controls == entry_pat_mask);
         let exit_efer_mask = u64::from(vmcs::VM_EXIT_SAVE_IA32_EFER | vmcs::VM_EXIT_LOAD_IA32_EFER);
         let entry_efer_mask = u64::from(vmcs::VM_ENTRY_LOAD_IA32_EFER);
-        let exit_efer_controls = exit_controls & exit_efer_mask;
-        let entry_efer_controls = entry_controls & entry_efer_mask;
-        let supported_efer_controls = (exit_efer_controls == 0 && entry_efer_controls == 0)
-            || (exit_efer_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0
-                && entry_efer_controls == entry_efer_mask);
         let supported = entry_load_count == Some(0)
             && (exit_controls & !(exit_perf_mask | exit_pat_mask | exit_efer_mask)) >> 18 == 0
-            && (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 == 0
-            && supported_pat_controls
-            && supported_efer_controls;
+            && (entry_controls & !(entry_perf_mask | entry_pat_mask | entry_efer_mask)) >> 13 == 0;
         (exit_controls, supported)
     };
     if exit_store_count != Some(0) || exit_load_count != Some(0) || !supported_entry_policy {
-        // ponytail: the measured KVM probe has empty MSR lists. Add bounded L0
-        // MSR mirrors when a real workload first supplies a non-empty list.
-        // ponytail: PAT controls follow the same all-clear or entry+exit-load
-        // ceiling as EFER; add forced-control shadowing before relaxing it.
-        // ponytail: accept measured trusted KVM's all-clear controls, which
-        // inherit live L1 EFER, or sets that load L2 and restore L1 EFER.
-        // Add forced-control shadowing before allowing other partial sets.
+        // Nonempty list execution is integrated separately from the completed
+        // original-control validation and PAT/EFER shadowing below.
         stop_unexpected_exit(
             b"unsupported nested VM-entry state",
             reason,
@@ -3180,12 +3248,6 @@ fn handle_l1_vmentry(
             registers,
         );
     }
-    let exit_loaded_l1_pat = (exit_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_PAT) != 0)
-        .then(|| direct_patch_value(&saved_direct, VmcsField::HostIa32Pat))
-        .flatten();
-    let exit_loaded_l1_efer = (exit_controls & u64::from(vmcs::VM_EXIT_LOAD_IA32_EFER) != 0)
-        .then(|| direct_patch_value(&saved_direct, VmcsField::HostIa32Efer))
-        .flatten();
     if let Some(carrier_values) = carrier_values {
         if !patch_direct_vmcs(&saved_direct, &carrier_values) {
             stop_unexpected_exit(
@@ -3198,6 +3260,16 @@ fn handle_l1_vmentry(
             );
         }
         *DIRECT_PATCH_VALUES.lock() = Some((current.address(), saved_direct));
+    }
+    if prepare_direct_msr_fields(&saved_direct).is_none() {
+        stop_unexpected_exit(
+            b"preparing private MSR fields failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
     }
     if cache_entry_policy {
         *DIRECT_ENTRY_POLICY.lock() = Some((current.address(), exit_controls));
@@ -3218,8 +3290,6 @@ fn handle_l1_vmentry(
         carrier,
         direct: current.address(),
         saved_direct,
-        exit_loaded_l1_pat,
-        exit_loaded_l1_efer,
         l1_interruptibility,
         outer_reason: reason,
         outer_qualification: qualification,
@@ -3391,6 +3461,7 @@ fn patch_direct_vmcs(
         let value = match patch.kind {
             PatchKind::HostState => carrier_values[index],
             PatchKind::ExitMsrStore | PatchKind::ExitMsrLoad => 0,
+            PatchKind::MsrControls | PatchKind::GuestMsrState => continue,
         };
         if saved_direct[index] == value {
             continue;
@@ -3410,6 +3481,101 @@ fn restore_direct_vmcs(values: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> bool
         }
     }
     true
+}
+
+/// Loads the L2 values original controls specify, while ensuring that any
+/// subsequent exit restores private L0 PAT/EFER. Hardware support for these
+/// forced bits was required before the initial carrier launch.
+fn prepare_direct_msr_fields(saved: &[u64; DIRECT_VMCS_PATCH_MANIFEST.len()]) -> Option<()> {
+    let entry = u32::try_from(direct_patch_value(saved, VmcsField::VmEntryControls)?).ok()?;
+    let exit = direct_patch_value(saved, VmcsField::VmExitControls)?;
+    let guest = PatEfer {
+        pat: direct_patch_value(saved, VmcsField::GuestIa32Pat)?,
+        efer: direct_patch_value(saved, VmcsField::GuestIa32Efer)?,
+    };
+    // SAFETY: this CPU owns the current Direct VMCS; guest CR0 is not patched.
+    let cr0 = unsafe { vmx::vmread(vmcs::GUEST_CR0) }.ok()?;
+    let loaded = with_direct_msr_state(|state| state.inherited.entry(guest, entry, cr0))?;
+    for (field, value) in [
+        (vmcs::GUEST_IA32_PAT, loaded.pat),
+        (vmcs::GUEST_IA32_EFER, loaded.efer),
+        (
+            vmcs::VM_ENTRY_CONTROLS,
+            u64::from(entry | vmcs::VM_ENTRY_LOAD_IA32_PAT | vmcs::VM_ENTRY_LOAD_IA32_EFER),
+        ),
+        (
+            vmcs::VM_EXIT_CONTROLS,
+            exit | u64::from(
+                vmcs::VM_EXIT_SAVE_IA32_PAT
+                    | vmcs::VM_EXIT_SAVE_IA32_EFER
+                    | vmcs::VM_EXIT_LOAD_IA32_PAT
+                    | vmcs::VM_EXIT_LOAD_IA32_EFER,
+            ),
+        ),
+    ] {
+        // SAFETY: only the owned Direct VMCS changes. Original fields remain in
+        // the patch manifest; no hardware entry occurs until all writes succeed.
+        if unsafe { vmx::vmwrite(field, value) } != VmxStatus::Success {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Recovers L1-visible MSRs without confusing forced saves with requested ones.
+/// Late failed entry does not save guest state or an exit MSR-store list.
+fn reflected_direct_msrs(run: &NestedRun, reason: u64) -> Option<PatEfer> {
+    let controls = u32::try_from(direct_patch_value(
+        &run.saved_direct,
+        VmcsField::VmExitControls,
+    )?)
+    .ok()?;
+    let host = PatEfer {
+        pat: direct_patch_value(&run.saved_direct, VmcsField::HostIa32Pat)?,
+        efer: direct_patch_value(&run.saved_direct, VmcsField::HostIa32Efer)?,
+    };
+    let live = if reason & (1 << 31) != 0 {
+        match reason & 0xffff {
+            // Guest checking/loading is concurrent. A not-yet-loaded original
+            // L1 value is a valid deterministic choice for undefined components.
+            33 => with_direct_msr_state(|state| state.inherited)?,
+            // Nonempty MSR lists are still rejected before entry; reason 34
+            // therefore cannot be produced by this zero-list runtime yet.
+            _ => return None,
+        }
+    } else {
+        // SAFETY: a normal Direct exit completed the forced PAT/EFER saves into
+        // this CPU-owned VMCS before hardware loaded L0's private host values.
+        let captured = unsafe {
+            PatEfer {
+                pat: vmx::vmread(vmcs::GUEST_IA32_PAT).ok()?,
+                efer: vmx::vmread(vmcs::GUEST_IA32_EFER).ok()?,
+            }
+        };
+        let mut cache = DIRECT_PATCH_VALUES.lock();
+        let (address, values) = cache.as_mut()?;
+        if *address != run.direct {
+            return None;
+        }
+        for (bit, field, value) in [
+            (
+                vmcs::VM_EXIT_SAVE_IA32_PAT,
+                vmcs::GUEST_IA32_PAT,
+                captured.pat,
+            ),
+            (
+                vmcs::VM_EXIT_SAVE_IA32_EFER,
+                vmcs::GUEST_IA32_EFER,
+                captured.efer,
+            ),
+        ] {
+            if controls & bit != 0 && !write_direct_patch_field(values, field, value) {
+                return None;
+            }
+        }
+        captured
+    };
+    Some(live.exit(host, controls))
 }
 
 /// Materializes one retained direct VMCS while VMCS01 is current.
@@ -3442,17 +3608,18 @@ fn materialize_direct_patch(only: Option<VmcsPhys>) -> bool {
 }
 
 /// Reflects a hardware L2 exit through VMCS01 into Linux KVM's host RIP.
-fn reflect_l2_vmexit(run: &NestedRun, registers: &GuestRegisters) {
+fn reflect_l2_vmexit(run: &NestedRun, reason: u64, registers: &GuestRegisters) {
     let mut current = u64::MAX;
     if unsafe { vmx::vmptrst(&mut current) } != VmxStatus::Success || current != run.direct.get() {
         stop_nested_exit(b"unexpected direct VMCS on L2 exit", run.direct, registers);
     }
-    let l1_pat = run
-        .exit_loaded_l1_pat
-        .unwrap_or_else(|| unsafe { cpu::rdmsr(cpu::IA32_PAT) });
-    let l1_efer = run
-        .exit_loaded_l1_efer
-        .unwrap_or_else(|| unsafe { cpu::rdmsr(cpu::IA32_EFER) });
+    let Some(l1_msrs) = reflected_direct_msrs(run, reason) else {
+        stop_nested_exit(
+            b"reflecting original MSR controls failed",
+            run.direct,
+            registers,
+        );
+    };
     if unsafe { vmx::vmptrld(run.carrier) } != VmxStatus::Success {
         stop_nested_exit(
             b"restoring carrier after L2 exit failed",
@@ -3461,7 +3628,7 @@ fn reflect_l2_vmexit(run: &NestedRun, registers: &GuestRegisters) {
         );
     }
 
-    if write_reflected_l1_state(run, l1_pat, l1_efer).is_none() {
+    if write_reflected_l1_state(run, l1_msrs.pat, l1_msrs.efer).is_none() {
         stop_nested_exit(b"reflecting L1 host state failed", run.direct, registers);
     }
 
@@ -4977,7 +5144,26 @@ mod tests {
         region.physical_start = 1 << 32;
         assert!(super::monitor_allocation_is_wb(&[region], 1 << 32));
         assert!(super::ERROR_REVISION_PAGE > 1);
-        assert_eq!(super::ERROR_REVISION_PAGE + 1, super::MONITOR_PAGES as u64);
+        assert_eq!(super::ERROR_REVISION_PAGE + 1, super::MSR_STATE_FIRST_PAGE);
+        assert_eq!(
+            super::MSR_STATE_FIRST_PAGE + super::MSR_STATE_PAGES as u64,
+            super::MONITOR_PAGES as u64
+        );
+    }
+
+    #[test]
+    fn cpu_msr_state_is_bounded_disjoint_and_initially_empty() {
+        let first = super::DirectMsrState::new();
+        let second = super::DirectMsrState::new();
+        assert!(!core::ptr::eq(&first, &second));
+        for state in [&first, &second] {
+            assert_eq!(state.inherited, super::PatEfer { pat: 0, efer: 0 });
+        }
+        assert_eq!(super::MSR_STATE_PAGES, 1);
+        assert!(
+            core::mem::size_of::<mutex::SpinLock<super::DirectMsrState>>()
+                <= super::MSR_STATE_PAGES * 4096
+        );
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Bounded, disposable QEMU/KVM nested-VMX instruction contract.
 //!
 //! Run the identical image below the project Direct-VMCS monitor and the
-//! outer-KVM reference. This image does not launch an L2; the Linux KVM probe
-//! tests real entry/exit separately. No variable, disk, or firmware identity
+//! outer-KVM reference. The ordinary variant does not launch an L2; the
+//! `msr-contract` variant runs real L2 entries and powers off without returning
+//! to firmware. The Linux KVM probe separately covers L2 OS state and lifetime.
+//! No variable, disk, or firmware identity
 //! service is written. All VMX regions belong to this application until cleared
 //! and VMXOFF succeeds; no test state survives a successful return.
 //!
@@ -16,6 +18,7 @@ mod l1_extended;
 mod l1_fault;
 mod l1_memory;
 mod l1_xstate;
+mod msr_contract;
 
 use core::arch::asm;
 use core::fmt;
@@ -278,7 +281,7 @@ fn prerequisites() -> Result<Prerequisites> {
 }
 
 /// Confirms the bounded low-memory allocation belongs to WB-capable firmware RAM.
-fn allocation_map(boot: *mut efi::BootServices, base: u64) -> Result<()> {
+fn allocation_map<const N: usize>(boot: *mut efi::BootServices, base: u64) -> Result<()> {
     let mut storage = [0_u64; 1024];
     let mut length = core::mem::size_of_val(&storage);
     let mut key = 0;
@@ -313,19 +316,19 @@ fn allocation_map(boot: *mut efi::BootServices, base: u64) -> Result<()> {
                 expected: 0,
             }
         })?;
-    allocation_covered(&regions[..count], base)
+    allocation_covered::<N>(&regions[..count], base)
 }
 
-fn allocation_covered(regions: &[FirmwareDescriptor], base: u64) -> Result<()> {
+fn allocation_covered<const N: usize>(regions: &[FirmwareDescriptor], base: u64) -> Result<()> {
     let end = base
-        .checked_add((PAGES * PAGE) as u64)
+        .checked_add((N * PAGE) as u64)
         .filter(|&end| base != 0 && base % PAGE as u64 == 0 && end <= 1 << 32)
         .ok_or(Failure {
             stage: "allocation-range",
             actual: base,
             expected: 0,
         })?;
-    let mut covered = [0_u8; PAGES];
+    let mut covered = [0_u8; N];
     for region in regions {
         let region_end = region
             .number_of_pages
@@ -603,6 +606,10 @@ unsafe fn entry_boundaries(capabilities: &Prerequisites) -> Result<()> {
             (vmcs::VM_EXIT_MSR_LOAD_COUNT, 0),
             (vmcs::VM_EXIT_MSR_STORE_COUNT, 0),
             (vmcs::VM_ENTRY_INTR_INFO_FIELD, 0),
+            // LOAD bits are clear. L0-forced loads must not validate or expose
+            // these deliberately invalid, originally ignored guest images.
+            (vmcs::GUEST_IA32_PAT, u64::MAX),
+            (vmcs::GUEST_IA32_EFER, u64::MAX),
         ] {
             success("entry-control-field", vmx::vmwrite(field, value))?;
         }
@@ -630,6 +637,9 @@ unsafe fn entry_boundaries(capabilities: &Prerequisites) -> Result<()> {
             vmcs::CPU_BASED_VM_EXEC_CONTROL,
             1,
         )?;
+        for field in [vmcs::GUEST_IA32_PAT, vmcs::GUEST_IA32_EFER] {
+            field_equal("entry-ignored-guest-msr-preserved", field, u64::MAX)?;
+        }
         // SAFETY: the VMCS remains clear and owned; the helper substitutes an
         // invalid host field before every entry with otherwise valid controls.
         host_field_boundaries()?;
@@ -1322,7 +1332,7 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisite
     };
     equal("allocate-pages", allocation.as_usize() as u64, 0)?;
     let result = (|| {
-        allocation_map(boot, base)?;
+        allocation_map::<PAGES>(boot, base)?;
         let vmxon = VmxonPhys::new(base).ok_or(Failure {
             stage: "vmxon-alignment",
             actual: base,
@@ -1429,13 +1439,16 @@ fn run(table: *mut efi::SystemTable, serial: &mut Serial) -> Result<Prerequisite
 pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTable) -> efi::Status {
     let mut serial = Serial;
     serial.initialize();
+    if cfg!(feature = "msr-contract") {
+        msr_contract::run(table, &mut serial);
+    }
     if writeln!(serial, "thin-hv: nested contract START").is_err() {
         return efi::Status::DEVICE_ERROR;
     }
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds={}",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=68 fx_irq=3 ymm_rounds={}",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,
@@ -1515,17 +1528,17 @@ mod tests {
             number_of_pages: PAGES as u64,
             attributes: efi::MEMORY_WB,
         };
-        assert!(allocation_covered(&[region], 0x1000).is_ok());
-        assert!(allocation_covered(&[region, region], 0x1000).is_err());
-        assert!(allocation_covered(&[region], 0).is_err());
-        assert!(allocation_covered(&[region], u64::MAX).is_err());
-        assert!(allocation_covered(&[region], (1 << 32) - PAGE as u64).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], 0x1000).is_ok());
+        assert!(allocation_covered::<PAGES>(&[region, region], 0x1000).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], 0).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], u64::MAX).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], (1 << 32) - PAGE as u64).is_err());
         region.attributes |= efi::MEMORY_RO;
-        assert!(allocation_covered(&[region], 0x1000).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], 0x1000).is_err());
         region.attributes = 0;
-        assert!(allocation_covered(&[region], 0x1000).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], 0x1000).is_err());
         region.attributes = efi::MEMORY_WB;
         region.number_of_pages -= 1;
-        assert!(allocation_covered(&[region], 0x1000).is_err());
+        assert!(allocation_covered::<PAGES>(&[region], 0x1000).is_err());
     }
 }

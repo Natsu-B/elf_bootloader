@@ -609,3 +609,70 @@ Validation through the existing Nix/cargo framework:
   `/tmp/x86-correctness-step5-list-fmt.log`. No AArch64 production changes.
 
 No Windows/Hyper-V, S3 or physical-hardware qualification was performed here.
+
+## Stage 5 prerequisite: private PAT/EFER and real nested control matrix
+
+Confirmed at `52534f0`: the carrier left L1 PAT and non-mode EFER bits live in
+L0, and Direct entry accepted only selected all-clear or paired LOAD control
+combinations. This is now replaced by private L0 restoration, without adding
+capability bits or replacing Direct-VMCS.
+
+* `arch_hal/x86_64_hal/src/host_state.rs`: `bind_monitor_data` / `monitor_data`
+  bind an opaque, retained CPU-owned object through private GS. Separate
+  environments have separate bindings; no borrowed object crosses VM entry.
+* `nested_vmx/src/lib.rs`: the 33-field patch manifest additionally retains
+  original entry/exit controls and guest PAT/EFER, including their ignored values.
+* `nested_vmx/src/msr_list.rs`: `PatEfer::entry` / `exit` implement inheritance
+  and original LOAD semantics. `failed_load` tests ordered successful-prefix
+  reconstruction for the subsequent nonempty-list work; this helper is not yet
+  connected to a nonempty-list runtime.
+* `x86_uefi_loader/src/vmx_smoke.rs`: the carrier and Direct VMCS always restore
+  private L0 PAT/EFER. `prepare_direct_msr_fields` loads the values that original
+  L1 controls specify, using stopped-carrier state rather than L0 RDMSR values.
+  `reflected_direct_msrs` updates guest-field shadows only when L1 requested SAVE,
+  and applies L1 host LOAD controls before resuming its carrier. Original control
+  words remain distinct from forced words throughout validation and caching.
+  CPU-private inherited state uses one reserved page; unused future list arrays
+  were removed before committing. Most other VMX state is still BSP-global.
+* `x86_guest_uefi_test/src/nested_contract.rs`: ignored guest PAT/EFER values
+  survive immediate failed entry (`guest_msr_shadow=2`). Allocation-map checking
+  is reused with a const-generic page count by the additional fixture.
+* `x86_guest_uefi_test/src/msr_contract.rs`, `Cargo.toml`: the existing nested
+  binary's `msr-contract` feature performs real L2 entries for all 64 combinations
+  of six PAT/EFER LOAD/SAVE controls, with two EFER.SCE polarities: **128 cases**.
+  L1 live, guest-field, L2-written and host-field PAT values differ. EFER checks
+  distinguish inherited/loaded and saved/unsaved state without toggling NXE or
+  changing the page tables. The disposable q35 fixture owns its descriptor/IST
+  storage, clears the VMCS, executes VMXOFF and powers off; it never returns to
+  firmware with disposable host descriptors. No firmware identity is changed.
+* `scripts/x86_64/run-uefi-smoke.sh`, `xtask/src/main.rs`: build/stage the extra
+  feature image and run it in both backends through the existing runner. Strict
+  gates require ordered cases 0..127, VMXOFF, backend provenance and Direct
+  private-host evidence. Missing/duplicated/reordered cases, NUL, wrong counts,
+  root failure or an unexpected firmware return fail host runner tests.
+
+Validation through `nix develop --accept-flake-config --command`:
+
+* All five `cargo xtest -p <package>` checks: **161 PASS, 0 FAIL** (nested 21,
+  HAL 51, loader 47, guest 10, xtask 32). Logs are
+  `/tmp/x86-msr-matrix-{nested-policy,hal,loader,guest,xtask}.log`; the final
+  one-page CPU-state loader retest is `...-small-state-loader.log`.
+* `cargo xbuild x86 --release`: **PASS**, including all three monitor ISA gates;
+  `/tmp/x86-msr-matrix-xbuild.log`. The one-page state is also rebuilt by xrun.
+* The standalone real-entry matrix: **128/128 PASS per backend**, **2 QEMU runs
+  PASS**, with required poweroff. Logs: `/tmp/x86-msr-reference-first.log` and
+  `/tmp/x86-msr-direct-first.log`. Reference evidence is not Direct evidence.
+* An accidental `LINUX_KVM_CYCLES=4096 cargo xrun x86 --nested --release`
+  invocation omitted the previously used `LINUX_KVM_TIMEOUT_SECONDS=600`.
+  Its default 300-second limit produced **6 PASS, 4 FAIL**: two known reference
+  partial-store failures and two Direct lifecycle timeouts while still making
+  progress. Direct plain reached cycle 3827 without a state assertion failure.
+  Log: `/tmp/x86-msr-matrix-nested-4096.log`. This is retained as a failed run,
+  not evidence of a new hang or a successful 4096-cycle completion.
+* The comparable 4096-cycle/600-second release run is in progress at this
+  intermediate checkpoint; its final result is recorded in the follow-up below.
+  No runner timeout or upstream selftest source was modified.
+
+Nonempty MSR lists remain unsupported at this checkpoint. Original timing-
+sensitive KVM failure, physical platform mapping, pCPU/AP, root NMI and S3 work
+remain open. Windows/Hyper-V and physical hardware have not been retested here.

@@ -137,9 +137,160 @@ impl Entry {
     }
 }
 
+/// The two MSRs whose L0-private restoration can hide inherited guest values.
+/// These values are architectural images, not an L1/L2 software context switch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatEfer {
+    /// IA32_PAT image.
+    pub pat: u64,
+    /// IA32_EFER image, including the current LMA bit.
+    pub efer: u64,
+}
+
+impl PatEfer {
+    /// Calculates VM-entry inheritance when L0 has forced private MSR controls.
+    /// LOAD_EFER=0 still sets LMA from IA32e guest mode. LME changes with that
+    /// mode only when guest CR0.PG=1; paging-disabled guests retain prior LME.
+    #[must_use]
+    pub const fn entry(self, guest: Self, controls: u32, guest_cr0: u64) -> Self {
+        let mut efer = guest.efer;
+        if controls & crate::ENTRY_LOAD_IA32_EFER == 0 {
+            let ia32e = controls & crate::ENTRY_IA32E_MODE != 0;
+            efer = (self.efer & !(1 << 10)) | ((ia32e as u64) << 10);
+            if guest_cr0 & (1 << 31) != 0 {
+                efer = (efer & !(1 << 8)) | ((ia32e as u64) << 8);
+            }
+        }
+        Self {
+            pat: if controls & crate::ENTRY_LOAD_IA32_PAT != 0 {
+                guest.pat
+            } else {
+                self.pat
+            },
+            efer,
+        }
+    }
+
+    /// Reconstructs these MSRs after hardware reports entry MSR-load failure.
+    /// `self` is the successfully loaded/inherited guest-state image. Hardware
+    /// processes the immutable entry mirror in order and identifies the failed
+    /// entry with a one-based qualification; only earlier entries took effect.
+    /// This must not be used for an invalid-guest-state failure (reason 33),
+    /// whose guest-state loading may be partial, or for immediate VMfail.
+    pub fn failed_load(self, mirror: &[Entry], qualification: u64) -> Option<Self> {
+        let completed = usize::try_from(qualification.checked_sub(1)?).ok()?;
+        if mirror.len() > MAX_MSR_MIRROR_ENTRIES as usize || completed >= mirror.len() {
+            return None;
+        }
+        let mut state = self;
+        for entry in &mirror[..completed] {
+            // A reported successful prefix cannot contain a format violation.
+            if !entry.format_valid(Operation::EntryLoad) {
+                return None;
+            }
+            match entry.index {
+                0x277 => state.pat = entry.value,
+                // MSR-list loads, like WRMSR, ignore the supplied LMA bit.
+                0xc000_0080 => state.efer = (entry.value & !(1 << 10)) | (state.efer & (1 << 10)),
+                _ => {}
+            }
+        }
+        Some(state)
+    }
+
+    /// Applies original VM-exit controls before L1's exit MSR-load list. Without
+    /// LOAD_EFER, VM exit still sets LME/LMA from host address-space size.
+    #[must_use]
+    pub const fn exit(self, host: Self, controls: u32) -> Self {
+        Self {
+            pat: if controls & crate::EXIT_LOAD_IA32_PAT != 0 {
+                host.pat
+            } else {
+                self.pat
+            },
+            efer: if controls & crate::EXIT_LOAD_IA32_EFER != 0 {
+                host.efer
+            } else {
+                (self.efer & !0x500)
+                    | if controls & crate::EXIT_HOST_ADDRESS_SPACE_SIZE != 0 {
+                        0x500
+                    } else {
+                        0
+                    }
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pat_efer_inherit_only_architecturally_unloaded_state() {
+        let l1 = PatEfer {
+            pat: 6,
+            efer: 0x901,
+        };
+        let l2 = PatEfer {
+            pat: 0,
+            efer: 0xd01,
+        };
+        for load_pat in [0, crate::ENTRY_LOAD_IA32_PAT] {
+            for load_efer in [0, crate::ENTRY_LOAD_IA32_EFER] {
+                for ia32e in [0, 1 << 9] {
+                    for paging in [0, 1 << 31] {
+                        let state = l1.entry(l2, load_pat | load_efer | ia32e, paging);
+                        assert_eq!(state.pat, if load_pat != 0 { l2.pat } else { l1.pat });
+                        if load_efer != 0 {
+                            assert_eq!(state.efer, l2.efer);
+                        } else {
+                            assert_eq!(state.efer & !0x500, l1.efer & !0x500);
+                            assert_eq!(state.efer & 0x400 != 0, ia32e != 0);
+                            assert_eq!(state.efer & 0x100 != 0, paging == 0 || ia32e != 0);
+                        }
+                    }
+                    let state = l2.exit(l1, (load_pat << 5) | (load_efer << 6) | ia32e);
+                    assert_eq!(state.pat, if load_pat != 0 { l1.pat } else { l2.pat });
+                    assert_eq!(
+                        state.efer,
+                        if load_efer != 0 {
+                            l1.efer
+                        } else {
+                            (l2.efer & !0x500) | if ia32e != 0 { 0x500 } else { 0 }
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_entry_load_preserves_only_the_successful_ordered_prefix() {
+        let initial = PatEfer {
+            pat: 6,
+            efer: 0xd01,
+        };
+        let entries = [
+            Entry::new(0x277, 0x606),
+            Entry::new(0xc000_0103, 99),
+            Entry::new(0x277, 0x60606),
+            Entry::new(0xc000_0080, 0x901),
+            Entry::new(u32::MAX, 0),
+        ];
+        assert_eq!(initial.failed_load(&entries, 1), Some(initial));
+        assert_eq!(initial.failed_load(&entries, 2).unwrap().pat, 0x606);
+        assert_eq!(initial.failed_load(&entries, 3).unwrap().pat, 0x606);
+        assert_eq!(initial.failed_load(&entries, 4).unwrap().pat, 0x60606);
+        assert_eq!(initial.failed_load(&entries, 5).unwrap().efer, 0xd01);
+        for qualification in [0, 6, u64::MAX] {
+            assert_eq!(initial.failed_load(&entries, qualification), None);
+        }
+        assert_eq!(initial.failed_load(&[], 1), None);
+        let bad = [Entry::new(0xc000_0100, 0), Entry::new(0x277, 0)];
+        assert_eq!(initial.failed_load(&bad, 2), None);
+        assert_eq!(initial.failed_load(&[entries[0]; 513], 1), None);
+    }
 
     #[test]
     fn empty_lists_ignore_the_address_but_not_capacity_or_cpu_width() {

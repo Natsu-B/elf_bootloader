@@ -25,6 +25,7 @@
 //! and <https://cdrdv2-public.intel.com/868136/252046-081-sdm-change-document.pdf>.
 
 use core::marker::PhantomData;
+use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
 
@@ -60,10 +61,12 @@ struct HostXstate {
     msr_fault_rip: u64,
     msr_resume_rip: u64,
     msr_faulted: u64,
+    monitor_data: usize,
 }
 const MSR_FAULT_RIP: usize = core::mem::offset_of!(HostXstate, msr_fault_rip);
 const MSR_RESUME_RIP: usize = core::mem::offset_of!(HostXstate, msr_resume_rip);
 const MSR_FAULTED: usize = core::mem::offset_of!(HostXstate, msr_faulted);
+const MONITOR_DATA: usize = core::mem::offset_of!(HostXstate, monitor_data);
 const IDT_OFFSET: usize = HOST_PAGE_BYTES;
 const IDT_GATE_BYTES: usize = 16;
 const IDT_ENTRIES: usize = 256;
@@ -370,6 +373,25 @@ impl<'storage> HostEnvironment<'storage> {
         (self.layout.base, self.layout.end)
     }
 
+    /// Binds the owning monitor's CPU-local metadata before publishing a VMCS.
+    /// The HAL does not interpret or borrow the pointed-to monitor structure.
+    ///
+    /// # Safety
+    ///
+    /// No CPU may currently use this environment. `data` must identify the
+    /// owning CPU's initialized, suitably aligned monitor object, retained and
+    /// mapped in HOST_CR3 for the entire environment lifetime. The monitor must
+    /// enforce its object's aliasing and synchronization contract when reading
+    /// the pointer; this binding does not grant concurrent mutable references.
+    pub unsafe fn bind_monitor_data(&mut self, data: NonNull<()>) {
+        let address = self.layout.base + (XSTATE_OFFSET + MONITOR_DATA) as u64;
+        // SAFETY: initialize validated this word's bounds/alignment in our
+        // exclusively borrowed storage. The caller excludes all hardware use
+        // until publication; this writes the pointer, not the opaque object.
+        unsafe { (address as *mut usize).write(data.as_ptr() as usize) };
+        compiler_fence(Ordering::Release);
+    }
+
     /// Returns four disjoint downward-growing IST ranges, in architectural order.
     #[must_use]
     pub fn exception_stack_ranges(&self) -> [(u64, u64); IST_COUNT] {
@@ -421,6 +443,29 @@ impl<'storage> HostEnvironment<'storage> {
             (vmcs::HOST_RSP, self.layout.host_stack.vmexit_rsp()),
         ]
     }
+}
+
+/// Retrieves the explicitly bound, opaque CPU-local monitor object, if any.
+///
+/// # Safety
+///
+/// This CPU must run in this module's initialized private host environment,
+/// with its own GS base installed and no CPU migration. The caller must uphold
+/// the bound object's lifetime, type and aliasing contract before dereferencing
+/// it. The pointer is not a lock guard or a mutable-reference capability.
+pub unsafe fn monitor_data() -> Option<NonNull<()>> {
+    let address: usize;
+    // SAFETY: the caller establishes the private GS base and live scratch.
+    // This reads one naturally aligned pointer word without mutating the object.
+    unsafe {
+        core::arch::asm!(
+            "mov {address}, gs:[{offset}]",
+            address = out(reg) address,
+            offset = const MONITOR_DATA,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    NonNull::new(address as *mut ())
 }
 
 /// Reads an MSR, recovering only this instruction's architectural #GP(0).
@@ -708,10 +753,10 @@ mod tests {
         let first_stack = owned_stack(&mut first_stack_bytes);
         let second_stack = owned_stack(&mut second_stack_bytes);
         // SAFETY: this table/stack pair is test-owned and no VMCS/CPU references it.
-        let first =
+        let mut first =
             unsafe { HostEnvironment::initialize(&mut first_storage.0, first_stack, 48) }.unwrap();
         // SAFETY: this distinct test-owned table/stack pair is likewise hardware-inert.
-        let second =
+        let mut second =
             unsafe { HostEnvironment::initialize(&mut second_storage.0, second_stack, 48) }
                 .unwrap();
         assert_ne!(first.storage_range(), second.storage_range());
@@ -780,7 +825,25 @@ mod tests {
                 .into_iter()
                 .all(|address| canonical(address, 48))
         );
+        let mut first_data = 1_u64;
+        let mut second_data = 2_u64;
+        let first_pointer = NonNull::from(&mut first_data).cast();
+        let second_pointer = NonNull::from(&mut second_data).cast();
+        // SAFETY: both initialized objects and environments are test-owned,
+        // distinct and stable until their final use here; no CPU loads the tables.
+        unsafe {
+            first.bind_monitor_data(first_pointer);
+            second.bind_monitor_data(second_pointer);
+        }
         // The borrow is no longer used; no hardware observes these test pages.
+        assert_eq!(
+            word(&first_storage.0[XSTATE_OFFSET + MONITOR_DATA..][..8]),
+            first_pointer.as_ptr() as usize as u64
+        );
+        assert_eq!(
+            word(&second_storage.0[XSTATE_OFFSET + MONITOR_DATA..][..8]),
+            second_pointer.as_ptr() as usize as u64
+        );
         assert!(
             first_storage.0[XSTATE_OFFSET..XSTATE_OFFSET + 512]
                 .iter()
