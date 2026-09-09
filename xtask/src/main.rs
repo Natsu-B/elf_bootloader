@@ -4144,7 +4144,10 @@ mod tests {
                 );
                 let diagnostics = "thin-hv: native L1 operand coverage pf=16 gp=8 ss=1 cross=6 priority=8 partial_stores=0\nthin-hv: native L1 original host validation PASS invalid=34 priority=2 restored=1\n";
                 let cr4_guard = "thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2\n";
-                let valid = format!("{provenance}{start}{cr4_guard}{diagnostics}{pass}{terminal}");
+                let rflags =
+                    "thin-hv: nested RFLAGS PASS succeed=64 invalid=64 valid=64 preserved=192\n";
+                let valid =
+                    format!("{provenance}{start}{rflags}{cr4_guard}{diagnostics}{pass}{terminal}");
                 if ept_types & 2 == 0 || vpid_types & 4 == 0 {
                     assert!(!check(backend, &valid));
                     continue;
@@ -4191,6 +4194,13 @@ mod tests {
                 assert!(check(backend, &valid.replace('\n', "\r\n")));
                 for invalid in [
                     valid.replace(start, ""),
+                    valid.replace(rflags, ""),
+                    valid.replace(rflags, &rflags.repeat(2)),
+                    valid.replace("RFLAGS PASS succeed=64", "RFLAGS PASS succeed=63"),
+                    valid.replace("preserved=192", "preserved=191"),
+                    valid.replace(rflags, &rflags.replace('\n', "\r\r\n")),
+                    format!("{rflags}{valid}"),
+                    format!("{}{rflags}", valid.replace(rflags, "")),
                     valid.replace(cr4_guard, ""),
                     valid.replace(cr4_guard, &cr4_guard.repeat(2)),
                     valid.replace("guard PASS probes=2", "guard PASS probes=1"),

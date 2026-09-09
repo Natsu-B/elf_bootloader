@@ -392,6 +392,45 @@ unsafe fn rejected_read(field: u64) -> (u64, u64) {
     (u64::from(carry) | (u64::from(zero) << 1), value)
 }
 
+/// Exercise every input combination of VMX's six status flags. Caller owns
+/// VMX operation and the selected VMCS (or intentionally has no current VMCS).
+unsafe fn status_flag_inputs(field: u64, status: u64, expected_value: u64) -> Result<()> {
+    const STATUS: u64 = 0x8d5; // OF, SF, ZF, AF, PF, CF; no control/privilege flags.
+    for bits in 0_u64..64 {
+        let seed = [0, 2, 4, 6, 7, 11]
+            .into_iter()
+            .enumerate()
+            .fold(0, |flags, (index, shift)| {
+                flags | (((bits >> index) & 1) << shift)
+            });
+        let mut value = SENTINEL;
+        let original: u64;
+        let observed: u64;
+        // SAFETY: the CPL0 fixture owns VMX/current-VMCS state. Only six status
+        // bits change, never IF/DF/TF/IOPL. PUSHFQ captures the instruction's
+        // result before any flag-changing instruction; original flags and RSP
+        // are restored before Rust resumes. All scratch registers are declared.
+        unsafe {
+            asm!(
+                "pushfq", "pop r9",
+                "mov r10, r9", "and r10, {clear}", "or r10, r8",
+                "push r10", "popfq",
+                "vmread rax, rcx",
+                "pushfq", "pop r11",
+                "push r9", "popfq",
+                clear = const !(STATUS as i64),
+                in("r8") seed, in("rcx") field,
+                inlateout("rax") value,
+                lateout("r9") original, lateout("r10") _, lateout("r11") observed,
+                options(preserves_flags),
+            );
+        }
+        equal("all-status-flags", observed, (original & !STATUS) | status)?;
+        equal("all-status-destination", value, expected_value)?;
+    }
+    Ok(())
+}
+
 /// Executes an unsupported/read-only VMWRITE without claiming the HAL contract.
 ///
 /// # Safety
@@ -1251,6 +1290,7 @@ unsafe fn instructions(
     l1_memory::without_current(vmxon.get() + (4 * PAGE) as u64)?;
     // SAFETY: VMXON succeeded and no VMPTRLD has executed in this session.
     unsafe {
+        status_flag_inputs(u64::from(vmcs::GUEST_RIP), 1, SENTINEL)?;
         pointer_equal("initial-pointer", u64::MAX)?;
         let (flags, value) = rejected_read(u64::from(vmcs::GUEST_RIP));
         equal("read-no-current-flags", flags, FAIL_INVALID)?;
@@ -1293,7 +1333,13 @@ unsafe fn instructions(
         success("load-first", vmx::vmptrld(first))?;
         success("write-first-rip", vmx::vmwrite(vmcs::GUEST_RIP, 0x1000))?;
         success("write-first-rsp", vmx::vmwrite(vmcs::GUEST_RSP, 0x8000))?;
+        status_flag_inputs(u64::from(vmcs::GUEST_RIP), 0, 0x1000)?;
+        status_flag_inputs(UNSUPPORTED_FIELD, 1 << 6, SENTINEL)?;
     }
+    let _ = writeln!(
+        serial,
+        "thin-hv: nested RFLAGS PASS succeed=64 invalid=64 valid=64 preserved=192"
+    );
     vmxe_cannot_clear_in_vmx()?;
     let _ = writeln!(
         serial,

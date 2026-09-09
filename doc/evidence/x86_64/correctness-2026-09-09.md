@@ -3057,5 +3057,98 @@ The existing xtask host tests exercise every mode, malformed values, explicit
 overrides and early rejection in the live runner: **38 PASS, 0 FAIL**.
 `nix develop --accept-flake-config --command cargo xtest -p xtask`,
 `/tmp/x86-windows-cpu-policy-host.log`; shell syntax, formatting and diff
-whitespace checks PASS. Actual matched one-/two-CPU reference runs are pending;
-no conclusion about Hyper-V's CPU requirements is drawn from runner tests.
+whitespace checks PASS.
+
+Actual frozen `f86c587` reference runs now complete **2 PASS, 0 FAIL**:
+one and two L1 CPUs both reach `thin-hv: windows hyperv PASS` and clean
+poweroff. They use separate disposable overlays from the same existing
+evaluation seed, `WINDOWS_MEMORY=4G`, `WINDOWS_PCI_PROFILE=firmware-default`,
+`WINDOWS_CPU=host,+vmx,-hypervisor,kvm=off`, and the original 600-second bound:
+
+```sh
+WINDOWS_SMP=1 scripts/x86_64/windows/windows-test.sh trusted-kvm-hyperv
+WINDOWS_SMP=2 scripts/x86_64/windows/windows-test.sh trusted-kvm-hyperv
+```
+
+Both commands ran in the Nix environment with distinct `WINDOWS_TEST_DIR`
+directories; `/tmp/x86-windows-cpu-reference.sh` records the exact invocation.
+`/tmp/x86-windows-cpu-reference-batch.log`,
+`/tmp/x86-windows-cpu-reference.0CwOVG`. Source/EFI hashes, both qcow2 checks
+and unchanged seed comparisons PASS. Thus one CPU alone does not prevent
+this evaluation Windows Hyper-V workload from booting under outer KVM.
+This does **not** explain the Direct failure or qualify Direct SMP/Hyper-V.
+Direct's default outer CPU string omits `kvm=off`; the project hides KVM's
+hypervisor CPUID leaves itself. No claim of a wholly identical backend or
+controlled timing comparison is made.
+
+All five required host package commands and `cargo xbuild x86` also pass at
+`f86c587`: **349 host PASS, 0 FAIL** (211 loader, 38 xtask, 31 nested, 59 HAL,
+10 guest). Formatting and diff whitespace checks PASS.
+`/tmp/x86-cpu-policy-full-host.log`.
+
+### Complete pinned Linux selftest inventory at frozen f01e1a5
+
+Every one of the existing runner's 70 named ELF tests ran on both backends.
+The wrapper only invokes `run-linux-selftest.sh` with its original per-case
+arguments, timers and strict transcript gate; upstream ELF hashes match before
+and after. No capability was enabled/hidden, no assertion weakened, and a
+SKIP remains a nonzero runner result rather than PASS.
+
+| QEMU/KVM backend | PASS | Actual FAIL | Upstream SKIP / non-PASS | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Direct / project L0 | 56 | 2 | 12 | 70 |
+| outer-KVM / reference | 60 | 0 | 10 | 70 |
+
+Direct failures are `memslot_perf_test` (process exit 142) and
+`vmx_exception_with_invalid_guest_state` (137 at the existing 600-second
+guest bound). The same original ELF tests pass on the reference backend.
+Direct-only SKIPs are `tsc_scaling_sync` (no VM TSC control capability) and
+`rseq_test` (requires at least two L1 CPUs; no physical AP ownership exists).
+The reference's existing rseq profile explicitly uses two L1 CPUs, so its
+PASS is not Direct SMP evidence.
+
+Ten SKIPs are shared: `monitor_mwait_test`, `amx_test`, `pmu_counters_test`,
+`pmu_event_filter_test`, `xen_vmcall_test`, `xen_shinfo_test`,
+`private_mem_kvm_exits_test`, `private_mem_conversions_test`,
+`aperfmperf_test`, `kvm_buslock_test`. Each records upstream exit 4 and the
+missing feature/capability. Among the actual Direct PASS cases are xcr0/CPUID,
+debug/state, all existing Hyper-V enlightenment selftests, dirty-log large-page
+splitting, NX huge pages, memslot modification, guest page-table, MMU stress,
+and maximum-vCPU creation. These test an L1 KVM API, not Windows Hyper-V boot.
+
+Exact existing-runner invocation for each backend/name:
+
+```sh
+LINUX_SELFTEST_BACKEND="$backend" LINUX_SELFTEST_NAME="$name" \
+    LINUX_SELFTEST_ELF="$pinned_elf" scripts/x86_64/run-linux-selftest.sh
+```
+
+Nix orchestration and the full name/ELF list are in
+`/tmp/x86-runtime-all-selftests.sh`; inputs are the previously pinned Linux
+7.1.5 selftests under `/tmp/thin-hv-kvm-selftests-7.1.5.MUloxc/out`.
+Logs: `/tmp/x86-runtime-all-selftests-direct-batch.log`,
+`/tmp/x86-runtime-all-selftests-reference-batch.log`;
+matrices `/tmp/x86-runtime-all-selftests-direct-vmx.RRAnYq` and
+`/tmp/x86-runtime-all-selftests-outer-kvm.OXthNJ`.
+Functional runs overlapped other finite QEMU tests (at most three host QEMUs),
+so these are not isolated performance measurements. The separate 61-case KVM
+unit matrices are still running and are not counted as completed here.
+
+### Native RFLAGS completion regression before optimization
+
+The native contract now tries all 64 combinations of CF/PF/AF/ZF/SF/OF for
+each of VMsucceed, VMfailInvalid (no current VMCS), and VMfailValid (unsupported
+field). It verifies the complete resulting PUSHFQ value and read destination,
+then restores the fixture's original flags before returning to Rust. These
+192 probes execute the project's actual L1 VMREAD interception, not merely
+KVM's L2 CPUID path. The existing strict runner requires the complete ordered
+RFLAGS marker; xtask rejects missing, duplicated, malformed and late markers.
+
+Before changing monitor completion, `cargo xtest -p x86_guest_uefi_test`,
+`cargo xtest -p xtask` give **48 host PASS, 0 FAIL**. The existing release
+`cargo xrun x86 --nested --release` remains **15 PASS, 5 FAIL / 20**, all
+**14 Direct PASS**, with the unchanged five reference differences described
+above. `/tmp/x86-rflags-contract-baseline.log`. All commands use Nix. The
+baseline monitor code is still `f86c587`; only the native fixture and gate
+changed. Its two release EFI artifacts were retained outside Git in
+`/tmp/x86-rflags-baseline-images` for a subsequent measured comparison.
