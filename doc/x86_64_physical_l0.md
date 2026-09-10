@@ -124,7 +124,24 @@ under a one-instruction permission window; INIT/SIPI delivery is acknowledged
 per target. Logical/self startup IPIs and APIC-base relocation remain unsupported.
 The strict runner retains bounded per-CPU JSON under `bin/x86_64/smp-failure.*`
 on failure. This is **not completed SMP lifecycle or performance qualification**.
-Windows SMP, reboot and power transitions remain unqualified. See the
+Ordinary Windows now also passes the **Current-mode 1/2/4/8-CPU QEMU matrix**,
+including a pinned computation on each active Windows CPU, the all-carrier
+handoff barrier, per-CPU diagnostics and final poweroff. With an already prepared
+disposable Windows test directory, use the existing runner:
+
+```sh
+nix develop --accept-flake-config --command cargo xbuild x86 --release
+nix develop --accept-flake-config --command env \
+  WINDOWS_DIRECT_MODE=smp-uefi WINDOWS_SMP=8 WINDOWS_MEMORY=4G \
+  bash scripts/x86_64/windows/windows-test.sh monitor
+```
+
+Use `WINDOWS_TEST_DIR` for each independent prepared test clone when running
+concurrently; never point it at a physical installation. The topology is one
+socket with the selected number of single-threaded cores. Desktop/console
+readiness is acknowledged through COM2 before starting the CPU probe; no drive
+letter is assumed. Ordinary Windows SMP is not Hyper-V, WSL2, reboot or S3/S4
+qualification. Hyper-V and power transitions remain unqualified. See the
 [incremental evidence](evidence/x86_64/daily-candidate-2026-09-11.md).
 
 Work started on 2026-09-07 and continued on 2026-09-08 (JST), without switching branches.

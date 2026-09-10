@@ -921,10 +921,131 @@ indicator or inventing a composed VMCS02. It is **not implemented here**.
 Its interrupt-vector translation exists for its device mediation and is not
 copied into this pass-through monitor.
 
+## Increment 12: Windows L1 CPU execution gate
+
+The Windows runner can select the existing `smp-uefi` images explicitly. Merely
+setting `WINDOWS_SMP` still cannot turn the single-CPU `physical-uefi` or research
+image into an SMP implementation. The supported test topologies are one socket,
+1/2/4/8 cores, one thread per core, with identical 4-GiB/default-q35 test settings.
+The original Windows installation is not touched: these are disposable QEMU
+snapshots and read-only copies of the test ESP, without a variable overlay.
+
+`cpu-probe.ps1` checks the actual Windows active processor count, binds a thread
+to every advertised CPU, verifies execution and a deterministic integer result,
+and restores its affinity. The strict runner additionally requires the L0
+all-CPU EBS handoff barrier, high-PCI/platform-map and nested-mode provenance,
+and a decoded stopped-VM diagnostic record for every CPU before normal poweroff.
+This is ordinary Windows L1 SMP coverage, not a Hyper-V/WSL2 result.
+
+The first automation attempt, `/tmp/x86-windows-smp-current.R4p3Z7`, reached
+the Windows desktop at 1/2/4 CPUs but did not start the long encoded command
+successfully through the Run dialog. The identical command succeeded through
+an open command console on CPU-1 (`thin-hv: windows SMP PASS cpus=1 mask=1`).
+That manual diagnostic is **not** an automated qualification PASS. All three
+old runners were terminated with status 143 after capturing each CPU's state;
+no project terminal VMX failure was recorded. Their disposable storage was
+deleted after process exit; logs/screens/JSON and immutable base images remain.
+The next run `/tmp/x86-windows-smp-console.YheB2w` exposed a second launch race:
+CPU-4's screen showed `hell -nop ...` instead of `powershell -nop ...`, because
+the initial terminal was not accepting input after the fixed three-second wait.
+Repeated launches also opened competing windows before the first probe completed.
+These three runners were stopped with status 143 and their disposable storage
+removed after diagnostics; they are not automated qualification passes.
+The shared console helper now waits for a fresh COM2 ready acknowledgement
+instead of a fixed startup delay. SMP testing first requires the short desktop
+probe, launches its CPU script once, and waits for its exact result. Keyboard
+injection also counts against the existing monotonic boot deadline rather than
+only counting the polling sleeps. No timeout was increased.
+
+The first host run `/tmp/x86-windows-smp-runner-host.log` passed **39** xtask
+tests in 28.37 seconds. The post-console-change run
+`/tmp/x86-windows-smp-console-host.log`, alongside three Windows boots, completed
+all **39** Rust tests in 30.05 seconds but the package gate **failed (124)** at
+its unchanged 30-second deadline. That attempt is not counted as a package PASS.
+
+Profiling with the bounded diagnostic command `timeout --foreground -k 5s 60s
+cargo test --target x86_64-unknown-linux-gnu -p xtask -- -Z unstable-options
+--report-time` identified 32.242 seconds in the serial combined Direct/reference
+contract matrix and 18.620 seconds in the upstream-log matrix. The independent
+Direct/reference matrices now run as separate libtest cases, each with its own
+temporary log, retaining every original positive/negative assertion. The normal
+`cargo xtest -p xtask` gate then passes **40 / 0 FAIL / 0 SKIP** in 18.73 seconds
+(`/tmp/x86-windows-smp-parallel-host.log`) while Windows QEMUs remain active.
+This is a test-scheduling improvement, not a faster monitor or a relaxed deadline.
+
+The corrected automatic run `/tmp/x86-windows-smp-handshake.EtyjwX` passes
+ordinary Direct Windows at **1, 2, 4 and 8 CPUs**, each including its exact CPU-mask
+result, complete per-CPU counter capture, high-PCI/platform/backend gates and
+normal poweroff (runner status zero). All captured CPU records contain L1 exits;
+none contains nested entries, as expected for the non-Hyper-V base.
+SMP Hyper-V results are separate below. Completed 1/2/4/8-CPU storage
+was removed after process exit; evidence and immutable images remain.
+
+`/tmp/x86-windows-smp-required-regressions.log` runs the requested package checks
+through Nix in order: `cargo xtest -p nested_vmx` (**33 PASS**),
+`cargo xtest -p x86_64_hal` (**62 PASS**), `cargo xtest -p x86_uefi_loader`
+(**360 PASS** across its existing feature-specific entries),
+`cargo xtest -p x86_guest_uefi_test` (**10 PASS**), and `cargo xtest -p xtask`
+(**40 PASS**, 17.57 seconds). Total host checks: **505 PASS / 0 FAIL / 0 SKIP**.
+`cargo xbuild x86` passes. `cargo xrun x86 --nested --release` then reports
+**15 PASS / 5 FAIL / 0 SKIP**: all **14 project Direct** cases pass, the reference
+Linux case passes, and the same five outer/reference contracts fail (`native`,
+`readonly-vmcs`, `msr`, `msr-abort-store`, `msr-abort-load`). Its exit status is 1;
+the reference failures are retained, not used to waive or mislabel Direct results.
+
+SMP Hyper-V (`/tmp/x86-windows-smp-hyperv.4O1cvg`) fails the unchanged 600-second
+gate at both **2 and 4 CPUs**. All CPUs passed the carrier handoff barrier. CPU-2's
+last screen is the Windows **Welcome** screen; CPU-4's is a real
+**DPC_WATCHDOG_VIOLATION (0x133)** bugcheck, at 15% dump progress. The CPU-2 capture
+records 3,430,723 / 3,157,910 nested entries; the CPU-4 capture records 3,369,884 /
+2,757,071 / 2,855,431 / 2,838,327. No CPU reports a nested-entry failure. These
+counters are not proof of Hyper-V service readiness or correct interrupt timing.
+
+A read-only NBD/FUSE inspection of the stopped CPU-4 disposable overlay found
+no materialized `MEMORY.DMP` or `Minidump` directory. Its pagefile begins with a
+`PAGEDU64` header. Only 128 bytes were read for structured diagnostic extraction;
+the retained JSON contains machine type `0x8664`, processor count 4, bugcheck
+`0x133`, and parameters `0 / 0x500 / 0x500 / 0xfffff802891c43b0`. No full dump or
+arbitrary memory payload was collected. Layout was checked against
+[QEMU 10.0.2's WinDumpHeader64](https://github.com/qemu/qemu/blob/v10.0.2/include/qemu/win_dump_defs.h).
+According to [Microsoft's 0x133 parameter definition](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-0x133-dpc-watchdog-violation),
+Arg1=0 identifies a single DPC/ISR exceeding its allotment, rather than cumulative
+high-IRQL residency. This narrows the symptom; it **does not identify the offending
+DPC or prove that logging, interrupts, state corruption or performance is the
+root cause**. The 8-CPU comparison also **fails**: after two automatic restarts,
+the third Direct boot reaches Preparing Automatic Repair, then a carrier EPT
+read violation at GPA `0x9f000`, GLA `0x176bb0ff000`, RIP `0xfffff80786c33e34`,
+qualification `0x181` stops L0. The logged AP bootstrap occupies the preceding
+single page at `0x9e000`; the failed address must not be assumed to be that
+bootstrap. The strict decoder rejects the repeated backend publications rather
+than attributing an old CPU allocation to the final boot. No per-CPU timeout
+counters are claimed for this run. Both the pre-repair restart cause and the
+low-memory EPT mapping require further investigation.
+
+The first standard rerun `/tmp/x86-windows-smp-standard-regressions.log` passed
+all release gates, then failed debug `runtime ownership rejection (cross-mode)`:
+the expected error triggered immediate QEMU quit while OVMF was printing a
+second attempt. The first attempt had correctly rejected the runtime and freed
+the handoff; the strict gate rejected the truncated retry. Expected pre-entry
+rejection fixtures now wait for OVMF's terminal no-bootable-option record before
+quitting. The parser still rejects incomplete attempts, unexpected faults and
+any guest execution. Ordinary Direct faults retain immediate termination; no
+deadline or negative assertion is relaxed.
+
+The corrected standard run `/tmp/x86-windows-smp-final-standard.log` passes
+`cargo xtest -p xtask` (**40**, 16.90 seconds), `cargo xrun x86 --release` and
+`cargo xrun x86`: **18 / 0 FAIL / 0 SKIP** QEMU gates per build profile
+(13 KVM, 5 TCG, including explicit reference and non-VMX fixtures). The two
+runtime rejection cases pass in both profiles without truncated firmware retries.
+`/tmp/x86-smp-console-selftest.GQyuBA/runner.log` separately passes the existing
+disposable Windows `check-physical-status` fixture through the shared console
+handshake, exact zero-hardware-query SelfTest JSON and final poweroff. This
+reference/fixture result is not Direct-VMX or physical validation.
+
 ## Qualification still required
 
 Profile boot-option return/error/reboot qualification and failure injection;
-1/2/4/8 Windows L1 CPUs and robust Linux AP hotplug/reboot;
+Windows/Linux SMP reboot and further AP lifecycle qualification;
 S3/cancellation/time/NMI; Direct Hyper-V/WSL2
 and S4; short/extended daily suite; measured Current/Unsafe A/B and default decision.
 Existing Linux test failures in `correctness-2026-09-09.md` are not waived.

@@ -4300,7 +4300,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn nested_contract_gate_requires_complete_architectural_and_cleanup_evidence() {
+    fn direct_contract_gate_requires_complete_architectural_and_cleanup_evidence() {
+        check_nested_contract_gate("direct-vmx");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_contract_gate_requires_complete_architectural_and_cleanup_evidence() {
+        check_nested_contract_gate("outer-kvm");
+    }
+
+    // Independent backends have private logs, so libtest can run their complete
+    // case matrices concurrently without sharing a writable fixture or raising
+    // the package deadline. Both still execute the actual shell runner gates.
+    #[cfg(unix)]
+    fn check_nested_contract_gate(backend: &str) {
         struct FixtureLog(std::path::PathBuf);
         impl Drop for FixtureLog {
             fn drop(&mut self) {
@@ -4332,7 +4346,7 @@ mod tests {
                 .success()
         };
         let check = |backend: &str, contents: &str| check_profile(backend, "native", contents);
-        for backend in ["direct-vmx", "outer-kvm"] {
+        {
             let (provenance, terminal) = if backend == "direct-vmx" {
                 (
                     "thin-hv: backend=direct-vmx role=project-l0\n\
@@ -5496,7 +5510,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn windows_cpu_selection_keeps_direct_single_cpu_and_allows_matched_reference() {
+    fn windows_cpu_selection_requires_explicit_smp_and_allows_matched_reference() {
         let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../scripts/x86_64/windows/windows-test.sh");
         let check = |mode: &str, requested: Option<&str>| {
@@ -5504,6 +5518,7 @@ mod tests {
             command
                 .arg(&runner)
                 .args(["print-smp", mode])
+                .env_remove("WINDOWS_DIRECT_MODE")
                 .env_remove("WINDOWS_SMP");
             if let Some(value) = requested {
                 command.env("WINDOWS_SMP", value);
@@ -5558,6 +5573,53 @@ mod tests {
         }
         assert_eq!(check("boot", Some("4")).stdout, b"4\n");
         assert!(!check("unknown", None).status.success());
+        for mode in ["monitor", "monitor-hyperv"] {
+            for cpus in ["1", "2", "4", "8", "0", "3", "16", "08"] {
+                for direct in ["physical-uefi", "smp-uefi"] {
+                    let result = Command::new("bash")
+                        .arg(&runner)
+                        .args(["print-smp", mode])
+                        .env("WINDOWS_DIRECT_MODE", direct)
+                        .env("WINDOWS_SMP", cpus)
+                        .output()
+                        .unwrap();
+                    let valid =
+                        cpus == "1" || (direct == "smp-uefi" && matches!(cpus, "2" | "4" | "8"));
+                    assert_eq!(result.status.success(), valid, "{mode} {direct} {cpus}");
+                    assert_eq!(
+                        result.stdout,
+                        if valid {
+                            format!("{cpus}\n").into_bytes()
+                        } else {
+                            vec![]
+                        }
+                    );
+                }
+            }
+        }
+        for cpus in ["1", "2", "4", "8", "0", "3", "08", "8;exit"] {
+            let result = Command::new("bash")
+                .arg(&runner)
+                .args(["cpu-test-command", cpus])
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.success(),
+                matches!(cpus, "1" | "2" | "4" | "8")
+            );
+            if result.status.success() {
+                let text = String::from_utf8(result.stdout).unwrap();
+                let encoded = text
+                    .strip_prefix("powershell -nop -ep bypass -encodedcommand ")
+                    .unwrap();
+                let result = Command::new("python3")
+                    .args(["-c", "import base64,sys; s=base64.b64decode(sys.argv[1],validate=True).decode('utf-16le'); assert 'Get-PSDrive -PSProvider FileSystem' in s; assert '$p.Count -ne 1' in s; assert 'thin-hv-cpu-probe.ps1' in s; assert s.endswith('-ExpectedProcessors '+sys.argv[2])", encoded, cpus])
+                    .status().unwrap();
+                assert!(result.success());
+            } else {
+                assert!(result.stdout.is_empty());
+            }
+        }
         // The live runner must reject unsupported overrides before compiling,
         // starting QEMU, creating a test disk or touching firmware variable files.
         for (mode, cpus) in [
@@ -5650,16 +5712,22 @@ mod tests {
             }
             command.output().expect("read-only Direct image selector")
         };
-        for mode in [None, Some(""), Some("qemu-research"), Some("physical-uefi")] {
+        for mode in [
+            None,
+            Some(""),
+            Some("qemu-research"),
+            Some("physical-uefi"),
+            Some("smp-uefi"),
+        ] {
             let result = check(mode, "print-direct-images");
             assert!(result.status.success());
             let fields: Vec<_> = result.stdout.split(|byte| *byte == 0).collect();
             assert_eq!(fields.len(), 3);
             assert!(fields[2].is_empty());
-            let prefix = if mode == Some("physical-uefi") {
-                "x86-uefi-physical-direct"
-            } else {
-                "x86-uefi"
+            let prefix = match mode {
+                Some("physical-uefi") => "x86-uefi-physical-direct",
+                Some("smp-uefi") => "x86-uefi-smp-direct",
+                _ => "x86-uefi",
             };
             for (field, suffix) in fields[..2].iter().zip(["loader.efi", "monitor.efi"]) {
                 assert!(

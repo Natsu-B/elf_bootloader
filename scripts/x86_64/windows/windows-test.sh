@@ -199,7 +199,7 @@ prepare_monitor_media() {
             die "runtime monitor not found: $monitor_image; run 'cargo xbuild x86'"
     fi
 
-    if [[ ${direct_mode:-qemu-research} == physical-uefi ]]; then
+    if [[ ${direct_mode:-qemu-research} == physical-uefi || ${direct_mode:-qemu-research} == smp-uefi ]]; then
         monitor_esp=$(mktemp -d "$work/monitor-physical-esp.XXXXXX")
         if [[ "$mode" == monitor-hyperv ]]; then
             copy_windows_test_esp "$hyperv_disk" qcow2 "$monitor_esp"
@@ -215,6 +215,10 @@ prepare_monitor_media() {
     install -m 0644 -- "$boot_loader" "$monitor_esp/EFI/BOOT/BOOTX64.EFI"
     if [[ -n "$monitor_image" ]]; then
         install -m 0644 -- "$monitor_image" "$monitor_esp/EFI/BOOT/MONITORX64.EFI"
+    fi
+    if [[ ${direct_mode:-qemu-research} == smp-uefi ]]; then
+        install -m 0644 -- "$repo_root/scripts/x86_64/windows/cpu-probe.ps1" \
+            "$monitor_esp/thin-hv-cpu-probe.ps1"
     fi
 }
 
@@ -346,10 +350,35 @@ run_dialog_command() {
     printf 'sendkey %s 20\n' "$submit_key" >&9
 }
 
+run_console_command() {
+    local offset started
+    # Encoded PowerShell commands exceed the Run dialog's command-length limit.
+    # Open cmd first; its input path preserves the complete encoded payload.
+    offset=$(stat -c %s -- "$desktop_serial_log")
+    run_dialog_command 'cmd /k echo thinhvconsoleready>com2'
+    started=$(host_uptime_seconds)
+    while ! tail -c "+$((offset + 1))" -- "$desktop_serial_log" | \
+        serial_has_exact_marker thinhvconsoleready; do
+        (($(host_uptime_seconds) - started < 30)) || die 'Windows command console handshake failed'
+        qemu_is_owned || die 'QEMU exited during command console handshake'
+        sleep 1
+    done
+    run_dialog_command "$1" ret console
+}
+
 probe_windows_desktop() {
     # ponytail: the Run dialog is the desktop-ready probe; use a guest agent
     # only if later tests need general command execution inside Windows.
     run_dialog_command "cmd /c echo $desktop_marker>com2"
+}
+
+cpu_test_command() {
+    local cpus=$1 bootstrap encoded
+    case "$cpus" in 1|2|4|8) ;; *) die 'CPU probe requires 1, 2, 4 or 8 processors' ;; esac
+    bootstrap='$p=@(Get-PSDrive -PSProvider FileSystem|ForEach-Object {Join-Path $_.Root "thin-hv-cpu-probe.ps1"}|Where-Object {Test-Path -LiteralPath $_ -PathType Leaf});if($p.Count -ne 1){exit 1};& $p[0] -ExpectedProcessors '
+    encoded=$(printf '%s%s' "$bootstrap" "$cpus" | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+    [[ "$encoded" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || die 'invalid encoded CPU probe command'
+    printf 'powershell -nop -ep bypass -encodedcommand %s' "$encoded"
 }
 
 physical_test_command() {
@@ -425,24 +454,30 @@ configure_direct_mode() {
     direct_mode=${WINDOWS_DIRECT_MODE:-qemu-research}
     case "$direct_mode" in
         qemu-research) ;;
-        physical-uefi)
+        physical-uefi|smp-uefi)
             [[ "$1" == monitor || "$1" == monitor-hyperv || "$1" == print-direct-images ]] \
-                || die 'WINDOWS_DIRECT_MODE=physical-uefi requires a Direct monitor test'
-            loader="$repo_root/bin/x86_64/x86-uefi-physical-direct-loader.efi"
-            runtime_monitor="$repo_root/bin/x86_64/x86-uefi-physical-direct-monitor.efi"
+                || die 'WINDOWS_DIRECT_MODE requires a Direct monitor test'
+            local image_kind=physical
+            [[ "$direct_mode" != smp-uefi ]] || image_kind=smp
+            loader="$repo_root/bin/x86_64/x86-uefi-$image_kind-direct-loader.efi"
+            runtime_monitor="$repo_root/bin/x86_64/x86-uefi-$image_kind-direct-monitor.efi"
             ;;
-        *) die 'WINDOWS_DIRECT_MODE must be qemu-research or physical-uefi' ;;
+        *) die 'WINDOWS_DIRECT_MODE must be qemu-research, physical-uefi or smp-uefi' ;;
     esac
 }
 
-# One-CPU Hyper-V reference is an explicit A/B control, never project SMP proof.
-# Keep WSL/S4/soak at their qualified two-CPU setting and reject ignored overrides.
+# Project SMP requires its separate handoff image, never just a larger -smp.
+# Keep WSL/S4/soak at their qualified two-CPU reference setting.
 windows_smp() {
-    local mode=$1 requested=$2 selected
+    local mode=$1 requested=$2 selected direct=${WINDOWS_DIRECT_MODE:-qemu-research}
     case "$mode" in
         monitor|monitor-hyperv)
             selected=${requested:-1}
-            [[ "$selected" == 1 ]] || return 1 ;;
+            if [[ "$direct" == smp-uefi ]]; then
+                case "$selected" in 1|2|4|8) ;; *) return 1 ;; esac
+            else
+                [[ "$selected" == 1 ]] || return 1
+            fi ;;
         hyperv|trusted-kvm-hyperv)
             selected=${requested:-2}
             [[ "$selected" == 1 || "$selected" == 2 ]] || return 1 ;;
@@ -489,6 +524,7 @@ run_windows() {
     local qemu swtpm tpm_socket tpm_pid_file monitor_fifo serial_log desktop_serial_log qemu_log
     local expected_marker marker_log media_file wsl_media_stamp=''
     local qemu_pid='' qemu_status elapsed=0 monitor_fd_open=0 setup_probe_sent=0
+    local boot_started
     local soak_probe_sent=0 soak_probe_elapsed=-1 soak_phase1_seen=0
     local soak_started_uptime=-1 soak_elapsed_seconds soak_completed_rounds soak_required_rounds
     local trusted_boot_count
@@ -567,6 +603,10 @@ run_windows() {
     if ((is_direct)); then
         printf 'Windows x86 test: Direct mode=%s environment=QEMU (not physical hardware)\n' "$direct_mode"
         printf 'Windows x86 test: stop-on-reset=%s diagnostic-only=%s\n' "$reset_diagnostic" "$reset_diagnostic"
+        if [[ "$direct_mode" == smp-uefi ]]; then
+            need_command iconv
+            need_command base64
+        fi
     fi
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
@@ -796,6 +836,9 @@ run_windows() {
         marker_log=$desktop_serial_log
     elif [[ "$mode" == monitor ]]; then
         expected_marker=$desktop_marker
+        if [[ "$direct_mode" == smp-uefi ]]; then
+            expected_marker="thin-hv: windows SMP PASS cpus=$smp mask=$(((1 << smp) - 1))"
+        fi
         marker_log=$desktop_serial_log
     else
         expected_marker=$marker
@@ -836,6 +879,7 @@ run_windows() {
         local reason=$1 resume=$2 directory screen record json_file quoted_record
         local decoder="$repo_root/scripts/x86_64/decode-vmx-diagnostics.py"
         local initial_state='' stopped=0 must_resume=0 address='' extent='' bytes='' result=1
+        local slot count=1 captured=0
 
         ((is_direct && monitor_fd_open)) && qemu_is_owned || return 1
         [[ "$reason" == failure || "$reason" == pre-success ]] || return 1
@@ -844,8 +888,7 @@ run_windows() {
         [[ "$work" != *$'\n'* && "$work" != *$'\r'* ]] || return 1
         directory=$(mktemp -d "$work/$mode-$reason-diagnostics.XXXXXX") || return 1
         screen="$directory/screen.ppm"
-        record="$directory/counters.bin"
-        json_file="$directory/counters.json"
+        [[ "$direct_mode" != smp-uefi ]] || count=$smp
         initial_state=$(direct_monitor_state) || initial_state=
         if [[ "$initial_state" == running ]]; then
             must_resume=$resume
@@ -862,27 +905,35 @@ run_windows() {
             printf 'Windows x86 test: direct diagnostics screen=%s reason=%s\n' "$screen" "$reason"
         fi
         if ((stopped)) && command -v python3 >/dev/null && [[ -f "$decoder" ]]; then
-            extent=$(python3 "$decoder" extent "$serial_log") || extent=
-            read -r address bytes <<<"$extent"
-            if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 || "$bytes" == 1344 || "$bytes" == 1408 || "$bytes" == 1472 ) ]]; then
-                quoted_record=${record//\\/\\\\}
-                quoted_record=${quoted_record//\"/\\\"}
-                # The decoder validated this unique monitor-owned publication.
-                # The VM is stopped; only the compiled ABI extents above
-                # are accepted, never an arbitrary log-supplied memory length.
-                if printf 'pmemsave %s %s "%s"\n' "$address" "$bytes" "$quoted_record" >&9 && \
-                    [[ $(direct_monitor_state) == paused || $(direct_monitor_state) == shutdown ]] && \
-                    python3 "$decoder" decode "$serial_log" "$record" >"$json_file"; then
-                    printf 'Windows x86 test: direct diagnostics counters=%s reason=%s\n' "$json_file" "$reason"
-                    cat -- "$json_file"
-                    result=0
-                else
-                    rm -f -- "$json_file"
+            for ((slot = 0; slot < count; slot++)); do
+                record="$directory/counters.bin"
+                json_file="$directory/counters.json"
+                if [[ "$direct_mode" == smp-uefi ]]; then
+                    record="$directory/cpu-$slot.bin"
+                    json_file="$directory/cpu-$slot.json"
                 fi
-            fi
+                extent=$(python3 "$decoder" --cpu "$slot" extent "$serial_log") || extent=
+                read -r address bytes <<<"$extent"
+                if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 || "$bytes" == 1344 || "$bytes" == 1408 || "$bytes" == 1472 ) ]]; then
+                    quoted_record=${record//\\/\\\\}
+                    quoted_record=${quoted_record//\"/\\\"}
+                    # The decoder validated this CPU's unique owned publication.
+                    # All CPUs are stopped; only compiled ABI extents are accepted.
+                    if printf 'pmemsave %s %s "%s"\n' "$address" "$bytes" "$quoted_record" >&9 && \
+                        [[ $(direct_monitor_state) == paused || $(direct_monitor_state) == shutdown ]] && \
+                        python3 "$decoder" --cpu "$slot" decode "$serial_log" "$record" >"$json_file"; then
+                        printf 'Windows x86 test: direct diagnostics counters=%s reason=%s\n' "$json_file" "$reason"
+                        cat -- "$json_file"
+                        ((captured += 1))
+                    else
+                        rm -f -- "$json_file"
+                    fi
+                fi
+                # Keep only validated bounded JSON, never raw counter dumps.
+                rm -f -- "$record"
+            done
+            ((captured == count)) && result=0
         fi
-        # Keep only validated bounded JSON and the requested screen, not a dump.
-        rm -f -- "$record"
         if ((must_resume)); then
             if ! printf 'cont\n' >&9 || [[ $(direct_monitor_state) != running ]]; then
                 printf 'Windows x86 test: direct diagnostics could not resume QEMU\n' >&2
@@ -953,7 +1004,7 @@ run_windows() {
         "${pci_args[@]}" \
         "${reset_args[@]}" \
         -cpu "$cpu" \
-        -smp "$smp" \
+        -smp "cpus=$smp,sockets=1,cores=$smp,threads=1" \
         -m "$memory" \
         -nodefaults \
         -display none \
@@ -979,6 +1030,7 @@ run_windows() {
         "${media_args[@]}" \
         <"$monitor_fifo" >"$qemu_log" 2>&1 &
     qemu_pid=$!
+    boot_started=$(host_uptime_seconds)
     ((is_physical_test)) && physical_started=$(host_uptime_seconds)
     printf 'Windows x86 test: %s running as PID %s; VNC %s\n' \
         "$mode" "$qemu_pid" "${WINDOWS_VNC:-127.0.0.1:1}"
@@ -990,7 +1042,11 @@ run_windows() {
         done
     fi
 
-    while ((elapsed < timeout_seconds)); do
+    # Keyboard injection also consumes the boot deadline, not only sleep 2.
+    while ((elapsed < timeout_seconds && $(host_uptime_seconds) - boot_started < timeout_seconds)); do
+        if serial_has_exact_marker 'thin-hv: windows SMP FAIL' "$marker_log"; then
+            die 'Windows per-CPU execution probe failed'
+        fi
         if ((is_direct)); then
             if ((reset_diagnostic)) && [[ $(direct_monitor_state) == shutdown ]]; then
                 die "diagnostic first reset/shutdown captured; not a qualification PASS"
@@ -1000,6 +1056,13 @@ run_windows() {
             else
                 (($? == 1)) || die "cannot read Direct-VMX failure log: $serial_log"
             fi
+        fi
+        if [[ "$mode" == monitor && "$direct_mode" == smp-uefi ]] && \
+            ((setup_probe_sent == 0)) && serial_has_exact_marker "$desktop_marker" "$marker_log"; then
+            # Wait for the desktop and command console, then start exactly once.
+            # Repeated launches can steal focus or contend for COM2 mid-probe.
+            run_console_command "$(cpu_test_command "$smp")"
+            setup_probe_sent=1
         fi
         if ((is_physical_test)); then
             (($(host_uptime_seconds) - physical_started < timeout_seconds)) || break
@@ -1012,12 +1075,7 @@ run_windows() {
                     physical_desktop_probe_sent=1
                 elif serial_has_exact_marker "$desktop_marker" "$marker_log"; then
                     physical_probe_started=$(host_uptime_seconds)
-                    # A previous screenshot showed only the desktop, not a
-                    # parser error. Keep a console open to expose the failing
-                    # launch phase without changing the encoded test command.
-                    run_dialog_command cmd
-                    sleep 3
-                    run_dialog_command "$(physical_test_command)" ret console
+                    run_console_command "$(physical_test_command)"
                     sleep 3
                     capture_physical_test_screen "$work/check-physical-status-command.ppm"
                 fi
@@ -1026,6 +1084,8 @@ run_windows() {
                     die 'physical-status self-test did not complete within 180 seconds'
             fi
         fi
+        # Console startup/input can span the deadline within this iteration.
+        (($(host_uptime_seconds) - boot_started < timeout_seconds)) || break
         marker_seen=0
         if ((is_daily_soak && wsl_ready_matches == 1)); then
             if ((soak_probe_sent)) && \
@@ -1122,7 +1182,7 @@ run_windows() {
         fi
         sleep 2
         elapsed=$((elapsed + 2))
-        if [[ "$mode" == monitor ]] && ((elapsed >= 150 && elapsed % 30 == 0)); then
+        if [[ "$mode" == monitor ]] && ((setup_probe_sent == 0 && elapsed >= 150 && elapsed % 30 == 0)); then
             probe_windows_desktop
         fi
         if [[ "$mode" == hyperv ]] && ((elapsed >= 150 && !setup_probe_sent)); then
@@ -1145,7 +1205,8 @@ run_windows() {
             soak_probe_elapsed=$elapsed
         fi
         if ((elapsed % 30 == 0)); then
-            printf 'Windows x86 test: waiting for marker (%ss/%ss)\n' "$elapsed" "$timeout_seconds"
+            printf 'Windows x86 test: waiting for marker (%ss/%ss)\n' \
+                "$(($(host_uptime_seconds) - boot_started))" "$timeout_seconds"
         fi
     done
     ((marker_seen)) || \
@@ -1187,7 +1248,11 @@ run_windows() {
         local high_pci_required=0
         [[ "$pci_profile" != firmware-default ]] || high_pci_required=1
         bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
-            --check-direct-platform-log "$high_pci_required" "$serial_log" || die 'Direct platform/high-PCI map evidence failed'
+            --check-direct-platform-log "$high_pci_required" "$serial_log" "$smp" || die 'Direct platform/high-PCI map evidence failed'
+        if [[ "$direct_mode" == smp-uefi ]]; then
+            serial_has_exact_marker "thin-hv: firmware handoff PASS exit_boot_services=success cpus=$smp ap_takeover=$((smp - 1))" "$serial_log" || \
+                die 'all-CPU carrier handoff barrier evidence missing'
+        fi
         grep -Fq -- 'thin-hv: runtime monitor active' "$serial_log" || \
             die "monitor marker missing from $serial_log"
         [[ $(direct_monitor_state) == running ]] || die 'QEMU is not running before direct success validation'
@@ -1195,7 +1260,8 @@ run_windows() {
             :
         else
             local diagnostics_status=$?
-            ((diagnostics_status != 2)) || die 'QEMU was not running or did not resume during direct diagnostics capture'
+            [[ "$direct_mode" != smp-uefi && "$diagnostics_status" != 2 ]] || \
+                die 'Direct per-CPU diagnostics missing or QEMU not running after capture'
         fi
     elif ((is_trusted)); then
         if ((wsl_monitor_offset >= 0)); then
@@ -1360,8 +1426,8 @@ usage() {
     printf 'usage: %s download|verify|download-wsl|verify-wsl|check-wsl-soak|install|boot|monitor|hyperv|wsl|wsl-s4|monitor-hyperv|trusted-kvm-hyperv|trusted-kvm-wsl|trusted-kvm-wsl-soak|trusted-kvm-s4\n' "$0"
     printf '       %s check-physical-status (disposable QEMU eval SelfTest only)\n' "$0"
     printf '       WINDOWS_PCI_PROFILE=firmware-default (default) or q35-smoke-1g (explicit QEMU A/B fixture)\n'
-    printf '       WINDOWS_DIRECT_MODE=qemu-research (default) or physical-uefi (no-overlay same-ESP QEMU fixture)\n'
-    printf '       WINDOWS_SMP=1 or 2 for Hyper-V reference A/B; Direct requires 1, WSL/S4/soak requires 2\n'
+    printf '       WINDOWS_DIRECT_MODE=qemu-research (default), physical-uefi, or smp-uefi (no-overlay same-ESP QEMU fixtures)\n'
+    printf '       WINDOWS_SMP=1/2/4/8 for explicit smp-uefi; other Direct requires 1, Hyper-V reference 1/2, WSL/S4/soak 2\n'
     printf '       WINDOWS_STOP_ON_RESET=1 freezes the first Direct reset/shutdown for diagnostics, never qualification PASS\n'
 }
 
@@ -1373,6 +1439,10 @@ case ${1:-} in
     check-wsl-soak) check_wsl_soak ;;
     check-physical-status) run_windows check-physical-status ;;
     physical-test-command) physical_test_command ;;
+    cpu-test-command)
+        (($# == 2)) || die 'cpu-test-command requires CPU_COUNT'
+        cpu_test_command "$2"
+        ;;
     check-direct-failure)
         (($# == 1 || $# == 2)) || die 'check-direct-failure takes an optional LOG'
         shift

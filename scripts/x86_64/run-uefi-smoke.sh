@@ -890,8 +890,8 @@ if [[ ${1:-} == --check-cpu-inventory-log ]]; then
     exit 0
 fi
 if [[ ${1:-} == --check-direct-platform-log ]]; then
-    [[ $# == 3 ]] || die 'usage: --check-direct-platform-log HIGH_PCI LOG'
-    check_direct_platform_log "$3" "$2" || die 'Direct platform EPT evidence rejected'
+    [[ $# == 3 || $# == 4 ]] || die 'usage: --check-direct-platform-log HIGH_PCI LOG [CPUS]'
+    check_direct_platform_log "$3" "$2" "${4:-1}" || die 'Direct platform EPT evidence rejected'
     exit 0
 fi
 if [[ ${1:-} == --check-direct-mode-log ]]; then
@@ -1386,7 +1386,14 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
         break
     fi
     if [[ "$backend" == direct-vmx ]] && ((!host_exception_test && !msr_abort_test)) &&
-        grep -Eq -- "$direct_failure_pattern" "$serial_log"; then
+        grep -Eq -- "$direct_failure_pattern" "$serial_log" &&
+        { [[ "$runtime_reject_test" == 0 && "$cpu_reject_test" == 0 ]] ||
+          grep -aFx -e 'BdsDxe: No bootable option or device was found.' \
+              -e $'BdsDxe: No bootable option or device was found.\r' "$serial_log" >/dev/null; }; then
+        # Expected pre-entry rejection returns to OVMF, which can retry the
+        # loader through another Boot####. Wait for BDS to finish those attempts
+        # so quit cannot truncate a retry. The strict rejection parser below
+        # still rejects partial attempts, guest execution and unexpected faults.
         capture_smp_failure || true
         printf 'quit\n' >&9
         break
