@@ -1274,7 +1274,20 @@ fn vmxe_cannot_clear_in_vmx() -> Result<()> {
         )?;
         equal("cr4-vmxe-guard-vector", fault.vector, 13)?;
         equal("cr4-vmxe-guard-error", fault.error, 0)?;
-        equal("cr4-vmxe-guard-preserves-state", observed, original)
+        equal("cr4-vmxe-guard-preserves-state", observed, original)?;
+        let cr0 = cpu::read_cr0();
+        for bit in [0, 5, 31] {
+            let fault = l1_xstate::probe_cr0(cr0 & !(1 << bit));
+            let observed = cpu::read_cr0();
+            // SAFETY: exact original firmware CR0 is valid in L1 VMX root.
+            // Restore NE even if a broken implementation accepted its change;
+            // the other operands cannot change paging in this long-mode test.
+            unsafe { cpu::write_cr0(cr0) };
+            equal("cr0-vmx-guard-vector", fault.vector, 13)?;
+            equal("cr0-vmx-guard-error", fault.error, 0)?;
+            equal("cr0-vmx-guard-preserves", observed, cr0)?;
+        }
+        Ok(())
     })
 }
 
@@ -1343,7 +1356,7 @@ unsafe fn instructions(
     vmxe_cannot_clear_in_vmx()?;
     let _ = writeln!(
         serial,
-        "thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2"
+        "thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2 cr0_gp=6"
     );
     let partial_stores = l1_memory::in_vmx(vmxon.get() + (4 * PAGE) as u64, serial)?;
     // SAFETY: first is current, second was cleared and has not been loaded.
@@ -1634,7 +1647,7 @@ pub extern "efiapi" fn efi_main(_image: efi::Handle, table: *mut efi::SystemTabl
     match run(table, &mut serial) {
         Ok(capabilities) => {
             if writeln!(serial,
-                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds={}",
+                "thin-hv: nested contract PASS vmcs=2 cycles={CYCLES} vmfail_invalid=9 vmfail_valid={} invept={} invvpid={} readonly={} wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow={} invept_types={} invvpid_types={} invalidation_success={} descriptor_failures={} cr0_moves=4 cr0_gp=4 osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku={} ospke_toggles={} operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds={}",
                 capabilities.valid_failures(), u8::from(capabilities.invept),
                 u8::from(capabilities.invvpid), u8::from(capabilities.readonly),
                 u8::from(capabilities.shadow), capabilities.invept_types,

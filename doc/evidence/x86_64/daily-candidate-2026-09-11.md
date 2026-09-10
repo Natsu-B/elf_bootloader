@@ -487,6 +487,82 @@ before completing their 64 L2 lifecycle cycles. Overall this invocation has
 package host coverage is **436 PASS / 0 FAIL / 0 SKIP** (287 loader, 39 xtask,
 32 nested_vmx, 59 HAL, 10 guest, 9 overlay). No Windows/S3/SMP readiness is inferred.
 
+## Increment 8: unrestricted carrier and architectural CR0 ownership
+
+The active carrier previously had no CR0 mask and did not enable unrestricted
+guest. An AP needs visible CR0.NE=0 while VMX requires the hardware bit to remain
+set. `vmx_smoke::configure_and_launch` now requires hardware EPT/unrestricted-guest
+support and shadows NE. This changes the carrier, not L1's advertised nested
+capabilities or the direct L1 hardware VMCS/EPTP model. Unsupported additional
+fixed-bit requirements fail before VMXON; there is no q35 or outer fallback.
+
+`l1_visible_cr0` uses the guest/mask/shadow composition, including for VMXON
+validation. `handle_l1_cr0_write` uses HAL `control_state::cr0_write` to validate
+the complete write before changing fields: hardwired ET, ignored low reserved
+bits, high reserved bits, NW/CD, PE/PG, long-mode/PAE/PCIDE and CET/WP dependencies.
+Invalid writes inject #GP(0) at the unchanged RIP. Valid mode changes update EFER
+LMA and the carrier IA-32e entry control together. Legacy PAE reloads first capture
+and check all four PDPTEs, including physical-width/reserved-bit rules, then publish
+them; no incomplete PDPTE set is used. The HAL exports their four VMCS encodings.
+
+`handle_l1_vmxon/vmxoff` additionally mask required PE/PG only during L1's VMX-root
+lifetime. Unrestricted execution must not relax L1's own VMX fixed-bit contract.
+Ordinary writes that do not change shadowed bits still execute in hardware;
+no EPT walk or new device interception was introduced. The carrier remains VPID
+untagged, so VM entry provides the needed linear-translation invalidation.
+
+The existing native L1 XSTATE fixture now toggles NE four times across CPUID exits
+and recovers from four invalid MOV-to-CR0 instructions. Its existing VMX-root
+CR4 guard also verifies six CR0 faults (PE/NE/PG, with and without a current nested
+VMCS). The strict runner and xtask fixture require these counts. These execute
+the project carrier interception, not just KVM L2 emulation. Pure HAL tests cover
+reset/long-mode transitions and legacy PAE reload/boundaries; they do not constitute
+a hardware AP startup or legacy-PAE execution test.
+
+Recorded commands (all logs outside Git):
+
+```sh
+# /tmp/x86-carrier-cr0-host-first.log
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p x86_64_hal; cargo xtest -p nested_vmx; cargo xtest -p x86_uefi_loader'
+# /tmp/x86-carrier-cr0-native-regression.log
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p x86_guest_uefi_test; cargo xtest -p xtask; cargo xbuild x86; cargo xrun x86 --nested --release'
+# /tmp/x86-carrier-cr0-boot-regression.log
+nix develop --accept-flake-config --command bash -c 'set -e; cargo xrun x86 --release; cargo xrun x86 --profile-direct --release; cargo fmt --check; git diff --check'
+# /tmp/x86-carrier-cr0-vmx-guard-regression.log (includes the final VMX-root guard)
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p x86_uefi_loader; cargo xtest -p x86_guest_uefi_test; cargo xtest -p xtask; cargo xbuild x86; cargo xrun x86 --nested --release'
+```
+
+First host run: **380 PASS / 0 FAIL / 0 SKIP** (HAL 61, nested 32, loader 287).
+First native run: **49 host PASS** (guest 10, xtask 39), debug xbuild PASS;
+nested release **15 PASS / 5 FAIL / 0 SKIP**, all 14 Direct cases passing.
+The first boot run passes all 18 standard and six profile Direct cases.
+The final VMX-root-guard run passes **336 host tests**, debug xbuild, and again
+all 14 Direct nested cases. Both nested invocations exit 1 for the same five
+known outer contract failures; outer Linux passes and remains reference-only.
+The six Direct Linux configurations each complete 64 KVM lifecycle cycles,
+including physical-mode default q35 at 2 and 12 GiB and the post-EBS handoff.
+No Windows, S3, real AP/SMP or physical-hardware result is inferred.
+
+The final review also keeps the initial shadow equal to **original firmware CR0**,
+not L0's normalized hardware CR0. The frozen final invocation records this exact
+source in `/tmp/x86-carrier-cr0-original-state-regression.log`:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p x86_uefi_loader; cargo xbuild x86; cargo xrun x86 --release; cargo xrun x86 --profile-direct --release; cargo fmt --check; git diff --check; cargo xrun x86 --nested --release'
+```
+
+**287 loader PASS**, debug build PASS, standard **18 PASS**, profile Direct
+**6 PASS**, nested **15 PASS / 5 FAIL / 0 SKIP**, with the same five outer failures.
+All **14 Direct nested** cases pass. The preceding
+`/tmp/x86-carrier-cr0-final-regression.log` additionally repeats HAL **61 PASS**,
+nested_vmx **32 PASS**, standard **18 PASS** and profile Direct **6 PASS** using
+`cargo xtest -p x86_64_hal; cargo xtest -p nested_vmx; cargo xrun x86 --release;
+cargo xrun x86 --profile-direct --release; cargo fmt --check; git diff --check`
+inside the same `nix develop ... --command bash -c 'set -e; ...'` environment.
+Latest combined package coverage: **438 PASS / 0 FAIL / 0 SKIP** (including the
+unchanged nine overlay tests). No AArch64 production path, dependency, physical
+device state or firmware identity was changed.
+
 ## Qualification still required
 
 Profile boot-option return/error/reboot qualification and failure injection;

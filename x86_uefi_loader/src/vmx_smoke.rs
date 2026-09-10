@@ -67,6 +67,7 @@ use x86_64_hal::addr::EptPhys;
 use x86_64_hal::addr::HostPhys;
 use x86_64_hal::addr::VmcsPhys;
 use x86_64_hal::addr::VmxonPhys;
+use x86_64_hal::control_state;
 use x86_64_hal::cpu;
 use x86_64_hal::ept;
 use x86_64_hal::host_state;
@@ -1587,9 +1588,12 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
     // SAFETY: the primary control MSR advertises secondary controls, which
     // establishes the secondary capability MSR's presence on this CPU.
     let secondary_capability = unsafe { cpu::rdmsr(vmx::IA32_VMX_PROCBASED_CTLS2) };
-    if (secondary_capability >> 32) as u32 & vmcs::SECONDARY_EXEC_ENABLE_EPT == 0 {
+    if (secondary_capability >> 32) as u32
+        & (vmcs::SECONDARY_EXEC_ENABLE_EPT | vmcs::SECONDARY_EXEC_UNRESTRICTED_GUEST)
+        != vmcs::SECONDARY_EXEC_ENABLE_EPT | vmcs::SECONDARY_EXEC_UNRESTRICTED_GUEST
+    {
         return Err(Error::Capability(
-            "EPT execution control",
+            "EPT/unrestricted carrier execution controls",
             secondary_capability,
         ));
     }
@@ -1770,6 +1774,14 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
         )
     };
     let fixed_cr0 = (original_cr0 | cr0_fixed0) & cr0_fixed1;
+    // PE/PG are relaxed by unrestricted guest, ET is architecturally fixed,
+    // and NE is shadowed. Do not silently omit any other hardware-required bit.
+    if cr0_fixed0 & !(1 | (1 << 4) | control_state::CR0_NE | (1 << 31)) != 0 {
+        return Err(Error::Capability(
+            "carrier CR0 fixed-bit policy",
+            cr0_fixed0,
+        ));
+    }
     let fixed_cr4 = (original_cr4 | (1 << 13) | cr4_fixed0) & cr4_fixed1;
     if cpu::cpuid(1, 0).ecx & (1 << 26) == 0 {
         return Err(Error::Capability("XSAVE", 0));
@@ -1826,6 +1838,7 @@ fn run_direct_monitor(handoff: &ResidentHandoff, serial: &mut SerialPort) -> Res
         maps.eptp,
         block + MSR_BITMAP_PAGE * PAGE_SIZE,
         fixed_cr0,
+        original_cr0,
         fixed_cr4,
         original_cr4,
         host_cr4,
@@ -2254,6 +2267,7 @@ fn configure_and_launch(
     ept_pointer: u64,
     msr_bitmap: u64,
     host_cr0: u64,
+    guest_cr0_shadow: u64,
     guest_cr4_hardware: u64,
     guest_cr4_shadow: u64,
     host_cr4: u64,
@@ -2301,6 +2315,7 @@ fn configure_and_launch(
     );
     let secondary = vmx::adjust_controls(
         vmcs::SECONDARY_EXEC_ENABLE_EPT
+            | vmcs::SECONDARY_EXEC_UNRESTRICTED_GUEST
             | vmcs::SECONDARY_EXEC_ENABLE_RDTSCP
             | vmcs::SECONDARY_EXEC_ENABLE_INVPCID
             | vmcs::SECONDARY_EXEC_ENABLE_XSAVES
@@ -2346,6 +2361,7 @@ fn configure_and_launch(
     if primary & vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS == 0
         || primary & vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_EPT == 0
+        || secondary & vmcs::SECONDARY_EXEC_UNRESTRICTED_GUEST == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_RDTSCP == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_INVPCID == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_XSAVES == 0
@@ -2379,9 +2395,9 @@ fn configure_and_launch(
         (vmcs::VM_EXIT_MSR_LOAD_COUNT, 0),
         (vmcs::VM_ENTRY_MSR_LOAD_COUNT, 0),
         (vmcs::VM_ENTRY_INTR_INFO_FIELD, 0),
-        (vmcs::CR0_GUEST_HOST_MASK, 0),
+        (vmcs::CR0_GUEST_HOST_MASK, control_state::CR0_NE),
         (vmcs::CR4_GUEST_HOST_MASK, CR4_VMX_ENABLE),
-        (vmcs::CR0_READ_SHADOW, host_cr0),
+        (vmcs::CR0_READ_SHADOW, guest_cr0_shadow),
         (vmcs::CR4_READ_SHADOW, guest_cr4_shadow),
         (vmcs::MSR_BITMAP, msr_bitmap),
         (vmcs::EPT_POINTER, ept_pointer),
@@ -3104,6 +3120,14 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
 
     if reason & (1 << 31) == 0
         && reason & 0xffff == EXIT_REASON_CR_ACCESS
+        && qualification & 0x3f == 0
+    {
+        handle_l1_cr0_write(reason, qualification, guest_rip, instruction_len, registers);
+        return VMEXIT_ACTION_RESUME;
+    }
+
+    if reason & (1 << 31) == 0
+        && reason & 0xffff == EXIT_REASON_CR_ACCESS
         && qualification & 0x3f == 4
     {
         let register = ((qualification >> 8) & 0xf) as u8;
@@ -3386,9 +3410,7 @@ fn handle_l1_vmxon(
         );
         return;
     }
-    // SAFETY: this VM-exit path stays at CPL0 in VMX root on the owner CPU;
-    // private GS and the current resident VMCS remain live during the access.
-    let cr0 = unsafe { vmcs_read(vmcs::GUEST_CR0) }.unwrap_or(0);
+    let cr0 = l1_visible_cr0().unwrap_or(0);
     if !vmx_control_registers_valid(cr0, cr4_shadow) {
         inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
         return;
@@ -3418,6 +3440,27 @@ fn handle_l1_vmxon(
             {
                 stop_unexpected_exit(
                     b"acquiring CPU VPID namespace failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+            // Unrestricted guest relaxations apply only outside L1 VMX root.
+            // Capture the currently visible bits before masking PE/PG as well.
+            let mask =
+                control_state::CR0_NE | (current_cpu().host_limits.cr0_fixed0 & ((1 << 31) | 1));
+            // SAFETY: the owned carrier remains current after materializing the
+            // inactive direct VMCS. VMXON's CR0 checks already accepted this full
+            // visible value. Publish shadow before mask; no guest runs between.
+            if unsafe { vmcs_write(vmcs::CR0_READ_SHADOW, cr0) } != VmxStatus::Success
+                // SAFETY: same stopped carrier; these additional bits enforce
+                // L1's VMX-root fixed-bit contract, not an extra L2 control.
+                || unsafe { vmcs_write(vmcs::CR0_GUEST_HOST_MASK, mask) } != VmxStatus::Success
+            {
+                stop_unexpected_exit(
+                    b"enforcing L1 VMX CR0 mask failed",
                     reason,
                     qualification,
                     guest_rip,
@@ -3480,6 +3523,20 @@ fn handle_l1_vmxoff(
     if !released {
         stop_unexpected_exit(
             b"releasing CPU VPID namespace failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    }
+    // SAFETY: the carrier is current and no guest runs while its namespace is
+    // released. PE/PG were fixed to one throughout L1 VMX operation; unmasking
+    // them restores native unrestricted execution without changing their value.
+    if unsafe { vmcs_write(vmcs::CR0_GUEST_HOST_MASK, control_state::CR0_NE) } != VmxStatus::Success
+    {
+        stop_unexpected_exit(
+            b"releasing L1 VMX CR0 mask failed",
             reason,
             qualification,
             guest_rip,
@@ -6166,6 +6223,134 @@ fn set_guest_gpr(registers: &mut GuestRegisters, index: u8, value: u64) -> bool 
         _ => return false,
     }
     true
+}
+
+/// Reads L1's architectural CR0, excluding VMX's private hardware NE bit.
+fn l1_visible_cr0() -> Option<u64> {
+    // SAFETY: the owning CPU is stopped in its current carrier exit handler.
+    // NE in hardware belongs to VMX, not to the L1-visible register value.
+    unsafe {
+        Some(xstate::visible_cr(
+            vmcs_read(vmcs::GUEST_CR0).ok()?,
+            vmcs_read(vmcs::CR0_GUEST_HOST_MASK).ok()?,
+            vmcs_read(vmcs::CR0_READ_SHADOW).ok()?,
+        ))
+    }
+}
+
+/// MOV-to-CR0 shadows NE, plus VMX-required PE/PG while L1 is in VMX operation.
+/// CLTS/LMSW cannot clear these bits. Other valid CR0 writes remain native.
+fn handle_l1_cr0_write(
+    reason: u64,
+    qualification: u64,
+    guest_rip: u64,
+    instruction_len: u64,
+    registers: &GuestRegisters,
+) {
+    let source = guest_gpr(registers, ((qualification >> 8) & 15) as u8);
+    // SAFETY: the carrier belongs to this root CPU; capture stopped architectural
+    // state before any write. No L1/L2 MSR list or private host state is changed.
+    let snapshot = unsafe {
+        (|| {
+            Some((
+                l1_visible_cr0()?,
+                l1_visible_cr4()?,
+                vmcs_read(vmcs::GUEST_IA32_EFER).ok()?,
+                vmcs_read(vmcs::GUEST_CS_AR_BYTES).ok()? & (1 << 13) != 0,
+                vmcs_read(vmcs::VM_ENTRY_CONTROLS).ok()?,
+                vmcs_read(vmcs::GUEST_CR3).ok()?,
+            ))
+        })()
+    };
+    let (Some(source), Some((old, cr4, efer, cs_long, entry, cr3))) = (source, snapshot) else {
+        stop_unexpected_exit(
+            b"reading virtual CR0 state failed",
+            reason,
+            qualification,
+            guest_rip,
+            instruction_len,
+            registers,
+        );
+    };
+    let limits = &current_cpu().host_limits;
+    let vmx_fixed = current_cpu()
+        .vcpu
+        .lock()
+        .in_vmx_operation()
+        .then_some((limits.cr0_fixed0, limits.cr0_fixed1));
+    let Some(update) = control_state::cr0_write(old, source, cr4, efer, cs_long, vmx_fixed) else {
+        inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+        return;
+    };
+    let mut pdpt = [0; 4];
+    if update.load_pdpt {
+        let valid = with_cpu_runtime(|state| {
+            for (index, slot) in pdpt.iter_mut().enumerate() {
+                let address = control_state::pae_pdpt_base(cr3) + index as u64 * 8;
+                let Some(value) = state.paging_word(address, 0) else {
+                    return false;
+                };
+                if !control_state::valid_pae_pdpte(value, state.ram.physical_width().bits()) {
+                    return false;
+                }
+                *slot = value;
+            }
+            true
+        }) == Some(true);
+        if !valid {
+            inject_general_protection(reason, qualification, guest_rip, instruction_len, registers);
+            return;
+        }
+        for (field, value) in [
+            vmcs::GUEST_PDPTE0,
+            vmcs::GUEST_PDPTE1,
+            vmcs::GUEST_PDPTE2,
+            vmcs::GUEST_PDPTE3,
+        ]
+        .into_iter()
+        .zip(pdpt)
+        {
+            // SAFETY: all four PDPTEs were captured and checked before the first
+            // write. Failure now is an L0 VMCS invariant, not a guest pointer fault.
+            if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
+                stop_unexpected_exit(
+                    b"writing carrier PDPTE failed",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+        }
+    }
+    let entry = (entry & !u64::from(vmcs::VM_ENTRY_IA32E_MODE))
+        | if update.efer & (1 << 10) != 0 {
+            u64::from(vmcs::VM_ENTRY_IA32E_MODE)
+        } else {
+            0
+        };
+    for (field, value) in [
+        (vmcs::GUEST_CR0, update.visible | control_state::CR0_NE),
+        (vmcs::CR0_READ_SHADOW, update.visible),
+        (vmcs::GUEST_IA32_EFER, update.efer),
+        (vmcs::VM_ENTRY_CONTROLS, entry),
+    ] {
+        // SAFETY: the complete transition, including optional PDPTEs, is valid
+        // for the owned unrestricted carrier. Its VPID is disabled, so VM entry
+        // also invalidates the prior linear translations, including globals.
+        if unsafe { vmcs_write(field, value) } != VmxStatus::Success {
+            stop_unexpected_exit(
+                b"writing virtual CR0 state failed",
+                reason,
+                qualification,
+                guest_rip,
+                instruction_len,
+                registers,
+            );
+        }
+    }
+    advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
 }
 
 /// Reads L1's architectural CR4, including bits L0 masks through a read shadow.

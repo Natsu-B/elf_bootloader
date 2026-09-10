@@ -250,7 +250,7 @@ check_runtime_reject_log() {
 check_nested_contract_log() {
     local backend=$1 cpu_profile=$2 log=$3 line transcript bytes phase=0 backends=0 private=0 clobber=0 window=0 cr4_guard=0 rflags=0 expected_backends
     local valid invept invvpid readonly shadow ept_types vpid_types success descriptors pku ospke_toggles bit expected_success expected_descriptors LC_ALL=C
-    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04]) operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds=[04]$'
+    local pass_pattern='^thin-hv: nested contract PASS vmcs=2 cycles=8 vmfail_invalid=9 vmfail_valid=(1[3-9]|2[0-6]) invept=([01]) invvpid=([01]) readonly=([01]) wide_fields=2 misaligned=2 revision=3 entry_failures=3 no_current=7 shadow=([01]) invept_types=([0-3]) invvpid_types=([0-9]|1[0-5]) invalidation_success=([0-6]) descriptor_failures=([0-9]) cr0_moves=4 cr0_gp=4 osxsave_toggles=4 xsetbv_valid=4 xsetbv_gp=4 xsetbv_ud=1 pku=([01]) ospke_toggles=([04]) operand_pf=16 operand_gp=8 operand_ss=1 operand_cross=6 operand_priority=8 host_invalid=34 host_priority=2 host_restore=1 msr_invalid=12 msr_priority=12 msr_ignored=3 control_invalid=5 control_priority=5 control_ignored=1 guest_msr_shadow=2 fx_cpuid=6 fx_xsetbv=12 fx_entry=79 fx_irq=3 ymm_rounds=[04]$'
     case "$backend" in direct-vmx) expected_backends=2 ;; outer-kvm) expected_backends=1 ;; *) return 1 ;; esac
     case "$cpu_profile" in native|readonly-vmcs) ;; host-xstate) [[ "$backend" == direct-vmx ]] || return 1 ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -299,7 +299,7 @@ check_nested_contract_log() {
                 ((phase == 1 && rflags == 0 && cr4_guard == 0)) || return 1
                 rflags=1
                 ;;
-            'thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2')
+            'thin-hv: nested CR4 VMXE guard PASS probes=2 state_preserved=2 cr0_gp=6')
                 ((phase == 1 && cr4_guard == 0 && rflags == 1)) || return 1
                 cr4_guard=1
                 ;;

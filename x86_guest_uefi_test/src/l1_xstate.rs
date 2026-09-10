@@ -1,12 +1,13 @@
 //! Direct L1 XSAVE/CPUID contract, also run unchanged on the reference backend.
-//! The temporary IDT catches only the test's exact XSETBV RIP. Firmware tables,
-//! CR4, XCR0 and interrupt enablement are restored before returning any result.
+//! The temporary IDT catches only the test's exact faulting instruction RIP.
+//! Firmware tables, CR0/CR4, XCR0 and IF are restored before returning a result.
 
 use super::Result;
 use super::equal;
 use super::l1_extended;
 use super::l1_fault;
 use core::arch::asm;
+use x86_64_hal::control_state::CR0_NE;
 use x86_64_hal::cpu;
 use x86_64_hal::xstate;
 
@@ -66,6 +67,61 @@ fn enabled_area_size(xcr0: u64) -> Result<()> {
         u64::from(cpu::cpuid(0xd, 0).ebx),
         u64::from(size),
     )
+}
+
+/// AP startup needs a visible NE=0 even though the hardware carrier needs NE=1.
+/// Exercise the L1 carrier, before this fixture enters its own VMX operation.
+fn cr0_ne() -> Result<()> {
+    let original = cpu::read_cr0();
+    let result = (|| {
+        for ne in [0, CR0_NE, 0, CR0_NE] {
+            let value = (original & !CR0_NE) | ne;
+            // SAFETY: IF is clear, firmware's x87 exceptions are masked and no
+            // x87 operation occurs here. Only numeric-error routing changes;
+            // paging, protection, cache and extended-state enables stay intact.
+            unsafe { cpu::write_cr0(value) };
+            let _ = cpu::cpuid(0, 0);
+            equal("l1-cr0-ne-visible", cpu::read_cr0(), value)?;
+        }
+        let before = cpu::read_cr0();
+        let toggled = before ^ CR0_NE;
+        for invalid in [
+            toggled | (1 << 63),
+            (toggled | (1 << 29)) & !(1 << 30),
+            toggled & !1,
+            toggled & !(1 << 31),
+        ] {
+            let record = probe_cr0(invalid);
+            equal("l1-cr0-gp-vector", record.vector, 13)?;
+            equal("l1-cr0-gp-error", record.error, 0)?;
+            equal("l1-cr0-gp-preserves", cpu::read_cr0(), before)?;
+        }
+        Ok(())
+    })();
+    // SAFETY: all fallible checks pass through this restoration; original CR0
+    // is the valid firmware value on this same CPU, with its original NE bit.
+    unsafe { cpu::write_cr0(original) };
+    result
+}
+
+/// Caller has installed the exact-RIP fault handler and supplies an invalid
+/// long-mode CR0 value, or a value whose only possible successful change is NE.
+pub(super) fn probe_cr0(value: u64) -> l1_fault::FaultRecord {
+    l1_fault::probe(|record| {
+        // SAFETY: the caller owns this CPU with IF clear and the private #GP
+        // gate live. It accepts only label 2 and returns to label 3. Code/stack
+        // mappings cannot change on a valid implementation, and no Rust call
+        // occurs while the faulting RIP is live. The record remains on stack.
+        unsafe {
+            asm!(
+                "lea r8, [rip + 2f]", "mov [r10], r8",
+                "lea r8, [rip + 3f]", "mov [r10 + 8], r8",
+                "2:", "mov cr0, r11", "3:",
+                in("r10") record, in("r11") value, out("r8") _,
+                options(nostack),
+            );
+        }
+    })
 }
 
 /// Temporarily makes PKRU permissive before any data access with PKE enabled.
@@ -136,6 +192,7 @@ pub(super) fn run() -> Result<()> {
 }
 
 fn run_with_handler() -> Result<()> {
+    cr0_ne()?;
     let leaf1 = cpu::cpuid(1, 0);
     let legacy = (1 << 24) | (1 << 25) | (1 << 26);
     equal(
