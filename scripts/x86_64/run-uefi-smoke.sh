@@ -52,9 +52,9 @@ check_backend_log() {
     ((seen))
 }
 
-# Three fresh driver entries, not three markers from one memory-only overlay.
+# Four fresh driver entries, including persistence of post-EBS runtime writes.
 check_profile_contract_log() {
-    local log=$1 line phase=0 boots=0 full=0 complete=0 views= bytes transcript
+    local log=$1 line phase=0 boots=0 full=0 complete=0 runtime=0 views= bytes transcript
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
     [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 2097152)) || return 1
@@ -73,17 +73,22 @@ check_profile_contract_log() {
                 ((full += 1)) ;;
             'thin-hv: profile contract reset=2') [[ "$phase" == 3 && "$full" == 1 && "$views" == 1221 ]] || return 1; phase=4; views= ;;
             'thin-hv: profile contract phase=2 begin') ((phase == 4 && boots == 3)) || return 1; phase=5 ;;
-            'thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged')
-                [[ "$phase" == 5 && "$complete" == 0 && "$views" == 121 ]] || return 1; complete=1 ;;
+            'thin-hv: profile contract runtime begin') [[ "$phase" == 5 && "$views" == 121 && "$runtime" == 0 ]] || return 1; runtime=1 ;;
+            'thin-hv: profile contract runtime physical PASS') ((runtime == 1)) || return 1; runtime=2 ;;
+            'thin-hv: profile contract runtime virtual PASS') ((runtime == 2)) || return 1; runtime=3 ;;
+            'thin-hv: profile contract reset=3') [[ "$phase" == 5 && "$views" == 121 && "$runtime" == 3 ]] || return 1; phase=6; views= ;;
+            'thin-hv: profile contract phase=3 begin') ((phase == 6 && boots == 4)) || return 1; phase=7 ;;
+            'thin-hv: profile contract PASS profiles=2 resets=3 persistence=firmware security=unchanged')
+                [[ "$phase" == 7 && "$complete" == 0 && "$views" == 12 && "$runtime" == 3 ]] || return 1; complete=1 ;;
             'thin-hv: profile contract view='*)
                 [[ "$line" =~ ^thin-hv:\ profile\ contract\ view=([12])\ mat_patches=[0-9]+$ ]] || return 1
                 views+=${BASH_REMATCH[1]}
-                ((complete == 0 && ${#views} <= 4 && (phase == 1 || phase == 3 || phase == 5))) || return 1 ;;
+                ((complete == 0 && ${#views} <= 4 && ((runtime == 0 && (phase == 1 || phase == 3 || phase == 5)) || phase == 7))) || return 1 ;;
             'thin-hv: uefi entry') ;;
             *'thin-hv:'*) return 1 ;;
         esac
     done <"$log"
-    ((phase == 5 && boots == 3 && full == 1 && complete == 1))
+    ((phase == 7 && boots == 4 && full == 1 && complete == 1))
 }
 
 # Mode provenance is separate from acceleration: physical-selection code is
@@ -853,7 +858,7 @@ case "$backend" in
         ;;
     uefi-profile-contract)
         guest_location=none
-        return_marker='thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged'
+        return_marker='thin-hv: profile contract PASS profiles=2 resets=3 persistence=firmware security=unchanged'
         payload_marker=
         variable_marker=
         failure_marker='thin-hv: profile contract FAIL'

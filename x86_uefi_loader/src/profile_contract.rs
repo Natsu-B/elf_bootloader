@@ -1,6 +1,7 @@
 //! Disposable QEMU firmware-backed profile contract, including real resets.
 //! The runner loads this as a runtime driver on a fresh, private variable store.
-//! No VMX, ExitBootServices, installed OS or security-variable write occurs.
+//! No VMX, installed OS or security-variable write occurs. The third boot tests
+//! physical and identity-virtual Runtime Services; the fourth proves persistence.
 
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
@@ -49,6 +50,8 @@ const SECURITY: efi::Guid = efi::Guid::from_fields(
 );
 /// Bounded scratch avoids a large UEFI stack or allocating confidential payloads.
 static SECURITY_SCRATCH: SpinLock<[u8; 65_536]> = SpinLock::new([0; 65_536]);
+/// Runtime-owned, naturally aligned descriptor scratch survives EBS until reset.
+static MEMORY_MAP: SpinLock<[u64; 4096]> = SpinLock::new([0; 4096]);
 
 /// Polling output is outside VMX and never emits firmware variable contents.
 struct Serial;
@@ -95,7 +98,7 @@ fn require(condition: bool) -> Result<(), efi::Status> {
     }
 }
 
-/// Owns the firmware interfaces until reset; this fixture never calls EBS.
+/// Retains runtime code/data and identity-mapped firmware interfaces until reset.
 struct Fixture {
     system: *mut efi::SystemTable,
     runtime: *mut efi::RuntimeServices,
@@ -137,8 +140,8 @@ impl Fixture {
     /// QueryVariableInfo stays the real shared firmware capacity, not a fake quota.
     fn variable_info(&self) -> Result<(u64, u64, u64), efi::Status> {
         let (mut maximum, mut remaining, mut value_maximum) = (0, 0, 0);
-        // SAFETY: the live pre-EBS firmware table receives three aligned owned
-        // output slots and a supported variable attribute combination.
+        // SAFETY: the runtime table remains identity mapped before/after EBS;
+        // it receives three aligned owned output slots and supported attributes.
         let status = unsafe {
             ((*self.runtime).query_variable_info)(
                 ATTR,
@@ -164,8 +167,8 @@ impl Fixture {
         }
         let mut size = data.len();
         let mut attributes = 0;
-        // SAFETY: this live table and owned buffers remain valid throughout the
-        // synchronous call. Names are bounded and terminated, even for size probes.
+        // SAFETY: runtime-retained table and owned buffers remain identity mapped
+        // before/after EBS and throughout the synchronous call. Names terminate.
         let status = unsafe {
             ((*self.runtime).get_variable)(
                 name.as_mut_ptr(),
@@ -187,7 +190,7 @@ impl Fixture {
             *to = u16::from(from);
         }
         // SAFETY: fixture-owned name/GUID/data live across this synchronous call;
-        // the firmware table is valid before EBS, which this fixture never invokes.
+        // the runtime-retained table stays identity mapped before and after EBS.
         unsafe {
             ((*self.runtime).set_variable)(
                 name.as_mut_ptr(),
@@ -249,11 +252,13 @@ impl Fixture {
 
     /// Enumerates the entire view twice with stable names/order and no raw keys.
     fn enumeration(&self, expected: &[&[u8]]) -> Result<(), efi::Status> {
+        require(expected.len() <= 320)?;
         let mut hashes = [0u64; 2];
         for hash in &mut hashes {
             let mut name = [0u16; 2048];
             let mut guid = GLOBAL;
-            let mut seen = 0u32;
+            let mut seen = [0u64; 5];
+            let mut count = 0;
             let mut ended = false;
             for _ in 0..512 {
                 let previous = name;
@@ -292,8 +297,10 @@ impl Fixture {
                             s.len() == len && s.iter().zip(&name).all(|(&a, &b)| u16::from(a) == b)
                         })
                         .ok_or(efi::Status::COMPROMISED_DATA)?;
-                    require(index < 32 && seen & (1 << index) == 0)?;
-                    seen |= 1 << index;
+                    let bit = 1u64 << (index % 64);
+                    require(seen[index / 64] & bit == 0)?;
+                    seen[index / 64] |= bit;
+                    count += 1;
                 }
                 for &unit in &name[..len] {
                     *hash = hash.wrapping_mul(131).wrapping_add(u64::from(unit));
@@ -326,7 +333,7 @@ impl Fixture {
                     )?;
                 }
             }
-            require(ended && seen == (1u32 << expected.len()) - 1)?;
+            require(ended && count == expected.len())?;
         }
         require(hashes[0] == hashes[1])
     }
@@ -360,6 +367,19 @@ impl Fixture {
                 self.set(b"Boot0022", GLOBAL, ATTR, &[0x7d; 4096]) == efi::Status::OUT_OF_RESOURCES,
             )?;
             self.value(b"Boot0022", &[0x22, 0])?;
+            let mut names = [[0u8; 8]; 256];
+            for (index, name) in names[..inserted].iter_mut().enumerate() {
+                *name = *b"Boot8000";
+                for digit in 0..3 {
+                    name[7 - digit] = b"0123456789ABCDEF"[(index >> (digit * 4)) & 15];
+                }
+            }
+            let mut expected: [&[u8]; 258] = [&[]; 258];
+            expected[..2].copy_from_slice(&[b"Boot0022", b"BootOrder"]);
+            for (to, name) in expected[2..].iter_mut().zip(&names[..inserted]) {
+                *to = name;
+            }
+            self.enumeration(&expected[..inserted + 2])?;
             let _ = writeln!(
                 Serial,
                 "thin-hv: profile contract storage-full PASS entries={inserted}"
@@ -379,7 +399,181 @@ impl Fixture {
         result.and(cleanup)
     }
 
-    fn run(&self) -> Result<(), efi::Status> {
+    /// Reads a complete bounded map without allocating or calling other services.
+    fn memory_map(
+        &self,
+        services: *mut efi::BootServices,
+        buffer: &mut [u64],
+    ) -> Result<(usize, usize, usize, u32), efi::Status> {
+        let mut size = core::mem::size_of_val(buffer);
+        let (mut key, mut stride, mut version) = (0, 0, 0);
+        // SAFETY: caller retained live Boot Services before the first EBS attempt;
+        // retries only follow failed EBS. The u64 buffer is aligned and writable
+        // for size bytes, and all four metadata output slots are owned locals.
+        let status = unsafe {
+            ((*services).get_memory_map)(
+                &mut size,
+                buffer.as_mut_ptr().cast(),
+                &mut key,
+                &mut stride,
+                &mut version,
+            )
+        };
+        if status.is_error() {
+            return Err(status);
+        }
+        require(
+            stride >= core::mem::size_of::<efi::MemoryDescriptor>()
+                && stride <= 4096
+                && size > 0
+                && size <= core::mem::size_of_val(buffer)
+                && size % stride == 0,
+        )?;
+        Ok((size, key, stride, version))
+    }
+
+    /// Checks variable semantics both before and after the virtual-address event.
+    fn runtime_variables(&self) -> Result<(), efi::Status> {
+        self.variable_info()?;
+        self.value(b"BootOrder", &[0x11, 0, 0x33, 0])?;
+        require(self.get(b"SelectedProfile", PROJECT, &mut [0; 8]).0 == efi::Status::NOT_FOUND)?;
+        require(self.get(PHASE_NAME, PROJECT, &mut [0]).0 == efi::Status::NOT_FOUND)?;
+        // Existing boot-only variables are write-protected at runtime. A new
+        // boot-only variable instead fails attribute validation (UEFI 8.2.3).
+        require(
+            self.set(
+                b"SelectedProfile",
+                PROJECT,
+                PHASE_ATTR,
+                &UefiProfile::Linux.selection_record(),
+            ) == efi::Status::WRITE_PROTECTED,
+        )?;
+        require(
+            self.set(b"ProfileRuntimeOnly", PROJECT, PHASE_ATTR, &[1])
+                == efi::Status::INVALID_PARAMETER,
+        )?;
+        require(self.set(b"BootNext", GLOBAL, ATTR, &[0x11, 0]) == efi::Status::SUCCESS)?;
+        self.value(b"BootNext", &[0x11, 0])?;
+        self.enumeration(&[b"Boot0011", b"BootOrder", b"BootNext"])?;
+        require(self.set(b"BootNext", GLOBAL, 0, &[]) == efi::Status::SUCCESS)?;
+        self.enumeration(&[b"Boot0011", b"BootOrder"])
+    }
+
+    /// Hands ownership to the fixture. After the first EBS attempt it never
+    /// returns to StartImage or invokes an overlay destructor using Boot Services.
+    fn exit_boot_contract(&self, image: efi::Handle) -> Result<(), efi::Status> {
+        let services = chainload::boot_services(self.system).map_err(chainload::Error::status)?;
+        let overlay = runtime_variables::install(
+            self.system,
+            UefiProfile::Windows.id(),
+            self.image_base,
+            self.image_size,
+        )?;
+        let _ = writeln!(Serial, "thin-hv: profile contract runtime begin");
+        let mut buffer = MEMORY_MAP.lock();
+        let mut metadata = self.memory_map(services, &mut buffer[..])?;
+        // Failed EBS may already have signaled shutdown callbacks: from here,
+        // only GetMemoryMap/EBS retries and Runtime Services are used. Runtime
+        // code/event/storage intentionally survive until ResetSystem.
+        core::mem::forget(overlay);
+        let mut exited = false;
+        let mut failure = efi::Status::INVALID_PARAMETER;
+        for _ in 0..4 {
+            // SAFETY: firmware supplied this live image handle; metadata contains
+            // the exact map key from the immediately preceding GetMemoryMap.
+            let status = unsafe { ((*services).exit_boot_services)(image, metadata.1) };
+            if status == efi::Status::SUCCESS {
+                exited = true;
+                break;
+            }
+            failure = status;
+            if status != efi::Status::INVALID_PARAMETER {
+                break;
+            }
+            match self.memory_map(services, &mut buffer[..]) {
+                Ok(next) => metadata = next,
+                Err(status) => {
+                    failure = status;
+                    break;
+                }
+            }
+        }
+        let result = (|| {
+            if !exited {
+                return Err(failure);
+            }
+            self.runtime_variables()?;
+            let security = self.security()?;
+            let _ = writeln!(Serial, "thin-hv: profile contract runtime physical PASS");
+            for offset in (0..metadata.0).step_by(metadata.2) {
+                // SAFETY: the successful GetMemoryMap bounded size/stride; each
+                // complete descriptor lies inside the still-owned runtime buffer.
+                let descriptor = unsafe {
+                    buffer
+                        .as_mut_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<efi::MemoryDescriptor>()
+                };
+                // SAFETY: descriptor bounds were checked above; firmware may use
+                // a non-native stride so read/write unaligned without references.
+                let mut value = unsafe { ptr::read_unaligned(descriptor) };
+                if value.attribute & efi::MEMORY_RUNTIME != 0 {
+                    value.virtual_start = value.physical_start;
+                    // SAFETY: this descriptor is owned scratch, not the firmware
+                    // memory map; identity virtual addresses retain all runtime pages.
+                    unsafe { ptr::write_unaligned(descriptor, value) };
+                }
+            }
+            // SAFETY: EBS succeeded, no prior virtual map was installed; complete
+            // map/stride/version came from firmware and every runtime range retains
+            // an identity virtual address. Runtime code and saved entry pointers
+            // remain callable while the address-change notification is dispatched.
+            let status = unsafe {
+                ((*self.runtime).set_virtual_address_map)(
+                    metadata.0,
+                    metadata.2,
+                    metadata.3,
+                    buffer.as_mut_ptr().cast(),
+                )
+            };
+            if status.is_error() {
+                return Err(status);
+            }
+            self.runtime_variables()?;
+            require(self.security()? == security)?;
+            require(
+                self.set(b"Boot0011", GLOBAL, ATTR, &[0x11, 0, 0x55, 0]) == efi::Status::SUCCESS,
+            )?;
+            require(self.set(b"BootNext", GLOBAL, ATTR, &[0x11, 0]) == efi::Status::SUCCESS)?;
+            let _ = writeln!(Serial, "thin-hv: profile contract runtime virtual PASS");
+            Ok(())
+        })();
+        drop(buffer);
+        let reset = match result {
+            Ok(()) => {
+                let _ = writeln!(Serial, "thin-hv: profile contract reset=3");
+                efi::RESET_COLD
+            }
+            Err(status) => {
+                let _ = writeln!(
+                    Serial,
+                    "thin-hv: profile contract FAIL runtime status={:#x}",
+                    status.as_usize()
+                );
+                efi::RESET_SHUTDOWN
+            }
+        };
+        // SAFETY: runtime table is identity mapped on both success and failure;
+        // this disposable VM is owned by the fixture and no locks/calls remain.
+        unsafe { ((*self.runtime).reset_system)(reset, efi::Status::SUCCESS, 0, ptr::null_mut()) };
+        let _ = writeln!(Serial, "thin-hv: profile contract FAIL reset returned");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn run(&self, image: efi::Handle) -> Result<(), efi::Status> {
         let security = self.security()?;
         let mut phase = [0u8];
         let (status, size, attr) = self.get(PHASE_NAME, PROJECT, &mut phase);
@@ -387,7 +581,7 @@ impl Fixture {
             phase[0] = 0;
         } else {
             require(
-                status == efi::Status::SUCCESS && size == 1 && attr == PHASE_ATTR && phase[0] <= 2,
+                status == efi::Status::SUCCESS && size == 1 && attr == PHASE_ATTR && phase[0] <= 3,
             )?;
         }
         let _ = writeln!(Serial, "thin-hv: profile contract phase={} begin", phase[0]);
@@ -416,20 +610,35 @@ impl Fixture {
             })?;
         }
         self.profile(UefiProfile::Windows, || {
-            self.value(b"Boot0011", &[0x11, 0])?;
+            self.value(
+                b"Boot0011",
+                if phase[0] == 3 {
+                    &[0x11, 0, 0x55, 0]
+                } else {
+                    &[0x11, 0]
+                },
+            )?;
             self.value(
                 b"BootOrder",
-                if phase[0] == 2 {
+                if phase[0] >= 2 {
                     &[0x11, 0, 0x33, 0]
                 } else {
                     &[0x11, 0]
                 },
             )?;
+            if phase[0] == 3 {
+                self.value(b"BootNext", &[0x11, 0])?;
+                self.enumeration(&[b"Boot0011", b"BootOrder", b"BootNext"])?;
+            }
             require(self.security()? == security)
         })?;
         self.profile(UefiProfile::Linux, || {
             self.value(b"Boot0022", &[0x22, 0])?;
             self.value(b"BootOrder", &[0x22, 0])?;
+            if phase[0] == 3 {
+                require(self.get(b"BootNext", GLOBAL, &mut []).0 == efi::Status::NOT_FOUND)?;
+                self.enumeration(&[b"Boot0022", b"BootOrder"])?;
+            }
             require(self.security()? == security)
         })?;
         require(
@@ -440,6 +649,24 @@ impl Fixture {
                     UefiProfile::Windows
                 }),
         )?;
+        if phase[0] == 3 {
+            require(self.get(b"ProfileRuntimeOnly", PROJECT, &mut []).0 == efi::Status::NOT_FOUND)?;
+            let _ = writeln!(
+                Serial,
+                "thin-hv: profile contract PASS profiles=2 resets=3 persistence=firmware security=unchanged"
+            );
+            // SAFETY: both profile hooks were rolled back; the fixture owns this
+            // disposable VM and all synchronous firmware writes have completed.
+            unsafe {
+                ((*self.runtime).reset_system)(
+                    efi::RESET_SHUTDOWN,
+                    efi::Status::SUCCESS,
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+            return Err(efi::Status::DEVICE_ERROR);
+        }
         if phase[0] == 1 {
             self.profile(UefiProfile::Linux, || self.full_store())?;
             self.profile(UefiProfile::Windows, || {
@@ -472,20 +699,8 @@ impl Fixture {
                 require(self.get(b"BootNext", GLOBAL, &mut []).0 == efi::Status::NOT_FOUND)?;
                 self.enumeration(&[b"Boot0011", b"BootOrder"])
             })?;
-            let _ = writeln!(
-                Serial,
-                "thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged"
-            );
-            // SAFETY: the fixture owns the disposable VM; hooks are rolled back,
-            // all nonvolatile writes returned and no locks or active calls remain.
-            unsafe {
-                ((*self.runtime).reset_system)(
-                    efi::RESET_SHUTDOWN,
-                    efi::Status::SUCCESS,
-                    0,
-                    ptr::null_mut(),
-                )
-            };
+            require(self.set(PHASE_NAME, PROJECT, PHASE_ATTR, &[3]) == efi::Status::SUCCESS)?;
+            return self.exit_boot_contract(image);
         } else {
             runtime_variables::write_boot_profile(
                 self.runtime,
@@ -588,7 +803,7 @@ pub extern "efiapi" fn efi_main(image: efi::Handle, system: *mut efi::SystemTabl
             image_base: base,
             image_size: size,
         }
-        .run()
+        .run(image)
     })();
     let status = result.err().unwrap_or(efi::Status::DEVICE_ERROR);
     let _ = writeln!(

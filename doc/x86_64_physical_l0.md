@@ -1,5 +1,27 @@
 # Physical x86 L0: incremental implementation and validation
 
+## Standalone persistent-profile gate
+
+```sh
+nix develop --accept-flake-config --command cargo xrun x86 --uefi-profiles --release
+```
+
+This finite test uses a fresh disposable OVMF variable store, default q35, 256 MiB,
+one CPU and no installed OS or project VMX. It also runs in the standard release
+suite. The production firmware-backed hooks must preserve Windows/Linux private
+boot-variable views through cold/warm resets, full-store failures, full enumeration,
+ExitBootServices and an identity SetVirtualAddressMap. A final cold reset checks
+the runtime writes and the independent persistent profile selector: four boots,
+three resets, 60 seconds total. Security variables and BootCurrent remain shared;
+no security contents or Windows product keys are logged.
+
+The transcript is `bin/x86_64/profile-contract.log`; generated firmware/EFI files
+are not source artifacts. This is a profile/firmware gate, not Direct SMP, S3/S4,
+nonidentity OS runtime mapping, Hyper-V or physical-laptop qualification. The
+physical Direct backend still has no overlay by default; production profile/path
+selection wiring remains work in progress. Current evidence and limitations are
+in [the daily-candidate log](evidence/x86_64/daily-candidate-2026-09-11.md).
+
 ## Authoritative starting point
 
 Work started on 2026-09-07 and continued on 2026-09-08 (JST), without switching branches.

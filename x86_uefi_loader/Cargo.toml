@@ -31,7 +31,7 @@ physical-preflight = ["dep:x86_64_hal", "x86_64_hal/vmx"]
 host-exception-test = ["direct-vmx"]
 # Deliberately clobbers L0 SIMD registers after saving guest state; QEMU only.
 host-xstate-test = ["direct-vmx"]
-# Standalone firmware-backed fixture; no VMX, no installed OS and no EBS.
+# Standalone firmware-backed fixture, including EBS; no VMX or installed OS.
 uefi-profile-contract = ["dep:mutex", "dep:uefi_variable_overlay"]
 
 [dependencies]

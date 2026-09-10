@@ -5646,7 +5646,9 @@ mod tests {
                 valid.push_str(&format!("thin-hv: profile contract reset={}\n", phase + 1));
             }
         }
-        valid.push_str("thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged\n");
+        valid.push_str("thin-hv: profile contract runtime begin\nthin-hv: profile contract runtime physical PASS\nthin-hv: profile contract runtime virtual PASS\n");
+        valid.push_str("thin-hv: profile contract reset=3\nthin-hv: uefi entry\nthin-hv: backend=uefi-profile-contract project_vmx=0\nthin-hv: profile contract phase=3 begin\nthin-hv: profile contract view=1 mat_patches=1\nthin-hv: profile contract view=2 mat_patches=1\n");
+        valid.push_str("thin-hv: profile contract PASS profiles=2 resets=3 persistence=firmware security=unchanged\n");
         assert!(check(&valid));
         assert!(check(&valid.replace('\n', "\r\n")));
         for (from, to) in [
@@ -5655,6 +5657,7 @@ mod tests {
             ("entries=230", "entries=0"),
             ("entries=230", "entries=257"),
             ("view=2", "view=1"),
+            ("runtime physical PASS", "runtime virtual PASS"),
             ("security=unchanged", "security=changed"),
             (
                 "backend=uefi-profile-contract project_vmx=0",

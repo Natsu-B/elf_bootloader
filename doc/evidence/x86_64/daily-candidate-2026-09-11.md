@@ -179,9 +179,55 @@ transition coverage from the standalone fixture: its resets occur before EBS.
 Full-store enumeration, post-EBS contract coverage, production selector/path wiring
 and additional lifecycle transitions remain subsequent implementation work.
 
+## Increment 3: full-store and post-EBS runtime contract
+
+`profile_contract::Fixture::{enumeration,full_store,memory_map,runtime_variables,
+exit_boot_contract,run}` now checks all 230 successfully created filler variables,
+twice, including buffer-size retry stability. A bounded bitset replaces the small
+expected-name mask; no heap or new store is introduced.
+
+On the third boot the actual runtime image retains the production hooks, obtains
+the firmware memory map and exits Boot Services. Only bounded GetMemoryMap/EBS
+retries are possible after the first attempt; no hook destructor or StartImage
+return may reference partially shut-down firmware. It exercises physical Runtime
+Services, then calls SetVirtualAddressMap with the complete firmware map and
+identity virtual addresses. Variable read/write/delete/enumeration, capacity and
+security pass-through are checked in both phases. Runtime updates are then verified
+after a third real ResetSystem on a fourth boot, together with the unchanged selector
+and the other profile. This is **identity-virtual firmware coverage**, not proof of
+nonidentity OS mappings, Direct nested operation, or S3/S4.
+
+The first post-EBS test failed because it incorrectly expected INVALID_PARAMETER
+when modifying an existing boot-only variable. Firmware correctly returned
+WRITE_PROTECTED; a new boot-only variable instead returns INVALID_PARAMETER.
+The expectation was corrected after checking EDK II's existing-variable path in
+[Variable.c](https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Universal/Variable/RuntimeDxe/Variable.c).
+Runtime hooks were not changed to hide that failure. Log
+`/tmp/x86-profile-contract-runtime-first.log` retains the failed assertion.
+No timeout increase occurred (the initial progress interpretation as timeout was
+corrected once the final log was available).
+
+`/tmp/x86-profile-contract-runtime-second.log`: physical/identity-virtual runtime
+checks PASS. `/tmp/x86-profile-contract-runtime-persistence.log`: final four-boot,
+three-reset release QEMU/KVM fixture PASS at the unchanged 60-second total bound.
+The runner gate and its existing xtask test now require all runtime milestones,
+the third reset, and the final two-profile verification, not merely a PASS string.
+
+Frozen regression `/tmp/x86-profile-contract-runtime-regression.log`: command exit
+0, **362 host PASS / 0 FAIL / 0 SKIP**, the same package counts as increment 2.
+Ran all six `cargo xtest -p` commands listed above, release standalone TCG with
+the same 256-MiB/one-CPU/60-second fixture configuration, debug
+`cargo xrun x86 --uefi-profiles`, `cargo xbuild x86`, and
+`cargo xrun x86 --release`; then `cargo fmt --check` and `git diff --check`.
+The normal release matrix is **12 PASS / 0 FAIL / 0 SKIP**; with the two standalone
+TCG/debug cases this invocation has **14 QEMU PASS / 0 FAIL / 0 SKIP** (11 KVM,
+3 TCG). Its three outer-KVM smoke cases remain reference evidence only. The
+pre-existing nested reference failures and Direct Hyper-V failure above remain
+open; this fixture-only increment does not change VMX runtime behavior.
+
 ## Qualification still required
 
-Persistent profile selector and live-runtime reboot/full-store/failure fixture;
+Production persistent-profile boot-path integration and failure injection;
 1/2/4/8 actual L1 CPUs; AP handoff; S3/cancellation/time/NMI; Direct Hyper-V/WSL2
 and S4; short/extended daily suite; measured Current/Unsafe A/B and default decision.
 Existing Linux test failures in `correctness-2026-09-09.md` are not waived.
