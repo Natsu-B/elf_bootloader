@@ -423,62 +423,9 @@ pub(crate) fn require_single_cpu(
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
-    use efi::protocols::mp_services as mp;
-    let services = chainload::boot_services(system_table)?;
-    let mut guid = mp::PROTOCOL_GUID;
-    let mut interface = ptr::null_mut();
-    // SAFETY: the live Boot Services table and bounded writable output are
-    // valid for this synchronous protocol lookup; no firmware state changes.
-    let status =
-        unsafe { ((*services).locate_protocol)(&mut guid, ptr::null_mut(), &mut interface) };
-    if status.is_error() {
-        return Err(Error::Firmware(
-            "physical MP Services unavailable",
-            status.as_usize(),
-        ));
-    }
-    if interface.is_null() {
-        return Err(invalid("physical MP Services null interface"));
-    }
-    let protocol = interface.cast::<mp::Protocol>();
-    let mut total = 0;
-    let mut enabled = 0;
-    let mut current = usize::MAX;
-    // SAFETY: firmware returned this live MP Services interface; outputs are
-    // initialized stack scalars. Both functions only query this CPU/topology.
-    let (count_status, who_status) = unsafe {
-        (
-            ((*protocol).get_number_of_processors)(protocol, &mut total, &mut enabled),
-            ((*protocol).who_am_i)(protocol, &mut current),
-        )
-    };
-    if count_status.is_error() {
-        return Err(Error::Firmware(
-            "physical GetNumberOfProcessors",
-            count_status.as_usize(),
-        ));
-    }
-    if who_status.is_error() {
-        return Err(Error::Firmware("physical WhoAmI", who_status.as_usize()));
-    }
-    let mut flags = 0;
-    if current < total {
-        let mut info = core::mem::MaybeUninit::<mp::ProcessorInformation>::zeroed();
-        // SAFETY: the validated current processor index and complete aligned
-        // output storage satisfy GetProcessorInfo. Only its initialized legacy
-        // status prefix is read, never an unrequested extended-information union.
-        let status =
-            unsafe { ((*protocol).get_processor_info)(protocol, current, info.as_mut_ptr()) };
-        if status.is_error() {
-            return Err(Error::Firmware(
-                "physical GetProcessorInfo",
-                status.as_usize(),
-            ));
-        }
-        // SAFETY: successful firmware output initialized this u32 prefix field;
-        // the allocation remains live, aligned, and unaliased on this stack.
-        flags = unsafe { ptr::addr_of!((*info.as_ptr()).status_flag).read() };
-    }
+    let inventory = crate::cpu_inventory::read(system_table)?;
+    let (total, enabled, current) = (inventory.total, inventory.enabled, inventory.bsp);
+    let flags = inventory.processors()[current].flags;
     if !single_bsp(total, enabled, current, flags) {
         let _ = writeln!(
             serial,

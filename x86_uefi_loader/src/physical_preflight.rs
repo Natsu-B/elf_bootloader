@@ -38,6 +38,7 @@ pub(crate) fn run(
 
 /// Captures once after reserving the temporary EPT-audit storage.
 fn inventory(system_table: *mut efi::SystemTable, serial: &mut SerialPort) -> Result<(), Error> {
+    crate::cpu_inventory::read(system_table)?.log(serial);
     platform_ept_audit::with_storage(system_table, |storage| {
         platform_snapshot::with_snapshot(system_table, serial, |cpu, map, serial| {
             let _ = writeln!(

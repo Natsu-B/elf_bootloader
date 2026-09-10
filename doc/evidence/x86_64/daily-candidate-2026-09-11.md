@@ -361,6 +361,76 @@ including the new OPTION.EFI. Small logs are retained as evidence; no generated
 EFI image, firmware-variable store, disk image, or unrelated AGENTS.md change is
 part of the commit.
 
+## Increment 6: complete read-only firmware CPU inventory
+
+The old physical gate queried only the current BSP's ProcessorInformation.
+`cpu_inventory.rs::Inventory::collect/read` now visits every firmware slot, up to
+64 fixed-capacity entries, separating firmware index from 32-bit APIC identity.
+It preserves disabled CPUs, rejects duplicate IDs/inconsistent BSP or enabled
+counts, and returns a query failure without publishing a partial inventory.
+It never calls StartupAllAPs, StartupThisAP, SwitchBSP or EnableDisableAP.
+
+`physical_chainload.rs::require_single_cpu` reuses this checked inventory and
+retains its single-CPU rejection. `physical_preflight.rs::inventory` emits bounded
+read-only per-CPU records. `main.rs` scopes the module to those backends.
+The existing smoke runner adds `check_cpu_inventory_log`; xtask's standard x86
+matrix runs 1/2/4/8 inventories with both KVM and TCG, preserving separate logs.
+This is preparation for delayed takeover, **not implemented AP VMX ownership**.
+No unused lifecycle state machine or shared global VMX lock was added.
+
+`/tmp/x86-cpu-inventory-host-build.log` records exit 0 for:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p x86_uefi_loader; cargo xbuild x86'
+```
+
+Loader host tests: **283 PASS / 0 FAIL / 0 SKIP**. Debug x86 build: PASS.
+`/tmp/x86-cpu-inventory-qemu-regression.log` preserves an intermediate xtask
+package timeout: all 39 assertions completed successfully in 30.37 seconds, but
+the existing 30-second process gate correctly failed (code 124). Its QEMU step
+did not run. The new test had unnecessarily spawned 65 shell processes to check
+each missing row again at the 64-CPU boundary. Every missing-row case remains
+covered at 1/2/4/8; the 64-CPU bound retains positive and mutated-input checks.
+No production timeout or checker rule was relaxed.
+
+`/tmp/x86-cpu-inventory-qemu-second.log` records exit 0 for:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p xtask; cargo xrun x86 --release'
+```
+
+xtask: **39 PASS / 0 FAIL / 0 SKIP**, 28.08 seconds. Standard release now has
+**18 PASS / 0 FAIL / 0 SKIP** (13 QEMU/KVM, 5 QEMU/TCG), including its expected
+fail-closed fixtures. The eight CPU inventories all report the exact 1/2/4/8
+counts, all processors enabled, BSP index 0, and no project AP startup/VMX.
+The ordinary Direct smoke, isolated profile reset/runtime fixture, and existing
+reference/non-VMX regressions also pass. Outer results remain reference only.
+
+Next CPU transition design under evaluation (not implemented by this inventory
+increment): reserve complete AP backing and a low-memory bootstrap before L1;
+wrap the original firmware ExitBootServices call in retained L1 bootstrap code;
+only on successful return notify L0, take over APs without MP Services, and hold
+the BSP until all required APs own VMX/carrier/host state. A failed firmware call
+must leave APs untouched and preserve normal GetMemoryMap/retry semantics.
+An ExitBootServices notification alone is too early to prove the original service
+has completed. APs already in VMX can subsequently receive INIT/SIPI as VM exits,
+avoiding a permanent APIC-MMIO trap merely to discover their first startup.
+This requires real reset-mode guest state and an all-CPU barrier before any SMP
+claim; none is inferred from read-only firmware enumeration.
+
+`/tmp/x86-cpu-inventory-direct-regression.log` records:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo xtest -p nested_vmx; cargo xtest -p x86_64_hal; cargo xtest -p x86_guest_uefi_test; cargo xtest -p uefi_variable_overlay; cargo xrun x86 --profile-direct --release; cargo fmt --check; git diff --check; cargo xrun x86 --nested --release'
+```
+
+Host: **110 PASS / 0 FAIL / 0 SKIP**; combined latest package coverage is
+**432 PASS / 0 FAIL / 0 SKIP**. Profile Direct release: **6 PASS / 0 FAIL / 0 SKIP**.
+Nested release: **15 PASS / 5 FAIL / 0 SKIP**, again all 14 Direct cases pass and
+the same five outer/reference contracts fail. Overall command status is 1 because
+those reference failures are not waived. Formatting and diff checks pass.
+No generated artifact or unrelated AArch64/user change is included.
+
 ## Qualification still required
 
 Profile boot-option return/error/reboot qualification and failure injection;

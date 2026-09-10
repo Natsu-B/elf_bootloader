@@ -1424,7 +1424,7 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
             ));
         }
     }
-    for (backend, filename, accel, cpu) in [
+    for (backend, filename, accel, cpu, cpu_counts) in [
         (
             "physical-chainload",
             "x86-uefi-physical-loader.efi",
@@ -1432,46 +1432,61 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
             // Match the reference fixture: the shared payload checks both the
             // hypervisor bit and the synthetic KVM CPUID signature leaf.
             "host,+vmx,-hypervisor,kvm=off",
+            &[1][..],
         ),
         (
             "physical-preflight",
             "x86-uefi-preflight.efi",
             "kvm",
             "host,+vmx,-hypervisor",
+            &[1, 2, 4, 8][..],
         ),
         (
             "physical-preflight",
             "x86-uefi-preflight.efi",
             "tcg",
             "qemu64",
+            &[1, 2, 4, 8][..],
         ),
     ] {
-        eprintln!("\n--- Running QEMU/{accel} {backend} regression (not physical hardware) ---");
-        let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
-            .arg(Path::new("bin/x86_64").join(filename))
-            .env("X86_UEFI_BACKEND", backend)
-            .env("X86_UEFI_PHYSICAL_POLICY", "0")
-            .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
-            .env("X86_UEFI_ACCEL", accel)
-            .env("X86_UEFI_CPU", cpu)
-            .env(
-                "X86_UEFI_TIMEOUT_SECONDS",
-                if accel == "tcg" { "60" } else { "30" },
-            )
-            .env_remove("X86_MONITOR_IMAGE")
-            .env_remove("X86_RETURN_MARKER")
-            .env_remove("X86_VARIABLE_MARKER")
-            .env_remove("X86_GUEST_MARKER")
-            .env_remove("X86_UEFI_GUEST_LOCATION")
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| format!("Failed to run {backend} QEMU/{accel} regression: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "{backend} QEMU/{accel} regression exited with status {status}"
-            ));
+        for cpu_count in cpu_counts {
+            eprintln!(
+                "\n--- Running QEMU/{accel} {backend} regression cpus={cpu_count} (not physical hardware) ---"
+            );
+            let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+                .arg(Path::new("bin/x86_64").join(filename))
+                .env("X86_UEFI_BACKEND", backend)
+                .env("X86_UEFI_PHYSICAL_POLICY", "0")
+                .env("X86_UEFI_HOST_EXCEPTION_TEST", "0")
+                .env("X86_UEFI_ACCEL", accel)
+                .env("X86_UEFI_CPU", cpu)
+                .env("X86_UEFI_SMP", cpu_count.to_string())
+                .env(
+                    "X86_UEFI_TIMEOUT_SECONDS",
+                    if accel == "tcg" { "60" } else { "30" },
+                )
+                .env_remove("X86_MONITOR_IMAGE")
+                .env_remove("X86_RETURN_MARKER")
+                .env_remove("X86_VARIABLE_MARKER")
+                .env_remove("X86_GUEST_MARKER")
+                .env_remove("X86_UEFI_GUEST_LOCATION")
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .map_err(|e| format!("Failed to run {backend} QEMU/{accel} regression: {e}"))?;
+            if backend == "physical-preflight" {
+                fs::copy(
+                    "bin/x86_64/serial.log",
+                    format!("bin/x86_64/preflight-{accel}-cpus-{cpu_count}.log"),
+                )
+                .map_err(|e| format!("CPU preflight evidence: {e}"))?;
+            }
+            if !status.success() {
+                return Err(format!(
+                    "{backend} QEMU/{accel} cpus={cpu_count} regression exited with status {status}"
+                ));
+            }
         }
     }
     eprintln!(
@@ -3569,6 +3584,59 @@ mod tests {
                 .success()
         };
         let vmx_absent = "thin-hv: preflight VMX=0 direct_vmx_ready=0\n";
+        let check_cpus = |count: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-cpu-inventory-log", count])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        for count in [1, 2, 4, 8, 64] {
+            let mut valid = String::new();
+            for index in 0..count {
+                valid += &format!(
+                    "thin-hv: CPU inventory index={index} apic_id={} flags={} state=firmware-owned\n",
+                    256 + index * 3,
+                    if index == count - 1 { 7 } else { 6 }
+                );
+            }
+            valid += &format!(
+                "thin-hv: CPU inventory PASS total={count} enabled={count} bsp={} project_ap_start=0 project_vmx=0\n",
+                count - 1
+            );
+            assert!(check_cpus(&count.to_string(), &valid));
+            assert!(check_cpus(&count.to_string(), &valid.replace('\n', "\r\n")));
+            // Exercise every missing row at the required 1/2/4/8 topologies.
+            // The 64-slot boundary uses the same loop; its positive and mutation
+            // checks below avoid spawning 65 duplicate shell processes.
+            for line in valid.lines().filter(|_| count <= 8) {
+                assert!(!check_cpus(
+                    &count.to_string(),
+                    &valid.replacen(&format!("{line}\n"), "", 1)
+                ));
+            }
+            for (from, to) in [
+                ("apic_id=259", "apic_id=256"),
+                ("apic_id=256", "apic_id=4294967296"),
+                ("flags=7", "flags=6"),
+                ("project_ap_start=0", "project_ap_start=1"),
+                ("state=firmware-owned", "state=monitor-owned"),
+            ] {
+                if valid.contains(from) {
+                    assert!(!check_cpus(&count.to_string(), &valid.replace(from, to)));
+                }
+            }
+            assert!(!check_cpus(&count.to_string(), &(valid.clone() + "\0")));
+            assert!(!check_cpus(
+                &count.to_string(),
+                &(valid + "thin-hv: CPU inventory FAIL late\n")
+            ));
+        }
         let vmx_present = "thin-hv: preflight VMX=1 direct_vmx_ready=0\n";
         let skip =
             "thin-hv: preflight EPT audit SKIP reason=no-ept-capability direct_vmx_ready=0\n";

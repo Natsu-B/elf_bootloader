@@ -543,6 +543,38 @@ check_host_exception_log() {
 
 # Fixed QEMU fixtures distinguish a real EPT construction from a capability skip.
 # The application may legitimately skip elsewhere; that is not this KVM test's PASS.
+check_cpu_inventory_log() {
+    local count=$1 log=$2 transcript bytes line index=0 enabled=0 bsp=-1 complete=0 id flags
+    local row='^thin-hv: CPU inventory index=(0|[1-9][0-9]?) apic_id=(0|[1-9][0-9]{0,9}) flags=([0-7]) state=firmware-owned$'
+    local -A seen=()
+    [[ "$count" =~ ^[1-9][0-9]?$ && -f "$log" ]] && ((count <= 64)) || return 1
+    bytes=$(wc -c <"$log") || return 1
+    ((bytes > 0 && bytes <= 262144)) || return 1
+    if IFS= read -r -d '' transcript <"$log"; then return 1; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" =~ $row ]]; then
+            ((complete == 0 && index < count && BASH_REMATCH[1] == index)) || return 1
+            id=${BASH_REMATCH[2]}; flags=${BASH_REMATCH[3]}
+            ((id <= 4294967295)) && [[ -z ${seen[$id]+present} ]] || return 1
+            seen[$id]=1
+            if ((flags & 1)); then
+                ((bsp == -1 && flags & 2)) || return 1
+                bsp=$index
+            fi
+            if ((flags & 2)); then ((enabled+=1)); fi
+            ((index+=1))
+        elif [[ "$line" == 'thin-hv: CPU inventory PASS '* ]]; then
+            ((complete == 0 && index == count && bsp >= 0 && enabled > 0)) || return 1
+            [[ "$line" == "thin-hv: CPU inventory PASS total=$count enabled=$enabled bsp=$bsp project_ap_start=0 project_vmx=0" ]] || return 1
+            complete=1
+        elif [[ "$line" == *'CPU inventory'* || "$line" == *'FAIL'* || "$line" == *'panic'* ]]; then
+            return 1
+        fi
+    done <<<"$transcript"
+    ((complete == 1))
+}
+
 check_preflight_ept_log() {
     local accel=$1 log=$2 line transcript bytes passes=0 skips=0 vmx_markers=0 tables leaves
     local acpi=0 acpi_ranges=0 pci=0 pci_ranges=0 gcd=0 ranges=0 previous_end=0 start end
@@ -793,6 +825,11 @@ fi
 if [[ ${1:-} == --check-preflight-ept-log ]]; then
     [[ $# == 3 ]] || die 'usage: --check-preflight-ept-log ACCEL LOG'
     check_preflight_ept_log "$2" "$3" || die 'preflight EPT construction transcript check failed'
+    exit 0
+fi
+if [[ ${1:-} == --check-cpu-inventory-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-cpu-inventory-log CPU_COUNT LOG'
+    check_cpu_inventory_log "$2" "$3" || die 'CPU inventory transcript check failed'
     exit 0
 fi
 if [[ ${1:-} == --check-direct-platform-log ]]; then
@@ -1337,6 +1374,7 @@ if [[ "$backend" == uefi-profile-contract ]]; then
     check_profile_contract_log "$serial_log" || die 'profile contract transcript check failed'
 fi
 if [[ "$backend" == physical-preflight ]]; then
+    check_cpu_inventory_log "$smp" "$serial_log" || die 'CPU inventory transcript check failed'
     check_preflight_ept_log "$accel" "$serial_log" || die 'preflight EPT construction transcript check failed'
 fi
 if ((physical_policy)); then

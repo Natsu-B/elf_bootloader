@@ -61,6 +61,14 @@ Hyper-V remain unfinished; these six cases are not a daily-use claim.
 
 ## Authoritative starting point
 
+The normal `cargo xrun x86 --release` suite now includes read-only CPU inventory
+under QEMU/KVM and QEMU/TCG with 1, 2, 4 and 8 CPUs. Logs are retained as
+`bin/x86_64/preflight-{kvm,tcg}-cpus-{1,2,4,8}.log`. Each must enumerate exactly
+the requested number of distinct APIC identities and a unique enabled BSP,
+without starting an AP or entering project VMX. Disabled CPUs are retained in
+the inventory. This is **firmware inventory coverage, not L1 SMP support**:
+the physical/profile Direct gate still rejects more than one firmware CPU.
+
 Work started on 2026-09-07 and continued on 2026-09-08 (JST), without switching branches.
 The checked-out local implementation is authoritative; the public Branches index described in
 the task did not expose this development branch. No code was reconstructed from older main/origin.
