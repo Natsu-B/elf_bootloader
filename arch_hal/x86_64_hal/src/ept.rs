@@ -252,6 +252,41 @@ impl PlatformEpt<'_> {
     pub const fn leaf_count(&self) -> u64 {
         self.leaves
     }
+
+    /// Locate an identity-mapped 4 KiB leaf in this fully built private arena.
+    /// Returns the physical slot address and complete entry, without changing
+    /// permissions. Large leaves, missing mappings and malformed links fail.
+    pub fn base_page_slot(&self, address: u64) -> Result<(u64, u64), BuildError> {
+        const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+        if address >= 1 << 48 || address & 4095 != 0 {
+            return Err(BuildError::Storage);
+        }
+        let mut table = 0;
+        for shift in [39, 30, 21, 12] {
+            let slot = ((address >> shift) & 511) as usize;
+            let entry = self.pages[table].entries[slot];
+            if shift == 12 {
+                if entry & ADDRESS != address || entry & 7 != 7 || entry & 128 != 0 {
+                    return Err(BuildError::Conflict);
+                }
+                return Ok((
+                    self.physical.get() + (table * 4096 + slot * 8) as u64,
+                    entry,
+                ));
+            }
+            if entry & !ADDRESS != 7 {
+                return Err(BuildError::Conflict);
+            }
+            let offset = (entry & ADDRESS)
+                .checked_sub(self.physical.get())
+                .ok_or(BuildError::Conflict)?;
+            table = usize::try_from(offset / 4096).map_err(|_| BuildError::Conflict)?;
+            if table == 0 || table >= self.pages.len() {
+                return Err(BuildError::Conflict);
+            }
+        }
+        Err(BuildError::Conflict)
+    }
 }
 
 /// Counts all required tables without iterating every 4 KiB leaf of a large map.
@@ -920,6 +955,12 @@ mod tests {
         assert_identity_leaf(&ept, GIB - 1, GIB, MemoryType::WriteBack);
         assert_identity_leaf(&ept, GIB, PAGE, MemoryType::WriteBack);
         assert_eq!(leaf(&ept, GIB + PAGE), None);
+        let (slot, entry) = ept.base_page_slot(GIB).unwrap();
+        assert!(slot >= ARENA && slot + 8 <= ARENA + 4 * PAGE);
+        assert_eq!(entry, GIB | 7 | (6 << 3));
+        for invalid in [0, GIB - PAGE, GIB + 1, GIB + PAGE, 1 << 48, u64::MAX] {
+            assert!(ept.base_page_slot(invalid).is_err());
+        }
     }
 
     #[test]

@@ -576,7 +576,38 @@ pub unsafe fn try_rdmsr(index: u32) -> Option<u64> {
     (faulted == 0).then_some(u64::from(low) | (u64::from(high) << 32))
 }
 
-/// Recovers an exact armed RDMSR fault; every other root #GP remains fatal.
+/// Writes an MSR, recovering only this instruction's architectural #GP(0).
+///
+/// # Safety
+/// The private GS/IDT/IST, CPL0, IF=0, CET=0 and non-reentrancy requirements of
+/// `try_rdmsr` apply. The caller must additionally permit all successful write
+/// side effects, including changes to architectural mode or interrupt delivery.
+/// This is not authorization to write an arbitrary guest-selected host MSR.
+pub unsafe fn try_wrmsr(index: u32, value: u64) -> bool {
+    let faulted: u64;
+    // SAFETY: the caller establishes the private CPU scratch and permitted MSR
+    // side effects. Only label 2's WRMSR is armed. The #GP gate validates exact
+    // RIP/CS/error and preserves the saved GPRs; every return disarms the probe.
+    unsafe {
+        core::arch::asm!(
+            "cmp qword ptr gs:[{armed}], 0", "jne {fatal}",
+            "lea rax, [rip + 3f]", "mov gs:[{resume}], rax",
+            "mov qword ptr gs:[{failed}], 0",
+            "lea rax, [rip + 2f]", "mov gs:[{armed}], rax",
+            "mov rax, {value}", "mov rdx, {value}", "shr rdx, 32",
+            "2:", "wrmsr", "3:",
+            "mov qword ptr gs:[{armed}], 0",
+            "mov {faulted}, gs:[{failed}]",
+            armed = const MSR_FAULT_RIP, resume = const MSR_RESUME_RIP,
+            failed = const MSR_FAULTED, fatal = sym exception_stop,
+            in("ecx") index, value = in(reg) value,
+            out("rax") _, out("rdx") _, faulted = out(reg) faulted,
+        );
+    }
+    faulted == 0
+}
+
+/// Recovers an exact armed MSR-access fault; every other root #GP remains fatal.
 // SAFETY: a 64-bit CPL0 interrupt gate uses the CPU-owned IST4, with error code,
 // RIP, CS, RFLAGS, old RSP and SS at offsets 0..40. GS remains private; this gate
 // neither swaps GS nor calls Rust nor touches FP state. Two saved GPRs shift

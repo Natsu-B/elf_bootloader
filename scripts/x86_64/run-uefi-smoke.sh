@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Shared by transcript validation and the live runner; a halted monitor cannot
 # recover by waiting for an unrelated guest success marker.
-direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|nested VMX abort|host exception |firmware handoff FAIL|panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
+direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|nested VMX abort|host exception |firmware handoff FAIL|AP IPI FAIL|panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
 
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
@@ -1352,6 +1352,7 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
     fi
     if [[ "$backend" == direct-vmx ]] && ((!host_exception_test && !msr_abort_test)) &&
         grep -Eq -- "$direct_failure_pattern" "$serial_log"; then
+        capture_smp_failure || true
         printf 'quit\n' >&9
         break
     fi

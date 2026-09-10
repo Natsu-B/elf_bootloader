@@ -563,7 +563,7 @@ Latest combined package coverage: **438 PASS / 0 FAIL / 0 SKIP** (including the
 unchanged nine overlay tests). No AArch64 production path, dependency, physical
 device state or firmware identity was changed.
 
-## Increment 9 (in progress): actual AP carrier ownership
+## Increment 9: actual AP carrier ownership
 
 The opt-in `smp-direct-vmx` image (`smp-uefi` runner mode) now reserves one
 independent monitor block per firmware CPU. The normal physical/profile images
@@ -656,6 +656,111 @@ capture run rebuilt the correct 8-CPU/hotplug UKI through the normal runner.
 
 No Direct Windows/Hyper-V/WSL2, S3, S4, reboot matrix, Unsafe mode or physical
 hardware success is inferred from these Linux cold boots.
+
+## Increment 10: startup-IPI completion, including rounded nested MMIO faults
+
+The confirmed AP hotplug failure was a SIPI delivered while the target handled
+INIT in VMX root. Hardware/KVM discards that SIPI. Merely shortening the target's
+reset path was insufficient. The opt-in SMP carrier now observes startup ICR
+writes and pairs a per-target requested/completed generation with bounded,
+directed SIPI retries. No lock crosses guest entry or serializes all CPUs. The
+existing guest timeout remains 300 seconds; the interlock has its own one-second
+delivery deadline and fails closed if the target cannot complete startup.
+
+`cpu_ipi::{IpiTrap,deliver,startup_targets}` uses the actual APIC base and a
+checked UC 4 KiB leaf located by `PlatformEpt::base_page_slot`. Platform resource
+splitting preserves discovered coverage and rolls back on capacity failure.
+The carrier alone traps writes to this page. Ordinary APIC writes execute in
+hardware under MTF, with write permission removed on the next exit; the direct
+L1-created L2 EPTP is unchanged. Decoded ICR writes retain their real hardware
+payload/destination, including restoring the original ICR after directed retries.
+Guarded x2APIC/APIC_BASE WRMSR uses the existing private exact-RIP #GP mechanism;
+native host-state fixtures now test both successful and faulting guarded WRMSR.
+Logical/self startup IPIs and APIC-base relocation fail explicitly. x2APIC ICR
+execution still needs its own QEMU qualification. This is justified, narrow
+startup mediation, not a new APIC/PCI/device model; whole-page trapping overhead
+is unmeasured and is not enabled in the default BSP-only physical image.
+
+Intermediate short tests were misleading: they passed without ever recognizing
+an ICR store. The added fixed per-CPU diagnostic v6 (1,472 bytes) showed GPA
+`0xfee00000`, EPT qualification `0x2b` (no valid GLA), zero decoded ICRs and zero
+startup generations despite APIC write exits. The host's local Linux 7.1.5 KVM
+`mmu/paging_tmpl.h` passes a GFN-rounded address to nested translation in this
+path. Using GPA alone, or a GLA whose valid bit is clear, misses offset `0x300`.
+The correction decodes a bounded MOV32 effective address and uses the existing
+checked L1 page walker. It handles address-size wrapping, ModRM/SIB, REX,
+RIP-relative and segment bases; tests cover truncated/unsupported instructions
+and address calculations. Hardware-valid offsets remain usable. No fixed QEMU
+map or stale GLA is substituted. Other ordinary stores still execute in hardware.
+
+The recorded intermediate failures are retained, not counted as final passes:
+
+| Log suffix (under `/tmp/x86-smp-ipi-`) | 8-CPU failure iteration | Successful AP returns |
+| --- | --- | ---: |
+| `full-host-hotplug-matrix.log` | round 3, CPU6 | 19 |
+| `epochs-extended.log` | round 1, CPU4 | 3 |
+| `linear-offset-extended.log` | round 23, CPU5 | 158 |
+| `mmio-offset-audit.log` | round 9, CPU3 | 58 |
+
+Bounded captures are in `bin/x86_64/smp-failure.{7RzZQk,QBssDP,p4fhOb,ca7Bfy}`.
+After effective-address decoding, `effective-address-extended.log` passes all
+100 rounds on 8 CPUs: 700 AP returns with fresh pinned KVM runs, initial 64 KVM
+lifecycle cycles, and clean S5. Guest completion is 95.19 seconds. No manual QEMU
+pause or diagnostic capture interfered with that passing run.
+
+Final frozen-source commands, in `/tmp/x86-smp-ipi-final-regression.log`:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e;
+cargo fmt; cargo fmt --check; git diff --check;
+cargo xtest -p nested_vmx; cargo xtest -p x86_64_hal;
+cargo xtest -p x86_uefi_loader; cargo xtest -p x86_guest_uefi_test;
+cargo xtest -p xtask; cargo xbuild x86;
+env LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=2 LINUX_KVM_CYCLES=64 LINUX_KVM_HOTPLUG_CYCLES=100 bash scripts/x86_64/run-linux-kvm-test.sh;
+env LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=4 LINUX_KVM_CYCLES=64 LINUX_KVM_HOTPLUG_CYCLES=100 bash scripts/x86_64/run-linux-kvm-test.sh;
+cargo xrun x86 --release; cargo xrun x86 --profile-direct --release;
+cargo xrun x86 --nested --release'
+```
+
+Host Rust: **503 PASS / 0 FAIL / 0 SKIP** (32 nested, 62 HAL, 360 loader,
+10 guest, 39 xtask). The decoder's **14 Python checks PASS** within xtask.
+Debug xbuild, format and diff checks PASS. The 2/4-CPU 100-round cases both PASS,
+adding 100/300 successful AP returns: **1,100 total** across the three topologies,
+not 1,100 reboots. Standard release **18 PASS** (13 KVM, 5 TCG); profile Direct
+**6 PASS**; nested release **15 PASS / 5 FAIL / 0 SKIP**. All **14 project Direct**
+nested cases pass. The same five outer/reference contracts fail (native,
+readonly-vmcs, MSR, MSR abort-store, MSR abort-load), so the overall command
+correctly exits 1. Outer Linux's pass is reference evidence only.
+
+### Direct Hyper-V retest remains FAIL
+
+The same disposable Hyper-V seed was cloned read-only into
+`/tmp/x86-ipi-current-hyperv.d4xVmb/guest`. No OEM installation was used:
+
+```sh
+nix develop --accept-flake-config --command env \
+  WINDOWS_TEST_DIR=/tmp/x86-ipi-current-hyperv.d4xVmb/guest \
+  WINDOWS_DIRECT_MODE=physical-uefi WINDOWS_MEMORY=4G \
+  WINDOWS_VNC=127.0.0.1:51 \
+  bash scripts/x86_64/windows/windows-test.sh monitor-hyperv
+```
+
+QEMU/KVM default q35, one L1 CPU, `host,+vmx,-hypervisor,kvm=off`, no variable
+overlay, unchanged 600-second gate: **0 PASS / 1 FAIL / 0 SKIP**. The captured
+screen says drive scanning/repair is 100% complete, unlike the initial HEAD's
+Please-wait screen; no common root cause is assumed. The final counters show
+4,728,418 L2 entries/reflections, 41,213,721 L1 exits, zero VM-entry failures,
+811,717,938 VMREADs, 173,061,134 VMWRITEs and 15,128,114 VMPTRLDs. Most L1 exits
+remain VMREAD (25,038,480) / VMWRITE (10,714,845); most L2 exits remain RDMSR
+(3,758,924). Forward progress/overhead needs investigation; no Hyper-V or WSL2
+success is claimed. Part of this run overlapped Linux testing, so it is not an
+isolated performance A/B measurement. Logs/screens/decoded counters are retained;
+completed private child disk, firmware stores, TPM state and copied media are
+disposable and removed, leaving the immutable seed intact.
+
+No AArch64 production changes or dependencies were added. Current/Unsafe mode
+selection, shadowing, SMP Windows, S3/S4, idle measurements and physical hardware
+remain unqualified. Existing nested checks/capability policy are retained.
 
 ## Qualification still required
 

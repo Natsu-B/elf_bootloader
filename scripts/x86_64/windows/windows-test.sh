@@ -840,7 +840,7 @@ run_windows() {
         if ((stopped)) && command -v python3 >/dev/null && [[ -f "$decoder" ]]; then
             extent=$(python3 "$decoder" extent "$serial_log") || extent=
             read -r address bytes <<<"$extent"
-            if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 || "$bytes" == 1344 ) ]]; then
+            if [[ "$address" =~ ^0x[0-9a-f]{16}$ && ( "$bytes" == 176 || "$bytes" == 1216 || "$bytes" == 1344 || "$bytes" == 1408 || "$bytes" == 1472 ) ]]; then
                 quoted_record=${record//\\/\\\\}
                 quoted_record=${quoted_record//\"/\\\"}
                 # The decoder validated this unique monitor-owned publication.

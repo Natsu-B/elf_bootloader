@@ -294,7 +294,7 @@ impl FirmwareControls {
 /// Little-endian snapshot signature; only the published owned record is captured.
 const DIAGNOSTIC_MAGIC: u64 = u64::from_le_bytes(*b"THVSTAT1");
 /// Fixed snapshot ABI, independent of the Rust lock's private layout.
-const DIAGNOSTIC_VERSION: u64 = 4;
+const DIAGNOSTIC_VERSION: u64 = 6;
 /// Reasons 0..63 have separate bins; newer/unknown basic reasons share bin 64.
 const DIAGNOSTIC_REASON_BINS: usize = 65;
 /// Selected VMREAD miss encodings, in ABI order; other encodings share the last
@@ -325,7 +325,10 @@ const DIAGNOSTIC_PCPU_SCOPE: u64 = 2;
 #[derive(Clone, Copy)]
 enum DiagnosticEvent {
     L1Exit(u64),
-    L0Handled { reason: u64, action: u64 },
+    L0Handled {
+        reason: u64,
+        action: u64,
+    },
     NestedExit(u64),
     Reflected(u64),
     EntryFailure(u64),
@@ -336,6 +339,32 @@ enum DiagnosticEvent {
     ReflectedStateWrite,
     VmcsAccessBatch(vmx::VmcsAccessCounts),
     L1VmreadHardware(u32),
+    #[cfg(feature = "smp-direct-vmx")]
+    IpiCommand {
+        init: bool,
+        targets: u64,
+    },
+    #[cfg(feature = "smp-direct-vmx")]
+    IpiRetry,
+    #[cfg(feature = "smp-direct-vmx")]
+    IpiEpoch {
+        requested: u64,
+        completed: u64,
+        accepted: bool,
+    },
+    #[cfg(feature = "smp-direct-vmx")]
+    IpiStep,
+    #[cfg(feature = "smp-direct-vmx")]
+    IpiFault {
+        physical: u64,
+        linear: u64,
+        qualification: u64,
+        stage: u64,
+    },
+    #[cfg(feature = "smp-direct-vmx")]
+    IpiDecoded {
+        x2: bool,
+    },
 }
 
 /// Movable value state for eventual per-pCPU ownership; all counters saturate.
@@ -369,6 +398,9 @@ struct ExitCounterValues {
     l2_reasons: [u64; DIAGNOSTIC_REASON_BINS],
     /// L1 VMREADs requiring direct-VMCS selection, excluding software hits.
     l1_vmread_hardware: [u64; DIAGNOSTIC_READ_FIELDS.len() + 1],
+    /// ABI v5 startup counters followed by v6 APIC fault address/qualification
+    /// metadata. No guest operand contents are recorded.
+    ipi: [u64; 16],
 }
 
 impl ExitCounterValues {
@@ -394,6 +426,7 @@ impl ExitCounterValues {
             l1_reasons: [0; DIAGNOSTIC_REASON_BINS],
             l2_reasons: [0; DIAGNOSTIC_REASON_BINS],
             l1_vmread_hardware: [0; DIAGNOSTIC_READ_FIELDS.len() + 1],
+            ipi: [0; 16],
         }
     }
 
@@ -425,6 +458,55 @@ impl ExitCounterValues {
     /// phase/reason; operation telemetry must not obscure progress diagnostics.
     fn record(&mut self, event: DiagnosticEvent) {
         let (phase, reason) = match event {
+            #[cfg(feature = "smp-direct-vmx")]
+            DiagnosticEvent::IpiCommand { init, targets } => {
+                diagnostic_increment(&mut self.ipi[usize::from(!init)]);
+                self.ipi[6] = targets;
+                return;
+            }
+            #[cfg(feature = "smp-direct-vmx")]
+            DiagnosticEvent::IpiRetry => {
+                diagnostic_increment(&mut self.ipi[2]);
+                return;
+            }
+            #[cfg(feature = "smp-direct-vmx")]
+            DiagnosticEvent::IpiEpoch {
+                requested,
+                completed,
+                accepted,
+            } => {
+                self.ipi[4] = requested;
+                self.ipi[5] = completed;
+                if accepted {
+                    diagnostic_increment(&mut self.ipi[3]);
+                }
+                return;
+            }
+            #[cfg(feature = "smp-direct-vmx")]
+            DiagnosticEvent::IpiStep => {
+                diagnostic_increment(&mut self.ipi[7]);
+                return;
+            }
+            #[cfg(feature = "smp-direct-vmx")]
+            DiagnosticEvent::IpiFault {
+                physical,
+                linear,
+                qualification,
+                stage,
+            } => {
+                diagnostic_increment(&mut self.ipi[8]);
+                self.ipi[11] = physical;
+                self.ipi[12] = linear;
+                self.ipi[13] = qualification;
+                self.ipi[14] |= 1 << ((physical & 4095) >> 4).min(63);
+                self.ipi[15] = stage;
+                return;
+            }
+            #[cfg(feature = "smp-direct-vmx")]
+            DiagnosticEvent::IpiDecoded { x2 } => {
+                diagnostic_increment(&mut self.ipi[if x2 { 10 } else { 9 }]);
+                return;
+            }
             DiagnosticEvent::L1VmreadHardware(field) => {
                 let bin = DIAGNOSTIC_READ_FIELDS
                     .iter()
@@ -523,8 +605,9 @@ fn diagnostic_next_sequence(previous: u64) -> Option<(u64, u64)> {
     Some((previous.checked_add(1)?, previous.checked_add(2)?))
 }
 
-/// ABI v4: v3's 152 words followed by 16 L1 VMREAD hardware-miss counters.
-/// Sequence is word 3, counters start at 5. No guest address/data is recorded.
+/// ABI v6: v4's 168 words followed by 16 startup-IPI/MMIO diagnostic cells.
+/// Sequence is word 3, counters start at 5. Only APIC fault address metadata is
+/// retained; no guest operand or firmware variable contents are recorded.
 /// Readers require magic/version/size/scope and a stable even sequence. Stop all
 /// QEMU vCPUs before copying this record; an odd/exhausted snapshot is not valid.
 #[repr(C)]
@@ -564,7 +647,7 @@ impl ExitDiagnostics {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 1344);
+const _: () = assert!(core::mem::size_of::<ExitDiagnostics>() == 1472);
 
 /// No serial or allocation is permitted here: this is the bounded hot-path hook.
 fn record_diagnostic(event: DiagnosticEvent) {
@@ -1689,6 +1772,8 @@ struct PreparedMonitor {
     eptp: u64,
     host_cr3: u64,
     host_pat: u64,
+    #[cfg(feature = "smp-direct-vmx")]
+    ipi: Option<cpu_boot::IpiTrap>,
 }
 
 /// The caller has checked the complete block and built its independent roots.
@@ -1767,6 +1852,8 @@ fn prepare_monitor(
         eptp: maps.eptp,
         host_cr3: maps.host_cr3,
         host_pat: maps.host_pat,
+        #[cfg(feature = "smp-direct-vmx")]
+        ipi: maps.ipi,
     })
 }
 
@@ -2283,6 +2370,8 @@ struct CarrierMaps {
     host_pat: u64,
     window: ept::HostWindow,
     mmio: MmioMap,
+    #[cfg(feature = "smp-direct-vmx")]
+    ipi: Option<cpu_boot::IpiTrap>,
 }
 
 /// No root is published until both complete platform maps and cleanup succeed.
@@ -2302,6 +2391,18 @@ fn build_carrier_maps(
         }
         let tables = platform_acpi::Tables::from_system_table(system_table, map)?;
         let mmio = platform_resources::platform_mmio(system_table, map, width, tables.as_ref(), serial)?;
+        #[cfg(feature = "smp-direct-vmx")]
+        let (mmio, apic_page) = {
+            let mut mmio = mmio;
+            let page = if layout.count > 1 {
+                // SAFETY: CPL0 firmware preparation has established CPUID.APIC;
+                // this reads the actual local APIC base without changing it.
+                let page = unsafe { cpu::rdmsr(0x1b) } & 0x000f_ffff_ffff_f000;
+                mmio.separate_page(page, width)?;
+                Some(page)
+            } else { None };
+            (mmio, page)
+        };
         let mtrrs = cpu.mtrrs().map_err(|_| reject("carrier MTRR state"))?
             .ok_or_else(|| reject("carrier MTRRs unavailable"))?;
         // Every VMX/host/EPT page must really be WB, not merely advertise the
@@ -2359,7 +2460,15 @@ fn build_carrier_maps(
         let _ = writeln!(serial,
             "thin-hv: direct platform HOST PASS tables={} leaves={} private_pages={} mmio_window=uc physical_ready=0",
             host.table_pages(), host.leaf_count(), HOST_TABLE_PAGES);
-        Ok(CarrierMaps { eptp: built.eptp(), host_cr3: host.cr3(), host_pat: host.pat(), window: host.window(), mmio })
+        #[cfg(feature = "smp-direct-vmx")]
+        let ipi = apic_page.map(|page| {
+            let (slot, entry) = built.base_page_slot(page).map_err(|_| reject("carrier APIC base leaf"))?;
+            cpu_boot::IpiTrap::new(page, slot, entry, built.eptp())
+                .ok_or_else(|| reject("carrier APIC UC identity leaf"))
+        }).transpose()?;
+        Ok(CarrierMaps { eptp: built.eptp(), host_cr3: host.cr3(), host_pat: host.pat(), window: host.window(), mmio,
+            #[cfg(feature = "smp-direct-vmx")] ipi,
+        })
     }).map_err(Error::Platform)
 }
 
@@ -3607,6 +3716,19 @@ fn l1_vmx_capability(msr: u32) -> Option<u64> {
         // No WRMSR, guest-state change, or hot-path logging is introduced.
         if unsafe { host_state::try_rdmsr(u32::MAX) }.is_some() {
             return None;
+        }
+        // SAFETY: the same private owner/IF=0 guard applies. The reserved MSR
+        // write must #GP without side effects. Rewriting the current private
+        // SYSENTER_CS then checks that the guard disarmed and a valid WRMSR
+        // remains usable; VMX independently switches the guest SYSENTER state.
+        unsafe {
+            if host_state::try_wrmsr(u32::MAX, 0) {
+                return None;
+            }
+            let sysenter_cs = host_state::try_rdmsr(0x174)?;
+            if !host_state::try_wrmsr(0x174, sysenter_cs) {
+                return None;
+            }
         }
     }
     let hardware = match msr {
@@ -7640,6 +7762,48 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "smp-direct-vmx")]
+    #[test]
+    fn startup_diagnostics_preserve_exit_phase_and_saturate_only_counters() {
+        let mut values = ExitCounterValues::new();
+        values.record(DiagnosticEvent::L1Exit(48));
+        values.ipi[2] = u64::MAX;
+        values.record(DiagnosticEvent::IpiCommand {
+            init: true,
+            targets: 0x40,
+        });
+        values.record(DiagnosticEvent::IpiCommand {
+            init: false,
+            targets: 0x20,
+        });
+        values.record(DiagnosticEvent::IpiRetry);
+        values.record(DiagnosticEvent::IpiEpoch {
+            requested: 3,
+            completed: 2,
+            accepted: false,
+        });
+        values.record(DiagnosticEvent::IpiEpoch {
+            requested: 3,
+            completed: 3,
+            accepted: true,
+        });
+        values.record(DiagnosticEvent::IpiStep);
+        values.record(DiagnosticEvent::IpiFault {
+            physical: 0xfee00300,
+            linear: 0xffffffffff5fc300,
+            qualification: 0x18b,
+            stage: 3,
+        });
+        values.record(DiagnosticEvent::IpiDecoded { x2: false });
+        values.record(DiagnosticEvent::IpiDecoded { x2: true });
+        assert_eq!(&values.ipi[..8], &[1, 1, u64::MAX, 1, 3, 3, 0x20, 1]);
+        assert_eq!(
+            &values.ipi[8..],
+            &[1, 1, 1, 0xfee00300, 0xffffffffff5fc300, 0x18b, 1 << 48, 3]
+        );
+        assert_eq!((values.last_phase, values.last_reason), (1, 48));
+    }
+
     #[test]
     fn diagnostics_classify_l1_l2_and_failed_entries_without_reflection_confusion() {
         let mut diagnostics = ExitDiagnostics::new();
@@ -7764,6 +7928,7 @@ mod tests {
             l1_reasons: [almost; super::DIAGNOSTIC_REASON_BINS],
             l2_reasons: [almost; super::DIAGNOSTIC_REASON_BINS],
             l1_vmread_hardware: [almost; super::DIAGNOSTIC_READ_FIELDS.len() + 1],
+            ipi: [almost; 16],
         };
         for _ in 0..3 {
             for reason in [
@@ -7816,7 +7981,7 @@ mod tests {
 
     #[test]
     fn diagnostics_snapshot_layout_and_sequence_exhaustion_are_fail_closed() {
-        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 1344);
+        assert_eq!(core::mem::size_of::<ExitDiagnostics>(), 1472);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, sequence), 24);
         assert_eq!(core::mem::offset_of!(ExitDiagnostics, values), 40);
         assert_eq!(

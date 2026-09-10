@@ -83,6 +83,44 @@ impl MmioMap {
         &self.ranges[..self.count]
     }
 
+    /// Preserve one complete MMIO page as a separate planning interval. This
+    /// changes neither ownership nor cache type; it prevents a large EPT leaf
+    /// from combining that page with unrelated registers. Call after discovery
+    /// has finished, since insert deliberately normalizes adjacent intervals.
+    #[cfg(feature = "smp-direct-vmx")]
+    pub(crate) fn separate_page(&mut self, page: u64, width: PhysicalWidth) -> Result<(), Error> {
+        let end = page
+            .checked_add(PAGE)
+            .ok_or_else(|| malformed("MMIO page overflow"))?;
+        let selected = PhysicalRange::new(page, end, width)
+            .map_err(|_| malformed("MMIO page alignment/width"))?;
+        let index = self
+            .ranges()
+            .iter()
+            .position(|r| r.start() <= page && end <= r.end())
+            .ok_or_else(|| malformed("MMIO page not discovered"))?;
+        let old = self.ranges[index];
+        let extra = usize::from(old.start() < page) + usize::from(end < old.end());
+        if self.count + extra > self.ranges.len() {
+            return Err(malformed("MMIO page split capacity"));
+        }
+        // All potentially failing construction precedes mutation.
+        let before = (old.start() < page)
+            .then(|| PhysicalRange::new(old.start(), page, width))
+            .transpose()
+            .map_err(|_| malformed("MMIO page prefix"))?;
+        let after = (end < old.end())
+            .then(|| PhysicalRange::new(end, old.end(), width))
+            .transpose()
+            .map_err(|_| malformed("MMIO page suffix"))?;
+        self.ranges[index] = selected;
+        for range in [before, after].into_iter().flatten() {
+            self.ranges[self.count] = range;
+            self.count += 1;
+        }
+        Ok(())
+    }
+
     /// Merge adjacent/overlapping page-rounded MMIO without relying on firmware
     /// enumeration order. Raw descriptors have already passed overlap checks.
     pub(crate) fn insert(
@@ -395,6 +433,49 @@ mod tests {
         for count in [0, MAX_DESCRIPTORS + 1, usize::MAX] {
             assert!(descriptor_bytes(count).is_err());
         }
+    }
+
+    #[cfg(feature = "smp-direct-vmx")]
+    #[test]
+    fn mmio_page_split_preserves_coverage_and_rejects_without_partial_mutation() {
+        for page in [0xfee00000, 0xfee01000, 0xfefff000] {
+            let mut map = MmioMap::empty(width()).unwrap();
+            map.insert(
+                PhysicalRange::new(0xfee00000, 0xff000000, width()).unwrap(),
+                width(),
+            )
+            .unwrap();
+            map.separate_page(page, width()).unwrap();
+            assert!(
+                map.ranges()
+                    .iter()
+                    .any(|r| r.start() == page && r.end() == page + PAGE)
+            );
+            assert_eq!(
+                map.ranges()
+                    .iter()
+                    .map(|r| r.end() - r.start())
+                    .sum::<u64>(),
+                0x200000
+            );
+            let previous = map.ranges().to_vec();
+            for invalid in [0, page + 1, 0xff000000, u64::MAX] {
+                assert!(map.separate_page(invalid, width()).is_err());
+                assert_eq!(map.ranges(), previous);
+            }
+        }
+        let mut map = MmioMap::empty(width()).unwrap();
+        for index in 0..MAX_MMIO_RANGES {
+            let start = index as u64 * 8 * PAGE;
+            map.insert(
+                PhysicalRange::new(start, start + 4 * PAGE, width()).unwrap(),
+                width(),
+            )
+            .unwrap();
+        }
+        let previous = map.ranges().to_vec();
+        assert!(map.separate_page(PAGE, width()).is_err());
+        assert_eq!(map.ranges(), previous);
     }
 
     #[test]

@@ -91,10 +91,15 @@ reserves memory; AP takeover occurs after the original successful
 `ExitBootServices`. The BSP waits for every AP to execute a private carrier probe
 before continuing L1. This mode keeps the platform map and has no variable overlay.
 All four Linux cold-boot configurations passed 64 pinned nested KVM probes each.
-This is **not completed SMP lifecycle qualification**: setting
-`LINUX_KVM_HOTPLUG_CYCLES=2` reproduces intermittent AP online failure after INIT,
-with the subsequent SIPI absent from that CPU's exit counters. The strict runner
-fails and saves bounded per-CPU JSON under `bin/x86_64/smp-failure.*`.
+The sender-side startup-IPI interlock now passes
+`LINUX_KVM_HOTPLUG_CYCLES=100` with 2, 4 and 8 CPUs (1,100 AP offline/online
+transitions, each followed by a fresh pinned KVM probe). It closes the observed
+SIPI-in-root race without extending the guest timeout. Only this experimental
+SMP build traps the physical APIC page: ordinary writes execute in hardware
+under a one-instruction permission window; INIT/SIPI delivery is acknowledged
+per target. Logical/self startup IPIs and APIC-base relocation remain unsupported.
+The strict runner retains bounded per-CPU JSON under `bin/x86_64/smp-failure.*`
+on failure. This is **not completed SMP lifecycle or performance qualification**.
 Windows SMP, reboot and power transitions remain unqualified. See the
 [incremental evidence](evidence/x86_64/daily-candidate-2026-09-11.md).
 

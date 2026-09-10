@@ -3,7 +3,7 @@
 
 The address command accepts one publication inside reserved CPU-owned storage
 (or the resident image for explicitly legacy publications),
-never a free-form physical address. Only ABI v2/v3/v4 (176/1216/1344 bytes)
+never a free-form physical address. Only ABI v2-v6 (176/1216/1344/1408/1472 bytes)
 records are accepted, with matching publication/header versions and sizes;
 it does not inspect guest, firmware, crash, or licensing data.
 """
@@ -18,7 +18,7 @@ import unittest
 
 
 SIZE = 176
-SIZES = {2: SIZE, 3: 1216, 4: 1344}
+SIZES = {2: SIZE, 3: 1216, 4: 1344, 5: 1408, 6: 1472}
 U64_MAX = (1 << 64) - 1
 PROTOTYPE_LIMIT = 1 << 47  # current private HOST_CR3 low-canonical address ceiling
 MAX_LOG_BYTES = 64 << 20
@@ -28,12 +28,12 @@ IMAGE = re.compile(r"thin-hv: runtime image base=0x([0-9a-f]{16}) end=0x([0-9a-f
 BLOCK = re.compile(r"thin-hv: monitor block=0x([0-9a-f]{16}) end=0x([0-9a-f]{16})")
 PUBLICATION = re.compile(
     r"thin-hv: vmx diagnostics address=0x([0-9a-f]{16}) "
-    r"size=(176|1216|1344) version=([234]) scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
+    r"size=(176|1216|1344|1408|1472) version=([23456]) scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
 )
 PCPU = re.compile(
     r"thin-hv: pcpu diagnostics slot=([1-9][0-9]?) apic_id=([0-9]{1,10}) "
     r"block=0x([0-9a-f]{16}) end=0x([0-9a-f]{16}) address=0x([0-9a-f]{16}) "
-    r"size=(1344) version=(4) environment=qemu-prototype storage=cpu-runtime"
+    r"size=(1344|1408|1472) version=([456]) environment=qemu-prototype storage=cpu-runtime"
 )
 READ_FIELDS = (
     "guest_rip", "guest_rsp", "guest_rflags", "guest_interruptibility",
@@ -174,7 +174,7 @@ def decode_record(data, address, cpu_slot=0):
     words = struct.unpack(f"<{len(data) // 8}Q", data)
     if (not isinstance(cpu_slot, int) or not 0 <= cpu_slot < 64
             or SIZES.get(words[1]) != len(data) or words[2] != len(data)
-            or words[4] != (2 if cpu_slot else 1) or (cpu_slot and words[1] != 4)):
+            or words[4] != (2 if cpu_slot else 1) or (cpu_slot and words[1] not in (4, 5, 6))):
         raise InvalidRecord("unsupported diagnostics version, size, or scope")
     if words[3] & 1 or words[3] == U64_MAX:
         raise InvalidRecord("torn or exhausted diagnostics sequence")
@@ -199,12 +199,22 @@ def decode_record(data, address, cpu_slot=0):
                     for index, count in enumerate(bins) if count}
             for layer, bins in (("l1", words[22:87]), ("l2", words[87:152]))
         }
-    if words[1] == 4:
+    if words[1] >= 4:
         result["l1_vmread_hardware"] = {
             field: count for field, count in zip(READ_FIELDS, words[152:168]) if count
         }
+    if words[1] >= 5:
+        result["startup_ipi"] = dict(zip((
+            "init_commands", "sipi_commands", "sipi_retries", "accepted_sipi",
+            "requested_generation", "completed_generation", "last_targets", "apic_write_steps",
+        ), words[168:176]))
     if cpu_slot:
         result["cpu_slot"] = cpu_slot
+    if words[1] >= 6:
+        result["startup_ipi"].update(zip((
+            "apic_ept_faults", "icr_decoded_writes", "x2_icr_writes", "last_fault_gpa",
+            "last_fault_gla", "last_fault_qualification", "observed_apic_offsets", "sender_stage",
+        ), words[176:184]))
     return result
 
 
@@ -260,6 +270,30 @@ class DecoderTests(unittest.TestCase):
             decode_record(raw, 0x300040)
         with self.assertRaises(InvalidRecord):
             decode_record(self.record(), 0x100040, 1)
+
+    def test_v5_startup_counters_keep_v4_offsets_and_bounded_publication(self):
+        words = self.words + [0] * (176 - len(self.words))
+        words[1], words[2] = 5, 1408
+        words[152] = 99
+        words[168:] = [4, 5, 6, 7, 8, 9, 0x40, 11]
+        data = struct.pack("<176Q", *words)
+        decoded = decode_record(data, 0x100040)
+        self.assertEqual(decoded["l1_vmread_hardware"], {"guest_rip": 99})
+        self.assertEqual(decoded["startup_ipi"]["sipi_retries"], 6)
+        self.assertEqual(decoded["startup_ipi"]["last_targets"], 0x40)
+        line = self.lines[3].replace("size=176 version=2", "size=1408 version=5")
+        self.assertEqual(publication(self.lines[:3] + [line], True)[2:], (1408, 5))
+        with self.assertRaises(InvalidRecord):
+            publication(self.lines[:3] + [line.replace("version=5", "version=4")], True)
+        words[4] = 2
+        self.assertEqual(decode_record(struct.pack("<176Q", *words), 0x300040, 1)["cpu_slot"], 1)
+        words += [10, 11, 12, 0xfee00000, 0, 0x2b, 1, 3]
+        words[1], words[2] = 6, 1472
+        decoded = decode_record(struct.pack("<184Q", *words), 0x300040, 1)
+        self.assertEqual(decoded["startup_ipi"]["apic_ept_faults"], 10)
+        self.assertEqual(decoded["startup_ipi"]["last_fault_qualification"], 0x2b)
+        line = line.replace("size=1408 version=5", "size=1472 version=6")
+        self.assertEqual(publication(self.lines[:3] + [line], True)[2:], (1472, 6))
 
     def test_missing_duplicate_and_unordered_publication(self):
         for index in range(4):

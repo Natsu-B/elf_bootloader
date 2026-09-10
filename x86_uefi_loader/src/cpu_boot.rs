@@ -15,6 +15,9 @@ use x86_64_hal::ap_bootstrap::MAX_CPUS;
 use x86_64_hal::cpu;
 use x86_64_hal::vmcs;
 use x86_64_hal::vmx;
+#[path = "cpu_ipi.rs"]
+mod cpu_ipi;
+pub(super) use cpu_ipi::IpiTrap;
 
 const FIRMWARE_OWNED: usize = 0;
 const HANDOFF_PENDING: usize = 1;
@@ -33,6 +36,11 @@ pub(super) struct CpuBoot {
     prepared: Option<PreparedMonitor>,
     stage: AtomicUsize,
     reset_pending: AtomicUsize,
+    /// Sender publishes before delivering INIT; receiver acknowledges only an
+    /// actual SIPI exit, so VMX-root delivery loss cannot look like success.
+    startup_requested: AtomicUsize,
+    startup_completed: AtomicUsize,
+    ipi: mutex::SpinLock<Option<IpiTrap>>,
 }
 
 impl CpuBoot {
@@ -54,6 +62,9 @@ impl CpuBoot {
             prepared: None,
             stage: AtomicUsize::new(FIRMWARE_OWNED),
             reset_pending: AtomicUsize::new(0),
+            startup_requested: AtomicUsize::new(1),
+            startup_completed: AtomicUsize::new(0),
+            ipi: mutex::SpinLock::new(None),
         }
     }
 
@@ -125,9 +136,12 @@ pub(super) fn prepare_aps(
                 layout: Some(layout),
                 slot,
                 probe: 0,
+                ipi: mutex::SpinLock::new(prepared.ipi),
                 prepared: Some(prepared),
                 stage: AtomicUsize::new(FIRMWARE_OWNED),
                 reset_pending: AtomicUsize::new(0),
+                startup_requested: AtomicUsize::new(1),
+                startup_completed: AtomicUsize::new(0),
             };
         }
         // SAFETY: this complete CPU object is still unobserved by its AP. The
@@ -178,6 +192,9 @@ pub(super) fn prepare_aps(
             prepared: None,
             stage: AtomicUsize::new(MONITOR_OWNED),
             reset_pending: AtomicUsize::new(0),
+            startup_requested: AtomicUsize::new(1),
+            startup_completed: AtomicUsize::new(1),
+            ipi: mutex::SpinLock::new(bsp.ipi),
         };
     }
     for slot in 1..topology.count {
@@ -192,6 +209,7 @@ pub(super) fn prepare_aps(
                 .probe = probe;
         }
     }
+    cpu_ipi::prepare(topology.count, layout, bsp)?;
     let _ = writeln!(
         serial,
         "thin-hv: AP preparation PASS cpus={} ownership=firmware bootstrap={:#x} vmxon=0",
@@ -459,6 +477,9 @@ pub(super) fn handle_exit(registers: &mut GuestRegisters, reason: u64) -> bool {
         return false;
     }
     let reason = reason & 0xffff;
+    if cpu_ipi::handle_exit(registers, reason) {
+        return true;
+    }
     let initial_probe = reason == super::EXIT_REASON_CPUID
         && registers.rax as u32 == ap_bootstrap::READY_LEAF
         && boot.slot != 0
@@ -467,6 +488,11 @@ pub(super) fn handle_exit(registers: &mut GuestRegisters, reason: u64) -> bool {
         return false;
     }
     if reason == 3 {
+        super::record_diagnostic(super::DiagnosticEvent::IpiEpoch {
+            requested: boot.startup_requested.load(Ordering::Acquire) as u64,
+            completed: boot.startup_completed.load(Ordering::Acquire) as u64,
+            accepted: false,
+        });
         // Actually enter WAIT before the sender's SIPI, rather than spending
         // its short INIT/SIPI interval issuing a full register reset in root.
         // No L1 instruction can execute in WAIT. Materialize the reset on the
@@ -484,6 +510,7 @@ pub(super) fn handle_exit(registers: &mut GuestRegisters, reason: u64) -> bool {
         return true;
     }
     let reset = initial_probe || boot.reset_pending.swap(0, Ordering::Relaxed) != 0;
+    let mut accepted_sipi = false;
     // SAFETY: hardware just exited this owner's carrier; no L1 runs while its
     // INIT/SIPI state is read or rewritten, and private GS selects this object.
     let result = unsafe {
@@ -513,6 +540,7 @@ pub(super) fn handle_exit(registers: &mut GuestRegisters, reason: u64) -> bool {
                     ] {
                         super::write_vmcs(field, value)?;
                     }
+                    accepted_sipi = true;
                     Ok(())
                 })
         } else {
@@ -555,7 +583,20 @@ pub(super) fn handle_exit(registers: &mut GuestRegisters, reason: u64) -> bool {
         }
     }
     if initial_probe {
+        if cpu_ipi::activate(boot).is_err() {
+            fail(boot, 8);
+        }
         boot.stage.store(RUNNING_L1, Ordering::Release);
+    } else if accepted_sipi {
+        boot.startup_completed.store(
+            boot.startup_requested.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        super::record_diagnostic(super::DiagnosticEvent::IpiEpoch {
+            requested: boot.startup_requested.load(Ordering::Acquire) as u64,
+            completed: boot.startup_completed.load(Ordering::Acquire) as u64,
+            accepted: true,
+        });
     }
     true
 }
@@ -634,6 +675,7 @@ pub(super) fn take_over_aps() -> Result<(), Error> {
             core::hint::spin_loop();
         }
     }
+    cpu_ipi::activate(boot)?;
     boot.stage.store(RUNNING_L1, Ordering::Release);
     for slot in 0..boot.handoff.count {
         let cpu = boot.cpu(slot)?;
