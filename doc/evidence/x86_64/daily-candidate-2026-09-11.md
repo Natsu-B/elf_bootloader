@@ -286,9 +286,84 @@ combined with loader 275, guest 10 and the latest xtask 39, affected host covera
 is **424 PASS / 0 FAIL / 0 SKIP**. These counts refer to the latest successful
 package runs, not an assertion that the earlier intermediate gate failure passed.
 
+## Increment 5: execute selected-profile boot options
+
+Verified `ddf39cb` still loaded only configured managers. The existing firmware
+backing namespace is now used directly for BootNext/BootOrder/Boot#### selection;
+no second store, new dependency, device model, or nested translation layer exists.
+
+Changed implementation surfaces:
+
+* `profile_boot.rs`: bounded `BootOption` decoding, `load_ordered`/`load_option`,
+  retained EFI optional-data ownership, `SelectedBoot::commit/release`, native
+  BootCurrent publication and failed-handoff restoration.
+* `runtime_variables.rs`: `read_profile_boot_variable` and
+  `consume_profile_boot_next`, before hooks and only in the selected namespace.
+* `physical_chainload.rs`: `boot_file_path`, `same_boot_device`, and
+  `load_profile_device_path`; full/current-ESP and partition-signature short forms
+  reuse the existing image-path and firmware LoadImage checks.
+* `vmx_smoke.rs::start_runtime_monitor`: commit/release selected boot metadata at
+  the existing validated runtime-image handoff/cleanup boundaries.
+* `profile_selection_test.rs::seed_boot_option`, guest `boot_option_fixture`,
+  `run-uefi-smoke.sh::check_profile_selection_log`, and xtask
+  `run_x86_profile_selection`: two additional actual-Direct cases and strict gates.
+
+Windows BootNext explicitly selects an inactive Boot0042 with a file-only path.
+Linux consumes a missing BootNext, skips inactive/missing BootOrder candidates,
+and selects active Boot0042 by a full current-device path. The actual selected
+payload (a disposable EFI application, not Windows/Linux) verifies its FilePath,
+eight retained optional bytes, BootCurrent/attributes, and absent consumed BootNext.
+Host tests additionally cover truncated/oversized load options, category filtering,
+short GPT path identity, malformed nodes, and mismatched partitions.
+
+BootNext consumption follows native one-shot semantics and is not rolled back on
+an unsuccessful target attempt. The independent persistent selector is unaffected.
+BootCurrent is native volatile boot metadata, not a fake security/identity value.
+Unsupported cross-ESP paths fail rather than searching another filesystem.
+Only missing BootOrder permits the configured same-profile default; an exhausted
+recorded order fails. Explicit profile UI bypasses private boot order for its
+configured manager. StartImage-return retry among multiple candidates and automatic
+Driver#### execution remain unsupported; this is not a full BDS replacement.
+
+Reference behavior inspected without copying code:
+[EDK II BdsEntry.c](https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Universal/BdsDxe/BdsEntry.c)
+consumes BootNext before launch and applies active/boot-category filtering to
+automatic BootOrder attempts. Firmware remains responsible for PE/Secure Boot
+validation and atomic per-variable persistence.
+
+`/tmp/x86-profile-boot-options-regression.log` records exit 0 for:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p x86_uefi_loader; cargo xtest -p x86_guest_uefi_test; cargo xtest -p xtask; cargo xrun x86 --profile-direct --release'
+```
+
+Host: loader 277, guest 10, xtask 39 = **326 PASS / 0 FAIL / 0 SKIP**.
+QEMU/KVM Direct profile suite: **6 PASS / 0 FAIL / 0 SKIP**, default q35, host VMX,
+one L1 CPU, 256 MiB, 60 seconds per case. This is not SMP or real-OS evidence.
+
+`/tmp/x86-profile-boot-options-direct-regression.log` records:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo xrun x86 --profile-direct; cargo xrun x86 --release; cargo fmt --check; git diff --check; cargo xrun x86 --nested --release'
+```
+
+Debug profile Direct: **6 PASS / 0 FAIL / 0 SKIP**. Standard release:
+**12 PASS / 0 FAIL / 0 SKIP**. Formatting/diff checks pass. Nested release:
+**15 PASS / 5 FAIL / 0 SKIP**; all 14 Direct cases pass, the outer Linux reference
+passes, and the same five outer reference contract failures remain. Therefore this
+combined command exits 1, not PASS. Direct Linux again runs 64 lifecycle cycles in
+each of six configurations, including 12-GiB/default high-PCI layouts. No nested
+runtime behavior was optimized in this increment. No real Windows, S3/S4, physical
+hardware, or Current/Unsafe A/B result is inferred from these native fixtures.
+
+Fixture ESPs are invocation-owned and removed by the existing runner trap,
+including the new OPTION.EFI. Small logs are retained as evidence; no generated
+EFI image, firmware-variable store, disk image, or unrelated AGENTS.md change is
+part of the commit.
+
 ## Qualification still required
 
-Full profile BootNext/BootOrder execution and failure injection;
+Profile boot-option return/error/reboot qualification and failure injection;
 1/2/4/8 actual L1 CPUs; AP handoff; S3/cancellation/time/NMI; Direct Hyper-V/WSL2
 and S4; short/extended daily suite; measured Current/Unsafe A/B and default decision.
 Existing Linux test failures in `correctness-2026-09-09.md` are not waived.

@@ -1907,7 +1907,7 @@ fn start_runtime_monitor(
         ProfileId(0),
     );
     #[cfg(feature = "profile-direct-vmx")]
-    let selection =
+    let mut selection =
         crate::profile_boot::load_selected(parent_image, system_table, &mut SerialPort)?;
     #[cfg(feature = "profile-direct-vmx")]
     let (guest, profile) = (selection.image, selection.profile.id());
@@ -1993,6 +1993,8 @@ fn start_runtime_monitor(
     // This code is reachable only before L1 entry. The guest's LoadImage handle
     // has never been started; attempt its cleanup even if monitor cleanup failed.
     chainload::unload_image(services, guest)?;
+    #[cfg(feature = "profile-direct-vmx")]
+    selection.release()?;
     if monitor_retired {
         SerialPort.write_bytes(
             b"thin-hv: runtime handoff cleanup PASS guest=unstarted monitor=retired\n",

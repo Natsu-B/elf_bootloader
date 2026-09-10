@@ -449,13 +449,94 @@ fn enumeration_is_logical(runtime: *mut efi::RuntimeServices) -> bool {
     false
 }
 
+/// Optional Direct boot-manager fixture: verify the actual selected image and
+/// retained EFI_LOAD_OPTION bytes, not only the parent's selection log.
+fn boot_option_fixture(image: efi::Handle, system: *mut efi::SystemTable) -> bool {
+    if system.is_null() {
+        return false;
+    }
+    // SAFETY: firmware supplied the live table before this payload exits Boot
+    // Services. This fixture reads only validated Runtime/Boot interface pointers.
+    let (runtime, services) = unsafe { ((*system).runtime_services, (*system).boot_services) };
+    if runtime.is_null() || services.is_null() {
+        return false;
+    }
+    let mut expected_name = ascii_uefi_name(b"ProfileOptionFixture\0");
+    let expected = match read_u16_variable(runtime, &mut expected_name, MONITOR_VENDOR_GUID) {
+        Err(status) if status == efi::Status::NOT_FOUND => return true,
+        Ok((number, efi::VARIABLE_BOOTSERVICE_ACCESS)) => number,
+        _ => return false,
+    };
+    let mut current = ascii_uefi_name(b"BootCurrent\0");
+    let mut next = ascii_uefi_name(b"BootNext\0");
+    if read_u16_variable(runtime, &mut current, EFI_GLOBAL_VARIABLE_GUID)
+        != Ok((
+            expected,
+            efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS,
+        ))
+        || !variable_is_absent(runtime, &mut next, EFI_GLOBAL_VARIABLE_GUID)
+    {
+        return false;
+    }
+    let mut guid = efi::protocols::loaded_image::PROTOCOL_GUID;
+    let mut loaded = ptr::null_mut();
+    // SAFETY: this running payload's handle is live; GUID and output are owned.
+    let status = unsafe { ((*services).handle_protocol)(image, &mut guid, &mut loaded) };
+    if status.is_error() || loaded.is_null() {
+        return false;
+    }
+    let loaded = loaded.cast::<efi::protocols::loaded_image::Protocol>();
+    // SAFETY: checked firmware interface describes this running image's path and
+    // options. They are borrowed before EBS or returning to its parent.
+    let (path, options, size) = unsafe {
+        (
+            (*loaded).file_path,
+            (*loaded).load_options,
+            (*loaded).load_options_size,
+        )
+    };
+    if path.is_null() || options.is_null() || size != 8 {
+        return false;
+    }
+    // SAFETY: LoadedImage declares eight readable bytes in the retained copy;
+    // this native fixture's expected optional data has exactly that size.
+    if unsafe { core::slice::from_raw_parts(options.cast::<u8>(), 8) } != b"THVOPT1\0" {
+        return false;
+    }
+    let file = ascii_uefi_name(b"\\EFI\\Test\\OPTION.EFI\0");
+    // SAFETY: the LoadedImage FilePath is a complete firmware path. Copy its
+    // first node header before checking the exact expected file-node byte size.
+    let header = unsafe { ptr::read_unaligned(path) };
+    if header.r#type != 4
+        || header.sub_type != 4
+        || usize::from(u16::from_le_bytes(header.length)) != 4 + file.len() * 2
+    {
+        return false;
+    }
+    for (index, expected) in file.into_iter().enumerate() {
+        // SAFETY: the firmware node's checked size contains this UTF-16 unit;
+        // read unaligned because device paths do not promise native alignment.
+        if unsafe { ptr::read_unaligned(path.cast::<u8>().add(4 + index * 2).cast::<u16>()) }
+            != expected
+        {
+            return false;
+        }
+    }
+    write_bytes(b"thin-hv: guest boot option PASS\r\n");
+    true
+}
+
 /// UEFI image entry point.
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(
-    _image: efi::Handle,
+    image: efi::Handle,
     system_table: *mut efi::SystemTable,
 ) -> efi::Status {
     init_serial();
+    if !boot_option_fixture(image, system_table) {
+        write_bytes(b"thin-hv: guest boot option FAIL\r\n");
+        return efi::Status::COMPROMISED_DATA;
+    }
     for byte in b"thin-hv: guest uefi payload\r\n" {
         write_byte(*byte);
     }

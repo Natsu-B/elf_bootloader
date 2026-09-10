@@ -30,16 +30,34 @@ The additional opt-in profile Direct selection gate is:
 nix develop --accept-flake-config --command cargo xrun x86 --profile-direct --release
 ```
 
-It tests four native-UEFI Direct cases, not installed Windows/Linux: each profile
-selected explicitly and from the persistent selector. The backend logs `profile-uefi`
+It tests six native-UEFI Direct cases, not installed Windows/Linux: each profile
+selected explicitly and from the persistent selector, plus Windows BootNext and
+Linux BootOrder execution. The backend logs `profile-uefi`
 and uses distinct `x86-uefi-profile-direct-{loader,monitor}.efi` artifacts. Exact
 UTF-16 `windows` / `linux` LoadOptions make an explicit selection; empty options
 require an existing valid selector. Linux's current-ESP path is supplied at build
 time by `THIN_HV_LINUX_EFI_PATH`; this test child build sets it to the disposable
 `\EFI\ubuntu\shimx64.efi` fixture. Missing configuration never selects another OS.
-The original `physical-uefi` backend remains overlay-free. Private BootNext/BootOrder
-execution, SMP, OS power/update cycles and Hyper-V remain unfinished; these four
-cases are not a daily-use claim.
+The original `physical-uefi` backend remains overlay-free.
+
+On a persistent-profile boot, only that profile's BootNext/BootOrder/Boot#### are
+consulted. BootNext is consumed before attempting its target; BootOrder considers
+active boot-category entries in order. Missing/inactive entries may be skipped,
+but malformed, unsupported, or other-ESP entries fail closed. A missing BootOrder
+uses the configured same-profile manager; an exhausted recorded order does not.
+Explicit profile selection boots the configured manager without consuming its
+BootNext. Full device paths must name the current ESP; file-only paths are rooted
+there, and short hard-drive paths must match its partition signature. No filesystem
+enumeration, synthetic identity, or outer-KVM fallback is involved.
+
+The selected Boot#### optional bytes are retained for the loaded image, and native
+volatile BootCurrent is published for that option. A pre-entry failure restores
+the previous BootCurrent and releases the option buffer after unloading the target.
+Configured-path boots leave BootCurrent firmware-provided. This is not a complete
+replacement for firmware BDS: additional BootOrder targets are not launched after
+an OS that successfully loaded subsequently returns from StartImage. Driver options
+are namespaced but not automatically launched. SMP, OS power/update cycles and
+Hyper-V remain unfinished; these six cases are not a daily-use claim.
 
 ## Authoritative starting point
 

@@ -127,6 +127,89 @@ pub(crate) fn write_boot_profile(
     }
 }
 
+/// Read one bounded profile-private boot variable through the original firmware
+/// namespace before installing hooks. Shared/security variables cannot match.
+#[cfg(feature = "profile-direct-vmx")]
+pub(crate) fn read_profile_boot_variable(
+    runtime: *mut efi::RuntimeServices,
+    profile: UefiProfile,
+    name: &[u16],
+    data: &mut [u8],
+) -> Result<Option<usize>, efi::Status> {
+    if runtime.is_null() {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    let key = map_private_variable(
+        profile.id(),
+        uefi_variable_overlay::EFI_GLOBAL_VARIABLE_GUID,
+        name,
+    )
+    .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let mut backend_name = [0; BACKEND_NAME_CAPACITY + 1];
+    backend_name[..key.name().len()].copy_from_slice(key.name());
+    let mut guid = to_efi_guid(key.guid());
+    let mut size = data.len();
+    let mut attributes = 0;
+    // SAFETY: caller supplies the live pre-EBS firmware table before hooks are
+    // installed. Owned, terminated key and bounded data/metadata are synchronous.
+    let status = unsafe {
+        ((*runtime).get_variable)(
+            backend_name.as_mut_ptr(),
+            &mut guid,
+            &mut attributes,
+            &mut size,
+            data.as_mut_ptr().cast(),
+        )
+    };
+    if status == efi::Status::NOT_FOUND {
+        return Ok(None);
+    }
+    if status.is_error() {
+        return Err(status);
+    }
+    if size > data.len()
+        || attributes
+            != efi::VARIABLE_NON_VOLATILE
+                | efi::VARIABLE_BOOTSERVICE_ACCESS
+                | efi::VARIABLE_RUNTIME_ACCESS
+    {
+        return Err(efi::Status::COMPROMISED_DATA);
+    }
+    Ok(Some(size))
+}
+
+/// Consume only this profile's one-shot BootNext before attempting its target.
+/// Firmware's own global BootNext and the independent selector are untouched.
+#[cfg(feature = "profile-direct-vmx")]
+pub(crate) fn consume_profile_boot_next(
+    runtime: *mut efi::RuntimeServices,
+    profile: UefiProfile,
+) -> Result<(), efi::Status> {
+    if runtime.is_null() {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    let name = crate::chainload::ascii_uefi_path(b"BootNext\0");
+    let key = map_private_variable(
+        profile.id(),
+        uefi_variable_overlay::EFI_GLOBAL_VARIABLE_GUID,
+        &name[..8],
+    )
+    .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let mut backend_name = [0; BACKEND_NAME_CAPACITY + 1];
+    backend_name[..key.name().len()].copy_from_slice(key.name());
+    let mut guid = to_efi_guid(key.guid());
+    // SAFETY: called before L0/L1 launch with live firmware services. This exact
+    // private key is NUL terminated; zero data size is the native deletion ABI.
+    let status = unsafe {
+        ((*runtime).set_variable)(backend_name.as_mut_ptr(), &mut guid, 0, 0, ptr::null_mut())
+    };
+    if status.is_error() {
+        Err(status)
+    } else {
+        Ok(())
+    }
+}
+
 /// One in-place EFI Memory Attributes Table edit retained for rollback.
 #[derive(Clone, Copy)]
 struct MemoryAttributePatch {

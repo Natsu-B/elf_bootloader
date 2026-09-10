@@ -129,7 +129,7 @@ check_direct_mode_log() {
     if [[ "$mode" == physical-uefi ]]; then
         ((cpus == modes && selections * 2 == modes && overlays == 0))
     elif [[ "$mode" == profile-uefi ]]; then
-        ((cpus == modes && selections * 2 == modes && profiles == selections && overlays * 2 == modes))
+        ((cpus == modes && profiles * 2 == modes && selections >= profiles && selections <= profiles * 257 && overlays * 2 == modes))
     else
         ((cpus == 0 && selections == 0 && overlays * 2 == modes))
     fi
@@ -137,8 +137,15 @@ check_direct_mode_log() {
 
 # Same Direct backend plus independent intended-versus-observed profile checks.
 check_profile_selection_log() {
-    local fixture=$1 log=$2 profile=1 line fixtures=0 boots=0 guests=0 backends=0
-    case "$fixture" in windows-explicit|windows-persistent) ;; linux-explicit|linux-persistent) profile=2 ;; *) return 1 ;; esac
+    local fixture=$1 log=$2 profile=1 line fixtures=0 boots=0 guests=0 backends=0 variables=0 options=0 source option_source=
+    source=${fixture#*-}
+    case "$fixture" in
+        windows-explicit|windows-persistent) ;;
+        linux-explicit|linux-persistent) profile=2 ;;
+        windows-next) source=persistent; option_source=BootNext ;;
+        linux-order) profile=2; source=persistent; option_source=BootOrder ;;
+        *) return 1 ;;
+    esac
     check_backend_log direct-vmx "$log" && check_direct_mode_log profile-uefi "$log" || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
@@ -146,11 +153,18 @@ check_profile_selection_log() {
             'thin-hv: profile selection fixture begin') ((backends == 0)) || return 1; ((fixtures+=1)) ;;
             'thin-hv: profile selection fixture '*) return 1 ;;
             'thin-hv: backend='*) ((fixtures == 1 && backends <= 1 && boots == backends)) || return 1; ((backends+=1)) ;;
-            'thin-hv: boot profile='*) [[ "$backends" == 1 && "$line" == "thin-hv: boot profile=$profile source=${fixture#*-} scope=current-esp" ]] || return 1; ((boots+=1)) ;;
+            'thin-hv: boot variable '*) [[ "$backends" == 1 && "$boots" == 0 && -n "$option_source" && "$line" == "thin-hv: boot variable source=$option_source index=0042" ]] || return 1; ((variables+=1)) ;;
+            'thin-hv: boot profile='*) [[ "$backends" == 1 && "$line" == "thin-hv: boot profile=$profile source=$source scope=current-esp" ]] || return 1; ((boots+=1)) ;;
+            'thin-hv: guest boot option '*) [[ "$backends" == 2 && "$guests" == 0 && -n "$option_source" && "$line" == 'thin-hv: guest boot option PASS' ]] || return 1; ((options+=1)) ;;
             'thin-hv: guest variable profile='*) [[ "$backends" == 2 && "$line" == "thin-hv: guest variable profile=$profile" ]] || return 1; ((guests+=1)) ;;
         esac
     done <"$log"
-    ((fixtures == 1 && boots == 1 && guests == 1 && backends == 2))
+    ((fixtures == 1 && boots == 1 && guests == 1 && backends == 2)) || return 1
+    if [[ -n "$option_source" ]]; then
+        ((variables == 1 && options == 1))
+    else
+        ((variables == 0 && options == 0))
+    fi
 }
 
 # An explicit negative fixture, never an alternative Direct success condition.
@@ -925,7 +939,7 @@ data_disk=${X86_UEFI_DATA_DISK:-}
 usernet=${X86_UEFI_USERNET:-0}
 profile_fixture=${X86_UEFI_PROFILE_FIXTURE:-}
 if [[ -n "$profile_fixture" ]]; then
-    case "$profile_fixture" in windows-explicit|windows-persistent|linux-explicit|linux-persistent) ;; *) die 'invalid profile selection fixture' ;; esac
+    case "$profile_fixture" in windows-explicit|windows-persistent|linux-explicit|linux-persistent|windows-next|linux-order) ;; *) die 'invalid profile selection fixture' ;; esac
     [[ "$backend" == direct-vmx && "$direct_mode" == profile-uefi && "$accel" == kvm && "$smp" == 1 && "$memory" == 256M && "$guest_location" == both && "$physical_policy" == 0 && "$host_exception_test" == 0 && "$msr_abort_test" == 0 && "$cpu_reject_test" == 0 && "$runtime_reject_test" == 0 && "$allow_reboot" == 0 && "$acpi_s3" == 0 && "$wake_cycles" == 0 && "$usernet" == 0 && -z "$data_disk" ]] || die 'profile fixture requires its isolated Direct configuration'
     [[ "$timeout_seconds" =~ ^([1-9]|[1-5][0-9]|60)$ ]] || die 'profile fixture timeout must be 1..60 seconds'
     [[ ${loader##*/} == "x86-uefi-profile-$profile_fixture.efi" && ${monitor##*/} == x86-uefi-profile-direct-monitor.efi && ${guest##*/} == x86_guest_uefi_test.efi ]] || die 'profile fixture artifact mismatch'
@@ -1076,7 +1090,7 @@ cleanup_esps() {
         rm -f -- "$directory/EFI/BOOT/BOOTX64.EFI" "$directory/EFI/BOOT/MONITORX64.EFI" \
             "$directory/EFI/BOOT/GUESTX64.EFI" "$directory/EFI/Microsoft/Boot/bootmgfw.efi" \
             "$directory/EFI/ubuntu/shimx64.efi" "$directory/EFI/Test/PHYSICAL.EFI" \
-            "$directory/EFI/Test/PROFILE.EFI" \
+            "$directory/EFI/Test/PROFILE.EFI" "$directory/EFI/Test/OPTION.EFI" \
             "$directory/EFI/Test/OTHERONLY.EFI"
         rmdir -- "$directory/EFI/Microsoft/Boot" "$directory/EFI/Microsoft" \
             "$directory/EFI/ubuntu" "$directory/EFI/Test" "$directory/EFI/BOOT" \
@@ -1106,6 +1120,9 @@ if [[ -n "$profile_fixture" ]]; then
     mkdir -p -- "$esp/EFI/Test" "$esp/EFI/ubuntu"
     install -m 0644 -- "$stage/x86-uefi-profile-direct-loader.efi" "$esp/EFI/Test/PROFILE.EFI"
     install -m 0644 -- "$guest" "$esp/EFI/ubuntu/shimx64.efi"
+    if [[ "$profile_fixture" == windows-next || "$profile_fixture" == linux-order ]]; then
+        install -m 0644 -- "$guest" "$esp/EFI/Test/OPTION.EFI"
+    fi
 fi
 esp_args=(
     -drive "if=none,id=esp,format=raw,file=fat:rw:$esp"

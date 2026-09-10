@@ -292,6 +292,116 @@ fn load_path(
     chainload::load_image_on_device(image, system_table, device, utilities, target.as_slice())
 }
 
+/// Separates a bounded, single-instance boot device path into device and file
+/// portions. The existing ImagePath decoder validates the file nodes afterward.
+#[cfg(feature = "profile-direct-vmx")]
+fn boot_file_path(bytes: &[u8]) -> Result<(&[u8], ImagePath), Error> {
+    if bytes.len() < 10 || bytes.len() > MAX_DEVICE_PATH_BYTES {
+        return Err(invalid("profile boot device-path length"));
+    }
+    let mut offset = 0;
+    while let Some(header) = bytes.get(offset..offset + 4) {
+        let size = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if size < 4 || size > bytes.len() - offset {
+            return Err(invalid("profile boot device-path node"));
+        }
+        if header[..2] == [4, 4] {
+            return Ok((&bytes[..offset], image_file_path(&bytes[offset..])?));
+        }
+        if header[0] == 0x7f {
+            return Err(invalid("profile boot path has no unique file"));
+        }
+        offset += size;
+    }
+    Err(invalid("profile boot path missing file"))
+}
+
+/// Full device paths must match this ESP exactly. A short hard-drive path can
+/// instead name this same partition by its firmware-provided signature. Nothing
+/// searches, rewrites, or assumes a particular PCI/filesystem enumeration order.
+#[cfg(feature = "profile-direct-vmx")]
+fn same_boot_device(requested: &[u8], current: &[u8]) -> bool {
+    if current.len() < 4 || !current.ends_with(&[0x7f, 0xff, 4, 0]) {
+        return false;
+    }
+    // A file-only option is explicitly rooted at this backend's current ESP.
+    if requested.is_empty() || requested == &current[..current.len() - 4] {
+        return true;
+    }
+    // UEFI hard-drive short form: one 42-byte media node, MBR or GPT signature.
+    if requested.len() != 42 || requested[..4] != [4, 1, 42, 0] {
+        return false;
+    }
+    let mut offset = 0;
+    while let Some(header) = current.get(offset..offset + 4) {
+        let size = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if size < 4 || size > current.len() - offset {
+            return false;
+        }
+        let node = &current[offset..offset + size];
+        if header[..2] == [4, 1] && size == 42 {
+            return matches!((node[40], node[41]), (1, 1) | (2, 2))
+                && node[40..42] == requested[40..42]
+                && match requested[41] {
+                    1 => node[4..8] == requested[4..8] && node[24..28] == requested[24..28],
+                    2 => node[24..40] == requested[24..40],
+                    _ => false,
+                };
+        }
+        if header[0] == 0x7f {
+            return false;
+        }
+        offset += size;
+    }
+    false
+}
+
+/// Loads a profile Boot#### file only after matching its device to the current
+/// ESP. Firmware still performs PE/signature checks through normal LoadImage.
+#[cfg(feature = "profile-direct-vmx")]
+pub(crate) fn load_profile_device_path(
+    image: efi::Handle,
+    system: *mut efi::SystemTable,
+    serial: &mut SerialPort,
+    path: &[u8],
+) -> Result<efi::Handle, Error> {
+    let (requested, target) = boot_file_path(path)?;
+    let loaded = chainload::loaded_image_protocol(image, system)?;
+    let services = chainload::boot_services(system)?;
+    let utilities = chainload::device_path_utilities_protocol(system)?;
+    // SAFETY: checked LoadedImage owns live firmware metadata until child launch.
+    let (device, current_path) = unsafe { ((*loaded).device_handle, (*loaded).file_path) };
+    if device.is_null() || current_path.is_null() {
+        return Err(invalid("profile ESP image"));
+    }
+    let mut guid = efi::protocols::device_path::PROTOCOL_GUID;
+    let mut base = ptr::null_mut();
+    // SAFETY: the live ESP handle is queried with owned GUID/output slots; this
+    // lookup cannot enumerate or substitute another device.
+    let status = unsafe { ((*services).handle_protocol)(device, &mut guid, &mut base) };
+    if status.is_error() {
+        return Err(Error::Firmware("profile ESP DevicePath", status.as_usize()));
+    }
+    if base.is_null() {
+        return Err(invalid("profile ESP null DevicePath"));
+    }
+    // SAFETY: successful protocol lookup returned this complete firmware path.
+    let size = unsafe { ((*utilities).get_device_path_size)(base.cast()) };
+    if !(4..=MAX_DEVICE_PATH_BYTES).contains(&size) || (base as usize).checked_add(size).is_none() {
+        return Err(invalid("profile ESP device-path bounds"));
+    }
+    // SAFETY: firmware supplied the live path allocation and its bounded size;
+    // the path is read only before loading/starting any image.
+    let current = unsafe { slice::from_raw_parts(base.cast::<u8>(), size) };
+    if !same_boot_device(requested, current) {
+        return Err(Error::Firmware(
+            "profile boot option names another ESP",
+            efi::Status::ACCESS_DENIED.as_usize(),
+        ));
+    }
+    load_path(image, system, serial, device, current_path, &target, true)
+}
+
 /// Conservative qualification gate, not SMP support. Even disabled additional
 /// processors are rejected: L1 must not later bring an unowned physical CPU up.
 #[cfg(feature = "physical-direct-vmx")]
@@ -436,6 +546,52 @@ mod tests {
         let current = image_file_path(&file_node("\\EFI\\BOOT\\BOOTX64.EFI")).unwrap();
         assert!(!path.same_file(&current));
         assert!(path.same_file(&selected_path(&options("\\efi\\UBUNTU\\SHIMX64.EFI")).unwrap()));
+    }
+
+    #[cfg(feature = "profile-direct-vmx")]
+    #[test]
+    fn boot_option_paths_resolve_only_current_esp_and_valid_file_nodes() {
+        let mut hd = [0u8; 42];
+        hd[..4].copy_from_slice(&[4, 1, 42, 0]);
+        hd[24..40].fill(0x5a);
+        hd[40..42].copy_from_slice(&[2, 2]);
+        let prefix = [2, 1, 4, 0];
+        let device = [prefix.as_slice(), &hd, &[0x7f, 0xff, 4, 0]].concat();
+        let file = file_node("\\EFI\\Test\\NEXT.EFI");
+        for path in [
+            file.clone(),
+            [&hd[..], &file].concat(),
+            [&device[..device.len() - 4], &file].concat(),
+        ] {
+            let (requested, image) = super::boot_file_path(&path).unwrap();
+            assert!(super::same_boot_device(requested, &device));
+            assert!(image.same_file(&selected_path(&options("\\EFI\\Test\\NEXT.EFI")).unwrap()));
+        }
+        let mut other = hd;
+        other[24] ^= 1;
+        assert!(!super::same_boot_device(&other, &device));
+        other = hd;
+        other[40] = 3;
+        assert!(!super::same_boot_device(&other, &device));
+        other = hd;
+        other[2] = 0;
+        assert!(!super::same_boot_device(&other, &device));
+        for malformed in [
+            std::vec![],
+            std::vec![0x7f, 0xff, 4, 0],
+            std::vec![4, 1, 255, 255],
+            [&[0x7f, 1, 4, 0][..], &file].concat(),
+        ] {
+            assert!(super::boot_file_path(&malformed).is_err());
+        }
+        let mut missing_end = file;
+        missing_end.truncate(missing_end.len() - 4);
+        assert!(super::boot_file_path(&missing_end).is_err());
+        assert!(!super::same_boot_device(
+            &hd,
+            &[4, 1, 255, 255, 0x7f, 0xff, 4, 0]
+        ));
+        assert!(!super::same_boot_device(&hd, &[]));
     }
 
     #[test]

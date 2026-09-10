@@ -717,7 +717,7 @@ fn run_x86_profiles() -> Result<(), String> {
     Ok(())
 }
 
-/// Four finite actual-Direct primary-OS selection cases, never a reference fallback.
+/// Finite actual-Direct primary-OS and boot-option cases, never a reference fallback.
 fn run_x86_profile_selection(args: &[String]) -> Result<(), String> {
     // Scope this fixture's Linux path to the child build, not process-global env.
     let status = Command::new("cargo")
@@ -730,12 +730,15 @@ fn run_x86_profile_selection(args: &[String]) -> Result<(), String> {
         return Err(format!("Profile Direct build failed: {status}"));
     }
     let mut failures = Vec::new();
-    for case in [
+    let cases = [
         "windows-explicit",
         "linux-explicit",
         "windows-persistent",
         "linux-persistent",
-    ] {
+        "windows-next",
+        "linux-order",
+    ];
+    for case in cases {
         let status = Command::new("cargo")
             .args([
                 "build",
@@ -795,7 +798,7 @@ fn run_x86_profile_selection(args: &[String]) -> Result<(), String> {
     }
     eprintln!(
         "profile Direct summary PASS={} FAIL={} SKIP=0",
-        4 - failures.len(),
+        cases.len() - failures.len(),
         failures.len()
     );
     if failures.is_empty() {
@@ -5803,10 +5806,32 @@ mod tests {
         };
         let mode = "thin-hv: backend=direct-vmx role=project-l0\nthin-hv: direct mode=profile-uefi variable_overlay=enabled selection=persistent-profile physical_ready=0\nthin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0\n";
         for (os, profile) in [("windows", 1), ("linux", 2)] {
-            for source in ["explicit", "persistent"] {
-                let case = format!("{os}-{source}");
+            for suffix in [
+                "explicit",
+                "persistent",
+                if profile == 1 { "next" } else { "order" },
+            ] {
+                let source = if suffix == "explicit" {
+                    "explicit"
+                } else {
+                    "persistent"
+                };
+                let option_source = match suffix {
+                    "next" => "BootNext",
+                    "order" => "BootOrder",
+                    _ => "",
+                };
+                let (variable, option) = if option_source.is_empty() {
+                    (String::new(), "")
+                } else {
+                    (
+                        format!("thin-hv: boot variable source={option_source} index=0042\n"),
+                        "thin-hv: guest boot option PASS\n",
+                    )
+                };
+                let case = format!("{os}-{suffix}");
                 let text = format!(
-                    "thin-hv: profile selection fixture begin\n{mode}thin-hv: physical chainload scope=current-esp explicit_path=1\nthin-hv: boot profile={profile} source={source} scope=current-esp\n{mode}thin-hv: variable overlay profile={profile} mat_patches=1\nthin-hv: guest variable profile={profile}\n"
+                    "thin-hv: profile selection fixture begin\n{mode}thin-hv: physical chainload scope=current-esp explicit_path=1\n{variable}thin-hv: boot profile={profile} source={source} scope=current-esp\n{mode}thin-hv: variable overlay profile={profile} mat_patches=1\n{option}thin-hv: guest variable profile={profile}\n"
                 );
                 assert!(check_selection(&case, &text));
                 assert!(check_selection(&case, &text.replace('\n', "\r\n")));
@@ -5822,6 +5847,10 @@ mod tests {
                     ("role=project-l0", "role=reference"),
                     ("selection=persistent-profile", "selection=test-profile"),
                     ("variable_overlay=enabled", "variable_overlay=disabled"),
+                    ("index=0042", "index=0043"),
+                    ("source=BootNext", "source=BootOrder"),
+                    ("source=BootOrder", "source=BootNext"),
+                    ("guest boot option PASS", "guest boot option FAIL"),
                 ] {
                     if text.contains(from) {
                         assert!(!check_selection(&case, &text.replace(from, to)));
