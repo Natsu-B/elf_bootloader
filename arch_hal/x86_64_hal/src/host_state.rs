@@ -392,6 +392,66 @@ impl<'storage> HostEnvironment<'storage> {
         compiler_fence(Ordering::Release);
     }
 
+    /// Installs the private descriptors and GS before an AP prepares VMX.
+    /// Its existing reserved bootstrap stack remains current; the first VM exit
+    /// will select the dedicated host stack supplied to `initialize`.
+    ///
+    /// # Safety
+    ///
+    /// This is a one-time transition on the owning CPU at CPL0 in 64-bit mode,
+    /// with IF clear, CR4.CET clear, and no firmware/guest execution to return to.
+    /// The TSS must still be available (never previously loaded with LTR).
+    /// `bind_monitor_data` must already have published this CPU's live object.
+    /// The private host map is active and covers all backing, the current stack
+    /// and this code. No other CPU may use these tables. After this call, even a
+    /// failed VMXON must retain the environment; firmware rollback is not valid.
+    pub unsafe fn install_ap_bootstrap(&self) {
+        #[repr(C, packed)]
+        struct Pointer {
+            limit: u16,
+            base: u64,
+        }
+        let gdt = Pointer {
+            limit: 39,
+            base: self.layout.base,
+        };
+        let idt = Pointer {
+            limit: (IDT_ENTRIES * IDT_GATE_BYTES - 1) as u16,
+            base: self.layout.base + IDT_OFFSET as u64,
+        };
+        let gs = self.layout.base + XSTATE_OFFSET as u64;
+        // SAFETY: initialize encoded a busy TSS for VMX host-state loading,
+        // which does not execute LTR. This first manual AP installation needs
+        // an available descriptor instead. Only this CPU owns the mapped fresh
+        // GDT; clear its busy bit, and LTR below sets it again atomically before
+        // any guest or VMCS can consume the private host state.
+        unsafe {
+            let access = (self.layout.base + u64::from(HOST_TSS_SELECTOR) + 5) as *mut u8;
+            access.write_volatile(0x89);
+        }
+        // SAFETY: the caller provides exclusive, retained and mapped descriptor
+        // state plus a valid bootstrap stack. The far return balances its two
+        // pushes and reloads CS before loading the new IDT. Fresh LTR marks only
+        // this CPU's own TSS busy. GS is bound before the #GP guard can run; all
+        // temporary table pointers remain on the unchanged bootstrap stack.
+        unsafe {
+            core::arch::asm!(
+                "lgdt [r8]",
+                "push {code}", "lea rax, [rip + 2f]", "push rax", "retfq", "2:",
+                "mov ax, {data}", "mov ss, ax", "mov ds, ax", "mov es, ax",
+                "xor eax, eax", "mov fs, ax", "mov gs, ax",
+                "mov ax, {tss}", "ltr ax",
+                "mov ecx, 0xc0000100", "xor eax, eax", "xor edx, edx", "wrmsr",
+                "mov ecx, 0xc0000101", "mov rax, r10", "mov rdx, r10", "shr rdx, 32", "wrmsr",
+                "lidt [r9]",
+                in("r8") &gdt, in("r9") &idt, in("r10") gs,
+                code = const HOST_CODE_SELECTOR, data = const HOST_DATA_SELECTOR,
+                tss = const HOST_TSS_SELECTOR,
+                out("rax") _, out("rcx") _, out("rdx") _,
+            );
+        }
+    }
+
     /// Returns four disjoint downward-growing IST ranges, in architectural order.
     #[must_use]
     pub fn exception_stack_ranges(&self) -> [(u64, u64); IST_COUNT] {

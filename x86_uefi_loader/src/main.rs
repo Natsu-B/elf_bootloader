@@ -206,8 +206,12 @@ pub extern "efiapi" fn efi_main(
         serial.init();
         let _ = writeln!(serial, "thin-hv: uefi entry");
         let _ = writeln!(serial, "thin-hv: backend=direct-vmx role=project-l0");
-        #[cfg(all(feature = "physical-direct-vmx", not(feature = "profile-direct-vmx")))]
+        #[cfg(feature = "smp-direct-vmx")]
+        serial.write_bytes(b"thin-hv: CPU ownership build=experimental-smp physical_ready=0\n");
+        #[cfg(all(feature = "physical-direct-vmx", not(feature = "profile-direct-vmx"), not(feature = "smp-direct-vmx")))]
         serial.write_bytes(b"thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n");
+        #[cfg(all(feature = "smp-direct-vmx", not(feature = "profile-direct-vmx")))]
+        serial.write_bytes(b"thin-hv: direct mode=smp-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n");
         #[cfg(feature = "profile-direct-vmx")]
         serial.write_bytes(b"thin-hv: direct mode=profile-uefi variable_overlay=enabled selection=persistent-profile physical_ready=0\n");
         #[cfg(not(feature = "physical-direct-vmx"))]

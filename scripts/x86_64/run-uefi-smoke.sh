@@ -94,10 +94,12 @@ check_profile_contract_log() {
 # Mode provenance is separate from acceleration: physical-selection code is
 # tested under QEMU, never reported as physical-machine validation.
 check_direct_mode_log() {
-    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 profiles=0 handoffs=0 selected= expected
+    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 profiles=0 handoffs=0 selected= expected smp_builds=0 carriers=0 ap_count=0
+    local -A carrier_vmcs=() carrier_ids=()
     case "$mode" in
         qemu-research) expected='thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0' ;;
         physical-uefi) expected='thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0' ;;
+        smp-uefi) expected='thin-hv: direct mode=smp-uefi variable_overlay=disabled selection=current-esp physical_ready=0' ;;
         profile-uefi) expected='thin-hv: direct mode=profile-uefi variable_overlay=enabled selection=persistent-profile physical_ready=0' ;;
         *) return 1 ;;
     esac
@@ -110,14 +112,32 @@ check_direct_mode_log() {
         case "$line" in
             'thin-hv: direct mode='*) [[ "$line" == "$expected" ]] || return 1; ((modes += 1)) ;;
             'thin-hv: firmware handoff '*)
-                [[ "$mode" != qemu-research && "$line" == 'thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0' ]] || return 1
+                if [[ "$mode" == smp-uefi ]]; then
+                    [[ "$line" =~ ^thin-hv:\ firmware\ handoff\ PASS\ exit_boot_services=success\ cpus=([1248])\ ap_takeover=([0137])$ ]] || return 1
+                    ((BASH_REMATCH[1] == carriers && BASH_REMATCH[2] + 1 == carriers)) || return 1
+                    ap_count=$carriers
+                else
+                    [[ "$mode" != qemu-research && "$line" == 'thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0' ]] || return 1
+                fi
                 ((modes == (handoffs + 1) * 2)) || return 1
                 ((handoffs += 1)) ;;
+            'thin-hv: CPU ownership build='*)
+                [[ "$mode" == smp-uefi && "$line" == 'thin-hv: CPU ownership build=experimental-smp physical_ready=0' ]] || return 1
+                ((smp_builds += 1)) ;;
+            'thin-hv: CPU carrier '*)
+                [[ "$mode" == smp-uefi && "$line" =~ ^thin-hv:\ CPU\ carrier\ PASS\ slot=([0-7])\ apic_id=([0-9]+)\ vmcs=(0x[0-9a-f]{1,12})\ ownership=monitor$ ]] || return 1
+                ((BASH_REMATCH[1] == carriers && handoffs == 0)) || return 1
+                [[ -z ${carrier_ids[${BASH_REMATCH[2]}]:-} && -z ${carrier_vmcs[${BASH_REMATCH[3]}]:-} ]] || return 1
+                ((BASH_REMATCH[3] > 0 && BASH_REMATCH[3] % 4096 == 0)) || return 1
+                carrier_ids[${BASH_REMATCH[2]}]=1
+                carrier_vmcs[${BASH_REMATCH[3]}]=1
+                ((carriers += 1)) ;;
+            'thin-hv: AP '*FAIL*) return 1 ;;
             'thin-hv: variable overlay profile='*)
-                [[ "$mode" != physical-uefi && "$line" =~ ^thin-hv:\ variable\ overlay\ profile=([12])\ mat_patches=[0-9]+$ ]] || return 1
+                [[ "$mode" != physical-uefi && "$mode" != smp-uefi && "$line" =~ ^thin-hv:\ variable\ overlay\ profile=([12])\ mat_patches=[0-9]+$ ]] || return 1
                 [[ "$mode" != profile-uefi || "${BASH_REMATCH[1]}" == "$selected" ]] || return 1
                 ((overlays += 1)) ;;
-            'thin-hv: uefi variable overlay PASS'*) [[ "$mode" != physical-uefi ]] || return 1 ;;
+            'thin-hv: uefi variable overlay PASS'*) [[ "$mode" != physical-uefi && "$mode" != smp-uefi ]] || return 1 ;;
             'thin-hv: boot profile='*)
                 [[ "$mode" == profile-uefi && "$line" =~ ^thin-hv:\ boot\ profile=([12])\ source=(explicit|persistent)\ scope=current-esp$ ]] || return 1
                 selected=${BASH_REMATCH[1]}; ((profiles += 1)) ;;
@@ -130,7 +150,9 @@ check_direct_mode_log() {
         esac
     done <<<"$transcript"
     ((modes >= 2 && modes <= 128 && modes % 2 == 0)) || return 1
-    if [[ "$mode" == physical-uefi ]]; then
+    if [[ "$mode" == smp-uefi ]]; then
+        ((modes == 2 && smp_builds == 2 && handoffs == 1 && ap_count == carriers && carriers >= 1 && cpus == 0 && selections == 1 && overlays == 0))
+    elif [[ "$mode" == physical-uefi ]]; then
         ((cpus == modes && selections * 2 == modes && overlays == 0))
     elif [[ "$mode" == profile-uefi ]]; then
         ((cpus == modes && profiles * 2 == modes && selections >= profiles && selections <= profiles * 257 && overlays * 2 == modes))
@@ -672,12 +694,13 @@ check_preflight_ept_log() {
 # Independent of terminal exception/abort verdicts: those fixtures must still
 # prove that the real Direct carrier consumed a complete platform EPT.
 check_direct_platform_log() {
-    local log=$1 high=$2 line count=0 hosts=0 residents=0 image_pages=0 high_bar=0 bytes transcript
+    local log=$1 high=$2 expected_cpus=${3:-1} line count=0 hosts=0 residents=0 image_pages=0 high_bar=0 bytes transcript
     local source_base private_base image_size
     local resident_pattern='^thin-hv: resident image PASS source=0x([0-9a-f]{16}) private=0x([0-9a-f]{16}) bytes=0x([0-9a-f]{1,7}) firmware_relocation=excluded bootstrap=firmware-runtime boot_guards=2$'
     local pattern='^thin-hv: direct platform EPT PASS source=uefi\+mtrr\+gcd\+acpi\+pci tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=([1-9][0-9]{0,4}) host_map=platform-ram bootstrap=firmware-runtime l0_image=private-copy physical_ready=0$'
     local host_pattern='^thin-hv: direct platform HOST PASS tables=([1-9][0-9]{0,2}) leaves=([1-9][0-9]{0,19}) private_pages=256 mmio_window=uc physical_ready=0$'
     [[ "$high" == 0 || "$high" == 1 ]] || return 1
+    case "$expected_cpus" in 1|2|4|8) ;; *) return 1 ;; esac
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
     [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 2097152)) || return 1
@@ -685,7 +708,7 @@ check_direct_platform_log() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
         if [[ "$line" =~ $resident_pattern ]]; then
-            ((residents == count && hosts == count)) || return 1
+            ((residents * expected_cpus == count && hosts == count)) || return 1
             [[ ${BASH_REMATCH[1]} < 0000800000000000 && ${BASH_REMATCH[2]} < 0000800000000000 ]] || return 1
             source_base=$((16#${BASH_REMATCH[1]})) private_base=$((16#${BASH_REMATCH[2]})) image_size=$((16#${BASH_REMATCH[3]}))
             ((source_base > 0 && private_base > 0 && source_base % 4096 == 0 && private_base % 4096 == 0)) || return 1
@@ -695,7 +718,7 @@ check_direct_platform_log() {
             image_pages=$((image_size / 4096))
             ((residents += 1))
         elif [[ "$line" =~ $pattern ]]; then
-            ((hosts == count && residents == count + 1)) || return 1
+            ((hosts == count && residents == count / expected_cpus + 1)) || return 1
             ((BASH_REMATCH[1] <= 256)) || return 1
             ((BASH_REMATCH[3] >= 512 + image_pages && BASH_REMATCH[3] <= 65536)) || return 1
             if ((${#BASH_REMATCH[2]} == 20)) && [[ ${BASH_REMATCH[2]} > 18446744073709551615 ]]; then return 1; fi
@@ -713,7 +736,7 @@ check_direct_platform_log() {
             if [[ ${BASH_REMATCH[1]} > 0000000200000000 ]]; then high_bar=1; fi
         fi
     done <<<"$transcript"
-    ((count > 0 && hosts == count && residents == count && (high == 0 || high_bar == 1)))
+    ((count > 0 && hosts == count && residents * expected_cpus == count && (high == 0 || high_bar == 1)))
 }
 
 # Validate the complete ordered transcript, not just the final fixture marker.
@@ -868,7 +891,7 @@ loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
 direct_mode=${X86_UEFI_DIRECT_MODE:-qemu-research}
-case "$direct_mode" in qemu-research|physical-uefi|profile-uefi) ;; *) die 'X86_UEFI_DIRECT_MODE must be qemu-research, physical-uefi, or profile-uefi' ;; esac
+case "$direct_mode" in qemu-research|physical-uefi|profile-uefi|smp-uefi) ;; *) die 'invalid X86_UEFI_DIRECT_MODE' ;; esac
 [[ "$direct_mode" == qemu-research || "$backend" == direct-vmx ]] || die 'physical-uefi mode requires project Direct L0'
 pci_profile=${X86_UEFI_PCI_PROFILE:-firmware-default}
 require_high_pci=${X86_UEFI_REQUIRE_HIGH_PCI:-0}
@@ -1022,6 +1045,9 @@ fi
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_TIMEOUT_SECONDS must be a positive integer'
 [[ "$memory" =~ ^[1-9][0-9]*[KMG]$ ]] || die 'X86_UEFI_MEMORY must be a positive QEMU size such as 256M'
 [[ "$smp" =~ ^[1-9][0-9]*$ ]] || die 'X86_UEFI_SMP must be a positive integer'
+if [[ "$direct_mode" == smp-uefi ]]; then
+    case "$smp" in 1|2|4|8) ;; *) die 'experimental SMP qualification requires 1, 2, 4 or 8 CPUs' ;; esac
+fi
 [[ -n "$cpu" ]] || die 'X86_UEFI_CPU must not be empty'
 [[ "$accel" == kvm || "$accel" == tcg ]] || die 'X86_UEFI_ACCEL must be kvm or tcg'
 [[ "$acpi_s3" =~ ^[01]$ ]] || die 'X86_UEFI_ACPI_S3 must be 0 or 1'
@@ -1261,6 +1287,31 @@ wake_cycle=0
 wake_marker_seen=0
 suspended_baseline=0
 abort_memory_requested=0
+
+# On a failed SMP case, capture only published, bounded L0 counter records.
+# This never turns a failure into PASS and never reads arbitrary guest memory.
+capture_smp_failure() {
+    [[ "$direct_mode" == smp-uefi ]] || return 0
+    local directory slot extent address size attempt raw decoder
+    decoder="$repo_root/scripts/x86_64/decode-vmx-diagnostics.py"
+    directory=$(mktemp -d "$stage/smp-failure.XXXXXX") || return 1
+    printf 'stop\n' >&9
+    for ((slot = 0; slot < smp; slot++)); do
+        extent=$(python3 "$decoder" --cpu "$slot" extent "$serial_log" 2>"$directory/cpu-$slot.error") || continue
+        read -r address size <<<"$extent"
+        raw="$directory/cpu-$slot.bin"
+        printf 'pmemsave %s %s "%s"\n' "$address" "$size" "$raw" >&9
+        for ((attempt = 0; attempt < 20; attempt++)); do
+            [[ -f "$raw" && $(wc -c <"$raw") == "$size" ]] && break
+            sleep 0.1
+        done
+        if python3 "$decoder" --cpu "$slot" decode "$serial_log" "$raw" >"$directory/cpu-$slot.json" 2>"$directory/cpu-$slot.error"; then
+            rm -f -- "$raw" "$directory/cpu-$slot.error"
+        fi
+    done
+    printf 'x86 SMP failure counters: %s (Direct QEMU evidence only)\n' "$directory" >&2
+}
+
 for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
     if ((msr_abort_test && !abort_memory_requested)); then
         armed_line=$(grep -E '^thin-hv: MSR abort armed code=[14] vmcs=0x00000000[0-9a-f]{8} store=0x00000000[0-9a-f]{8} value=0x[0-9a-f]{16}' "$serial_log" || true)
@@ -1291,6 +1342,7 @@ for ((elapsed = 0; elapsed < timeout_seconds * 10; elapsed++)); do
         fi
     fi
     if [[ -n "$failure_marker" ]] && grep -Fq -- "$failure_marker" "$serial_log"; then
+        capture_smp_failure || true
         printf 'quit\n' >&9
         break
     fi
@@ -1335,7 +1387,9 @@ if ((cpu_reject_test)); then
     exit 0
 fi
 if [[ "$backend" == direct-vmx ]]; then
-    check_direct_platform_log "$serial_log" "$require_high_pci" || die 'Direct platform EPT evidence missing or malformed'
+    platform_cpus=1
+    [[ "$direct_mode" != smp-uefi ]] || platform_cpus=$smp
+    check_direct_platform_log "$serial_log" "$require_high_pci" "$platform_cpus" || die 'Direct platform EPT evidence missing or malformed'
     check_direct_mode_log "$direct_mode" "$serial_log" || die 'Direct mode provenance missing or contradictory'
     if [[ -n "$profile_fixture" ]]; then
         check_profile_selection_log "$profile_fixture" "$serial_log" || die 'profile fixture selected the wrong primary OS'

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and decode only the BSP QEMU prototype's fixed VM-exit counters.
+"""Validate and decode CPU-owned QEMU prototype fixed VM-exit counters.
 
 The address command accepts one publication inside reserved CPU-owned storage
 (or the resident image for explicitly legacy publications),
@@ -30,6 +30,11 @@ PUBLICATION = re.compile(
     r"thin-hv: vmx diagnostics address=0x([0-9a-f]{16}) "
     r"size=(176|1216|1344) version=([234]) scope=bsp-only environment=qemu-prototype( storage=cpu-runtime)?"
 )
+PCPU = re.compile(
+    r"thin-hv: pcpu diagnostics slot=([1-9][0-9]?) apic_id=([0-9]{1,10}) "
+    r"block=0x([0-9a-f]{16}) end=0x([0-9a-f]{16}) address=0x([0-9a-f]{16}) "
+    r"size=(1344) version=(4) environment=qemu-prototype storage=cpu-runtime"
+)
 READ_FIELDS = (
     "guest_rip", "guest_rsp", "guest_rflags", "guest_interruptibility",
     "guest_cr0", "guest_cr3", "guest_cr4", "guest_cs_ar", "guest_ss_ar",
@@ -55,7 +60,7 @@ class InvalidRecord(ValueError):
     """A bounded validation failure whose text contains no log contents."""
 
 
-def publication(lines, with_extent=False):
+def publication(lines, with_extent=False, cpu_slot=0):
     """Return the one validated record address and its owning allocation bounds."""
     backend_count = 0
     image = None
@@ -63,6 +68,10 @@ def publication(lines, with_extent=False):
     owner = None
     address = None
     record_size = record_version = None
+    ap_records = {}
+    ap_ids = set()
+    if not isinstance(cpu_slot, int) or not 0 <= cpu_slot < 64:
+        raise InvalidRecord("CPU slot outside the fixed capacity")
     for raw in lines:
         line = raw.rstrip("\r\n")
         if line.startswith("thin-hv: backend="):
@@ -98,10 +107,31 @@ def publication(lines, with_extent=False):
             owner = block if match[4] is not None else image
             if owner is None or address % 8 or not (owner[0] <= address and address + record_size <= owner[1]):
                 raise InvalidRecord("diagnostics record is not wholly inside its declared owner")
+        elif line.startswith("thin-hv: pcpu diagnostics "):
+            match = PCPU.fullmatch(line)
+            if match is None or block is None or address is None:
+                raise InvalidRecord("invalid or unordered per-CPU publication")
+            slot, apic = int(match[1]), int(match[2])
+            start, end, pointer = (int(match[i], 16) for i in (3, 4, 5))
+            size, version = int(match[6]), int(match[7])
+            if (slot != len(ap_records) + 1 or slot >= 64 or apic > 0xFFFFFFFE
+                    or apic in ap_ids or SIZES[version] != size
+                    or not 0 < start < end <= PROTOTYPE_LIMIT or end - start > 16 << 20
+                    or start % 4096 or end % 4096 or pointer % 8
+                    or not start <= pointer < pointer + size <= end
+                    or any(start < upper and lower < end for lower, upper in
+                           [image, block] + [record[1] for record in ap_records.values()])):
+                raise InvalidRecord("overlapping, repeated or invalid per-CPU ownership")
+            ap_ids.add(apic)
+            ap_records[slot] = (pointer, (start, end), size, version)
         elif "thin-hv: trusted outer KVM" in line:
             raise InvalidRecord("reference backend cannot publish Direct-VMX diagnostics")
     if backend_count != 2 or image is None or address is None:
         raise InvalidRecord("incomplete Direct-VMX diagnostics publication")
+    if cpu_slot:
+        if cpu_slot not in ap_records:
+            raise InvalidRecord("requested CPU did not publish diagnostics")
+        address, owner, record_size, record_version = ap_records[cpu_slot]
     return (address, owner, record_size, record_version) if with_extent else (address, owner)
 
 
@@ -117,7 +147,7 @@ def regular_file(path):
         raise
 
 
-def published_address(path, with_extent=False):
+def published_address(path, with_extent=False, cpu_slot=0):
     """Scan a bounded serial log without retaining or printing its contents."""
     with regular_file(path) as source:
         if os.fstat(source.fileno()).st_size > MAX_LOG_BYTES:
@@ -134,15 +164,17 @@ def published_address(path, with_extent=False):
                     raise InvalidRecord("serial log exceeds diagnostic scan bound")
                 yield line.decode("utf-8", errors="replace")
 
-        return publication(lines(), with_extent)
+        return publication(lines(), with_extent, cpu_slot)
 
 
-def decode_record(data, address):
+def decode_record(data, address, cpu_slot=0):
     """Decode the immutable snapshot; never accept a torn or exhausted sequence."""
     if len(data) not in SIZES.values() or data[:8] != b"THVSTAT1":
         raise InvalidRecord("incorrect diagnostics size or magic")
     words = struct.unpack(f"<{len(data) // 8}Q", data)
-    if SIZES.get(words[1]) != len(data) or words[2] != len(data) or words[4] != 1:
+    if (not isinstance(cpu_slot, int) or not 0 <= cpu_slot < 64
+            or SIZES.get(words[1]) != len(data) or words[2] != len(data)
+            or words[4] != (2 if cpu_slot else 1) or (cpu_slot and words[1] != 4)):
         raise InvalidRecord("unsupported diagnostics version, size, or scope")
     if words[3] & 1 or words[3] == U64_MAX:
         raise InvalidRecord("torn or exhausted diagnostics sequence")
@@ -153,7 +185,7 @@ def decode_record(data, address):
         "backend": "direct-vmx",
         "role": "project-l0",
         "environment": "QEMU/KVM",
-        "scope": "bsp-only-qemu-prototype",
+        "scope": "pcpu-qemu-prototype" if cpu_slot else "bsp-only-qemu-prototype",
         "address": f"0x{address:016x}",
         "size": len(data),
         "sequence": words[3],
@@ -171,6 +203,8 @@ def decode_record(data, address):
         result["l1_vmread_hardware"] = {
             field: count for field, count in zip(READ_FIELDS, words[152:168]) if count
         }
+    if cpu_slot:
+        result["cpu_slot"] = cpu_slot
     return result
 
 
@@ -195,6 +229,37 @@ class DecoderTests(unittest.TestCase):
         expected = (0x100040, (0x100000, 0x101000))
         self.assertEqual(publication(self.lines), expected)
         self.assertEqual(publication(line + "\r\n" for line in self.lines), expected)
+
+    def test_per_cpu_records_require_ordered_disjoint_owned_allocations(self):
+        bsp = self.lines[:3] + [
+            "thin-hv: monitor block=0x0000000000200000 end=0x0000000000202000",
+            self.lines[3].replace("0000000000100040", "0000000000200040") + " storage=cpu-runtime",
+        ]
+        ap = ("thin-hv: pcpu diagnostics slot=1 apic_id=9 "
+              "block=0x0000000000300000 end=0x0000000000302000 address=0x0000000000300040 "
+              "size=1344 version=4 environment=qemu-prototype storage=cpu-runtime")
+        self.assertEqual(publication(bsp + [ap], True, 1), (0x300040, (0x300000, 0x302000), 1344, 4))
+        self.assertEqual(publication(bsp + [ap])[0], 0x200040)
+        for invalid in [ap.replace("slot=1", "slot=2"), ap.replace("slot=1", "slot=64"),
+                        ap.replace("apic_id=9", "apic_id=4294967295"),
+                        ap.replace("0000000000300040", "0000000000302040"),
+                        ap.replace("0000000000300000", "0000000000200000"),
+                        ap.replace("size=1344", "size=176"), ap.replace("version=4", "version=3")]:
+            with self.assertRaises(InvalidRecord):
+                publication(bsp + [invalid], True, 1)
+        for lines, slot in [(bsp + [ap, ap], 1), (bsp, 1), (bsp + [ap], 2), (bsp + [ap], 64)]:
+            with self.assertRaises(InvalidRecord):
+                publication(lines, True, slot)
+        words = self.words + [0] * (1344 // 8 - len(self.words))
+        words[1], words[2], words[4] = 4, 1344, 2
+        raw = struct.pack("<168Q", *words)
+        decoded = decode_record(raw, 0x300040, 1)
+        self.assertEqual(decoded["cpu_slot"], 1)
+        self.assertEqual(decoded["scope"], "pcpu-qemu-prototype")
+        with self.assertRaises(InvalidRecord):
+            decode_record(raw, 0x300040)
+        with self.assertRaises(InvalidRecord):
+            decode_record(self.record(), 0x100040, 1)
 
     def test_missing_duplicate_and_unordered_publication(self):
         for index in range(4):
@@ -331,11 +396,17 @@ def main(arguments):
     if arguments == ["--self-test"]:
         unittest.main(argv=[sys.argv[0]])
         return 0
+    cpu_slot = 0
+    if arguments[:1] == ["--cpu"]:
+        if len(arguments) < 2 or re.fullmatch(r"0|[1-9][0-9]?", arguments[1]) is None:
+            raise InvalidRecord("invalid CPU slot")
+        cpu_slot = int(arguments[1])
+        arguments = arguments[2:]
     if len(arguments) not in (2, 3) or arguments[0] not in ("address", "extent", "decode"):
-        raise InvalidRecord("usage: address LOG | extent LOG | decode LOG RECORD | --self-test")
+        raise InvalidRecord("usage: [--cpu SLOT] address LOG | extent LOG | decode LOG RECORD | --self-test")
     if (arguments[0] in ("address", "extent")) != (len(arguments) == 2):
         raise InvalidRecord("incorrect diagnostics command arguments")
-    address, _, size, version = published_address(arguments[1], True)
+    address, _, size, version = published_address(arguments[1], True, cpu_slot)
     if arguments[0] == "address":
         print(f"0x{address:016x}")
     elif arguments[0] == "extent":
@@ -343,7 +414,7 @@ def main(arguments):
     else:
         with regular_file(arguments[2]) as source:
             data = source.read(size + 1)
-        decoded = decode_record(data, address)
+        decoded = decode_record(data, address, cpu_slot)
         if decoded["size"] != size or decoded["schema"] != f"thin-hv.vmx-diagnostics.v{version}":
             raise InvalidRecord("publication/header ABI mismatch")
         print(json.dumps(decoded, sort_keys=True, separators=(",", ":")))

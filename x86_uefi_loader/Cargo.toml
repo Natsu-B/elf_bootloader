@@ -29,6 +29,8 @@ direct-vmx = [
 # Physical-selection Direct path: no Runtime Services overlay or test ESP fallback.
 # BSP-only until complete pCPU/AP ownership exists; runtime rejects multiple CPUs.
 physical-direct-vmx = ["direct-vmx"]
+# Explicit AP bring-up build; never infer SMP readiness from the BSP-only mode.
+smp-direct-vmx = ["physical-direct-vmx"]
 # Explicit persistent primary-OS selection on the current ESP, with boot overlay.
 # The no-overlay physical-direct-vmx mode remains independently selectable.
 profile-direct-vmx = ["physical-direct-vmx"]

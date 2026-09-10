@@ -11,6 +11,12 @@ log_lifecycle() {
     printf '<5>thin-hv: linux L2 lifecycle %s\n' "$*" >/dev/kmsg
 }
 
+# Ordinary status writes use the same printk serialization. A pending tty echo
+# from another CPU must not split the next strict lifecycle record.
+log_message() {
+    printf '<5>%s\n' "$*" >/dev/kmsg
+}
+
 fail_lifecycle() {
     log_lifecycle "FAIL $*"
     # The host runner detects this marker and terminates this disposable VM.
@@ -21,10 +27,21 @@ fail_lifecycle() {
 # and uses a fresh probe process (and therefore fresh VM/vCPU descriptors) per run.
 cycles=
 lifecycle_backend=
+l1_cpus=1
+hotplug_cycles=0
 read -r boot_arguments </proc/cmdline
 set -f
 for argument in $boot_arguments; do
     case "$argument" in
+        thin_hv_hotplug_cycles=*)
+            hotplug_cycles=${argument#*=}
+            case "$hotplug_cycles" in ''|*[!0-9]*) fail_lifecycle invalid-hotplug-cycles ;; esac
+            [ "${#hotplug_cycles}" -le 3 ] && [ "$hotplug_cycles" -le 100 ] || fail_lifecycle hotplug-count-out-of-range
+            ;;
+        thin_hv_l1_cpus=*)
+            l1_cpus=${argument#*=}
+            case "$l1_cpus" in 1|2|4|8) ;; *) fail_lifecycle invalid-L1-cpu-count ;; esac
+            ;;
         thin_hv_kvm_cycles=*)
             [ -z "$cycles" ] || fail_lifecycle duplicate-cycle-argument
             cycles=${argument#*=}
@@ -47,50 +64,74 @@ if [ -n "$cycles$lifecycle_backend" ]; then
     [ -n "$cycles" ] && [ -n "$lifecycle_backend" ] \
         || fail_lifecycle incomplete-lifecycle-arguments
     read -r online_cpus </sys/devices/system/cpu/online
-    [ "$online_cpus" = 0 ] || fail_lifecycle requires-one-L1-cpu
+    expected_online=0
+    [ "$l1_cpus" = 1 ] || expected_online="0-$((l1_cpus - 1))"
+    [ "$online_cpus" = "$expected_online" ] || fail_lifecycle "missing-L1-cpu expected=$expected_online actual=$online_cpus"
 fi
 
 kvm_ready=1
 if grep -qw vmx /proc/cpuinfo; then
-    echo 'thin-hv: linux L1 /proc/cpuinfo vmx=1'
+    log_message 'thin-hv: linux L1 /proc/cpuinfo vmx=1'
 else
-    echo 'thin-hv: linux L1 /proc/cpuinfo vmx=0'
+    log_message 'thin-hv: linux L1 /proc/cpuinfo vmx=0'
     kvm_ready=0
 fi
-echo 'thin-hv: linux L1 modprobe kvm begin'
+log_message 'thin-hv: linux L1 modprobe kvm begin'
 if modprobe kvm; then
-    echo 'thin-hv: linux L1 modprobe kvm end rc=0'
+    log_message 'thin-hv: linux L1 modprobe kvm end rc=0'
 else
-    echo 'thin-hv: linux L1 modprobe kvm end rc=1'
+    log_message 'thin-hv: linux L1 modprobe kvm end rc=1'
     kvm_ready=0
 fi
-echo 'thin-hv: linux L1 modprobe kvm_intel begin'
+log_message 'thin-hv: linux L1 modprobe kvm_intel begin'
 if modprobe kvm_intel nested=0 && [ -d /sys/module/kvm_intel ]; then
-    echo 'thin-hv: linux L1 kvm_intel=1'
+    log_message 'thin-hv: linux L1 kvm_intel=1'
 else
-    echo 'thin-hv: linux L1 kvm_intel=0'
+    log_message 'thin-hv: linux L1 kvm_intel=0'
     kvm_ready=0
 fi
 if [ -c /dev/kvm ]; then
-    echo 'thin-hv: linux L1 /dev/kvm=1'
+    log_message 'thin-hv: linux L1 /dev/kvm=1'
     if [ -z "$cycles" ]; then
         /bin/kvm-probe || true
     else
         [ "$kvm_ready" = 1 ] || fail_lifecycle KVM-unavailable
-        log_lifecycle "begin backend=$lifecycle_backend cycles=$cycles l1_cpus=1"
+        log_lifecycle "begin backend=$lifecycle_backend cycles=$cycles l1_cpus=$l1_cpus"
         completed=0
         while [ "$completed" -lt "$cycles" ]; do
             # PASS follows checked IO completion, state/memslot checks, and
             # explicit munmap/close of both independent single-vCPU VMs.
-            if probe_output=$(/bin/kvm-probe); then
+            if probe_output=$(/bin/busybox taskset -c "$((completed % l1_cpus))" /bin/kvm-probe); then
                 [ "$probe_output" = 'thin-hv: linux L1 L2 KVM PASS' ] \
                     || fail_lifecycle probe-success-marker-mismatch
             else
-                echo "$probe_output"
+                log_message "$probe_output"
                 fail_lifecycle "probe-process-exit cycle=$((completed + 1))"
             fi
             completed=$((completed + 1))
             log_lifecycle "cycle=$completed KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=96 halt=32 remaps=14 state_checks=16 sse_checks=16 long64_rounds=16 paging_checks=64 invlpg=16 cr3_writes=48 xmm16_checks=16 msr_checks=16 debug_checks=16 tsc_checks=16 teardown=explicit process_exit=0"
+        done
+        hotplug_round=0
+        while [ "$hotplug_round" -lt "$hotplug_cycles" ]; do
+            hotplug_round=$((hotplug_round + 1))
+            cpu_index=1
+            while [ "$cpu_index" -lt "$l1_cpus" ]; do
+                online_path="/sys/devices/system/cpu/cpu$cpu_index/online"
+                printf '0\n' >"$online_path" || fail_lifecycle "offline-failed cpu=$cpu_index"
+                read -r online_state <"$online_path"
+                [ "$online_state" = 0 ] || fail_lifecycle "offline-state cpu=$cpu_index"
+                printf '1\n' >"$online_path" || fail_lifecycle "online-failed cpu=$cpu_index"
+                read -r online_state <"$online_path"
+                [ "$online_state" = 1 ] || fail_lifecycle "online-state cpu=$cpu_index"
+                if probe_output=$(/bin/busybox taskset -c "$cpu_index" /bin/kvm-probe); then
+                    [ "$probe_output" = 'thin-hv: linux L1 L2 KVM PASS' ] || fail_lifecycle hotplug-probe-marker
+                else
+                    log_message "$probe_output"
+                    fail_lifecycle "hotplug-probe cycle=$hotplug_round cpu=$cpu_index"
+                fi
+                log_lifecycle "hotplug cycle=$hotplug_round cpu=$cpu_index offline=1 online=1 KVM_RUN=IO"
+                cpu_index=$((cpu_index + 1))
+            done
         done
         log_lifecycle "PASS backend=$lifecycle_backend cycles=$completed"
         log_lifecycle 'poweroff requested'
@@ -98,8 +139,8 @@ if [ -c /dev/kvm ]; then
         fail_lifecycle poweroff-returned
     fi
 else
-    echo 'thin-hv: linux L1 /dev/kvm=0'
+    log_message 'thin-hv: linux L1 /dev/kvm=0'
     [ -z "$cycles" ] || fail_lifecycle missing-KVM-device
 fi
-echo 'thin-hv: linux L1 shell'
+log_message 'thin-hv: linux L1 shell'
 exec setsid cttyhack sh

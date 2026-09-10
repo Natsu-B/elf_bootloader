@@ -14,8 +14,11 @@ validate_cycles() {
 }
 
 check_log() {
-    local backend=$1 cycles=$2 log=$3 bytes transcript LC_ALL=C
+    local backend=$1 cycles=$2 log=$3 cpus=${4:-1} hotplug=${5:-0} bytes transcript LC_ALL=C
     case "$backend" in direct-vmx|outer-kvm) ;; *) return 1 ;; esac
+    case "$cpus" in 1|2|4|8) ;; *) return 1 ;; esac
+    [[ "$hotplug" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((hotplug <= 100)) || return 1
+    ((cpus > 1 || hotplug == 0)) || return 1
     validate_cycles "$cycles" || return 1
     [[ -f "$log" && -r "$log" ]] || return 1
     bytes=$(wc -c <"$log") || return 1
@@ -27,27 +30,34 @@ check_log() {
         return 1
     fi
     bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" --check-backend-log "$backend" "$log" || return 1
-    awk -v backend="$backend" -v cycles="$cycles" '
+    awk -v backend="$backend" -v cycles="$cycles" -v cpus="$cpus" -v hotplug="$hotplug" '
         {
             sub(/\r$/, "")
             sub(/^\[[ ]*[0-9]+\.[0-9]+\] /, "")
             if ($0 ~ /Kernel panic|Oops:|BUG:|thin-hv: linux L1 L2 KVM FAIL|thin-hv: linux L2 lifecycle FAIL/) bad=1
             if (index($0, "thin-hv: direct mode=physical-uefi ") == 1) physical++
+            if (index($0, "thin-hv: direct mode=smp-uefi ") == 1) physical++
             if (index($0, "thin-hv: firmware handoff ") == 1) {
                 if (backend != "direct-vmx" || physical != 2 || begin || handoff ||
-                    $0 != "thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0") bad=1
+                    $0 != "thin-hv: firmware handoff PASS exit_boot_services=success cpus=" cpus " ap_takeover=" (cpus - 1)) bad=1
                 handoff++
             }
             if (index($0, "thin-hv: linux L2 lifecycle ") != 1) next
-            if ($0 == "thin-hv: linux L2 lifecycle begin backend=" backend " cycles=" cycles " l1_cpus=1") {
+            if ($0 == "thin-hv: linux L2 lifecycle begin backend=" backend " cycles=" cycles " l1_cpus=" cpus) {
                 if (begin || count || done || poweroff) bad=1
                 begin++
             } else if (index($0, "thin-hv: linux L2 lifecycle cycle=") == 1) {
                 count++
                 if (begin != 1 || done || poweroff || count > cycles ||
                     $0 != "thin-hv: linux L2 lifecycle cycle=" count " KVM_RUN=IO port=0xe9 data=L2OK vm_contexts=2 rounds=8 io_in=16 io_out=96 halt=32 remaps=14 state_checks=16 sse_checks=16 long64_rounds=16 paging_checks=64 invlpg=16 cr3_writes=48 xmm16_checks=16 msr_checks=16 debug_checks=16 tsc_checks=16 teardown=explicit process_exit=0") bad=1
+            } else if (index($0, "thin-hv: linux L2 lifecycle hotplug ") == 1) {
+                if (begin != 1 || count != cycles || done || poweroff || cpus < 2 || hotplug < 1) { bad=1; next }
+                expected_round = int(plugs / (cpus - 1)) + 1
+                expected_cpu = plugs % (cpus - 1) + 1
+                if (expected_round > hotplug || $0 != "thin-hv: linux L2 lifecycle hotplug cycle=" expected_round " cpu=" expected_cpu " offline=1 online=1 KVM_RUN=IO") bad=1
+                plugs++
             } else if ($0 == "thin-hv: linux L2 lifecycle PASS backend=" backend " cycles=" cycles) {
-                if (begin != 1 || count != cycles || done || poweroff) bad=1
+                if (begin != 1 || count != cycles || done || poweroff || plugs != hotplug * (cpus - 1)) bad=1
                 done++
             } else if ($0 == "thin-hv: linux L2 lifecycle poweroff requested") {
                 if (done != 1 || poweroff) bad=1
@@ -60,15 +70,21 @@ check_log() {
 
 # Pure log checks are called by the existing xtask host-test suite; no VM starts.
 if [[ ${1:-} == --check-log ]]; then
-    [[ $# == 4 ]] || die 'usage: --check-log BACKEND CYCLES LOG'
-    check_log "$2" "$3" "$4" || die 'lifecycle evidence rejected'
+    [[ $# == 4 || $# == 5 || $# == 6 ]] || die 'usage: --check-log BACKEND CYCLES LOG [CPUS [HOTPLUG]]'
+    check_log "$2" "$3" "$4" "${5:-1}" "${6:-0}" || die 'lifecycle evidence rejected'
     exit 0
 fi
 [[ $# == 0 ]] || die 'configure with LINUX_KVM_BACKEND, LINUX_KVM_CYCLES, and LINUX_KVM_TIMEOUT_SECONDS'
 
 backend=${LINUX_KVM_BACKEND:-direct-vmx}
 direct_mode=${LINUX_KVM_DIRECT_MODE:-qemu-research}
-case "$direct_mode" in qemu-research|physical-uefi) ;; *) die 'LINUX_KVM_DIRECT_MODE must be qemu-research or physical-uefi' ;; esac
+case "$direct_mode" in qemu-research|physical-uefi|smp-uefi) ;; *) die 'invalid LINUX_KVM_DIRECT_MODE' ;; esac
+cpus=${LINUX_KVM_CPUS:-1}
+case "$cpus" in 1|2|4|8) ;; *) die 'LINUX_KVM_CPUS must be 1, 2, 4 or 8' ;; esac
+[[ "$cpus" == 1 || "$direct_mode" == smp-uefi ]] || die 'multiple L1 CPUs require explicit smp-uefi mode'
+hotplug=${LINUX_KVM_HOTPLUG_CYCLES:-0}
+[[ "$hotplug" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((hotplug <= 100)) || die 'LINUX_KVM_HOTPLUG_CYCLES must be 0..100'
+((cpus > 1 || hotplug == 0)) || die 'hotplug requires multiple L1 CPUs'
 [[ "$direct_mode" == qemu-research || "$backend" == direct-vmx ]] || die 'physical-uefi mode requires project Direct L0'
 cycles=${LINUX_KVM_CYCLES:-64}
 timeout_seconds=${LINUX_KVM_TIMEOUT_SECONDS:-300}
@@ -99,12 +115,16 @@ if ((host_xstate_test)); then
     monitor="$repo_root/bin/x86_64/x86-uefi-host-xstate-monitor.efi"
 fi
 guest_location=guest
-if [[ "$direct_mode" == physical-uefi ]]; then
+if [[ "$direct_mode" == physical-uefi || "$direct_mode" == smp-uefi ]]; then
     loader="$repo_root/bin/x86_64/x86-uefi-physical-direct-loader.efi"
     monitor="$repo_root/bin/x86_64/x86-uefi-physical-direct-monitor.efi"
     # Linux is a test EFI at the default same-ESP path, not a Windows test or
     # a physical Windows disk. The loader itself never knows this QEMU staging.
     guest_location=windows
+fi
+if [[ "$direct_mode" == smp-uefi ]]; then
+    loader="$repo_root/bin/x86_64/x86-uefi-smp-direct-loader.efi"
+    monitor="$repo_root/bin/x86_64/x86-uefi-smp-direct-monitor.efi"
 fi
 output="$repo_root/bin/x86_64/linux-l1-kvm-$backend.efi"
 serial_log="$repo_root/bin/x86_64/serial.log"
@@ -115,7 +135,7 @@ env \
     LINUX_L1_INIT="$repo_root/scripts/x86_64/linux-l1-init" \
     LINUX_L1_KVM_PROBE="$repo_root/scripts/x86_64/linux-l1-kvm-probe.c" \
     LINUX_L1_EXTRA_MODULES= \
-    LINUX_L1_CMDLINE="console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=1 panic=0 thin_hv_kvm_backend=$backend thin_hv_kvm_cycles=$cycles" \
+    LINUX_L1_CMDLINE="console=ttyS0,115200n8 earlycon=uart8250,io,0x3f8,115200n8 rdinit=/init maxcpus=$cpus panic=0 thin_hv_kvm_backend=$backend thin_hv_kvm_cycles=$cycles thin_hv_l1_cpus=$cpus thin_hv_hotplug_cycles=$hotplug" \
     scripts/x86_64/build-linux-uki.sh "$output"
 
 env \
@@ -125,7 +145,7 @@ env \
     X86_MONITOR_IMAGE="$monitor" \
     X86_UEFI_CPU='host,+vmx,-hypervisor,kvm=off' \
     X86_UEFI_MEMORY="$memory" \
-    X86_UEFI_SMP=1 \
+    X86_UEFI_SMP="$cpus" \
     X86_UEFI_GUEST_LOCATION="$guest_location" \
     X86_UEFI_ALLOW_REBOOT=0 \
     X86_UEFI_REQUIRE_POWEROFF=1 \
@@ -140,7 +160,7 @@ env \
     X86_GUEST_FAILURE_MARKER='thin-hv: linux L2 lifecycle FAIL' \
     scripts/x86_64/run-uefi-smoke.sh "$loader" "$output"
 
-check_log "$backend" "$cycles" "$serial_log" || die 'lifecycle evidence rejected'
+check_log "$backend" "$cycles" "$serial_log" "$cpus" "$hotplug" || die 'lifecycle evidence rejected'
 if ((host_xstate_test)); then
     [[ $(grep -Fxc $'thin-hv: host xstate clobber fixture armed\r' "$serial_log") == 1 ]] \
         || die 'host XSTATE clobber fixture did not run exactly once'

@@ -563,10 +563,105 @@ Latest combined package coverage: **438 PASS / 0 FAIL / 0 SKIP** (including the
 unchanged nine overlay tests). No AArch64 production path, dependency, physical
 device state or firmware identity was changed.
 
+## Increment 9 (in progress): actual AP carrier ownership
+
+The opt-in `smp-direct-vmx` image (`smp-uefi` runner mode) now reserves one
+independent monitor block per firmware CPU. The normal physical/profile images
+retain their single-CPU rejection. This is experimental QEMU SMP, not a physical
+or daily-use qualification claim.
+
+`MonitorLayout`, `PreparedMonitor`, and `cpu_boot::{Handoff,CpuBoot}` separate
+whole-machine reservations from each CPU's VMXON/carrier/error VMCS, stack,
+GDT/TSS/IST, GS-bound nested state, XSTATE scratch, VPID namespace, diagnostics
+and private host roots. Firmware enumeration does not start/disable APs. Only
+healthy, enabled processors are accepted for this first milestone. A reserved
+RuntimeServicesCode page below 1 MiB supplies the SIPI bootstrap; all initial
+roots/monitor blocks are allocated below 4 GiB, without limiting L1 RAM/MMIO.
+The bootstrap selects full CPUID APIC identities, switches to the owner's root
+and stack, and retains INIT's original cache bits and PAT. No low address is
+stolen and no fixed q35 EPT/host-map fallback is used.
+
+Only after the original ExitBootServices succeeds does the BSP send targeted
+INIT/SIPI. Each AP checks its capabilities, installs private descriptors,
+executes its own VMXON and enters a real-mode carrier CPUID probe. The BSP waits
+for every probe before acknowledging firmware handoff. A failed/missing AP
+prevents OS continuation; no live allocation is freed. Initial LTR required
+making the VMX-oriented busy TSS descriptor available first: the first 2-CPU
+attempt stopped exactly at LTR (RIP private image + `0x1bda4`), before GS/IDT
+installation. LTR itself now sets the descriptor busy again. The first
+successful 2-CPU guest run exposed mixed tty/printk output; Linux status messages
+now share the existing printk-based lifecycle logger, without relaxing the gate.
+
+The existing Linux runner accepts `LINUX_KVM_DIRECT_MODE=smp-uefi` and
+`LINUX_KVM_CPUS=1|2|4|8`. Fresh KVM probes rotate CPU affinity, retaining the
+existing two-VM/state/memslot contract. Strict mode checks require distinct
+APIC IDs/carrier addresses and an all-CPU handoff. `LINUX_KVM_HOTPLUG_CYCLES`
+adds bounded (0..100) offline/online rounds and a fresh KVM probe on each returned
+AP. It defaults to zero; hotplug is a separate gate, not silently counted as
+passing by the cold-boot cases.
+
+Commands below all used `nix develop --accept-flake-config --command`:
+
+* `cargo xtest -p nested_vmx; cargo xtest -p x86_64_hal; cargo xtest -p
+  x86_uefi_loader; cargo xtest -p x86_guest_uefi_test; cargo xtest -p xtask`:
+  **498 PASS / 0 FAIL / 0 SKIP** (32/62/355/10/39), including the new SMP feature
+  entry in xtest.txt. `cargo xbuild x86`: **PASS**.
+* `env LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=N LINUX_KVM_CYCLES=64
+  bash scripts/x86_64/run-linux-kvm-test.sh`, N=1,2,4,8:
+  **4 cold-boot cases PASS / 0 FAIL**, each with 64 complete KVM lifecycle
+  iterations and S5 poweroff. QEMU/KVM, ordinary q35 high-PCI layout,
+  `host,+vmx,-hypervisor,kvm=off`, 2 GiB. These are actual Direct L1 CPUs, not
+  merely multiple L2 vCPUs on one L1 CPU.
+* `cargo xrun x86 --release`: **18 PASS** (13 KVM, 5 TCG).
+  `cargo xrun x86 --profile-direct --release`: **6 PASS**.
+  `cargo xrun x86 --nested --release`: **15 PASS / 5 FAIL**; all 14 Direct cases
+  pass, outer/reference Linux passes, and the same five outer instruction/MSR
+  cases fail. No reference success replaces a Direct result.
+* 8 CPUs, 64 KVM cycles, `LINUX_KVM_HOTPLUG_CYCLES=2`: **FAIL**.
+  Original full-reset handling failed at round 1 / CPU1. Entering WAIT sooner
+  and completing reset on SIPI improved progress but still failed at round 1 /
+  CPU4, then round 1 / CPU6 on a separate run. No timeout or Linux INIT/SIPI
+  timing was increased. These failures remain mandatory regressions.
+
+The hotplug failure now has per-CPU evidence, not just a guest timeout. Existing
+1344-byte diagnostic v4 records use explicit AP scope 2, with separately bounded
+nonoverlapping per-CPU publications. `decode-vmx-diagnostics.py --cpu SLOT
+extent|decode ...` validates the selected owner and binary scope. Its **13 host
+self-tests PASS**. The existing QEMU runner stops the failed guest and captures
+only these published L0 records, then preserves the original FAIL verdict.
+Successful snapshots are decoded to JSON and raw counter copies are deleted.
+
+In `bin/x86_64/smp-failure.TYP5te/cpu-{0..7}.json`, CPUs1..5 each observed
+`INIT=1, SIPI=2`; failed CPU6 observed `INIT=1, SIPI=1`, with last exit INIT.
+CPU7 (not yet offlined) observed `INIT=0, SIPI=1`. Thus the failed CPU received
+its initial boot SIPI but not the hotplug SIPI. Earlier stopped-register capture
+also showed a carrier in WAIT with reset CS:RIP, not a root exception.
+The inspected local KVM `vmx_check_nested_events` / `kvm_apic_accept_events`
+paths explicitly discard SIPIs while the nested hypervisor is in VMX root.
+This supports an INIT/SIPI delivery-ordering race; it is not yet a fixed
+lifecycle. BitVisor's direct-WAIT path likewise minimizes root work, while its
+software-WAIT alternative observes startup ICR writes. No APIC/device emulation
+has been added in this increment; any further intervention needs measured
+justification and must preserve ordinary device/interrupt ownership.
+
+Evidence logs: `/tmp/x86-smp-current-host-and-one-cpu.log`,
+`/tmp/x86-smp-two-cpus-serial-fix.log`, `/tmp/x86-smp-four-cpus-first.log`,
+`/tmp/x86-smp-eight-cpus-first.log`, `/tmp/x86-smp-bsp-full-regression.log`,
+`/tmp/x86-smp-eight-cpus-hotplug-first.log`,
+`/tmp/x86-smp-eight-cpus-hotplug-wait-first.log`, and
+`/tmp/x86-smp-eight-hotplug-pcpu-capture.log`. A manual diagnostic invocation in
+`/tmp/x86-smp-eight-pcpu-hotplug-diag.log` accidentally reused the subsequent
+1-CPU UKI; it was stopped and is **not** SMP/hotplug evidence. The automated
+capture run rebuilt the correct 8-CPU/hotplug UKI through the normal runner.
+
+No Direct Windows/Hyper-V/WSL2, S3, S4, reboot matrix, Unsafe mode or physical
+hardware success is inferred from these Linux cold boots.
+
 ## Qualification still required
 
 Profile boot-option return/error/reboot qualification and failure injection;
-1/2/4/8 actual L1 CPUs; AP handoff; S3/cancellation/time/NMI; Direct Hyper-V/WSL2
+1/2/4/8 Windows L1 CPUs and robust Linux AP hotplug/reboot;
+S3/cancellation/time/NMI; Direct Hyper-V/WSL2
 and S4; short/extended daily suite; measured Current/Unsafe A/B and default decision.
 Existing Linux test failures in `correctness-2026-09-09.md` are not waived.
 

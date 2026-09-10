@@ -600,6 +600,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         "profile-direct",
         "profile-direct-vmx",
     )?;
+    build_x86_direct_variant(args, &workspace, &artifact, "smp-direct", "smp-direct-vmx")?;
     for (feature, filename) in [
         ("nested-contract", "x86-uefi-nested-contract.efi"),
         ("msr-contract", "x86-uefi-msr-contract.efi"),
@@ -3886,6 +3887,42 @@ mod tests {
             assert!(!check_mode("physical-uefi", &invalid));
         }
         assert!(!check_mode("qemu-research", &research.replace(overlay, "")));
+        let smp_mode = "thin-hv: CPU ownership build=experimental-smp physical_ready=0\nthin-hv: direct mode=smp-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n";
+        for count in [1, 2, 4, 8] {
+            let carriers = (0..count).map(|slot| format!(
+                "thin-hv: CPU carrier PASS slot={slot} apic_id={} vmcs={:#x} ownership=monitor\n", slot + 8, 0x200000 + slot * 0x300000
+            )).collect::<String>();
+            let handoff = format!(
+                "thin-hv: firmware handoff PASS exit_boot_services=success cpus={count} ap_takeover={}\n",
+                count - 1
+            );
+            let valid = format!("{smp_mode}{selected}{smp_mode}{carriers}{handoff}");
+            assert!(check_mode("smp-uefi", &valid));
+            assert!(check_mode("smp-uefi", &valid.replace('\n', "\r\n")));
+            for invalid in [
+                valid.replace(&carriers, ""),
+                valid.replace(&handoff, ""),
+                valid.replace("experimental-smp", "bsp-only"),
+                valid.replace("vmcs=0x200000", "vmcs=0x200001"),
+                valid.replace("ap_takeover=", "ap_takeover=9"),
+                format!("{valid}{overlay}"),
+                format!("{valid}thin-hv: AP ownership FAIL\n"),
+                valid.repeat(2),
+            ] {
+                assert!(!check_mode("smp-uefi", &invalid));
+            }
+            if count > 1 {
+                assert!(!check_mode(
+                    "smp-uefi",
+                    &valid.replace("apic_id=9", "apic_id=8")
+                ));
+                assert!(!check_mode(
+                    "smp-uefi",
+                    &valid.replace("vmcs=0x500000", "vmcs=0x200000")
+                ));
+            }
+            assert!(!check_mode("physical-uefi", &valid));
+        }
         let check_reject = |status: &str, contents: &str| {
             fs::write(&log.0, contents).unwrap();
             Command::new("bash")

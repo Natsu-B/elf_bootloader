@@ -14,7 +14,7 @@ const EXIT_LOAD_EFER: u64 = 1 << 21;
 const EXIT_LOAD_CET: u64 = 1 << 28;
 
 /// Architectural limits of the CPU executing the nested VM-entry instruction.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     /// Required-one CR0 bits in VMX operation.
     pub cr0_fixed0: u64,

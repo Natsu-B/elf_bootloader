@@ -76,6 +76,28 @@ marker is `firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0
 This establishes the precise boundary for later AP ownership, not SMP itself.
 The overlay-free physical mode still has no Runtime Services variable hooks.
 
+An explicit experimental AP build is now available, without changing those
+BSP-only defaults:
+
+```sh
+nix develop --accept-flake-config --command env \
+  LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=8 LINUX_KVM_CYCLES=64 \
+  bash scripts/x86_64/run-linux-kvm-test.sh
+```
+
+`LINUX_KVM_CPUS` accepts 1/2/4/8. Each CPU has a separate runtime block, VMXON,
+carrier VMCS, private host environment and nested state. Firmware-time work only
+reserves memory; AP takeover occurs after the original successful
+`ExitBootServices`. The BSP waits for every AP to execute a private carrier probe
+before continuing L1. This mode keeps the platform map and has no variable overlay.
+All four Linux cold-boot configurations passed 64 pinned nested KVM probes each.
+This is **not completed SMP lifecycle qualification**: setting
+`LINUX_KVM_HOTPLUG_CYCLES=2` reproduces intermittent AP online failure after INIT,
+with the subsequent SIPI absent from that CPU's exit counters. The strict runner
+fails and saves bounded per-CPU JSON under `bin/x86_64/smp-failure.*`.
+Windows SMP, reboot and power transitions remain unqualified. See the
+[incremental evidence](evidence/x86_64/daily-candidate-2026-09-11.md).
+
 Work started on 2026-09-07 and continued on 2026-09-08 (JST), without switching branches.
 The checked-out local implementation is authoritative; the public Branches index described in
 the task did not expose this development branch. No code was reconstructed from older main/origin.

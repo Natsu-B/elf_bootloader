@@ -179,6 +179,7 @@ impl FirmwareDescriptor {
 /// Owned, checked firmware descriptors for bounded physical RAM access.
 /// This validates metadata only: callers must separately establish their CPU
 /// mapping, memory types, ownership exclusions and absence of concurrent writes.
+#[derive(Clone)]
 pub struct FirmwareMap<const N: usize> {
     descriptors: [FirmwareDescriptor; N],
     count: usize,

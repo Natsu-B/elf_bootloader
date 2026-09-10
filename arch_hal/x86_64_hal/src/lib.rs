@@ -8,6 +8,8 @@ compile_error!("x86_64_hal requires an x86_64 target");
 #[cfg(feature = "vmx")]
 pub mod addr;
 #[cfg(feature = "vmx")]
+pub mod ap_bootstrap;
+#[cfg(feature = "vmx")]
 pub mod control_state;
 pub mod cpu;
 #[cfg(feature = "vmx")]
