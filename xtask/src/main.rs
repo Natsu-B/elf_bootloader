@@ -4621,6 +4621,34 @@ mod tests {
             );
             assert!(check(backend, "2", &valid));
             assert!(check(backend, "2", &valid.replace('\n', "\r\n")));
+            if backend == "direct-vmx" {
+                let mode = "thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n";
+                let handoff = "thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0\n";
+                assert!(check(
+                    backend,
+                    "2",
+                    &format!("{mode}{mode}{handoff}{valid}")
+                ));
+                assert!(!check(backend, "2", &format!("{mode}{mode}{valid}")));
+                assert!(!check(
+                    backend,
+                    "2",
+                    &format!("{mode}{mode}{handoff}{handoff}{valid}")
+                ));
+                assert!(!check(
+                    backend,
+                    "2",
+                    &format!("{mode}{handoff}{mode}{valid}")
+                ));
+                assert!(!check(
+                    backend,
+                    "2",
+                    &format!(
+                        "{mode}{mode}{}{valid}",
+                        handoff.replace("ap_takeover=0", "ap_takeover=1")
+                    )
+                ));
+            }
             let kernel_records = valid
                 .lines()
                 .map(|line| {

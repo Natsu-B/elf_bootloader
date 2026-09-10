@@ -753,6 +753,8 @@ struct NestedRun {
 /// this object now; AP/INIT/SIPI support is still required before enabling SMP.
 #[repr(C, align(16))]
 struct CpuMonitor {
+    #[cfg(feature = "physical-direct-vmx")]
+    firmware_handoff: AtomicUsize,
     physical_bits: u8,
     /// Captured on this physical CPU before entry, immutable for its VMX
     /// lifetime. l1_ia32e is deliberately false here, never cached guest mode.
@@ -769,6 +771,8 @@ struct CpuMonitor {
 impl CpuMonitor {
     fn new(runtime: CpuRuntimeState, host_limits: host_validation::Limits) -> Self {
         Self {
+            #[cfg(feature = "physical-direct-vmx")]
+            firmware_handoff: AtomicUsize::new(0),
             physical_bits: runtime.ram.physical_width().bits(),
             host_limits,
             diagnostics: SpinLock::new(ExitDiagnostics::new()),
@@ -1387,6 +1391,9 @@ fn start_resident_core(
                         profile.0,
                         overlay.memory_attribute_patch_count()
                     );
+                    #[cfg(feature = "physical-direct-vmx")]
+                    let _boot_handoff =
+                        crate::boot_handoff::install(system_table).map_err(Error::Platform)?;
                     let result = (|| {
                         let guarded =
                             resident_image::GuardedAllocation::new(allocation, pages, limit)
@@ -3206,6 +3213,31 @@ fn dispatch_l1_exit(registers: &mut GuestRegisters, reason: u64) -> u64 {
     }
 
     if reason & (1 << 31) == 0 && reason & 0xffff == EXIT_REASON_VMCALL {
+        #[cfg(feature = "physical-direct-vmx")]
+        if registers.rax == crate::boot_handoff::REQUEST {
+            if current_cpu()
+                .firmware_handoff
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                stop_unexpected_exit(
+                    b"duplicate firmware handoff",
+                    reason,
+                    qualification,
+                    guest_rip,
+                    instruction_len,
+                    registers,
+                );
+            }
+            // The existing pre-entry gate still proves one CPU only. This is
+            // an exact firmware boundary, not AP takeover or an SMP claim.
+            SerialPort.write_bytes(
+                b"thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0\n",
+            );
+            registers.rax = crate::boot_handoff::ACKNOWLEDGED;
+            advance_guest_rip(reason, qualification, guest_rip, instruction_len, registers);
+            return VMEXIT_ACTION_RESUME;
+        }
         record_diagnostic(DiagnosticEvent::L0Handled {
             reason,
             action: VMEXIT_ACTION_RESUME,

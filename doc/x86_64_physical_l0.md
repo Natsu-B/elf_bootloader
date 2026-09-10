@@ -69,6 +69,13 @@ without starting an AP or entering project VMX. Disabled CPUs are retained in
 the inventory. This is **firmware inventory coverage, not L1 SMP support**:
 the physical/profile Direct gate still rejects more than one firmware CPU.
 
+Physical/profile Direct now wraps the original firmware `ExitBootServices` entry
+in retained runtime code. A failed call returns its original status untouched;
+only a successful return issues the one-shot L0 handoff notification. The current
+marker is `firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0`.
+This establishes the precise boundary for later AP ownership, not SMP itself.
+The overlay-free physical mode still has no Runtime Services variable hooks.
+
 Work started on 2026-09-07 and continued on 2026-09-08 (JST), without switching branches.
 The checked-out local implementation is authoritative; the public Branches index described in
 the task did not expose this development branch. No code was reconstructed from older main/origin.

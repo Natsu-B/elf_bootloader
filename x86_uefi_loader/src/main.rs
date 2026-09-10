@@ -37,6 +37,8 @@ compile_error!("x86 UEFI backends are mutually exclusive");
 )))]
 compile_error!("select one x86 UEFI backend");
 
+#[cfg(feature = "physical-direct-vmx")]
+mod boot_handoff;
 mod chainload;
 #[cfg(any(feature = "physical-preflight", feature = "physical-direct-vmx"))]
 mod cpu_inventory;

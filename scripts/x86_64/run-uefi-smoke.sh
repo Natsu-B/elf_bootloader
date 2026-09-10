@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Shared by transcript validation and the live runner; a halted monitor cannot
 # recover by waiting for an unrelated guest success marker.
-direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|nested VMX abort|host exception |panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
+direct_failure_pattern='thin-hv: (vmx smoke FAIL|vmx guest FAIL|VMRESUME FAIL|VMXOFF status=|nested VMX abort|host exception |firmware handoff FAIL|panic|CPUID VMX=0|IA32_FEATURE_CONTROL=unavailable|IA32_VMX_BASIC=unavailable)'
 
 die() {
     printf 'x86 UEFI smoke: %s\n' "$*" >&2
@@ -37,7 +37,7 @@ check_backend_log() {
             case "$line" in
                 *'thin-hv: loading runtime monitor'* | *'thin-hv: runtime monitor active'* | \
                 *'thin-hv: private host state'* | *'thin-hv: host exception '* | \
-                *'thin-hv: nested VMX abort'* | \
+                *'thin-hv: nested VMX abort'* | *'thin-hv: firmware handoff '* | \
                 *'thin-hv: variable overlay profile='* | *'thin-hv: uefi variable overlay PASS'* | \
                 *'thin-hv: L1 '* | *'thin-hv: vmx '*) return 1 ;;
             esac
@@ -94,7 +94,7 @@ check_profile_contract_log() {
 # Mode provenance is separate from acceleration: physical-selection code is
 # tested under QEMU, never reported as physical-machine validation.
 check_direct_mode_log() {
-    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 profiles=0 selected= expected
+    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 profiles=0 handoffs=0 selected= expected
     case "$mode" in
         qemu-research) expected='thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0' ;;
         physical-uefi) expected='thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0' ;;
@@ -109,6 +109,10 @@ check_direct_mode_log() {
         line=${line%$'\r'}
         case "$line" in
             'thin-hv: direct mode='*) [[ "$line" == "$expected" ]] || return 1; ((modes += 1)) ;;
+            'thin-hv: firmware handoff '*)
+                [[ "$mode" != qemu-research && "$line" == 'thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0' ]] || return 1
+                ((modes == (handoffs + 1) * 2)) || return 1
+                ((handoffs += 1)) ;;
             'thin-hv: variable overlay profile='*)
                 [[ "$mode" != physical-uefi && "$line" =~ ^thin-hv:\ variable\ overlay\ profile=([12])\ mat_patches=[0-9]+$ ]] || return 1
                 [[ "$mode" != profile-uefi || "${BASH_REMATCH[1]}" == "$selected" ]] || return 1

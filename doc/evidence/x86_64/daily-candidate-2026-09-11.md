@@ -431,6 +431,62 @@ the same five outer/reference contracts fail. Overall command status is 1 becaus
 those reference failures are not waived. Formatting and diff checks pass.
 No generated artifact or unrelated AArch64/user change is included.
 
+## Increment 7: observe the actual end of firmware Boot Services
+
+`boot_handoff.rs::install/Installed/exit_boot_services/after_firmware` introduces
+an opt-in physical/profile Direct Boot Services wrapper, not a Runtime Services
+variable overlay. It retains the original firmware entry, forwards the image/map
+key unchanged, and notifies L0 only after EFI_SUCCESS. Invalid map keys and other
+firmware errors return unchanged without notifying L0 or allocating/calling other
+Boot Services. The exact table entry and CRC are restored on pre-entry rollback,
+including failed CRC calculation. No filesystem or firmware service is used after
+success. The wrapper belongs to the retained registered runtime image, never a
+disposable Boot Services allocation or L0's private PE copy.
+
+`vmx_smoke.rs::start_resident_core` scopes the installation to validated runtime
+preparation. `CpuMonitor::firmware_handoff` owns the one-shot observation on the
+current CPU; `dispatch_l1_exit` acknowledges the dedicated VMCALL, advances its RIP,
+and emits one bounded lifecycle marker. Duplicate handoff or an internal ABI
+failure stops visibly instead of pretending firmware services can be retried.
+The marker explicitly says `cpus=1 ap_takeover=0`: **AP VMX takeover is not yet
+implemented**, and the existing multi-CPU rejection is still enforced.
+
+`run-linux-kvm-test.sh::check_log` now requires that exact successful boundary
+before a physical Direct Linux lifecycle begins. The generic UEFI backend/mode
+gates reject handoff failures, mixed backends and duplicate/malformed records.
+xtask's existing gate tests cover a missing, repeated, misordered or falsely
+AP-enabled marker. No new runner framework, dependency or device mediation exists.
+
+`/tmp/x86-firmware-handoff-direct-first.log` records a test-build failure because
+the initial CRC mock used a const input pointer rather than r-efi's mutable ABI;
+the mock was corrected, not the production signature. The next run
+`/tmp/x86-firmware-handoff-direct-second.log` passes **287 loader host tests** and
+observes the real post-EBS marker plus 64 completed KVM cycles in both physical
+Direct Linux configurations. However, two runner processes encountered a shell
+file-offset parse error because their scripts were edited while they were running.
+That invocation is **13 PASS / 7 FAIL / 0 SKIP**, not a clean qualification: five
+known outer contract failures, plus outer Linux and 12-GiB physical Direct runner
+failures. The successful guest output does not override a failed runner.
+The complete rerun freezes runner/source files for its duration.
+
+`/tmp/x86-firmware-handoff-frozen-regression.log` records:
+
+```sh
+bash -n scripts/x86_64/run-uefi-smoke.sh
+bash -n scripts/x86_64/run-linux-kvm-test.sh
+nix develop --accept-flake-config --command bash -c 'set -e; cargo fmt; cargo xtest -p xtask; cargo xrun x86 --release; cargo xrun x86 --profile-direct --release; cargo fmt --check; git diff --check; cargo xrun x86 --nested --release'
+```
+
+xtask: **39 PASS / 0 FAIL / 0 SKIP** (28.05 seconds). Standard release:
+**18 PASS / 0 FAIL / 0 SKIP**. Profile Direct release: **6 PASS / 0 FAIL / 0 SKIP**.
+Nested release: **15 PASS / 5 FAIL / 0 SKIP**, all 14 Direct cases passing;
+the same five outer contracts remain failures, so the command correctly exits 1.
+Both physical Direct Linux configurations prove the new exact post-EBS boundary
+before completing their 64 L2 lifecycle cycles. Overall this invocation has
+**39 QEMU PASS / 5 FAIL / 0 SKIP**. Shell/format/diff checks pass. Latest combined
+package host coverage is **436 PASS / 0 FAIL / 0 SKIP** (287 loader, 39 xtask,
+32 nested_vmx, 59 HAL, 10 guest, 9 overlay). No Windows/S3/SMP readiness is inferred.
+
 ## Qualification still required
 
 Profile boot-option return/error/reboot qualification and failure injection;

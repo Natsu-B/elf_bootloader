@@ -32,6 +32,12 @@ check_log() {
             sub(/\r$/, "")
             sub(/^\[[ ]*[0-9]+\.[0-9]+\] /, "")
             if ($0 ~ /Kernel panic|Oops:|BUG:|thin-hv: linux L1 L2 KVM FAIL|thin-hv: linux L2 lifecycle FAIL/) bad=1
+            if (index($0, "thin-hv: direct mode=physical-uefi ") == 1) physical++
+            if (index($0, "thin-hv: firmware handoff ") == 1) {
+                if (backend != "direct-vmx" || physical != 2 || begin || handoff ||
+                    $0 != "thin-hv: firmware handoff PASS exit_boot_services=success cpus=1 ap_takeover=0") bad=1
+                handoff++
+            }
             if (index($0, "thin-hv: linux L2 lifecycle ") != 1) next
             if ($0 == "thin-hv: linux L2 lifecycle begin backend=" backend " cycles=" cycles " l1_cpus=1") {
                 if (begin || count || done || poweroff) bad=1
@@ -48,7 +54,7 @@ check_log() {
                 poweroff++
             } else bad=1
         }
-        END { exit (bad || begin != 1 || count != cycles || done != 1 || poweroff != 1) }
+        END { exit (bad || begin != 1 || count != cycles || done != 1 || poweroff != 1 || (physical && (physical != 2 || handoff != 1))) }
     ' "$log"
 }
 
