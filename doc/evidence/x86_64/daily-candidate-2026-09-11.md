@@ -76,7 +76,18 @@ QEMU/KVM, default q35 PCI aperture, `host,+vmx,-hypervisor`, one L1 CPU, no over
 This is project Direct-VMX evidence, not physical hardware. The immutable seed is
 `/tmp/thin-hv-nested-windows-reference.QaTUrn`; no original disk is test-written.
 Run directory retains command provenance, hashes, logs and bounded diagnostics.
-Result pending. Outer-KVM results remain reference evidence only.
+Result: **FAIL**, command exit 1 at the unchanged 600-second bound, screen still
+`Please wait`. L2 entries/reflections 4,577,759; nested entry failures 0;
+L1 exits 39,970,515; VMREAD 786,864,838; VMWRITE 167,969,630; VMPTRLD 14,699,806.
+L2 RDMSR 3,633,800 and WRMSR 438,463 dominate. This is evidence of continuing
+nested activity, not a diagnosed root cause or proof of correct state/interrupts.
+`failure.png` was visually inspected; no bugcheck is visible. Outer-KVM results
+remain reference evidence only.
+
+Finished-run cleanup removed exactly its qcow2 child, three copied variable stores,
+two raw/MSI symlinks (not their targets), copied TPM directories, generated media
+and copied ESP. These disposable copies are not recoverable; reusable original
+seed/backing files, hashes, screenshots and diagnostics remain intact.
 
 ## Lifecycle reference audit (no copied code)
 
@@ -93,8 +104,80 @@ Result pending. Outer-KVM results remain reference evidence only.
   devirtualize on departure from S0 and reinitialize on return, relying on Windows
   callbacks unavailable to a standalone UEFI L0.
 
-The three requested BitVisor commit URLs returned 404 from the `matsu/bitvisor`
-mirror; exact-commit verification is pending locating the authoritative repository.
+The requested commits were subsequently found and inspected in `igel-oss/bitvisor`:
+[924b9c3](https://github.com/igel-oss/bitvisor/commit/924b9c3d7d778bcdeb03cfce7d83ffb95d5845f2)
+adds the all-CPU barrier before guest resume;
+[8b18a60](https://github.com/igel-oss/bitvisor/commit/8b18a6084e1cb0b7f6c8caafbb9acb68c9501d35)
+updates per-CPU time correction as well as the TSC base;
+[ed3274a](https://github.com/igel-oss/bitvisor/commit/ed3274a2b03769f601fb121d3ac5086c2c615ba2)
+restores hypervisor-owned xHCI address state. The latter complexity is unnecessary
+here while device state stays guest-owned; no xHCI save/restore was added.
+
+## Increment 2: live firmware profile fixture
+
+`cargo xrun x86 --uefi-profiles --release` uses the existing x86 runner with a
+new standalone fixture backend, no Windows/Linux image and VMX hidden. The boot
+application loads its runtime-driver copy using shared current-ESP image helpers;
+the fixture directly uses production `runtime_variables` hooks, then rolls them
+back before every firmware reset. A runtime driver directly at BOOTX64 was rejected
+by OVMF's boot discovery in the first attempt; normal LoadImage/StartImage fixed the
+fixture boot path, without a test timeout increase.
+
+Second run: **PASS**, QEMU/KVM default q35, 256 MiB, one CPU, 60-second total bound.
+Log `/tmp/x86-profile-contract-second-run.log`. Cold then warm ResetSystem produced
+three fresh driver entries and 11 profile views. Both firmware-backed namespaces
+survived; append, empty append, deletion, buffer-too-small attributes and complete
+filtered enumeration passed. Nine security/BootCurrent values were compared in
+memory without printing/persisting their contents. Store exhaustion occurred after
+230 filler variables; rejected growth retained the old value, then fillers were
+deleted. This is firmware/profile evidence, **not Direct-VMX or OS lifecycle proof**.
+
+The independent `SelectedProfile` record has eight bytes, magic/version/reserved
+fields and a supported OS ID; malformed records do not fall back. NV+BS attributes
+keep this boot-time selection outside normal OS runtime writes. Guest BootNext
+does not alter it. Production boot-path selection wiring remains pending.
+
+The selector is now explicitly changed Windows -> Linux before cold reset and
+Linux -> Windows before warm reset; each new driver validates the stored selection
+independently of its two profile views. Same fixture passes under both QEMU/KVM
+(`host,-vmx,-hypervisor`) and QEMU TCG (`qemu64`). Final logs:
+`/tmp/x86-profile-contract-selector-reset.log` and `/tmp/x86-profile-contract-tcg.log`.
+QueryVariableInfo remains unchanged across hook installation, and a mis-staged
+application in the runtime-driver position is rejected/unloaded before StartImage.
+
+Host regression: **362 PASS / 0 FAIL / 0 SKIP** (nested_vmx 32, x86_64_hal 59,
+uefi_variable_overlay 9, x86_uefi_loader 213, x86_guest_uefi_test 10, xtask 39).
+`/tmp/x86-profile-contract-all-regression.log` records all six `cargo xtest -p`
+commands, `cargo xbuild x86`, `cargo xrun x86 --release`, and `cargo fmt --check`.
+The standard release run now includes the strict profile gate: **12 PASS / 0 FAIL**
+(10 QEMU/KVM, 2 TCG). Further standalone profile reruns are not added to that total.
+
+`nix develop --accept-flake-config --command cargo xrun x86 --nested --release`:
+**15 PASS / 5 FAIL / 0 SKIP**; command exit 1. All 14 Direct configurations pass
+(8 native/negative contracts, 6 real Linux KVM configurations including 12 GiB).
+The additional Linux reference passes. Five outer-KVM/reference instruction
+contracts remain FAIL: native, readonly-vmcs, msr, msr-abort-store, msr-abort-load.
+These match the pre-existing differences, are not waived, and do not indicate
+successful Direct SMP (the 2-CPU rejection is deliberately a negative test).
+Log: `/tmp/x86-profile-contract-nested-release.log`.
+
+Intermediate test-development failures retained: OVMF did not discover a runtime
+driver as a boot application; a host gate test initially used a wrong test-module
+path; a fmt check overlapped subsequent edits. Those were fixture/integration
+errors, not silently retried Hyper-V success. Later frozen regression commands
+passed as listed above. No timeout was increased.
+
+Latest-selector debug fixture: **PASS**, `/tmp/x86-profile-contract-selector-debug.log`.
+Mis-staged runtime negative: **PASS** (expected runner exit 1, no phase entry or
+variable write), `/tmp/x86-profile-contract-reject-app.log`; it reports bounded
+type-rejection diagnostics instead of recursively loading itself. The earlier
+`/tmp/x86-profile-contract-image-guard.log` reran loader host tests and the release
+fixture after adding the pre-StartImage image-type guard.
+
+This increment deliberately does not claim post-ExitBootServices/virtual-address
+transition coverage from the standalone fixture: its resets occur before EBS.
+Full-store enumeration, post-EBS contract coverage, production selector/path wiring
+and additional lifecycle transitions remain subsequent implementation work.
 
 ## Qualification still required
 

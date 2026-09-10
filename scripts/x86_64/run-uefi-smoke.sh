@@ -18,6 +18,7 @@ check_backend_log() {
         outer-kvm) expected='thin-hv: backend=outer-kvm role=reference' ;;
         physical-chainload) expected='thin-hv: backend=physical-chainload project_vmx=0 resident_runtime=0' ;;
         physical-preflight) expected='thin-hv: backend=physical-preflight project_vmx=0' ;;
+        uefi-profile-contract) expected='thin-hv: backend=uefi-profile-contract project_vmx=0' ;;
         *) return 1 ;;
     esac
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -49,6 +50,40 @@ check_backend_log() {
         fi
     done <"$log"
     ((seen))
+}
+
+# Three fresh driver entries, not three markers from one memory-only overlay.
+check_profile_contract_log() {
+    local log=$1 line phase=0 boots=0 full=0 complete=0 views= bytes transcript
+    [[ -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 2097152)) || return 1
+    if IFS= read -r -d '' -n 2097153 transcript <"$log"; then return 1; fi
+    check_backend_log uefi-profile-contract "$log" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        case "$line" in
+            'thin-hv: backend=uefi-profile-contract project_vmx=0') ((boots += 1)) ;;
+            'thin-hv: profile contract phase=0 begin') ((phase == 0 && boots == 1)) || return 1; phase=1 ;;
+            'thin-hv: profile contract reset=1') [[ "$phase" == 1 && "$views" == 1212 ]] || return 1; phase=2; views= ;;
+            'thin-hv: profile contract phase=1 begin') ((phase == 2 && boots == 2)) || return 1; phase=3 ;;
+            'thin-hv: profile contract storage-full PASS entries='*)
+                [[ "$phase" == 3 && "$views" == 122 && "$line" =~ entries=([1-9][0-9]*)$ ]] || return 1
+                ((${BASH_REMATCH[1]} <= 256)) || return 1
+                ((full += 1)) ;;
+            'thin-hv: profile contract reset=2') [[ "$phase" == 3 && "$full" == 1 && "$views" == 1221 ]] || return 1; phase=4; views= ;;
+            'thin-hv: profile contract phase=2 begin') ((phase == 4 && boots == 3)) || return 1; phase=5 ;;
+            'thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged')
+                [[ "$phase" == 5 && "$complete" == 0 && "$views" == 121 ]] || return 1; complete=1 ;;
+            'thin-hv: profile contract view='*)
+                [[ "$line" =~ ^thin-hv:\ profile\ contract\ view=([12])\ mat_patches=[0-9]+$ ]] || return 1
+                views+=${BASH_REMATCH[1]}
+                ((complete == 0 && ${#views} <= 4 && (phase == 1 || phase == 3 || phase == 5))) || return 1 ;;
+            'thin-hv: uefi entry') ;;
+            *'thin-hv:'*) return 1 ;;
+        esac
+    done <"$log"
+    ((phase == 5 && boots == 3 && full == 1 && complete == 1))
 }
 
 # Mode provenance is separate from acceleration: physical-selection code is
@@ -696,6 +731,11 @@ if [[ ${1:-} == --check-msr-abort-log ]]; then
     check_msr_abort_log "$2" "$3" "$4" "$5" "$6" || die 'MSR abort transcript/memory check failed'
     exit 0
 fi
+if [[ ${1:-} == --check-profile-contract-log ]]; then
+    [[ $# == 2 ]] || die 'usage: --check-profile-contract-log LOG'
+    check_profile_contract_log "$2" || die 'profile contract transcript check failed'
+    exit 0
+fi
 if [[ ${1:-} == --check-physical-policy-log ]]; then
     [[ $# == 2 ]] || die 'usage: --check-physical-policy-log LOG'
     check_physical_policy_log "$2" || die 'physical-chainload policy transcript check failed'
@@ -811,9 +851,16 @@ case "$backend" in
         payload_marker=
         variable_marker=
         ;;
-    *) die 'X86_UEFI_BACKEND must be direct-vmx, outer-kvm, physical-chainload, or physical-preflight' ;;
+    uefi-profile-contract)
+        guest_location=none
+        return_marker='thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged'
+        payload_marker=
+        variable_marker=
+        failure_marker='thin-hv: profile contract FAIL'
+        ;;
+    *) die 'X86_UEFI_BACKEND must be direct-vmx, outer-kvm, physical-chainload, physical-preflight, or uefi-profile-contract' ;;
 esac
-if [[ "$backend" != direct-vmx && -n "$monitor" ]]; then
+if [[ "$backend" != direct-vmx && "$backend" != uefi-profile-contract && -n "$monitor" ]]; then
     die "$backend must not stage a project runtime monitor"
 fi
 if [[ ! ${X86_VARIABLE_MARKER+x} && ${guest##*/} == x86_guest_uefi_test.efi ]]; then
@@ -845,7 +892,7 @@ usernet=${X86_UEFI_USERNET:-0}
 case "$guest_location" in
     guest | both) trusted_profile=2 ;;
     windows) trusted_profile=1 ;;
-    none) [[ "$backend" == physical-preflight ]] || die 'only preflight may omit the guest' ;;
+    none) [[ "$backend" == physical-preflight || "$backend" == uefi-profile-contract ]] || die 'only standalone firmware fixtures may omit the guest' ;;
     *) die "X86_UEFI_GUEST_LOCATION must be guest, windows, or both" ;;
 esac
 if [[ "$backend" == physical-chainload && "$guest_location" != windows ]]; then
@@ -883,6 +930,10 @@ fi
 [[ "$allow_reboot" =~ ^[01]$ ]] || die 'X86_UEFI_ALLOW_REBOOT must be 0 or 1'
 [[ "$require_poweroff" =~ ^[01]$ ]] || die 'X86_UEFI_REQUIRE_POWEROFF must be 0 or 1'
 [[ "$usernet" =~ ^[01]$ ]] || die 'X86_UEFI_USERNET must be 0 or 1'
+if [[ "$backend" == uefi-profile-contract ]]; then
+    [[ "$smp" == 1 && "$allow_reboot" == 1 && "$require_poweroff" == 1 && "$acpi_s3" == 0 && "$wake_cycles" == 0 && "$physical_policy" == 0 && "$host_exception_test" == 0 && "$cpu_reject_test" == 0 && "$runtime_reject_test" == 0 && "$msr_abort_test" == 0 && -z "$data_disk" && "$usernet" == 0 ]] || die 'profile fixture requires its standalone one-CPU reboot/poweroff configuration'
+    [[ "$timeout_seconds" =~ ^([1-9]|[1-5][0-9]|60)$ ]] || die 'profile fixture timeout must be bounded to 1..60 seconds'
+fi
 [[ -z "$data_disk" || -f "$data_disk" ]] || die "data disk not found: $data_disk"
 ((wake_cycles == 0 || acpi_s3 == 1)) || die 'X86_UEFI_WAKE_CYCLES requires X86_UEFI_ACPI_S3=1'
 if ((acpi_s3)); then
@@ -1212,6 +1263,9 @@ if [[ -n "$trusted_chainload_marker" ]]; then
         die "marker '$trusted_chainload_marker' missing from $serial_log (QEMU status $qemu_status)"
 fi
 check_backend_log "$backend" "$serial_log" || die "backend provenance check failed for $backend in $serial_log"
+if [[ "$backend" == uefi-profile-contract ]]; then
+    check_profile_contract_log "$serial_log" || die 'profile contract transcript check failed'
+fi
 if [[ "$backend" == physical-preflight ]]; then
     check_preflight_ept_log "$accel" "$serial_log" || die 'preflight EPT construction transcript check failed'
 fi

@@ -7,6 +7,11 @@ edition = "2024"
 name = "x86-uefi-loader"
 path = "src/main.rs"
 
+[[bin]]
+name = "x86-uefi-profile-contract"
+path = "src/profile_contract.rs"
+required-features = ["uefi-profile-contract"]
+
 [features]
 default = ["direct-vmx"]
 direct-vmx = [
@@ -26,6 +31,8 @@ physical-preflight = ["dep:x86_64_hal", "x86_64_hal/vmx"]
 host-exception-test = ["direct-vmx"]
 # Deliberately clobbers L0 SIMD registers after saving guest state; QEMU only.
 host-xstate-test = ["direct-vmx"]
+# Standalone firmware-backed fixture; no VMX, no installed OS and no EBS.
+uefi-profile-contract = ["dep:mutex", "dep:uefi_variable_overlay"]
 
 [dependencies]
 mutex = { path = "../mutex", optional = true }

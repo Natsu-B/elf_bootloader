@@ -12,7 +12,9 @@ use r_efi::efi;
 use uefi_variable_overlay::BACKEND_NAME_CAPACITY;
 use uefi_variable_overlay::Guid;
 use uefi_variable_overlay::MONITOR_VENDOR_GUID;
+use uefi_variable_overlay::PROFILE_SELECTOR_NAME;
 use uefi_variable_overlay::ProfileId;
+use uefi_variable_overlay::UefiProfile;
 use uefi_variable_overlay::is_profile_private;
 use uefi_variable_overlay::map_private_variable;
 use uefi_variable_overlay::unmap_private_variable;
@@ -46,6 +48,83 @@ struct OriginalEntries {
     get_variable: efi::RuntimeGetVariable,
     get_next_variable_name: efi::RuntimeGetNextVariableName,
     set_variable: efi::RuntimeSetVariable,
+}
+
+/// The boot UI owns this selector. It survives reboot but is not writable via
+/// OS runtime calls after ExitBootServices; guest BootNext remains independent.
+const SELECTOR_ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS;
+
+/// Reads the primary-OS selector before installing any overlay. Missing state is
+/// distinct from corruption and is resolved only by explicit boot selection.
+pub(crate) fn read_boot_profile(
+    runtime: *mut efi::RuntimeServices,
+) -> Result<Option<UefiProfile>, efi::Status> {
+    if runtime.is_null() {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    let mut name = [0; 16];
+    name[..PROFILE_SELECTOR_NAME.len()].copy_from_slice(PROFILE_SELECTOR_NAME);
+    let mut guid = to_efi_guid(MONITOR_VENDOR_GUID);
+    let mut record = [0; 8];
+    let mut size = record.len();
+    let mut attributes = 0;
+    // SAFETY: the caller holds a live physical RuntimeServices table before EBS;
+    // bounded NUL-terminated name, GUID, payload and outputs live across the call.
+    let status = unsafe {
+        ((*runtime).get_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            &mut attributes,
+            &mut size,
+            record.as_mut_ptr().cast(),
+        )
+    };
+    if status == efi::Status::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == efi::Status::BUFFER_TOO_SMALL {
+        return Err(efi::Status::COMPROMISED_DATA);
+    }
+    if status.is_error() {
+        return Err(status);
+    }
+    if attributes != SELECTOR_ATTRIBUTES || size != record.len() {
+        return Err(efi::Status::COMPROMISED_DATA);
+    }
+    UefiProfile::from_selection_record(&record)
+        .map(Some)
+        .ok_or(efi::Status::COMPROMISED_DATA)
+}
+
+/// Commits an explicit boot-UI selection in one firmware-atomic write, without
+/// changing the live overlay. Only a subsequent boot consumes this selector.
+pub(crate) fn write_boot_profile(
+    runtime: *mut efi::RuntimeServices,
+    profile: UefiProfile,
+) -> Result<(), efi::Status> {
+    if runtime.is_null() {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    let mut name = [0; 16];
+    name[..PROFILE_SELECTOR_NAME.len()].copy_from_slice(PROFILE_SELECTOR_NAME);
+    let mut guid = to_efi_guid(MONITOR_VENDOR_GUID);
+    let record = profile.selection_record();
+    // SAFETY: caller owns this boot-time selection and a live firmware table;
+    // firmware reads the terminated name and exact eight-byte record synchronously.
+    let status = unsafe {
+        ((*runtime).set_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            SELECTOR_ATTRIBUTES,
+            record.len(),
+            record.as_ptr().cast_mut().cast(),
+        )
+    };
+    if status.is_error() {
+        Err(status)
+    } else {
+        Ok(())
+    }
 }
 
 /// One in-place EFI Memory Attributes Table edit retained for rollback.

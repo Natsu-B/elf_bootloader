@@ -8,6 +8,12 @@
 /// The maximum encoded backend-name length, in UTF-16 code units.
 pub const BACKEND_NAME_CAPACITY: usize = 21;
 
+/// Project-owned primary-OS selector name (UTF-16 without the terminating NUL).
+/// BootNext is deliberately unrelated to this firmware-backed selection.
+pub const PROFILE_SELECTOR_NAME: &[u16] = &[
+    0x53, 0x65, 0x6c, 0x65, 0x63, 0x74, 0x65, 0x64, 0x50, 0x72, 0x6f, 0x66, 0x69, 0x6c, 0x65,
+];
+
 /// The UEFI global-variable namespace.
 pub const EFI_GLOBAL_VARIABLE_GUID: Guid = Guid::new(
     0x8be4_df61,
@@ -67,6 +73,23 @@ pub enum UefiProfile {
 }
 
 impl UefiProfile {
+    /// Versioned, bounded persistent selector record. Firmware's atomic
+    /// SetVariable update supplies old-or-new durability for the entire record.
+    #[must_use]
+    pub const fn selection_record(self) -> [u8; 8] {
+        [b'T', b'H', b'V', b'P', 1, 0, self.id().0 as u8, 0]
+    }
+
+    /// Rejects truncated, extended, unknown-version or invalid selector records.
+    /// No corrupt or missing record implicitly selects a different OS.
+    #[must_use]
+    pub fn from_selection_record(record: &[u8]) -> Option<Self> {
+        match record {
+            [b'T', b'H', b'V', b'P', 1, 0, id, 0] => Self::from_id(ProfileId(u32::from(*id))),
+            _ => None,
+        }
+    }
+
     /// Returns the stable ID used in existing persistent boot-variable names.
     #[must_use]
     pub const fn id(self) -> ProfileId {

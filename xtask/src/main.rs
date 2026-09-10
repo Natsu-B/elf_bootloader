@@ -378,6 +378,7 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
             || arg.contains("nested-contract")
             || arg.contains("msr-contract")
             || arg.contains("msr-abort")
+            || arg.contains("uefi-profile-contract")
     }) {
         return Err(
             "x86 builds all backend artifacts; do not select an alternate backend feature explicitly"
@@ -630,7 +631,83 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         )
         .map_err(|error| format!("Failed to stage nested VMX contract fixture: {error}"))?;
     }
+    build_x86_profile_contract(args)?;
     Ok(destination.to_string_lossy().into_owned())
+}
+
+/// Builds a standalone runtime-driver fixture using the production variable hooks.
+fn build_x86_profile_contract(args: &[String]) -> Result<(), String> {
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "x86_uefi_loader",
+            "--bin",
+            "x86-uefi-profile-contract",
+            "--target",
+            "x86_64-unknown-uefi",
+        ])
+        .args(args)
+        .args([
+            "--no-default-features",
+            "--features",
+            "uefi-profile-contract",
+        ])
+        .env("XTASK_BUILD", "1")
+        .status()
+        .map_err(|error| format!("Failed to build profile fixture: {error}"))?;
+    if !status.success() {
+        return Err(format!("Profile fixture build failed: {status}"));
+    }
+    let artifact = Path::new("target/x86_64-unknown-uefi")
+        .join(resolve_profile(args))
+        .join("x86-uefi-profile-contract.efi");
+    verify_no_decoded_vmx(&artifact)?;
+    let destination = Path::new("bin/x86_64/x86-uefi-profile-contract.efi");
+    fs::create_dir_all(
+        destination
+            .parent()
+            .ok_or("Profile fixture parent missing")?,
+    )
+    .map_err(|e| format!("Profile stage: {e}"))?;
+    fs::copy(&artifact, destination).map_err(|error| format!("Profile fixture copy: {error}"))?;
+    let runtime = Path::new("bin/x86_64/x86-uefi-profile-contract-runtime.efi");
+    fs::copy(&artifact, runtime).map_err(|error| format!("Profile runtime copy: {error}"))?;
+    let status = Command::new("objcopy")
+        .arg("--subsystem=efi-rtd")
+        .arg(runtime)
+        .status()
+        .map_err(|error| format!("Profile runtime conversion: {error}"))?;
+    if !status.success() {
+        return Err(format!("Profile runtime conversion failed: {status}"));
+    }
+    Ok(())
+}
+
+/// Strict, finite no-OS profile/persistence gate on a fresh private OVMF store.
+fn run_x86_profiles() -> Result<(), String> {
+    let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+        .arg("bin/x86_64/x86-uefi-profile-contract.efi")
+        .env("X86_UEFI_BACKEND", "uefi-profile-contract")
+        .env("X86_UEFI_ACCEL", "kvm")
+        .env("X86_UEFI_CPU", "host,-vmx,-hypervisor")
+        .env("X86_UEFI_SMP", "1")
+        .env("X86_UEFI_MEMORY", "256M")
+        .env("X86_UEFI_TIMEOUT_SECONDS", "60")
+        .env("X86_UEFI_ALLOW_REBOOT", "1")
+        .env("X86_UEFI_REQUIRE_POWEROFF", "1")
+        .env(
+            "X86_MONITOR_IMAGE",
+            "bin/x86_64/x86-uefi-profile-contract-runtime.efi",
+        )
+        .status()
+        .map_err(|error| format!("Profile QEMU fixture: {error}"))?;
+    fs::copy("bin/x86_64/serial.log", "bin/x86_64/profile-contract.log")
+        .map_err(|error| format!("Profile evidence copy: {error}"))?;
+    if !status.success() {
+        return Err(format!("Profile QEMU fixture failed: {status}"));
+    }
+    Ok(())
 }
 
 /// Builds explicitly named Direct variants without replacing other backends.
@@ -1083,6 +1160,18 @@ fn run_x86_nested() -> Result<(), String> {
 }
 
 fn run_x86_uefi(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--uefi-profiles") {
+        if args.iter().any(|arg| arg == "--nested") {
+            return Err("Select either --uefi-profiles or --nested".to_string());
+        }
+        let build_args: Vec<_> = args
+            .iter()
+            .filter(|arg| *arg != "--uefi-profiles")
+            .cloned()
+            .collect();
+        build_x86_profile_contract(&build_args)?;
+        return run_x86_profiles();
+    }
     if args.iter().any(|arg| arg == "--nested") {
         let build_args: Vec<_> = args
             .iter()
@@ -1302,7 +1391,7 @@ fn run_x86_uefi(args: &[String]) -> Result<(), String> {
             "physical policy QEMU/TCG fixture exited with status {status}"
         ));
     }
-    Ok(())
+    run_x86_profiles()
 }
 
 fn run_default(args: &[String]) -> ! {
@@ -5510,6 +5599,83 @@ mod tests {
             "thin-hv: L1 VMLAUNCH\n",
         ] {
             assert!(!check(&format!("{valid}{forbidden}")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_gate_requires_real_reset_phases_and_exact_profile_sequence() {
+        struct FixtureLog(std::path::PathBuf);
+        impl Drop for FixtureLog {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let temporary = Command::new("mktemp")
+            .args(["-t", "thin-hv-profile-contract-log.XXXXXX"])
+            .output()
+            .unwrap();
+        assert!(temporary.status.success());
+        let log = FixtureLog(String::from_utf8(temporary.stdout).unwrap().trim().into());
+        let runner = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/x86_64/run-uefi-smoke.sh");
+        let check = |contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .arg("--check-profile-contract-log")
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let mut valid = String::new();
+        for (phase, views) in [(0, "1212"), (1, "1221"), (2, "121")] {
+            valid.push_str(&format!("thin-hv: uefi entry\nthin-hv: backend=uefi-profile-contract project_vmx=0\nthin-hv: profile contract phase={phase} begin\n"));
+            for (index, view) in views.chars().enumerate() {
+                valid.push_str(&format!(
+                    "thin-hv: profile contract view={view} mat_patches=1\n"
+                ));
+                if phase == 1 && index == 2 {
+                    valid.push_str("thin-hv: profile contract storage-full PASS entries=230\n");
+                }
+            }
+            if phase < 2 {
+                valid.push_str(&format!("thin-hv: profile contract reset={}\n", phase + 1));
+            }
+        }
+        valid.push_str("thin-hv: profile contract PASS profiles=2 resets=2 persistence=firmware security=unchanged\n");
+        assert!(check(&valid));
+        assert!(check(&valid.replace('\n', "\r\n")));
+        for (from, to) in [
+            ("reset=1", "reset=2"),
+            ("phase=1 begin", "phase=0 begin"),
+            ("entries=230", "entries=0"),
+            ("entries=230", "entries=257"),
+            ("view=2", "view=1"),
+            ("security=unchanged", "security=changed"),
+            (
+                "backend=uefi-profile-contract project_vmx=0",
+                "backend=outer-kvm role=reference",
+            ),
+        ] {
+            assert!(!check(&valid.replace(from, to)), "{from}");
+        }
+        for line in valid.lines().filter(|l| l.contains("profile contract")) {
+            assert!(
+                !check(&valid.replacen(&format!("{line}\n"), "", 1)),
+                "missing {line}"
+            );
+        }
+        for suffix in [
+            "\0",
+            "thin-hv: profile contract FAIL late\n",
+            "thin-hv: vmx guest PASS\n",
+            "thin-hv: profile contract view=1 mat_patches=1\n",
+        ] {
+            assert!(!check(&(valid.clone() + suffix)));
         }
     }
 

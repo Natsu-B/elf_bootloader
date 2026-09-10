@@ -38,6 +38,38 @@ fn primary_profiles_preserve_existing_persistent_names() {
 }
 
 #[test]
+fn selector_record_is_versioned_bounded_and_independent_of_boot_next() {
+    use uefi_variable_overlay::PROFILE_SELECTOR_NAME;
+    use uefi_variable_overlay::UefiProfile;
+    assert_eq!(PROFILE_SELECTOR_NAME, utf16("SelectedProfile"));
+    assert_eq!(
+        classify(MONITOR_VENDOR_GUID, PROFILE_SELECTOR_NAME),
+        VariableScope::Shared
+    );
+    for profile in [UefiProfile::Windows, UefiProfile::Linux] {
+        let record = profile.selection_record();
+        assert_eq!(UefiProfile::from_selection_record(&record), Some(profile));
+        for len in 0..record.len() {
+            assert_eq!(UefiProfile::from_selection_record(&record[..len]), None);
+        }
+        let mut extended = record.to_vec();
+        extended.push(0);
+        assert_eq!(UefiProfile::from_selection_record(&extended), None);
+        for index in [0, 1, 2, 3, 4, 5, 7] {
+            let mut invalid = record;
+            invalid[index] ^= 0xff;
+            assert_eq!(UefiProfile::from_selection_record(&invalid), None);
+        }
+        for id in [0, 3, 255] {
+            let mut invalid = record;
+            invalid[6] = id;
+            assert_eq!(UefiProfile::from_selection_record(&invalid), None);
+        }
+        assert_eq!(UefiProfile::from_selection_record(&[1, 0]), None);
+    }
+}
+
+#[test]
 fn classification_is_exact_and_keeps_secure_boot_shared() {
     for name in [
         "BootOrder",
