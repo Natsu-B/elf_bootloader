@@ -36,6 +36,7 @@ use mutex::SpinLock;
 use nested_vmx::ControlProvenance;
 use nested_vmx::DIRECT_VMCS_PATCH_MANIFEST;
 use nested_vmx::EXIT_ACKNOWLEDGE_INTERRUPT;
+use nested_vmx::NestedMode;
 use nested_vmx::PIN_EXTERNAL_INTERRUPT_EXITING;
 use nested_vmx::PRIMARY_INTERRUPT_WINDOW_EXITING;
 use nested_vmx::PatchKind;
@@ -794,6 +795,11 @@ const _: () =
     assert!(HOST_TABLE_FIRST_PAGE + HOST_TABLE_PAGES as u64 == HOST_ENVIRONMENT_FIRST_PAGE);
 const _: () = assert!(ERROR_REVISION_PAGE + 1 == CPU_STATE_FIRST_PAGE);
 
+/// One explicit build choice, checked before loading an OS. Cargo tracks the
+/// environment value for recompilation; no mode branch enters the hot path.
+const NESTED_MODE: Option<NestedMode> =
+    NestedMode::from_setting(option_env!("THIN_HV_NESTED_MODE"));
+
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
 const RUNTIME_MODE: u32 = (if cfg!(feature = "profile-direct-vmx") {
     2
@@ -801,10 +807,13 @@ const RUNTIME_MODE: u32 = (if cfg!(feature = "profile-direct-vmx") {
     1
 } else {
     0
-}) | if cfg!(feature = "smp-direct-vmx") {
+}) | (if cfg!(feature = "smp-direct-vmx") {
     4
 } else {
     0
+}) | match NESTED_MODE {
+    Some(mode) => (mode as u32) << 8,
+    None => 1 << 31,
 };
 
 #[repr(C)]
@@ -1369,8 +1378,14 @@ pub(crate) fn run(
     system_table: *mut efi::SystemTable,
     serial: &mut SerialPort,
 ) -> Result<(), Error> {
+    let nested_mode = NESTED_MODE.ok_or(Error::Capability("unknown nested mode", 0))?;
     #[cfg(all(feature = "physical-direct-vmx", not(feature = "smp-direct-vmx")))]
     crate::physical_chainload::require_single_cpu(system_table, serial).map_err(Error::Platform)?;
+    let _ = writeln!(
+        serial,
+        "thin-hv: nested mode={} vmcs=direct eptp=l1",
+        nested_mode.name()
+    );
     let loaded_image = loaded_image_protocol(parent_image, system_table)?;
     // SAFETY: HandleProtocol returned the non-null, live protocol for this
     // executing image. Copy only metadata while Boot Services are still live.
@@ -2625,8 +2640,14 @@ fn configure_and_launch(
     } else {
         vmx::IA32_VMX_ENTRY_CTLS
     };
+    // SAFETY: CPUID.VMX and BASIC established this CPU's selected pin-control MSR.
     let pin_capability = unsafe { cpu::rdmsr(pin_msr) };
-    let pin = vmx::adjust_controls(PIN_EXTERNAL_INTERRUPT_EXITING, pin_capability);
+    let pin = NESTED_MODE
+        .and_then(|mode| mode.carrier_pin_controls(pin_capability))
+        .ok_or(Error::Capability(
+            "nested-mode carrier interrupts",
+            pin_capability,
+        ))?;
     let primary_capability = unsafe { cpu::rdmsr(primary_msr) };
     let primary = vmx::adjust_controls(
         vmcs::PRIMARY_EXEC_ACTIVATE_SECONDARY_CONTROLS | vmcs::PRIMARY_EXEC_USE_MSR_BITMAPS,
@@ -2695,8 +2716,6 @@ fn configure_and_launch(
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_INVPCID == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_XSAVES == 0
         || secondary & vmcs::SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE == 0
-        || pin & PIN_EXTERNAL_INTERRUPT_EXITING == 0
-        || pin_capability as u32 & PIN_EXTERNAL_INTERRUPT_EXITING != 0
         || primary & PRIMARY_INTERRUPT_WINDOW_EXITING != 0
         || (primary_capability >> 32) as u32 & PRIMARY_INTERRUPT_WINDOW_EXITING == 0
         || exit & vmcs::VM_EXIT_HOST_ADDRESS_SPACE_SIZE == 0
@@ -7134,7 +7153,10 @@ mod tests {
 
     #[test]
     fn runtime_handoff_rejects_cross_backend_profiles_and_null_guest() {
-        for mode in [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX] {
+        for mode in [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX]
+            .into_iter()
+            .flat_map(|mode| [mode, mode | 256])
+        {
             for profile in [0, 1, 2, 3, u32::MAX] {
                 // Opaque non-null token only: this pure validator never accesses
                 // the represented image, protocol, or any physical memory.

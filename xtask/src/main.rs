@@ -366,6 +366,12 @@ fn build_bootloader_with_feature(args: &[String], feature: &str) -> Result<Strin
 }
 
 fn build_x86_uefi(args: &[String]) -> Result<String, String> {
+    let nested_mode = match std::env::var("THIN_HV_NESTED_MODE") {
+        Ok(value) if matches!(value.as_str(), "current" | "unsafe-direct") => value,
+        Err(std::env::VarError::NotPresent) => "current".to_string(),
+        _ => return Err("THIN_HV_NESTED_MODE must be current or unsafe-direct".to_string()),
+    };
+    eprintln!("x86 Direct build: nested mode={nested_mode} (outer backend remains reference-only)");
     if args.iter().any(|arg| {
         arg == "--all-features"
             || arg.contains("trusted-outer-kvm")
@@ -3853,6 +3859,39 @@ mod tests {
                 .unwrap()
                 .success()
         };
+        let check_nested = |mode: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-nested-mode-log", mode])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        for mode in ["current", "unsafe-direct"] {
+            let record = format!("thin-hv: nested mode={mode} vmcs=direct eptp=l1\r\n");
+            for count in [0, 1, 2, 3, 4, 128, 130] {
+                assert_eq!(
+                    check_nested(mode, &record.repeat(count)),
+                    matches!(count, 2 | 4 | 128),
+                );
+            }
+            let valid = record.repeat(2);
+            for other in ["current", "unsafe-direct", "shadowing", ""] {
+                assert_eq!(check_nested(other, &valid), mode == other);
+            }
+            for malformed in [
+                valid.replacen(mode, "wrong-mode", 1),
+                valid.replace("eptp=l1", "eptp=l0"),
+                valid.replace("vmcs=direct", "vmcs=composed"),
+                valid.replace("nested", "nested\0"),
+            ] {
+                assert!(!check_nested(mode, &malformed));
+            }
+        }
         let physical_mode = "thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n";
         let research_mode = "thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0\n";
         let cpu = "thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0\n";
@@ -5545,6 +5584,61 @@ mod tests {
     fn windows_physical_direct_fixture_never_falls_back_to_research_or_reference() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let runner = root.join("scripts/x86_64/windows/windows-test.sh");
+        for (input, expected) in [
+            ("VM status: running\r\n", "running\n"),
+            ("VM status: paused\n", "paused\n"),
+            ("VM status: paused (shutdown)\r\n", "shutdown\n"),
+            ("VM status: paused (internal-error)\n", ""),
+            ("VM status: running-extra\n", ""),
+            (
+                "VM status: running\nVM status: paused\n",
+                "running\npaused\n",
+            ),
+        ] {
+            use std::io::Write;
+            let mut child = Command::new("bash")
+                .arg(&runner)
+                .arg("check-direct-status")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(result.status.success());
+            assert_eq!(result.stdout, expected.as_bytes());
+        }
+        for mode in ["monitor", "monitor-hyperv", "boot", "trusted-kvm-hyperv"] {
+            for selection in [None, Some("0"), Some("1"), Some(""), Some("2"), Some("1\n")] {
+                let mut command = Command::new("bash");
+                command
+                    .arg(&runner)
+                    .args(["print-reset-args", mode])
+                    .env_remove("WINDOWS_STOP_ON_RESET");
+                if let Some(value) = selection {
+                    command.env("WINDOWS_STOP_ON_RESET", value);
+                }
+                let result = command.output().unwrap();
+                let diagnostic = selection == Some("1");
+                let valid = selection.is_none()
+                    || selection == Some("0")
+                    || (diagnostic && matches!(mode, "monitor" | "monitor-hyperv"));
+                assert_eq!(result.status.success(), valid, "{mode} {selection:?}");
+                assert_eq!(
+                    result.stdout,
+                    if valid && diagnostic {
+                        b"-no-reboot\0-no-shutdown\0".as_slice()
+                    } else {
+                        &[]
+                    }
+                );
+            }
+        }
         let check = |selection: Option<&str>, mode: &str| {
             let mut command = Command::new("bash");
             command

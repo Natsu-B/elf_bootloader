@@ -24,6 +24,30 @@ in [the daily-candidate log](evidence/x86_64/daily-candidate-2026-09-11.md).
 
 ## Opt-in profile Direct selection
 
+Direct nested policy is an explicit build setting, shared by the normal runner:
+
+```sh
+nix develop --accept-flake-config --command env THIN_HV_NESTED_MODE=current cargo xrun x86 --nested --release
+nix develop --accept-flake-config --command env THIN_HV_NESTED_MODE=unsafe-direct cargo xrun x86 --nested --release
+```
+
+Use the same setting when building and running Linux/Windows scripts. Both EFI
+images print the selected mode; their handoff cookie and runner provenance gate
+reject a mismatch. Missing configuration keeps `current`; invalid configuration
+never falls back. The first `unsafe-direct` experiment removes only the carrier's
+forced external-interrupt exits. It retains direct L1 VMCS/EPTP use, L1-requested
+L2 exits, state restoration, patching and architectural failure checks. No VMCS
+shadowing is implemented. This is a build-selected A/B experiment, not a new
+default or a claim of Hyper-V, power-cycle or physical readiness.
+
+For disposable Direct Windows crash investigation, `WINDOWS_STOP_ON_RESET=1`
+holds QEMU at its first reset/shutdown and captures the existing bounded L0
+counters plus screen. This diagnostic always exits unsuccessfully, even if a
+guest-ready marker appears; use the default `0` for qualification. No guest BCD
+or firmware-variable setting is changed to suppress Windows restart. The first
+UnsafeDirect Hyper-V trial resets early, whereas Current still times out later
+in boot; neither mode is Hyper-V qualified (see the dated evidence record).
+
 The additional opt-in profile Direct selection gate is:
 
 ```sh

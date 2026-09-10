@@ -37,7 +37,7 @@ check_backend_log() {
             case "$line" in
                 *'thin-hv: loading runtime monitor'* | *'thin-hv: runtime monitor active'* | \
                 *'thin-hv: private host state'* | *'thin-hv: host exception '* | \
-                *'thin-hv: nested VMX abort'* | *'thin-hv: firmware handoff '* | \
+                *'thin-hv: nested VMX abort'* | *'thin-hv: nested mode='* | *'thin-hv: firmware handoff '* | \
                 *'thin-hv: variable overlay profile='* | *'thin-hv: uefi variable overlay PASS'* | \
                 *'thin-hv: L1 '* | *'thin-hv: vmx '*) return 1 ;;
             esac
@@ -50,6 +50,25 @@ check_backend_log() {
         fi
     done <"$log"
     ((seen))
+}
+
+# The build choice and the two executing EFI images must agree. Reboot logs
+# may contain more pairs; an absent, mixed or unsupported mode is never PASS.
+check_nested_mode_log() {
+    local mode=$1 log=$2 line bytes transcript count=0
+    case "$mode" in current|unsafe-direct) ;; *) return 1 ;; esac
+    [[ -f "$log" && -r "$log" ]] || return 1
+    bytes=$(wc -c <"$log") || return 1
+    [[ "$bytes" =~ ^[0-9]+$ ]] && ((bytes > 0 && bytes <= 2097152)) || return 1
+    if IFS= read -r -d '' -n 2097153 transcript <"$log"; then return 1; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        if [[ "$line" == 'thin-hv: nested mode='* ]]; then
+            [[ "$line" == "thin-hv: nested mode=$mode vmcs=direct eptp=l1" ]] || return 1
+            ((count += 1))
+        fi
+    done <<<"$transcript"
+    ((count >= 2 && count <= 128 && count % 2 == 0))
 }
 
 # Four fresh driver entries, including persistence of post-EBS runtime writes.
@@ -255,6 +274,10 @@ check_runtime_reject_log() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
         [[ "$line" == *thin-hv:* ]] || continue
+        if [[ "$line" == 'thin-hv: nested mode='* ]]; then
+            [[ "$line" == "thin-hv: nested mode=${THIN_HV_NESTED_MODE:-current} vmcs=direct eptp=l1" ]] || return 1
+            continue
+        fi
         if [[ "$line" =~ ^thin-hv:\ IA32_FEATURE_CONTROL=0x[0-9a-f]{16}\ lock=1\ vmx_outside_smx=1$ ]]; then
             line=feature-control
         elif [[ "$line" =~ ^thin-hv:\ IA32_VMX_BASIC=0x[0-9a-f]{16}\ revision=0x[0-9a-f]{8}\ region_size=[1-9][0-9]*\ memory_type=6\ true_controls=[01]$ ]]; then
@@ -285,7 +308,9 @@ check_nested_contract_log() {
     check_backend_log "$backend" "$log" || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
-        if [[ "$line" =~ $pass_pattern ]]; then
+        # Only the PASS record can match this anchored expression. Avoid
+        # compiling the full field grammar for every unrelated serial line.
+        if [[ "$line" == 'thin-hv: nested contract PASS '* && "$line" =~ $pass_pattern ]]; then
             ((phase == 1 && cr4_guard == 1)) || return 1
             valid=${BASH_REMATCH[1]}
             invept=${BASH_REMATCH[2]}
@@ -814,6 +839,11 @@ check_physical_policy_log() {
     ((secondary == 1 && complete == 1 && active == 0 && index == ${#names[@]}))
 }
 
+if [[ ${1:-} == --check-nested-mode-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-nested-mode-log MODE LOG'
+    check_nested_mode_log "$2" "$3" || die 'nested mode provenance rejected'
+    exit 0
+fi
 if [[ ${1:-} == --check-backend-log ]]; then
     [[ $# == 3 ]] || die 'usage: --check-backend-log BACKEND LOG'
     check_backend_log "$2" "$3" || die "backend provenance check failed for $2"
@@ -890,6 +920,11 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
+nested_mode=${THIN_HV_NESTED_MODE:-current}
+case "$nested_mode" in current|unsafe-direct) ;; *) die 'invalid THIN_HV_NESTED_MODE' ;; esac
+if [[ "$backend" == direct-vmx ]]; then
+    printf 'x86 UEFI smoke: nested mode=%s (explicit build/observed-image gate)\n' "$nested_mode"
+fi
 direct_mode=${X86_UEFI_DIRECT_MODE:-qemu-research}
 case "$direct_mode" in qemu-research|physical-uefi|profile-uefi|smp-uefi) ;; *) die 'invalid X86_UEFI_DIRECT_MODE' ;; esac
 [[ "$direct_mode" == qemu-research || "$backend" == direct-vmx ]] || die 'physical-uefi mode requires project Direct L0'
@@ -1392,6 +1427,7 @@ if [[ "$backend" == direct-vmx ]]; then
     [[ "$direct_mode" != smp-uefi ]] || platform_cpus=$smp
     check_direct_platform_log "$serial_log" "$require_high_pci" "$platform_cpus" || die 'Direct platform EPT evidence missing or malformed'
     check_direct_mode_log "$direct_mode" "$serial_log" || die 'Direct mode provenance missing or contradictory'
+    check_nested_mode_log "$nested_mode" "$serial_log" || die 'nested mode provenance missing or contradictory'
     if [[ -n "$profile_fixture" ]]; then
         check_profile_selection_log "$profile_fixture" "$serial_log" || die 'profile fixture selected the wrong primary OS'
     fi

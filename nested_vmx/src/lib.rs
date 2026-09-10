@@ -18,6 +18,58 @@ use x86_64_hal::ept::EPT_CAP_PDE_2MB;
 use x86_64_hal::vmx;
 use x86_64_hal::vmx::restrict_controls;
 
+/// Boot-selected trusted Direct-VMCS policy. Neither mode composes VMCS02/EPT02.
+/// Current remains the reference until the alternative passes lifecycle A/B.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum NestedMode {
+    /// Existing carrier interrupt mediation and direct nested execution.
+    Current = 0,
+    /// Deliver ordinary carrier interrupts in hardware, without L0 mediation.
+    /// L1-requested L2 exits and architectural state management remain intact.
+    UnsafeDirect = 1,
+}
+
+impl NestedMode {
+    /// Exact build setting; absence retains Current, invalid input never falls back.
+    #[must_use]
+    pub const fn from_setting(setting: Option<&str>) -> Option<Self> {
+        match setting {
+            None => Some(Self::Current),
+            Some(value) => match value.as_bytes() {
+                b"current" => Some(Self::Current),
+                b"unsafe-direct" => Some(Self::UnsafeDirect),
+                _ => None,
+            },
+        }
+    }
+
+    /// Stable transcript spelling shared by selection and validation.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::UnsafeDirect => "unsafe-direct",
+        }
+    }
+
+    /// Configure the carrier only. Direct L2 pin controls remain L1-owned.
+    /// Reject hardware that forces mediation in the transparent mode, rather
+    /// than silently using Current. Both paths require external-exit bit zero
+    /// to be legal: Current temporarily clears it during interrupt delivery.
+    #[must_use]
+    pub fn carrier_pin_controls(self, capability: u64) -> Option<u32> {
+        let requested = match self {
+            Self::Current => PIN_EXTERNAL_INTERRUPT_EXITING,
+            Self::UnsafeDirect => 0,
+        };
+        let effective = vmx::adjust_controls(requested, capability);
+        (capability as u32 & PIN_EXTERNAL_INTERRUPT_EXITING == 0
+            && effective & PIN_EXTERNAL_INTERRUPT_EXITING == requested)
+            .then_some(effective)
+    }
+}
+
 /// Carry flag in RFLAGS.
 const RFLAGS_CF: u64 = 1 << 0;
 /// Parity flag in RFLAGS.
@@ -872,6 +924,30 @@ pub const DIRECT_VMCS_PATCH_MANIFEST: [DirectVmcsPatch; 35] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_modes_are_exact_and_never_fall_back_on_capabilities() {
+        assert_eq!(NestedMode::from_setting(None), Some(NestedMode::Current));
+        for mode in [NestedMode::Current, NestedMode::UnsafeDirect] {
+            assert_eq!(NestedMode::from_setting(Some(mode.name())), Some(mode));
+            for must_be_one in [0_u32, 1, 8, 9] {
+                for allowed_one in [0_u32, 1, 8, 9] {
+                    let cap = u64::from(must_be_one) | u64::from(allowed_one) << 32;
+                    let result = mode.carrier_pin_controls(cap);
+                    let expected = must_be_one & 1 == 0
+                        && (mode == NestedMode::UnsafeDirect || allowed_one & 1 != 0);
+                    assert_eq!(result.is_some(), expected);
+                    if let Some(controls) = result {
+                        assert_eq!(controls & 1 != 0, mode == NestedMode::Current);
+                        assert_eq!(controls & 8, must_be_one & allowed_one & 8);
+                    }
+                }
+            }
+        }
+        for invalid in ["", "Current", "unsafe", "unsafe-direct ", "vmcs-shadowing"] {
+            assert_eq!(NestedMode::from_setting(Some(invalid)), None);
+        }
+    }
 
     #[test]
     fn vmcs_revision_and_shadow_indicator_follow_l1_capability() {

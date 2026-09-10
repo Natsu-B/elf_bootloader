@@ -762,6 +762,165 @@ No AArch64 production changes or dependencies were added. Current/Unsafe mode
 selection, shadowing, SMP Windows, S3/S4, idle measurements and physical hardware
 remain unqualified. Existing nested checks/capability policy are retained.
 
+## Increment 11: explicit Current/UnsafeDirect carrier policy
+
+`nested_vmx::NestedMode::{Current,UnsafeDirect}` parses the exact
+`THIN_HV_NESTED_MODE=current|unsafe-direct` build setting. Missing means Current;
+unknown/empty values fail. Cargo tracks the setting, both executing EFI copies
+print it, and the cross-image handoff cookie includes the mode. xtask rejects
+invalid settings before building, and Linux/native/Windows Direct runners verify
+the observed mode instead of trusting the environment or a stale artifact.
+Host tests cover absent/mixed/unknown/truncated mode evidence and both mode cookies.
+This first increment chooses at initialization/build time, not throughout the
+hot exit path; runtime switching and automatic shadowing selection do not exist.
+
+The actual difference is narrow: UnsafeDirect's carrier does not force external
+interrupt exits. Root handlers run with IF=0; ordinary maskable interrupts remain
+pending until hardware can deliver them in non-root. Hardware pin capabilities
+must permit disabling interception, or initialization fails. Current keeps its
+existing acknowledgement/window mediation. L1-requested direct L2 pin controls
+are untouched, so their exits still reflect to L1. Both modes already use L1's
+hardware VMCS/EPTP: no VMCS02/EPT02 layer was removed or added. No patch-manifest
+field, host validator, MSR mirror, VPID lifetime check or error path was removed.
+VMCS shadowing remains unimplemented; local hardware reports its capability,
+but a shadow VMCS cannot be entered and changing an active revision indicator
+without VMCLEAR is not architecturally valid (Intel SDM 27.10). It is not enabled
+speculatively. Current remains the default, pending real stability/performance A/B.
+
+The 4,096-cycle baseline before these source changes is
+`/tmp/x86-current-4096-smp-baseline.log`, compiled at `4bccbb5`:
+
+```sh
+nix develop --accept-flake-config --command env \
+  LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=8 LINUX_KVM_CYCLES=4096 \
+  bash scripts/x86_64/run-linux-kvm-test.sh
+```
+
+**FAIL**, unchanged 300-second gate, last completed iteration **2,939**. All
+recorded iterations succeeded; the requested whole run did not. No timeout was
+raised, and this is not a 4,096-cycle PASS.
+
+`/tmp/x86-nested-mode-host-first.log` runs `cargo fmt; cargo xtest -p nested_vmx;
+cargo xtest -p x86_uefi_loader; cargo xtest -p xtask` through Nix. Rust tests:
+33 nested and 360 loader PASS. xtask's 39 assertions all completed successfully,
+but the package gate **FAILed with code 124**: completion took 30.95 seconds,
+beyond its unchanged 30-second limit. An isolated exact
+`nix develop --accept-flake-config --command cargo xtest -p xtask` rerun in
+`/tmp/x86-nested-mode-xtask-isolated.log` passes **39/39** in 29.35 seconds.
+The initial timeout is retained as a timing failure, not erased by the rerun.
+
+`/tmp/x86-nested-mode-first-ab.log` records:
+
+```sh
+nix develop --accept-flake-config --command bash -c 'set -e;
+THIN_HV_NESTED_MODE=unsafe-direct cargo xtest -p x86_uefi_loader;
+THIN_HV_NESTED_MODE=current LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=8 LINUX_KVM_CYCLES=64 LINUX_KVM_HOTPLUG_CYCLES=2 bash scripts/x86_64/run-linux-kvm-test.sh;
+THIN_HV_NESTED_MODE=unsafe-direct LINUX_KVM_DIRECT_MODE=smp-uefi LINUX_KVM_CPUS=8 LINUX_KVM_CYCLES=64 LINUX_KVM_HOTPLUG_CYCLES=2 bash scripts/x86_64/run-linux-kvm-test.sh;
+THIN_HV_NESTED_MODE=unsafe-direct cargo xrun x86 --nested --release'
+```
+
+Unsafe loader host tests: **360 PASS**. Both mode-specific 8-CPU cases PASS:
+64 KVM lifecycle cycles, 14 AP offline/online returns with fresh KVM, and S5.
+The same q35/host CPU/2 GiB configuration produced single-run guest-log intervals
+of 6.429560 seconds (Current) and 6.089963 seconds (UnsafeDirect) for the 64 probes.
+These are **one sample per mode**, not median/p95/p99 or reproducible speedup
+evidence. Unsafe nested release: **15 PASS / 5 FAIL / 0 SKIP**; all **14 project
+Direct** cases pass, including native architectural/extended-state, MSR, VPID,
+EPT2M and 2/4/12 GiB Linux cases. The same five outer/reference contracts fail;
+its Linux pass is reference evidence only. No existing Direct failure is skipped.
+
+The unchanged 600-second Direct Hyper-V gate **FAILed** under UnsafeDirect:
+`/tmp/x86-unsafe-irq-hyperv.OvwEIy/runner.log`. It used the same disposable seed,
+one CPU, 4 GiB, default q35 and no variable overlay, with no concurrent QEMU.
+Two automatic reboots led to Windows Recovery's "Choose an option" screen.
+The strict single-boot counter decoder rejected that rebooted transcript, not
+misattributed a later boot's counters to the failed one. Read-only NBD/FUSE and
+native NTFS inspection found no MEMORY.DMP or Minidump for this failure.
+The completed child disk, copied vars/TPM, media and ESP were then deleted;
+the immutable backing, logs and screens remain. No original installation or BCD
+was modified. This is not evidence of improved Windows stability.
+
+`WINDOWS_STOP_ON_RESET=1` now provides an explicitly diagnostic-only Direct
+runner path using QEMU's `-no-reboot -no-shutdown`, never a qualification PASS.
+It preserves the first reset's screen/counters without changing Windows BCD.
+QEMU 10.0.2 reports this as `VM status: paused (shutdown)`, distinct from a
+running VM or a user pause. The first fixture uncovered that exact HMP spelling;
+the initial parser could not recognize it, so the stopped record was captured
+explicitly, then the parser was corrected and covered by existing xtask tests.
+`/tmp/x86-unsafe-first-reset.4V4knE/first-reset.json` records 33,287 L1 exits,
+32,953 CPUID exits, 17 L2 entries, all 17 reflected VMCALL exits, and zero nested
+entry failures or carrier interrupt exits. The stopped CPU was executing a
+guest reset-port write (`DX=0xcf9`, `AX=0x000f`), not a diagnosed L0 VM-entry
+failure. This identifies the reset mechanism, **not its Windows/Hyper-V cause**.
+The corrected automated capture in `/tmp/x86-unsafe-reset-auto.itlsMu/runner.log`
+again stops after **17** L2 VMCALL exits, with zero nested-entry failures. Its
+nonzero exit is intentional diagnostic behavior, not a Hyper-V PASS. Current's
+matched first-reset run `/tmp/x86-current-first-reset.uGz2gn/runner.log` does not
+reset but **FAILs** the 600-second ready-marker gate: the last screen says
+"Please wait". Its validated record counts **4,696,275** entries/reflections,
+**40,982,906** L1 exits, **806,805,824** VMREADs, **172,061,213** VMWRITEs and
+**15,047,466** VMPTRLDs, with zero nested-entry failures. Host tests and later
+the small Current smoke/profile suite overlapped portions of this diagnostic;
+it is not an isolated performance measurement. Both final counter JSONs and
+screens remain outside Git; the completed Current and first manual Unsafe
+child disks/vars/TPM/ESPs were deleted. Raw counter bytes are deleted after decoding.
+
+`/tmp/x86-nested-mode-required-host.log` re-runs the four required packages:
+`cargo xtest -p x86_64_hal`, `-p x86_guest_uefi_test`, `-p nested_vmx`, and
+`-p x86_uefi_loader`: **465 PASS / 0 FAIL / 0 SKIP** in total.
+The reset-selector host run `/tmp/x86-reset-diagnostic-host-full.log` passed
+39/39. A subsequent full xtask attempt in
+`/tmp/x86-current-first-reset-build.log` again hit code 124 at the package
+boundary, despite all 39 Rust results passing (29.66-second test body).
+The native-contract transcript gate now prefix-filters unrelated serial lines
+before compiling its unchanged anchored PASS grammar. No negative case or
+deadline was removed: `/tmp/x86-mode-gate-fast-prefilter.log` passes all **39**
+in **27.62 seconds**, including the reset-diagnostic/HMP status cases.
+An earlier `cargo xtest -p xtask -t windows_physical_direct_fixture_never_falls_back_to_research_or_reference`
+attempt selected no manifest entry and ran no tests; only the package runs count.
+
+Both `/tmp/x86-current-mode-standard-profiles.log` and
+`/tmp/x86-unsafe-mode-standard-profiles.log` run the respective mode's
+`cargo xrun x86 --release` followed by `cargo xrun x86 --profile-direct --release`
+through Nix. Each standard suite passes **18** finite gates (13 QEMU/KVM and
+5 TCG), and each additional profile suite passes **6 / 0 FAIL / 0 SKIP**.
+The standard suite includes explicit outer/reference and non-VMX fixtures;
+those are not Direct nested evidence. The two reset-rejection fixtures retain
+their expected-failure semantics.
+
+UnsafeDirect ordinary Windows is **PASS**, including actual desktop probe and
+normal final poweroff: `/tmp/x86-unsafe-normal.JsIvl1/runner.log`. The existing
+`monitor` test used its unchanged 900-second boot/120-second shutdown limits,
+one CPU, 4 GiB, default q35, same-ESP physical-uefi fixture, no variable overlay,
+and the immutable ordinary Windows raw base through QEMU snapshot mode. At the
+desktop capture, carrier external-interrupt/window exits were both zero and
+there were no nested entries (Hyper-V is not enabled in that base). The probe
+was observed after the 180-second progress record; this is not a precise boot
+time or an isolated speed comparison. The small Unsafe smoke/profile suite
+overlapped the latter part of this boot. Normal Windows success does not override
+the separately reproduced Hyper-V failure.
+
+The final Current run `/tmp/x86-current-mode-final-regressions.log` executes
+`cargo xbuild x86; cargo xrun x86; cargo xrun x86 --nested --release` through Nix:
+debug build PASS, debug/default standard **18 PASS**, release nested **15 PASS /
+5 FAIL / 0 SKIP**. All **14 project Direct** cases pass; the same five named
+outer/reference contracts fail. `cargo fmt --check` and `git diff --check` pass.
+The current default is retained: UnsafeDirect has not demonstrated acceptable
+Hyper-V stability or a reproducible real-workload performance improvement.
+No SMP Windows, S3/S4, 4,096-cycle or physical readiness claim follows from this
+increment. Completed diagnostic and ordinary-Windows disposable storage was
+removed after its processes ended; screen/JSON/log evidence and immutable seeds
+were preserved.
+
+Reference inspection, not transplanted code: BitVisor's
+[`vt_shadow_vt.c` at `0a0cb567`](https://github.com/matsu/bitvisor/blob/0a0cb5679434ed24b38c9e4d4608cdc31f77809a/core/x86/vt_shadow_vt.c)
+uses a separate shadow VMCS for selected fields (`vmcs_shadowing_copy`,
+`run_l2vm`) while still restoring L1 host state through its carrier. That is a
+possible future experiment without changing the active Direct VMCS's shadow
+indicator or inventing a composed VMCS02. It is **not implemented here**.
+Its interrupt-vector translation exists for its device mediation and is not
+copied into this pass-through monitor.
+
 ## Qualification still required
 
 Profile boot-option return/error/reboot qualification and failure injection;

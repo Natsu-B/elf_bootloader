@@ -456,6 +456,29 @@ windows_smp() {
     printf '%s\n' "$selected"
 }
 
+# Diagnostic only: freeze the first reset, without editing guest BCD or firmware.
+# This run can never produce a qualification PASS, including before that reset.
+configure_reset_diagnostic() {
+    reset_diagnostic=${WINDOWS_STOP_ON_RESET-0}
+    reset_args=()
+    case "$reset_diagnostic" in
+        0) ;;
+        1)
+            [[ "$1" == monitor || "$1" == monitor-hyperv ]] || \
+                die 'WINDOWS_STOP_ON_RESET requires a Direct monitor test'
+            reset_args=(-no-reboot -no-shutdown) ;;
+        *) die 'WINDOWS_STOP_ON_RESET must be 0 or 1' ;;
+    esac
+}
+
+# QEMU HMP describes a reset held by -no-shutdown as "paused (shutdown)".
+# Keep that distinct from a user pause; neither can satisfy a running gate.
+direct_status_records() {
+    tr -d '\r' | sed -n \
+        -e 's/.*VM status: paused (shutdown)$/shutdown/p' \
+        -e 's/.*VM status: \(running\|paused\)$/\1/p'
+}
+
 run_windows() {
     local mode=$1
     local s4_phase=${2:-}
@@ -478,12 +501,13 @@ run_windows() {
     local is_physical_test=0 physical_state='' physical_started=0 physical_probe_started=-1
     local physical_desktop_probe_sent=0
     local is_direct=0 diagnostics_failure_captured=0
-    local pci_profile
+    local pci_profile reset_diagnostic
     local direct_mode loader=$loader runtime_monitor=$runtime_monitor monitor_esp=$monitor_esp
-    local -a pci_args media_args network_args=(-netdev user,id=net0)
+    local -a pci_args reset_args media_args network_args=(-netdev user,id=net0)
 
     configure_pci_profile
     configure_direct_mode "$mode"
+    configure_reset_diagnostic "$mode"
     smp=$(windows_smp "$mode" "${WINDOWS_SMP-}") || die "WINDOWS_SMP is unsupported for $mode"
     valid_poweroff_timeout "$poweroff_timeout_seconds" || die 'poweroff timeout must be 1..1800 seconds'
 
@@ -542,6 +566,7 @@ run_windows() {
     printf 'Windows x86 test: PCI profile=%s environment=QEMU (not physical hardware)\n' "$pci_profile"
     if ((is_direct)); then
         printf 'Windows x86 test: Direct mode=%s environment=QEMU (not physical hardware)\n' "$direct_mode"
+        printf 'Windows x86 test: stop-on-reset=%s diagnostic-only=%s\n' "$reset_diagnostic" "$reset_diagnostic"
     fi
 
     ovmf_code=$(first_file "${OVMF_FULL_CODE:-}") || die 'OVMF_FULL_CODE not found; run through nix develop'
@@ -796,9 +821,8 @@ run_windows() {
         printf 'info status\n' >&9 || return 1
         for ((attempt = 0; attempt < 50; attempt++)); do
             qemu_is_owned || return 1
-            state=$(tail -c "+$((offset + 1))" -- "$qemu_log" | tr -d '\r' | \
-                sed -n 's/.*VM status: \(running\|paused\)$/\1/p') || return 1
-            if [[ "$state" == running || "$state" == paused ]]; then
+            state=$(tail -c "+$((offset + 1))" -- "$qemu_log" | direct_status_records) || return 1
+            if [[ "$state" == running || "$state" == paused || "$state" == shutdown ]]; then
                 printf '%s\n' "$state"
                 return 0
             fi
@@ -828,7 +852,7 @@ run_windows() {
             if printf 'stop\n' >&9 && [[ $(direct_monitor_state) == paused ]]; then
                 stopped=1
             fi
-        elif [[ "$initial_state" == paused ]]; then
+        elif [[ "$initial_state" == paused || "$initial_state" == shutdown ]]; then
             stopped=1
         fi
 
@@ -847,7 +871,7 @@ run_windows() {
                 # The VM is stopped; only the compiled ABI extents above
                 # are accepted, never an arbitrary log-supplied memory length.
                 if printf 'pmemsave %s %s "%s"\n' "$address" "$bytes" "$quoted_record" >&9 && \
-                    [[ $(direct_monitor_state) == paused ]] && \
+                    [[ $(direct_monitor_state) == paused || $(direct_monitor_state) == shutdown ]] && \
                     python3 "$decoder" decode "$serial_log" "$record" >"$json_file"; then
                     printf 'Windows x86 test: direct diagnostics counters=%s reason=%s\n' "$json_file" "$reason"
                     cat -- "$json_file"
@@ -927,6 +951,7 @@ run_windows() {
         -global ICH9-LPC.disable_s3=1 \
         -global "ICH9-LPC.disable_s4=$disable_s4" \
         "${pci_args[@]}" \
+        "${reset_args[@]}" \
         -cpu "$cpu" \
         -smp "$smp" \
         -m "$memory" \
@@ -967,6 +992,9 @@ run_windows() {
 
     while ((elapsed < timeout_seconds)); do
         if ((is_direct)); then
+            if ((reset_diagnostic)) && [[ $(direct_monitor_state) == shutdown ]]; then
+                die "diagnostic first reset/shutdown captured; not a qualification PASS"
+            fi
             if serial_has_direct_failure "$serial_log"; then
                 die "terminal Direct-VMX failure; logs: $serial_log $qemu_log"
             else
@@ -1122,6 +1150,7 @@ run_windows() {
     done
     ((marker_seen)) || \
         die "marker timeout; logs: $serial_log $marker_log $qemu_log"
+    ((reset_diagnostic == 0)) || die 'diagnostic run reached its marker; not a qualification PASS'
     if ((is_physical_test)); then
         serial_has_exact_marker "$physical_test_json" "$marker_log" || die 'physical-status exact JSON missing'
     fi
@@ -1153,6 +1182,8 @@ run_windows() {
             --check-backend-log direct-vmx "$serial_log" || die 'Direct-VMX backend provenance failed'
         bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
             --check-direct-mode-log "$direct_mode" "$serial_log" || die 'Direct mode/overlay provenance failed'
+        bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
+            --check-nested-mode-log "${THIN_HV_NESTED_MODE:-current}" "$serial_log" || die 'Direct nested mode provenance failed'
         local high_pci_required=0
         [[ "$pci_profile" != firmware-default ]] || high_pci_required=1
         bash "$repo_root/scripts/x86_64/run-uefi-smoke.sh" \
@@ -1331,6 +1362,7 @@ usage() {
     printf '       WINDOWS_PCI_PROFILE=firmware-default (default) or q35-smoke-1g (explicit QEMU A/B fixture)\n'
     printf '       WINDOWS_DIRECT_MODE=qemu-research (default) or physical-uefi (no-overlay same-ESP QEMU fixture)\n'
     printf '       WINDOWS_SMP=1 or 2 for Hyper-V reference A/B; Direct requires 1, WSL/S4/soak requires 2\n'
+    printf '       WINDOWS_STOP_ON_RESET=1 freezes the first Direct reset/shutdown for diagnostics, never qualification PASS\n'
 }
 
 case ${1:-} in
@@ -1355,6 +1387,15 @@ case ${1:-} in
         (($# == 1)) || die 'print-direct-images takes no arguments'
         configure_direct_mode "$1"
         printf '%s\0%s\0' "$loader" "$runtime_monitor"
+        ;;
+    print-reset-args)
+        (($# == 2)) || die 'print-reset-args requires MODE'
+        configure_reset_diagnostic "$2"
+        if ((${#reset_args[@]})); then printf '%s\0' "${reset_args[@]}"; fi
+        ;;
+    check-direct-status)
+        (($# == 1)) || die 'check-direct-status reads HMP records from stdin'
+        direct_status_records
         ;;
     check-poweroff-timeout)
         (($# == 2)) || die 'check-poweroff-timeout requires SECONDS'
