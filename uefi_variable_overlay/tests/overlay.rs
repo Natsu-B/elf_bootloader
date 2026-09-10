@@ -20,6 +20,24 @@ fn utf16(value: &str) -> Vec<u16> {
 }
 
 #[test]
+fn primary_profiles_preserve_existing_persistent_names() {
+    use uefi_variable_overlay::UefiProfile;
+    for (profile, id, name) in [
+        (UefiProfile::Windows, 1, "P00000001:BootOrder"),
+        (UefiProfile::Linux, 2, "P00000002:BootOrder"),
+    ] {
+        assert_eq!(profile.id(), ProfileId(id));
+        assert_eq!(UefiProfile::from_id(profile.id()), Some(profile));
+        let key = map_private_variable(profile.id(), EFI_GLOBAL_VARIABLE_GUID, &utf16("BootOrder"))
+            .unwrap();
+        assert_eq!(key.name(), utf16(name));
+    }
+    for invalid in [0, 3, u32::MAX] {
+        assert_eq!(UefiProfile::from_id(ProfileId(invalid)), None);
+    }
+}
+
+#[test]
 fn classification_is_exact_and_keeps_secure_boot_shared() {
     for name in [
         "BootOrder",
@@ -281,7 +299,7 @@ fn runtime_adapter_dispatches_four_operations_and_isolates_profiles() {
         let result = overlay.get_variable(guid, &boot_order, &mut too_small);
         assert_eq!(result.status, VariableStatus::BufferTooSmall);
         assert_eq!(result.data_size, 2);
-        assert_eq!(result.attributes, None);
+        assert_eq!(result.attributes, Some(attributes));
         assert_eq!(too_small, [0xaa]);
     }
 
@@ -365,4 +383,54 @@ fn runtime_adapter_dispatches_four_operations_and_isolates_profiles() {
         VariableStatus::Success
     );
     assert_eq!(data, [1, 0]);
+}
+
+#[test]
+fn enumeration_rejects_unknown_and_other_profile_cursors_without_changing_outputs() {
+    let guid = EFI_GLOBAL_VARIABLE_GUID;
+    let mut backend = MemoryBackend::default();
+    for (profile, name) in [(ProfileId(1), "Boot0001"), (ProfileId(2), "Boot0002")] {
+        let mut overlay = RuntimeVariableOverlay::<_, 8>::new(profile, &mut backend);
+        assert_eq!(
+            overlay.set_variable(guid, &utf16(name), 7, &[1]),
+            VariableStatus::Success
+        );
+    }
+    let overlay = RuntimeVariableOverlay::<_, 8>::new(ProfileId(1), &mut backend);
+    for (cursor_guid, name) in [
+        (guid, "Boot0002"),
+        (guid, "Missing"),
+        (MONITOR_VENDOR_GUID, "P00000001:Boot0001"),
+        (MONITOR_VENDOR_GUID, "P00000002:Boot0002"),
+    ] {
+        let mut output = [0xaaaa; 32];
+        let result = overlay.get_next_variable_name(cursor_guid, &utf16(name), &mut output);
+        assert_eq!(result.status, VariableStatus::InvalidParameter);
+        assert_eq!(result.guid, None);
+        assert_eq!(result.name_size, 0);
+        assert_eq!(output, [0xaaaa; 32]);
+    }
+    assert_eq!(
+        overlay
+            .get_next_variable_name(guid, &utf16("Boot0001"), &mut [0; 32])
+            .status,
+        VariableStatus::NotFound,
+    );
+}
+
+#[test]
+fn empty_profile_has_no_successor_but_rejects_nonempty_cursor() {
+    let mut backend = MemoryBackend::default();
+    let overlay = RuntimeVariableOverlay::<_, 8>::new(ProfileId(1), &mut backend);
+    let guid = EFI_GLOBAL_VARIABLE_GUID;
+    assert_eq!(
+        overlay.get_next_variable_name(guid, &[], &mut []).status,
+        VariableStatus::NotFound
+    );
+    assert_eq!(
+        overlay
+            .get_next_variable_name(guid, &utf16("BootOrder"), &mut [0; 16])
+            .status,
+        VariableStatus::InvalidParameter,
+    );
 }

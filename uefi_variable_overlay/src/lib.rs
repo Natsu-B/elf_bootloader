@@ -54,6 +54,39 @@ impl Guid {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfileId(pub u32);
 
+/// Selected primary OS, not a concurrently executing virtual machine.
+///
+/// The IDs preserve the existing firmware-backed `P00000001:` and
+/// `P00000002:` namespaces; changing a profile never changes machine identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UefiProfile {
+    /// The motherboard's installed Windows environment.
+    Windows,
+    /// The selected Linux environment.
+    Linux,
+}
+
+impl UefiProfile {
+    /// Returns the stable ID used in existing persistent boot-variable names.
+    #[must_use]
+    pub const fn id(self) -> ProfileId {
+        match self {
+            Self::Windows => ProfileId(1),
+            Self::Linux => ProfileId(2),
+        }
+    }
+
+    /// Decodes a primary-OS ID without falling back to another profile.
+    #[must_use]
+    pub const fn from_id(id: ProfileId) -> Option<Self> {
+        match id.0 {
+            1 => Some(Self::Windows),
+            2 => Some(Self::Linux),
+            _ => None,
+        }
+    }
+}
+
 /// Storage policy for a logical UEFI variable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VariableScope {
@@ -273,7 +306,8 @@ impl<const ENTRY_CAPACITY: usize, const NAME_CAPACITY: usize>
     /// Returns the next visible key after the supplied logical key.
     ///
     /// An empty `previous_name` starts enumeration. An unknown prior key and
-    /// the end of the catalog both return `None`, matching UEFI `NOT_FOUND`.
+    /// the end both return `None`; the runtime adapter checks membership first
+    /// to distinguish UEFI `INVALID_PARAMETER` from `NOT_FOUND`.
     #[must_use]
     pub fn get_next(&self, previous_guid: Guid, previous_name: &[u16]) -> Option<VariableRef<'_>> {
         let index = if previous_name.is_empty() {
@@ -288,6 +322,13 @@ impl<const ENTRY_CAPACITY: usize, const NAME_CAPACITY: usize>
             .get(index)
             .filter(|_| index < self.len)
             .map(CatalogEntry::as_ref)
+    }
+
+    /// Tests whether a nonempty enumeration cursor belongs to this view.
+    fn contains(&self, guid: Guid, name: &[u16]) -> bool {
+        self.entries[..self.len]
+            .iter()
+            .any(|entry| entry.matches(guid, name))
     }
 
     /// Returns the number of visible keys in the snapshot.
@@ -357,8 +398,11 @@ pub struct VariableInfo {
 /// Minimal persistent-variable store used by [`RuntimeVariableOverlay`].
 ///
 /// Names do not include a terminating NUL. Returning `false` from the
-/// `visit_keys` callback stops enumeration successfully. `set_variable` must
-/// interpret an empty `data` slice as deletion, matching UEFI `DataSize == 0`.
+/// `visit_keys` callback stops enumeration successfully. `set_variable` owns
+/// attribute, append and deletion semantics: an empty payload normally deletes,
+/// but an empty append must not delete a variable. A successful nonvolatile
+/// update must be durable and an interrupted update must retain the old or new
+/// value, never a partially written value, as required by UEFI SetVariable.
 pub trait VariableBackend {
     /// Reads one physical backend variable without copying its payload.
     ///
@@ -394,7 +438,7 @@ pub struct GetVariableResult {
     pub status: VariableStatus,
     /// Payload size in bytes, including the required size on buffer failure.
     pub data_size: usize,
-    /// Attributes on success; error paths leave the ABI output untouched.
+    /// Attributes on success or `BUFFER_TOO_SMALL`, as required by UEFI.
     pub attributes: Option<u32>,
 }
 
@@ -449,7 +493,7 @@ impl<'a, B: VariableBackend + ?Sized, const ENTRY_CAPACITY: usize, const NAME_CA
                 return GetVariableResult {
                     status: VariableStatus::BufferTooSmall,
                     data_size: stored.data.len(),
-                    attributes: None,
+                    attributes: Some(stored.attributes),
                 };
             }
 
@@ -462,7 +506,7 @@ impl<'a, B: VariableBackend + ?Sized, const ENTRY_CAPACITY: usize, const NAME_CA
         })
     }
 
-    /// Dispatches UEFI `SetVariable`; an empty payload deletes the variable.
+    /// Dispatches UEFI `SetVariable`, retaining backend append/delete semantics.
     pub fn set_variable(
         &mut self,
         guid: Guid,
@@ -511,6 +555,10 @@ impl<'a, B: VariableBackend + ?Sized, const ENTRY_CAPACITY: usize, const NAME_CA
         }
         if catalog_failed {
             return next_error(VariableStatus::OutOfResources);
+        }
+
+        if !previous_name.is_empty() && !catalog.contains(previous_guid, previous_name) {
+            return next_error(VariableStatus::InvalidParameter);
         }
 
         let Some(next) = catalog.get_next(previous_guid, previous_name) else {

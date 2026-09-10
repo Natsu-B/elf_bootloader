@@ -61,6 +61,8 @@ use nested_vmx::vmcs_revision_is_supported;
 use nested_vmx::vpid::Namespace as VpidNamespace;
 use r_efi::efi;
 use uefi_variable_overlay::ProfileId;
+#[cfg(not(feature = "physical-direct-vmx"))]
+use uefi_variable_overlay::UefiProfile;
 use x86_64_hal::addr::EptPhys;
 use x86_64_hal::addr::HostPhys;
 use x86_64_hal::addr::VmcsPhys;
@@ -240,10 +242,10 @@ const WINDOWS_BOOT_IMAGE_PATH: [efi::Char16; 33] =
     ascii_uefi_path(b"\\EFI\\Microsoft\\Boot\\bootmgfw.efi\0");
 /// Stable profile selected when the staged Linux/test payload is present.
 #[cfg(not(feature = "physical-direct-vmx"))]
-const LINUX_PROFILE: ProfileId = ProfileId(2);
+const LINUX_PROFILE: ProfileId = UefiProfile::Linux.id();
 /// Stable profile selected when chainloading the installed Windows ESP.
 #[cfg(not(feature = "physical-direct-vmx"))]
-const WINDOWS_PROFILE: ProfileId = ProfileId(1);
+const WINDOWS_PROFILE: ProfileId = UefiProfile::Windows.id();
 
 #[cfg(not(feature = "physical-direct-vmx"))]
 const fn ascii_uefi_path<const N: usize>(ascii: &[u8; N]) -> [efi::Char16; N] {
@@ -2027,7 +2029,7 @@ fn valid_runtime_profile(profile: ProfileId) -> bool {
     }
     #[cfg(not(feature = "physical-direct-vmx"))]
     {
-        matches!(profile, WINDOWS_PROFILE | LINUX_PROFILE)
+        UefiProfile::from_id(profile).is_some()
     }
 }
 
