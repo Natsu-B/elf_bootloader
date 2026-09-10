@@ -192,6 +192,62 @@ pub(crate) fn load_selected(
         unsafe { slice::from_raw_parts(options.cast::<u8>(), options_size) }
     };
     let target = selected_path(bytes)?;
+    load_path(
+        image,
+        system_table,
+        serial,
+        device,
+        current_path,
+        &target,
+        !bytes.is_empty(),
+    )
+}
+
+/// Loads a configured profile path on the same firmware-identified ESP. No
+/// filesystem enumeration or missing-image fallback is permitted.
+#[cfg(feature = "profile-direct-vmx")]
+pub(crate) fn load_profile_path(
+    image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    serial: &mut SerialPort,
+    path: &str,
+) -> Result<efi::Handle, Error> {
+    if path.len() >= MAX_PATH_UNITS {
+        return Err(invalid("profile path length"));
+    }
+    let mut units = [0; MAX_PATH_UNITS];
+    for (unit, byte) in units.iter_mut().zip(path.bytes()) {
+        *unit = u16::from(byte);
+    }
+    let target = ImagePath::from_units(&units[..path.len() + 1])?;
+    let loaded = chainload::loaded_image_protocol(image, system_table)?;
+    // SAFETY: the checked LoadedImage interface is live before StartImage/EBS.
+    // Its device handle and FilePath remain firmware-owned during this load.
+    let (device, current_path) = unsafe { ((*loaded).device_handle, (*loaded).file_path) };
+    if device.is_null() || current_path.is_null() {
+        return Err(invalid("profile loader needs an existing ESP file path"));
+    }
+    load_path(
+        image,
+        system_table,
+        serial,
+        device,
+        current_path,
+        &target,
+        true,
+    )
+}
+
+/// Shared final path validation and firmware load, after source/target decoding.
+fn load_path(
+    image: efi::Handle,
+    system_table: *mut efi::SystemTable,
+    serial: &mut SerialPort,
+    device: efi::Handle,
+    current_path: *mut efi::protocols::device_path::Protocol,
+    target: &ImagePath,
+    explicit: bool,
+) -> Result<efi::Handle, Error> {
     let utilities = chainload::device_path_utilities_protocol(system_table)?;
     // SAFETY: LoadedImage.FilePath is a live firmware device path; the validated
     // DevicePathUtilities interface describes its allocation without modifying it.
@@ -231,7 +287,7 @@ pub(crate) fn load_selected(
     let _ = writeln!(
         serial,
         "thin-hv: physical chainload scope=current-esp explicit_path={}",
-        u8::from(!bytes.is_empty())
+        u8::from(explicit)
     );
     chainload::load_image_on_device(image, system_table, device, utilities, target.as_slice())
 }

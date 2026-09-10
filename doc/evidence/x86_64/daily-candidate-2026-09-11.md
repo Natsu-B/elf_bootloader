@@ -225,9 +225,70 @@ TCG/debug cases this invocation has **14 QEMU PASS / 0 FAIL / 0 SKIP** (11 KVM,
 pre-existing nested reference failures and Direct Hyper-V failure above remain
 open; this fixture-only increment does not change VMX runtime behavior.
 
+## Increment 4: explicit profile Direct boot path (in progress)
+
+The opt-in `profile-direct-vmx` feature adds `direct mode=profile-uefi`; it is not
+a new nested execution implementation. It uses the same platform map, private L0,
+Direct hardware VMCS/EPTP and conservative single-BSP ownership gate. Mode cookie
+2 distinguishes its runtime image/handoff from physical no-overlay mode 1 and
+research mode 0. Existing backends remain selectable without silent fallback.
+
+`profile_boot::{explicit_profile,configured_path,load_selected,SelectedBoot::commit}`
+accepts exact terminated UTF-16 `windows` / `linux`, or empty options to retain the
+existing eight-byte firmware selector. Absence/corruption without explicit selection
+is an error. The selector is committed only after loading the selected OS and
+validating the runtime-monitor image, before starting that monitor. Repeated
+persistent boots do not rewrite the selector. Firmware SetVariable failure retains
+its native status and existing cleanup path. No activation/identity data is accessed.
+
+`physical_chainload::{load_path,load_profile_path}` reuses current-ESP protocol,
+path and self-reference checks. Windows selects the original bootmgfw path; Linux
+uses `THIN_HV_LINUX_EFI_PATH` from the build environment and rejects missing or
+invalid configuration. The no-overlay physical path retains its existing LoadOptions
+path contract. Profile-mode hooks are installed only in the original retained
+runtime image, after allocations; the L0-private copy never owns their entry points.
+
+`cargo xrun x86 --profile-direct --release`: **4 QEMU Direct PASS / 0 FAIL / 0 SKIP**,
+`/tmp/x86-profile-direct-second.log`. Each case has default q35, one CPU, 256 MiB,
+KVM `host,+vmx,-hypervisor`, the same native UEFI guest and a 60-second bound.
+The separate selection driver supplies explicit Windows/Linux commands over an
+opposite stored selector, or empty commands over each stored selector. The actual
+L0 loads the current-ESP path and its L1 payload verifies the active variable namespace.
+The guest's previous Linux-only namespace probe was corrected to seed/check the
+selected namespace; the legacy absent-selector research fixture still explicitly
+uses Linux. No Windows/Linux OS boot is inferred from this native UEFI payload.
+
+Debug `cargo xrun x86 --profile-direct` also passes all four cases. The same command
+log `/tmp/x86-profile-direct-regression.log` then records the existing release
+matrix **12 PASS / 0 FAIL / 0 SKIP**, fmt/diff checks and xtask **39 PASS**. Total
+QEMU for that invocation is **16 PASS / 0 FAIL / 0 SKIP** (14 KVM, 2 TCG).
+Package host log `/tmp/x86-profile-direct-host-regression.log` has loader **275 PASS**
+and guest **10 PASS**; its first gate test correctly caught a missing backend
+marker that was not rejected. The strengthened checker requires both ordered Direct
+entries; the subsequent xtask rerun above passes. Initial fixture build also needed
+an explicit Result type; `/tmp/x86-profile-direct-first.log` retains that compiler
+failure. The earlier `/tmp/x86-profile-direct-host-first.log` found the old two-mode
+handoff test expectation; the three-mode expectation is now exercised.
+
+This increment still selects the configured primary boot-manager path, not an
+arbitrary private BootNext/BootOrder load option. Those variables are isolated and
+persistent but their cold-boot execution policy is **not complete**. Do not treat
+this opt-in mode as an OS-update/S4/daily-use qualification. Driver options remain
+namespaced; firmware BootCurrent and all security/identity state remain shared.
+
+Nested regression `/tmp/x86-profile-direct-nested-regression.log` repeats all 20
+release cases: **15 PASS / 5 FAIL / 0 SKIP**. All 14 Direct cases pass, including
+the six Linux KVM configurations and both 12-GiB/default-high-PCI runs. The five
+outer-KVM/reference contracts fail in the same categories listed in increment 2;
+the outer Linux reference passes. No unexpected Direct regression was observed.
+The same invocation passes nested_vmx 32, x86_64_hal 59 and overlay 9 host tests;
+combined with loader 275, guest 10 and the latest xtask 39, affected host coverage
+is **424 PASS / 0 FAIL / 0 SKIP**. These counts refer to the latest successful
+package runs, not an assertion that the earlier intermediate gate failure passed.
+
 ## Qualification still required
 
-Production persistent-profile boot-path integration and failure injection;
+Full profile BootNext/BootOrder execution and failure injection;
 1/2/4/8 actual L1 CPUs; AP handoff; S3/cancellation/time/NMI; Direct Hyper-V/WSL2
 and S4; short/extended daily suite; measured Current/Unsafe A/B and default decision.
 Existing Linux test failures in `correctness-2026-09-09.md` are not waived.

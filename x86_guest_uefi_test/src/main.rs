@@ -118,14 +118,16 @@ fn variable_services_round_trip(
     }
 
     let seed = 0x2222;
-    if !set_u16_variable(
-        runtime,
-        &mut linux_name,
-        MONITOR_VENDOR_GUID,
-        attributes,
-        seed,
-    ) || read_u16_variable(runtime, &mut linux_name, MONITOR_VENDOR_GUID)
-        != Ok((seed, attributes))
+    let Some(profile) = overlay_profile(runtime) else {
+        return (None, false);
+    };
+    let seed_name = if profile == 1 {
+        &mut windows_name
+    } else {
+        &mut linux_name
+    };
+    if !set_u16_variable(runtime, seed_name, MONITOR_VENDOR_GUID, attributes, seed)
+        || read_u16_variable(runtime, seed_name, MONITOR_VENDOR_GUID) != Ok((seed, attributes))
     {
         let _ = cleanup_test_variables(runtime);
         return (None, false);
@@ -189,33 +191,76 @@ fn native_round_trip(runtime: *mut efi::RuntimeServices, attributes: u32) -> boo
         && returned == INACTIVE_DRIVER_LOAD_OPTION
 }
 
-/// Completes the profile-isolation checks after the Linux key detects hooks.
+/// Completes isolation checks after the selected profile key detects hooks.
 fn overlay_round_trip(runtime: *mut efi::RuntimeServices, attributes: u32) -> bool {
+    let Some(profile) = overlay_profile(runtime) else {
+        return false;
+    };
+    write_bytes(b"thin-hv: guest variable profile=");
+    write_byte(b'0' + profile);
+    write_bytes(b"\r\n");
     let mut logical_name = TEST_DRIVER;
-    let mut windows_name = WINDOWS_TEST_DRIVER;
-    let mut linux_name = LINUX_TEST_DRIVER;
-    let windows_value = 0x1111;
-    let linux_value = 0x3333;
+    let (mut inactive_name, mut active_name) = if profile == 1 {
+        (LINUX_TEST_DRIVER, WINDOWS_TEST_DRIVER)
+    } else {
+        (WINDOWS_TEST_DRIVER, LINUX_TEST_DRIVER)
+    };
+    let inactive_value = 0x1111;
+    let active_value = 0x3333;
 
     set_u16_variable(
         runtime,
-        &mut windows_name,
+        &mut inactive_name,
         MONITOR_VENDOR_GUID,
         attributes,
-        windows_value,
+        inactive_value,
     ) && set_u16_variable(
         runtime,
         &mut logical_name,
         EFI_GLOBAL_VARIABLE_GUID,
         attributes,
-        linux_value,
+        active_value,
     ) && read_u16_variable(runtime, &mut logical_name, EFI_GLOBAL_VARIABLE_GUID)
-        == Ok((linux_value, attributes))
-        && read_u16_variable(runtime, &mut linux_name, MONITOR_VENDOR_GUID)
-            == Ok((linux_value, attributes))
-        && read_u16_variable(runtime, &mut windows_name, MONITOR_VENDOR_GUID)
-            == Ok((windows_value, attributes))
+        == Ok((active_value, attributes))
+        && read_u16_variable(runtime, &mut active_name, MONITOR_VENDOR_GUID)
+            == Ok((active_value, attributes))
+        && read_u16_variable(runtime, &mut inactive_name, MONITOR_VENDOR_GUID)
+            == Ok((inactive_value, attributes))
         && enumeration_is_logical(runtime)
+}
+
+/// Legacy research fixtures have no selector and explicitly use profile 2.
+/// Profile-mode fixtures instead require the exact durable selector written by L0.
+fn overlay_profile(runtime: *mut efi::RuntimeServices) -> Option<u8> {
+    let mut name = ascii_uefi_name(b"SelectedProfile\0");
+    let mut guid = MONITOR_VENDOR_GUID;
+    let mut record = [0u8; 8];
+    let mut size = record.len();
+    let mut attributes = 0;
+    // SAFETY: variable_services_round_trip validated this live pre-EBS runtime
+    // table; the terminated name and bounded output storage live across the call.
+    let status = unsafe {
+        ((*runtime).get_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            &mut attributes,
+            &mut size,
+            record.as_mut_ptr().cast(),
+        )
+    };
+    if status == efi::Status::NOT_FOUND {
+        return Some(2);
+    }
+    if status != efi::Status::SUCCESS
+        || size != 8
+        || attributes != efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS
+    {
+        return None;
+    }
+    match record {
+        [b'T', b'H', b'V', b'P', 1, 0, id @ (1 | 2), 0] => Some(id),
+        _ => None,
+    }
 }
 
 /// Reads one exact two-byte variable and its attributes.

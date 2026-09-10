@@ -17,7 +17,7 @@ use crate::platform_resources;
 use crate::platform_resources::MmioMap;
 use crate::platform_snapshot;
 use crate::resident_image;
-#[cfg(not(feature = "physical-direct-vmx"))]
+#[cfg(any(not(feature = "physical-direct-vmx"), feature = "profile-direct-vmx"))]
 use crate::runtime_variables;
 use core::ffi::c_void;
 use core::fmt;
@@ -61,7 +61,7 @@ use nested_vmx::vmcs_revision_is_supported;
 use nested_vmx::vpid::Namespace as VpidNamespace;
 use r_efi::efi;
 use uefi_variable_overlay::ProfileId;
-#[cfg(not(feature = "physical-direct-vmx"))]
+#[cfg(any(not(feature = "physical-direct-vmx"), feature = "profile-direct-vmx"))]
 use uefi_variable_overlay::UefiProfile;
 use x86_64_hal::addr::EptPhys;
 use x86_64_hal::addr::HostPhys;
@@ -692,7 +692,9 @@ const _: () =
 const _: () = assert!(ERROR_REVISION_PAGE + 1 == CPU_STATE_FIRST_PAGE);
 
 /// Bootstrap-to-runtime handoff retained for the direct nested `StartImage` call.
-const RUNTIME_MODE: u32 = if cfg!(feature = "physical-direct-vmx") {
+const RUNTIME_MODE: u32 = if cfg!(feature = "profile-direct-vmx") {
+    2
+} else if cfg!(feature = "physical-direct-vmx") {
     1
 } else {
     0
@@ -1319,7 +1321,7 @@ fn start_resident_core(
         efi::Status::INVALID_PARAMETER.as_usize(),
     ))?;
     let guest = handoff.0;
-    #[cfg(not(feature = "physical-direct-vmx"))]
+    #[cfg(any(not(feature = "physical-direct-vmx"), feature = "profile-direct-vmx"))]
     let profile = handoff.1;
     // SAFETY: run validated this live protocol for the executing runtime image.
     let (source, size, data_type) = unsafe {
@@ -1363,16 +1365,22 @@ fn start_resident_core(
                 MONITOR_ALLOCATION_PAGES,
                 vmx_limit,
                 |monitor_allocation| {
-                    // All runtime allocations precede legacy test-hook installation. OVMF
+                    // All runtime allocations precede profile-hook installation. OVMF
                     // republishes its MAT when runtime memory changes; installing earlier
                     // would lose the original image's narrowly scoped executable fixup.
                     // Hooks remain in that registered image, never in the private L0 copy.
-                    #[cfg(not(feature = "physical-direct-vmx"))]
+                    #[cfg(any(
+                        not(feature = "physical-direct-vmx"),
+                        feature = "profile-direct-vmx"
+                    ))]
                     let overlay = runtime_variables::install(system_table, profile, source, size)
                         .map_err(|status| {
                         Error::Firmware("install variable overlay", status.as_usize())
                     })?;
-                    #[cfg(not(feature = "physical-direct-vmx"))]
+                    #[cfg(any(
+                        not(feature = "physical-direct-vmx"),
+                        feature = "profile-direct-vmx"
+                    ))]
                     let _ = writeln!(
                         serial,
                         "thin-hv: variable overlay profile={} mat_patches={}",
@@ -1507,7 +1515,10 @@ fn start_resident_core(
                     })();
                     // Rollback runs in the original image with its original statics. It
                     // precedes FreePages, which may replace the MAT whose edits it restores.
-                    #[cfg(not(feature = "physical-direct-vmx"))]
+                    #[cfg(any(
+                        not(feature = "physical-direct-vmx"),
+                        feature = "profile-direct-vmx"
+                    ))]
                     overlay.rollback().map_err(|status| {
                         Error::Firmware("restore variable overlay", status.as_usize())
                     })?;
@@ -1889,12 +1900,17 @@ fn start_runtime_monitor(
     #[cfg(not(feature = "physical-direct-vmx"))]
     let (guest, profile) =
         load_selected_guest(parent_image, parent_device, system_table, utilities)?;
-    #[cfg(feature = "physical-direct-vmx")]
+    #[cfg(all(feature = "physical-direct-vmx", not(feature = "profile-direct-vmx")))]
     let (guest, profile) = (
         crate::physical_chainload::load_selected(parent_image, system_table, &mut SerialPort)
             .map_err(Error::Platform)?,
         ProfileId(0),
     );
+    #[cfg(feature = "profile-direct-vmx")]
+    let selection =
+        crate::profile_boot::load_selected(parent_image, system_table, &mut SerialPort)?;
+    #[cfg(feature = "profile-direct-vmx")]
+    let (guest, profile) = (selection.image, selection.profile.id());
     let services = chainload::boot_services(system_table)?;
     let mut monitor_retired = false;
     let result = (|| {
@@ -1916,6 +1932,8 @@ fn start_runtime_monitor(
                     efi::Status::UNSUPPORTED.as_usize(),
                 ));
             }
+            #[cfg(feature = "profile-direct-vmx")]
+            selection.commit()?;
             Ok(loaded)
         })();
         let monitor_loaded = match metadata {
@@ -2021,13 +2039,14 @@ fn validated_runtime_handoff(handoff: RuntimeHandoff) -> Option<(efi::Handle, Pr
         .then_some((handoff.guest, profile))
 }
 
-/// Physical handoffs carry no variable profile and cannot consume research mode.
+/// The no-overlay physical mode carries ID 0; named-profile modes require 1/2.
+/// The separate mode cookie prevents consuming another backend's handoff.
 fn valid_runtime_profile(profile: ProfileId) -> bool {
-    #[cfg(feature = "physical-direct-vmx")]
+    #[cfg(all(feature = "physical-direct-vmx", not(feature = "profile-direct-vmx")))]
     {
         profile.0 == 0
     }
-    #[cfg(not(feature = "physical-direct-vmx"))]
+    #[cfg(any(not(feature = "physical-direct-vmx"), feature = "profile-direct-vmx"))]
     {
         UefiProfile::from_id(profile).is_some()
     }
@@ -6531,13 +6550,16 @@ mod tests {
 
     #[test]
     fn runtime_handoff_rejects_cross_backend_profiles_and_null_guest() {
-        for mode in [0, 1, 2, u32::MAX] {
+        for mode in [0, 1, 2, 3, u32::MAX] {
             for profile in [0, 1, 2, 3, u32::MAX] {
                 // Opaque non-null token only: this pure validator never accesses
                 // the represented image, protocol, or any physical memory.
                 let guest = 1_usize as super::efi::Handle;
                 let valid = mode == super::RUNTIME_MODE
-                    && if cfg!(feature = "physical-direct-vmx") {
+                    && if cfg!(all(
+                        feature = "physical-direct-vmx",
+                        not(feature = "profile-direct-vmx")
+                    )) {
                         profile == 0
                     } else {
                         matches!(profile, 1 | 2)

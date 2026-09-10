@@ -22,6 +22,25 @@ physical Direct backend still has no overlay by default; production profile/path
 selection wiring remains work in progress. Current evidence and limitations are
 in [the daily-candidate log](evidence/x86_64/daily-candidate-2026-09-11.md).
 
+## Opt-in profile Direct selection
+
+The additional opt-in profile Direct selection gate is:
+
+```sh
+nix develop --accept-flake-config --command cargo xrun x86 --profile-direct --release
+```
+
+It tests four native-UEFI Direct cases, not installed Windows/Linux: each profile
+selected explicitly and from the persistent selector. The backend logs `profile-uefi`
+and uses distinct `x86-uefi-profile-direct-{loader,monitor}.efi` artifacts. Exact
+UTF-16 `windows` / `linux` LoadOptions make an explicit selection; empty options
+require an existing valid selector. Linux's current-ESP path is supplied at build
+time by `THIN_HV_LINUX_EFI_PATH`; this test child build sets it to the disposable
+`\EFI\ubuntu\shimx64.efi` fixture. Missing configuration never selects another OS.
+The original `physical-uefi` backend remains overlay-free. Private BootNext/BootOrder
+execution, SMP, OS power/update cycles and Hyper-V remain unfinished; these four
+cases are not a daily-use claim.
+
 ## Authoritative starting point
 
 Work started on 2026-09-07 and continued on 2026-09-08 (JST), without switching branches.

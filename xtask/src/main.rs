@@ -593,6 +593,13 @@ fn build_x86_uefi(args: &[String]) -> Result<String, String> {
         "physical-direct",
         "physical-direct-vmx",
     )?;
+    build_x86_direct_variant(
+        args,
+        &workspace,
+        &artifact,
+        "profile-direct",
+        "profile-direct-vmx",
+    )?;
     for (feature, filename) in [
         ("nested-contract", "x86-uefi-nested-contract.efi"),
         ("msr-contract", "x86-uefi-msr-contract.efi"),
@@ -708,6 +715,94 @@ fn run_x86_profiles() -> Result<(), String> {
         return Err(format!("Profile QEMU fixture failed: {status}"));
     }
     Ok(())
+}
+
+/// Four finite actual-Direct primary-OS selection cases, never a reference fallback.
+fn run_x86_profile_selection(args: &[String]) -> Result<(), String> {
+    // Scope this fixture's Linux path to the child build, not process-global env.
+    let status = Command::new("cargo")
+        .args(["xbuild", "x86"])
+        .args(args)
+        .env("THIN_HV_LINUX_EFI_PATH", "\\EFI\\ubuntu\\shimx64.efi")
+        .status()
+        .map_err(|e| format!("Profile Direct build: {e}"))?;
+    if !status.success() {
+        return Err(format!("Profile Direct build failed: {status}"));
+    }
+    let mut failures = Vec::new();
+    for case in [
+        "windows-explicit",
+        "linux-explicit",
+        "windows-persistent",
+        "linux-persistent",
+    ] {
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "-p",
+                "x86_uefi_loader",
+                "--bin",
+                "x86-uefi-profile-selection-test",
+                "--target",
+                "x86_64-unknown-uefi",
+                "--no-default-features",
+                "--features",
+                "uefi-profile-contract",
+            ])
+            .args(args)
+            .env("XTASK_BUILD", "1")
+            .env("THIN_HV_PROFILE_FIXTURE", case)
+            .status()
+            .map_err(|e| format!("Profile driver build: {e}"))?;
+        if !status.success() {
+            return Err(format!("Profile driver {case} failed: {status}"));
+        }
+        let artifact = Path::new("target/x86_64-unknown-uefi")
+            .join(resolve_profile(args))
+            .join("x86-uefi-profile-selection-test.efi");
+        verify_no_decoded_vmx(&artifact)?;
+        let driver = format!("bin/x86_64/x86-uefi-profile-{case}.efi");
+        fs::copy(artifact, &driver).map_err(|e| format!("Profile driver copy: {e}"))?;
+        let status = Command::new("./scripts/x86_64/run-uefi-smoke.sh")
+            .arg(&driver)
+            .env("X86_UEFI_BACKEND", "direct-vmx")
+            .env("X86_UEFI_DIRECT_MODE", "profile-uefi")
+            .env("X86_UEFI_PROFILE_FIXTURE", case)
+            .env("X86_UEFI_GUEST_LOCATION", "both")
+            .env("X86_UEFI_ACCEL", "kvm")
+            .env("X86_UEFI_CPU", "host,+vmx,-hypervisor")
+            .env("X86_UEFI_SMP", "1")
+            .env("X86_UEFI_MEMORY", "256M")
+            .env("X86_UEFI_TIMEOUT_SECONDS", "60")
+            .env(
+                "X86_MONITOR_IMAGE",
+                "bin/x86_64/x86-uefi-profile-direct-monitor.efi",
+            )
+            .arg("bin/x86_64/x86_guest_uefi_test.efi")
+            .status()
+            .map_err(|e| format!("Profile Direct run: {e}"))?;
+        fs::copy(
+            "bin/x86_64/serial.log",
+            format!("bin/x86_64/profile-direct-{case}.log"),
+        )
+        .map_err(|e| format!("Profile Direct evidence: {e}"))?;
+        if status.success() {
+            eprintln!("profile Direct: PASS case={case}");
+        } else {
+            eprintln!("profile Direct: FAIL case={case}");
+            failures.push(case);
+        }
+    }
+    eprintln!(
+        "profile Direct summary PASS={} FAIL={} SKIP=0",
+        4 - failures.len(),
+        failures.len()
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Profile Direct failures: {failures:?}"))
+    }
 }
 
 /// Builds explicitly named Direct variants without replacing other backends.
@@ -1160,6 +1255,20 @@ fn run_x86_nested() -> Result<(), String> {
 }
 
 fn run_x86_uefi(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--profile-direct") {
+        if args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--nested" | "--uefi-profiles"))
+        {
+            return Err("Select one x86 qualification suite".to_string());
+        }
+        let build_args: Vec<_> = args
+            .iter()
+            .filter(|arg| *arg != "--profile-direct")
+            .cloned()
+            .collect();
+        return run_x86_profile_selection(&build_args);
+    }
     if args.iter().any(|arg| arg == "--uefi-profiles") {
         if args.iter().any(|arg| arg == "--nested") {
             return Err("Select either --uefi-profiles or --nested".to_string());
@@ -5679,6 +5788,51 @@ mod tests {
             "thin-hv: profile contract view=1 mat_patches=1\n",
         ] {
             assert!(!check(&(valid.clone() + suffix)));
+        }
+        let check_selection = |case: &str, contents: &str| {
+            fs::write(&log.0, contents).unwrap();
+            Command::new("bash")
+                .arg(&runner)
+                .args(["--check-profile-selection-log", case])
+                .arg(&log.0)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let mode = "thin-hv: backend=direct-vmx role=project-l0\nthin-hv: direct mode=profile-uefi variable_overlay=enabled selection=persistent-profile physical_ready=0\nthin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0\n";
+        for (os, profile) in [("windows", 1), ("linux", 2)] {
+            for source in ["explicit", "persistent"] {
+                let case = format!("{os}-{source}");
+                let text = format!(
+                    "thin-hv: profile selection fixture begin\n{mode}thin-hv: physical chainload scope=current-esp explicit_path=1\nthin-hv: boot profile={profile} source={source} scope=current-esp\n{mode}thin-hv: variable overlay profile={profile} mat_patches=1\nthin-hv: guest variable profile={profile}\n"
+                );
+                assert!(check_selection(&case, &text));
+                assert!(check_selection(&case, &text.replace('\n', "\r\n")));
+                for line in text.lines() {
+                    assert!(
+                        !check_selection(&case, &text.replacen(&format!("{line}\n"), "", 1)),
+                        "missing {line}"
+                    );
+                }
+                for (from, to) in [
+                    ("profile=1", "profile=2"),
+                    ("profile=2", "profile=1"),
+                    ("role=project-l0", "role=reference"),
+                    ("selection=persistent-profile", "selection=test-profile"),
+                    ("variable_overlay=enabled", "variable_overlay=disabled"),
+                ] {
+                    if text.contains(from) {
+                        assert!(!check_selection(&case, &text.replace(from, to)));
+                    }
+                }
+                assert!(!check_selection(
+                    &case,
+                    &(text.clone() + "thin-hv: profile selection fixture FAIL\n")
+                ));
+                assert!(!check_selection(&case, &(text + "\0")));
+            }
         }
     }
 

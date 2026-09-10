@@ -12,6 +12,11 @@ name = "x86-uefi-profile-contract"
 path = "src/profile_contract.rs"
 required-features = ["uefi-profile-contract"]
 
+[[bin]]
+name = "x86-uefi-profile-selection-test"
+path = "src/profile_selection_test.rs"
+required-features = ["uefi-profile-contract"]
+
 [features]
 default = ["direct-vmx"]
 direct-vmx = [
@@ -24,6 +29,9 @@ direct-vmx = [
 # Physical-selection Direct path: no Runtime Services overlay or test ESP fallback.
 # BSP-only until complete pCPU/AP ownership exists; runtime rejects multiple CPUs.
 physical-direct-vmx = ["direct-vmx"]
+# Explicit persistent primary-OS selection on the current ESP, with boot overlay.
+# The no-overlay physical-direct-vmx mode remains independently selectable.
+profile-direct-vmx = ["physical-direct-vmx"]
 trusted-outer-kvm = []
 physical-chainload = []
 physical-preflight = ["dep:x86_64_hal", "x86_64_hal/vmx"]

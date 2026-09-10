@@ -55,9 +55,14 @@ mod platform_resources;
 #[cfg(any(feature = "physical-preflight", feature = "direct-vmx"))]
 mod platform_snapshot;
 
+#[cfg(feature = "profile-direct-vmx")]
+mod profile_boot;
 #[cfg(feature = "direct-vmx")]
 mod resident_image;
-#[cfg(all(feature = "direct-vmx", not(feature = "physical-direct-vmx")))]
+#[cfg(all(
+    feature = "direct-vmx",
+    any(not(feature = "physical-direct-vmx"), feature = "profile-direct-vmx")
+))]
 mod runtime_variables;
 #[cfg(feature = "trusted-outer-kvm")]
 mod trusted_outer_kvm;
@@ -197,8 +202,10 @@ pub extern "efiapi" fn efi_main(
         serial.init();
         let _ = writeln!(serial, "thin-hv: uefi entry");
         let _ = writeln!(serial, "thin-hv: backend=direct-vmx role=project-l0");
-        #[cfg(feature = "physical-direct-vmx")]
+        #[cfg(all(feature = "physical-direct-vmx", not(feature = "profile-direct-vmx")))]
         serial.write_bytes(b"thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0\n");
+        #[cfg(feature = "profile-direct-vmx")]
+        serial.write_bytes(b"thin-hv: direct mode=profile-uefi variable_overlay=enabled selection=persistent-profile physical_ready=0\n");
         #[cfg(not(feature = "physical-direct-vmx"))]
         serial.write_bytes(b"thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0\n");
     }

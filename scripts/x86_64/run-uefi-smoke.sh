@@ -94,10 +94,11 @@ check_profile_contract_log() {
 # Mode provenance is separate from acceleration: physical-selection code is
 # tested under QEMU, never reported as physical-machine validation.
 check_direct_mode_log() {
-    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 expected
+    local mode=$1 log=$2 line transcript bytes modes=0 overlays=0 cpus=0 selections=0 profiles=0 selected= expected
     case "$mode" in
         qemu-research) expected='thin-hv: direct mode=qemu-research variable_overlay=enabled selection=test-profile physical_ready=0' ;;
         physical-uefi) expected='thin-hv: direct mode=physical-uefi variable_overlay=disabled selection=current-esp physical_ready=0' ;;
+        profile-uefi) expected='thin-hv: direct mode=profile-uefi variable_overlay=enabled selection=persistent-profile physical_ready=0' ;;
         *) return 1 ;;
     esac
     [[ -f "$log" && -r "$log" ]] || return 1
@@ -109,23 +110,47 @@ check_direct_mode_log() {
         case "$line" in
             'thin-hv: direct mode='*) [[ "$line" == "$expected" ]] || return 1; ((modes += 1)) ;;
             'thin-hv: variable overlay profile='*)
-                [[ "$mode" == qemu-research && "$line" =~ ^thin-hv:\ variable\ overlay\ profile=[12]\ mat_patches=[0-9]+$ ]] || return 1
+                [[ "$mode" != physical-uefi && "$line" =~ ^thin-hv:\ variable\ overlay\ profile=([12])\ mat_patches=[0-9]+$ ]] || return 1
+                [[ "$mode" != profile-uefi || "${BASH_REMATCH[1]}" == "$selected" ]] || return 1
                 ((overlays += 1)) ;;
-            'thin-hv: uefi variable overlay PASS'*) [[ "$mode" == qemu-research ]] || return 1 ;;
+            'thin-hv: uefi variable overlay PASS'*) [[ "$mode" != physical-uefi ]] || return 1 ;;
+            'thin-hv: boot profile='*)
+                [[ "$mode" == profile-uefi && "$line" =~ ^thin-hv:\ boot\ profile=([12])\ source=(explicit|persistent)\ scope=current-esp$ ]] || return 1
+                selected=${BASH_REMATCH[1]}; ((profiles += 1)) ;;
             'thin-hv: physical CPU ownership '*)
-                [[ "$mode" == physical-uefi && "$line" == 'thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0' ]] || return 1
+                [[ "$mode" != qemu-research && "$line" == 'thin-hv: physical CPU ownership PASS total=1 enabled=1 current=0 scope=bsp-only physical_smp=0' ]] || return 1
                 ((cpus += 1)) ;;
             'thin-hv: physical chainload scope='*)
-                [[ "$mode" == physical-uefi && "$line" =~ ^thin-hv:\ physical\ chainload\ scope=current-esp\ explicit_path=[01]$ ]] || return 1
+                [[ "$mode" != qemu-research && "$line" =~ ^thin-hv:\ physical\ chainload\ scope=current-esp\ explicit_path=[01]$ ]] || return 1
                 ((selections += 1)) ;;
         esac
     done <<<"$transcript"
     ((modes >= 2 && modes <= 128 && modes % 2 == 0)) || return 1
     if [[ "$mode" == physical-uefi ]]; then
         ((cpus == modes && selections * 2 == modes && overlays == 0))
+    elif [[ "$mode" == profile-uefi ]]; then
+        ((cpus == modes && selections * 2 == modes && profiles == selections && overlays * 2 == modes))
     else
         ((cpus == 0 && selections == 0 && overlays * 2 == modes))
     fi
+}
+
+# Same Direct backend plus independent intended-versus-observed profile checks.
+check_profile_selection_log() {
+    local fixture=$1 log=$2 profile=1 line fixtures=0 boots=0 guests=0 backends=0
+    case "$fixture" in windows-explicit|windows-persistent) ;; linux-explicit|linux-persistent) profile=2 ;; *) return 1 ;; esac
+    check_backend_log direct-vmx "$log" && check_direct_mode_log profile-uefi "$log" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        case "$line" in
+            'thin-hv: profile selection fixture begin') ((backends == 0)) || return 1; ((fixtures+=1)) ;;
+            'thin-hv: profile selection fixture '*) return 1 ;;
+            'thin-hv: backend='*) ((fixtures == 1 && backends <= 1 && boots == backends)) || return 1; ((backends+=1)) ;;
+            'thin-hv: boot profile='*) [[ "$backends" == 1 && "$line" == "thin-hv: boot profile=$profile source=${fixture#*-} scope=current-esp" ]] || return 1; ((boots+=1)) ;;
+            'thin-hv: guest variable profile='*) [[ "$backends" == 2 && "$line" == "thin-hv: guest variable profile=$profile" ]] || return 1; ((guests+=1)) ;;
+        esac
+    done <"$log"
+    ((fixtures == 1 && boots == 1 && guests == 1 && backends == 2))
 }
 
 # An explicit negative fixture, never an alternative Direct success condition.
@@ -766,6 +791,11 @@ if [[ ${1:-} == --check-direct-mode-log ]]; then
     check_direct_mode_log "$2" "$3" || die 'Direct mode provenance rejected'
     exit 0
 fi
+if [[ ${1:-} == --check-profile-selection-log ]]; then
+    [[ $# == 3 ]] || die 'usage: --check-profile-selection-log CASE LOG'
+    check_profile_selection_log "$2" "$3" || die 'profile selection evidence rejected'
+    exit 0
+fi
 if [[ ${1:-} == --check-cpu-ownership-reject-log ]]; then
     [[ $# == 3 ]] || die 'usage: --check-cpu-ownership-reject-log QEMU_STATUS LOG'
     check_cpu_ownership_reject_log "$2" "$3" || die 'CPU ownership rejection evidence rejected'
@@ -783,7 +813,7 @@ loader=${1:-"$repo_root/bin/x86_64/x86-uefi-loader.efi"}
 guest=${2:-"$repo_root/bin/x86_64/x86_guest_uefi_test.efi"}
 backend=${X86_UEFI_BACKEND:-direct-vmx}
 direct_mode=${X86_UEFI_DIRECT_MODE:-qemu-research}
-case "$direct_mode" in qemu-research|physical-uefi) ;; *) die 'X86_UEFI_DIRECT_MODE must be qemu-research or physical-uefi' ;; esac
+case "$direct_mode" in qemu-research|physical-uefi|profile-uefi) ;; *) die 'X86_UEFI_DIRECT_MODE must be qemu-research, physical-uefi, or profile-uefi' ;; esac
 [[ "$direct_mode" == qemu-research || "$backend" == direct-vmx ]] || die 'physical-uefi mode requires project Direct L0'
 pci_profile=${X86_UEFI_PCI_PROFILE:-firmware-default}
 require_high_pci=${X86_UEFI_REQUIRE_HIGH_PCI:-0}
@@ -893,6 +923,15 @@ allow_reboot=${X86_UEFI_ALLOW_REBOOT:-0}
 require_poweroff=${X86_UEFI_REQUIRE_POWEROFF:-0}
 data_disk=${X86_UEFI_DATA_DISK:-}
 usernet=${X86_UEFI_USERNET:-0}
+profile_fixture=${X86_UEFI_PROFILE_FIXTURE:-}
+if [[ -n "$profile_fixture" ]]; then
+    case "$profile_fixture" in windows-explicit|windows-persistent|linux-explicit|linux-persistent) ;; *) die 'invalid profile selection fixture' ;; esac
+    [[ "$backend" == direct-vmx && "$direct_mode" == profile-uefi && "$accel" == kvm && "$smp" == 1 && "$memory" == 256M && "$guest_location" == both && "$physical_policy" == 0 && "$host_exception_test" == 0 && "$msr_abort_test" == 0 && "$cpu_reject_test" == 0 && "$runtime_reject_test" == 0 && "$allow_reboot" == 0 && "$acpi_s3" == 0 && "$wake_cycles" == 0 && "$usernet" == 0 && -z "$data_disk" ]] || die 'profile fixture requires its isolated Direct configuration'
+    [[ "$timeout_seconds" =~ ^([1-9]|[1-5][0-9]|60)$ ]] || die 'profile fixture timeout must be 1..60 seconds'
+    [[ ${loader##*/} == "x86-uefi-profile-$profile_fixture.efi" && ${monitor##*/} == x86-uefi-profile-direct-monitor.efi && ${guest##*/} == x86_guest_uefi_test.efi ]] || die 'profile fixture artifact mismatch'
+    [[ -f "$stage/x86-uefi-profile-direct-loader.efi" ]] || die 'profile Direct loader missing'
+    failure_marker='thin-hv: profile selection fixture FAIL'
+fi
 
 case "$guest_location" in
     guest | both) trusted_profile=2 ;;
@@ -1037,6 +1076,7 @@ cleanup_esps() {
         rm -f -- "$directory/EFI/BOOT/BOOTX64.EFI" "$directory/EFI/BOOT/MONITORX64.EFI" \
             "$directory/EFI/BOOT/GUESTX64.EFI" "$directory/EFI/Microsoft/Boot/bootmgfw.efi" \
             "$directory/EFI/ubuntu/shimx64.efi" "$directory/EFI/Test/PHYSICAL.EFI" \
+            "$directory/EFI/Test/PROFILE.EFI" \
             "$directory/EFI/Test/OTHERONLY.EFI"
         rmdir -- "$directory/EFI/Microsoft/Boot" "$directory/EFI/Microsoft" \
             "$directory/EFI/ubuntu" "$directory/EFI/Test" "$directory/EFI/BOOT" \
@@ -1061,6 +1101,11 @@ fi
 if [[ "$guest_location" == windows || "$guest_location" == both ]]; then
     mkdir -p -- "$esp/EFI/Microsoft/Boot"
     install -m 0644 -- "$guest" "$esp/EFI/Microsoft/Boot/bootmgfw.efi"
+fi
+if [[ -n "$profile_fixture" ]]; then
+    mkdir -p -- "$esp/EFI/Test" "$esp/EFI/ubuntu"
+    install -m 0644 -- "$stage/x86-uefi-profile-direct-loader.efi" "$esp/EFI/Test/PROFILE.EFI"
+    install -m 0644 -- "$guest" "$esp/EFI/ubuntu/shimx64.efi"
 fi
 esp_args=(
     -drive "if=none,id=esp,format=raw,file=fat:rw:$esp"
@@ -1234,6 +1279,9 @@ fi
 if [[ "$backend" == direct-vmx ]]; then
     check_direct_platform_log "$serial_log" "$require_high_pci" || die 'Direct platform EPT evidence missing or malformed'
     check_direct_mode_log "$direct_mode" "$serial_log" || die 'Direct mode provenance missing or contradictory'
+    if [[ -n "$profile_fixture" ]]; then
+        check_profile_selection_log "$profile_fixture" "$serial_log" || die 'profile fixture selected the wrong primary OS'
+    fi
 fi
 if ((qemu_status != 0)); then
     cat -- "$qemu_log" >&2
