@@ -315,6 +315,16 @@ pub struct Rp1Gem {
 
 #[cfg(target_arch = "aarch64")]
 impl Rp1Gem {
+    /// Read-only stop check using the current mapping, without claiming or
+    /// reinitializing the released driver. Reads NCR at most 1000 times.
+    /// This verifies control bits, not completion of outstanding AXI/PCIe DMA.
+    pub fn verify_stopped_from_rp1_config(rp1: &Rp1Config) -> Result<u32, Rp1GemError> {
+        let map = Rp1PeripheralMap::from_config(rp1).map_err(|_| Rp1GemError::InvalidWindow)?;
+        let base = map.rp1_gem_base().map_err(|_| Rp1GemError::InvalidWindow)?;
+        poll_ncr_stopped(|| read_mmio(base, GEM_APERTURE_SIZE, NCR))
+            .map_err(|ncr| Rp1GemError::QuiesceTimeout { ncr })
+    }
+
     pub fn init_from_rp1_config(
         rp1: &Rp1Config,
         mac_addr: MacAddr,
