@@ -192,8 +192,10 @@ extern "C" fn main() -> ! {
             ));
         }
     }
-    gem.quiesce();
-    log(format_args!("[rp1-net-smoke] GEM quiesced"));
+    match gem.quiesce() {
+        Ok(ncr) => log(format_args!("[rp1-net-smoke] GEM NCR stopped: {ncr:#010x}")),
+        Err(err) => log(format_args!("[rp1-net-smoke] GEM stop failed: {err:?}")),
+    }
     wait_forever()
 }
 

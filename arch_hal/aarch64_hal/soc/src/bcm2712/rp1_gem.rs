@@ -9,7 +9,6 @@
 use core::arch::asm;
 #[cfg(target_arch = "aarch64")]
 use core::cell::UnsafeCell;
-#[cfg(target_arch = "aarch64")]
 use core::hint::spin_loop;
 #[cfg(target_arch = "aarch64")]
 use core::mem::MaybeUninit;
@@ -138,8 +137,8 @@ const DMA_BUF_LEN: usize = 2048;
 const MAX_FRAME_LEN: usize = 1518;
 const MDIO_POLL_LIMIT: usize = 20_000;
 const TX_POLL_LIMIT: usize = 100_000;
-#[cfg(target_arch = "aarch64")]
 const QUIESCE_POLL_LIMIT: usize = 1_000;
+const QUIESCE_NCR_MASK: u32 = NCR_RE | NCR_TE | NCR_TSTART | NCR_MPE;
 const LINK_POLL_INTERVAL_US: u64 = 10_000;
 const DEFAULT_LINK_WAIT_US: u64 = 5_000_000;
 
@@ -263,12 +262,21 @@ pub enum Rp1GemError {
     AddressTranslationFailed,
     DmaAddressNotCovered,
     MdioTimeout,
+    /// The last NCR still had requested enable/start bits set after bounded polling.
+    QuiesceTimeout {
+        ncr: u32,
+    },
     NoPhy,
     LinkTimeout,
     TxTimeout,
     TxFrameInvalid,
-    RxDescriptorError { addr_lo: u32, status: u32 },
-    RxFrameTooLarge { len: usize },
+    RxDescriptorError {
+        addr_lo: u32,
+        status: u32,
+    },
+    RxFrameTooLarge {
+        len: usize,
+    },
     Gpio(Bcm2712Error),
 }
 
@@ -436,17 +444,19 @@ impl Rp1Gem {
         self.last_error.take()
     }
 
-    /// Quiesces the device and releases the singleton claim.
+    /// Checks the NCR stop request and releases the singleton only on success.
     ///
     /// # Safety
     ///
     /// The caller must stop using this `Rp1Gem` reference immediately after
-    /// this call returns. The next successful `init_from_rp1_config` will
+    /// this call returns `Ok`. On `Err`, ownership and DMA storage stay retained.
+    /// The next successful `init_from_rp1_config` after release will
     /// overwrite the same static driver storage and create a fresh unique
     /// mutable reference for the reinitialized RP1 instance.
-    pub unsafe fn release_after_quiesce(&mut self) {
-        self.quiesce();
+    pub unsafe fn release_after_quiesce(&mut self) -> Result<u32, Rp1GemError> {
+        let ncr = self.quiesce()?;
         release_singleton();
+        Ok(ncr)
     }
 
     /// Quiesces the device for Linux and releases the singleton claim.
@@ -454,19 +464,21 @@ impl Rp1Gem {
     /// # Safety
     ///
     /// The caller must stop using this `Rp1Gem` reference immediately after
-    /// this call returns. This is intended for the terminal Linux handoff path.
-    pub unsafe fn release_after_linux_handoff(&mut self) {
-        self.handoff_to_linux();
+    /// this call returns `Ok`. On `Err`, the singleton remains owned; do not
+    /// jump to Linux. This is intended for the terminal Linux handoff path.
+    pub unsafe fn release_after_linux_handoff(&mut self) -> Result<u32, Rp1GemError> {
+        let ncr = self.handoff_to_linux()?;
         release_singleton();
+        Ok(ncr)
     }
 
-    /// Leaves GEM in an idle, driver-neutral state before Linux probes it.
+    /// Checks NCR enable/start bits, then clears bootstrap queue configuration.
     ///
     /// This deliberately does not reset RP1 or power down the GEM block, because
     /// Linux still needs the freshly loaded RP1 firmware and will reprogram the
     /// MAC/DMA state from its own driver.
-    pub fn handoff_to_linux(&mut self) {
-        self.quiesce();
+    pub fn handoff_to_linux(&mut self) -> Result<u32, Rp1GemError> {
+        let ncr = self.quiesce()?;
 
         // Linux will install its own DMA rings.  After RX/TX are stopped, clear
         // queue base registers and DMA configuration so no stale bootstrap
@@ -481,31 +493,26 @@ impl Rp1Gem {
         self.reg_write(RSR, u32::MAX);
         self.reg_write(ISR, u32::MAX);
         dsb_sy();
+        Ok(ncr)
     }
 
-    /// Stops DMA activity and leaves the GEM idle for a firmware or Linux handoff.
+    /// Requests RX/TX/management stop and returns the observed disabled NCR.
     ///
-    /// Descriptor and packet storage remain allocated so this operation is safe
-    /// to call repeatedly and never invalidates the driver's static DMA area.
-    pub fn quiesce(&mut self) {
+    /// A bounded poll timeout is an error, not permission to reload RP1 or hand
+    /// it off. Storage stays allocated on either result. NCR readback alone
+    /// does not prove that all in-flight DMA transactions have completed.
+    pub fn quiesce(&mut self) -> Result<u32, Rp1GemError> {
         // Disable every interrupt source before changing DMA ownership.  IDR is
         // a set-disable register, so writing all ones is idempotent.
         self.reg_write(IDR, u32::MAX);
 
         // Clear receive/transmit enable and the transmit-start command while
         // retaining no management-port enable: a handoff does not need MDIO,
-        // and this leaves the MAC fully idle.
+        // and verify those requested control bits below.
         let ncr = self.reg_read(NCR);
-        self.reg_write(
-            NCR,
-            (ncr & !(NCR_RE | NCR_TE | NCR_TSTART | NCR_MPE)) | NCR_CLRSTAT,
-        );
-        for _ in 0..QUIESCE_POLL_LIMIT {
-            if self.reg_read(NCR) & (NCR_RE | NCR_TE | NCR_TSTART) == 0 {
-                break;
-            }
-            spin_loop();
-        }
+        self.reg_write(NCR, (ncr & !QUIESCE_NCR_MASK) | NCR_CLRSTAT);
+        let ncr = poll_ncr_stopped(|| self.reg_read(NCR))
+            .map_err(|ncr| Rp1GemError::QuiesceTimeout { ncr })?;
 
         // These status registers are write-one-to-clear.  A final ISR read is
         // intentionally avoided because it can have device-specific effects.
@@ -513,6 +520,7 @@ impl Rp1Gem {
         self.reg_write(RSR, u32::MAX);
         self.reg_write(ISR, u32::MAX);
         dsb_sy();
+        Ok(ncr)
     }
 
     pub fn send_test_broadcast(&mut self) -> Result<(), Rp1GemError> {
@@ -978,6 +986,19 @@ const fn gem_amp_value(ar2r_max_pipe: u8, aw2w_max_pipe: u8, aw2b_fill: bool) ->
     (ar2r_max_pipe as u32) | ((aw2w_max_pipe as u32) << 8) | ((aw2b_fill as u32) << 16)
 }
 
+// Readback of control bits only: this is not an AXI/PCIe drain test.
+fn poll_ncr_stopped(mut read: impl FnMut() -> u32) -> Result<u32, u32> {
+    let mut ncr = u32::MAX;
+    for _ in 0..QUIESCE_POLL_LIMIT {
+        ncr = read();
+        if ncr & QUIESCE_NCR_MASK == 0 {
+            return Ok(ncr);
+        }
+        spin_loop();
+    }
+    Err(ncr)
+}
+
 fn is_zero_mac(mac: MacAddr) -> bool {
     mac.0 == [0; 6]
 }
@@ -1011,6 +1032,34 @@ const fn decode_link_speed(common: u16, ctrl1000: u16, stat1000: u16) -> LinkSpe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_ncr_is_required_with_bounded_polling() {
+        for ready_at in [1, 2, QUIESCE_POLL_LIMIT] {
+            let mut reads = 0;
+            let result = poll_ncr_stopped(|| {
+                reads += 1;
+                if reads == ready_at {
+                    NCR_CLRSTAT
+                } else {
+                    QUIESCE_NCR_MASK
+                }
+            });
+            assert_eq!(result, Ok(NCR_CLRSTAT));
+            assert_eq!(reads, ready_at);
+        }
+        for held in [NCR_RE, NCR_TE, NCR_TSTART, NCR_MPE, u32::MAX] {
+            let mut reads = 0;
+            assert_eq!(
+                poll_ncr_stopped(|| {
+                    reads += 1;
+                    held
+                }),
+                Err(held)
+            );
+            assert_eq!(reads, QUIESCE_POLL_LIMIT);
+        }
+    }
 
     #[test]
     fn rx_descriptor_ownership_and_wrap_encoding() {
